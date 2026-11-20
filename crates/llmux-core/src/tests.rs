@@ -97,7 +97,14 @@ async fn fixture_with_context(
     refresh_fails: bool,
     max_context: [Option<u32>; 3],
 ) -> Fixture {
-    fixture_with_models(errors, refresh_fails, max_context, &[("model", &[0, 1, 2])]).await
+    fixture_with_models(
+        errors,
+        refresh_fails,
+        max_context,
+        &[("model", &[0, 1, 2])],
+        Default::default(),
+    )
+    .await
 }
 
 async fn fixture_with_models(
@@ -105,6 +112,7 @@ async fn fixture_with_models(
     refresh_fails: bool,
     max_context: [Option<u32>; 3],
     models: &[(&str, &[u32])],
+    shared_quota: llmux_types::QuotaSpec,
 ) -> Fixture {
     let server = llmux_testkit::TestServer::start(axum::Router::new().fallback(|| async { "ok" }))
         .await
@@ -133,7 +141,11 @@ async fn fixture_with_models(
             priority: i as i32,
             weight: 1,
             billing: Default::default(),
-            quota: Default::default(),
+            quota: if i < 2 {
+                shared_quota
+            } else {
+                Default::default()
+            },
             timeout: Duration::from_secs(1),
             max_context: max_context[i as usize],
         })
@@ -457,6 +469,7 @@ async fn rate_limit_cools_down_every_model_sharing_the_upstream_route() {
         false,
         [None; 3],
         &[("a", &[0, 2]), ("b", &[1, 2])],
+        Default::default(),
     )
     .await;
     let first = executor
@@ -483,4 +496,36 @@ async fn rate_limit_cools_down_every_model_sharing_the_upstream_route() {
         .map(|(dep, _)| dep.to_string())
         .collect();
     assert_eq!(calls, ["dep0", "dep2", "dep2"]);
+}
+
+#[tokio::test]
+async fn local_rpm_budget_is_shared_by_models_on_the_same_upstream_route() {
+    let (executor, adapter, _, _server) = fixture_with_models(
+        vec![],
+        false,
+        [None; 3],
+        &[("a", &[0, 2]), ("b", &[1, 2])],
+        llmux_types::QuotaSpec {
+            rpm: Some(1),
+            ..Default::default()
+        },
+    )
+    .await;
+    for model in ["a", "b"] {
+        executor
+            .execute(GatewayRequest {
+                model: model.into(),
+                ..request()
+            })
+            .await
+            .unwrap();
+    }
+    let calls: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(calls, ["dep0", "dep2"]);
 }
