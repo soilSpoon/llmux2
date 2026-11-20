@@ -4,6 +4,9 @@ Rust gateway exposing multiple API-key upstreams under one OpenAI-compatible mod
 
 ## Run
 
+See [official free API providers](docs/free-providers.md) for importer-gap
+replacements, verified free-offer evidence, compatibility caveats, and configs.
+
 1. Copy `examples/llmux.example.toml` to `llmux.toml` and set the upstream base URLs and model IDs. Base URLs include the provider's API prefix, such as `/v1`; the adapter appends `/chat/completions`.
 2. Set the secrets named by the config in your environment (or use `file:/path/to/secret` references). The gateway rejects inline keys. Use a separate key for gateway clients.
 3. Start the server with `cargo run --locked -- llmux.toml`. It listens on loopback by default; if exposing it remotely, use a TLS reverse proxy.
