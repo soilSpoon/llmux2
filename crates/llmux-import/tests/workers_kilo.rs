@@ -36,6 +36,56 @@ fn success(output: &std::process::Output) -> String {
 }
 
 #[test]
+fn replacement_rewriting_preserves_source_codex_fallback_exclusions() {
+    let mut root = fixture();
+    let name = "openrouter/anthropic/claude-fable-5.2";
+    root["providerConnections"].as_array_mut().unwrap().push(json!({"id":"anthropic","provider":"anthropic","authType":"apikey","apiKey":"synthetic-anthropic-key"}));
+    root["combos"].as_array_mut().unwrap().extend([
+        json!({"id":"source","name":name,"models":["codex/owner", "openai/unverified"]}),
+        json!({"name":"nested-owner","models":[{"kind":"combo-ref","comboName":name}]}),
+    ]);
+    root["modelAliases"] = json!({"owner-alias":name});
+    root["modelComboMappings"] =
+        json!([{"pattern":"mapped-owner","comboId":"source","enabled":true}]);
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("fallback-key");
+    fs::write(&key, "synthetic-fallback-key").unwrap();
+    let key = format!("file:{}", key.display());
+    success(&run(
+        &root,
+        dir.path(),
+        &[
+            ("--openrouter-replacements", dir.path()),
+            (
+                "--omniroute-fallback",
+                Path::new("http://127.0.0.1:20128/v1"),
+            ),
+            ("--omniroute-key", Path::new(&key)),
+        ],
+    ));
+    let text = fs::read_to_string(dir.path().join("out.toml")).unwrap();
+    let config: toml::Value = toml::from_str(&text).unwrap();
+    let models = config["models"].as_array().unwrap();
+    let catch_all = models
+        .iter()
+        .find(|m| m["name"].as_str() == Some("*"))
+        .unwrap();
+    let excluded = catch_all["exclude"].as_array().unwrap();
+    for name in [name, "nested-owner", "owner-alias", "mapped-owner"] {
+        assert!(
+            excluded.iter().any(|v| v.as_str() == Some(name)),
+            "missing exclusion {name}"
+        );
+    }
+    for model in models
+        .iter()
+        .filter(|m| [name, "nested-owner"].contains(&m["name"].as_str().unwrap()))
+    {
+        assert_eq!(model["deployments"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[test]
 fn workers_options_compose_with_explicit_omniroute_fallback() {
     let mut root = fixture();
     root["providerConnections"]

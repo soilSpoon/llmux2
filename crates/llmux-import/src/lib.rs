@@ -604,7 +604,7 @@ pub fn import_with_options(
     let mut combo_ids = HashMap::new();
     let mut order = Vec::new();
     for (i, entry) in array(&root, "combos").iter().enumerate() {
-        let mut combo = if let Some(data) = entry.get("data") {
+        let combo = if let Some(data) = entry.get("data") {
             if let Some(data) = data.as_str() {
                 match serde_json::from_str(data) {
                     Ok(combo) => combo,
@@ -638,16 +638,25 @@ pub fn import_with_options(
                 .entry(id.to_owned())
                 .or_insert_with(|| name.clone());
         }
-        if policy.openrouter_replacements {
+        combos.insert(name, combo);
+    }
+    let fallback_exclusions = fallback
+        .map(|_| fallback::exclusions(&root, &combos, &combo_ids))
+        .transpose()?;
+    if policy.openrouter_replacements {
+        for name in &order {
             if let Some(model) = name.strip_prefix("openrouter/") {
-                combo["models"] =
-                    json!([upstream::ProviderIdentity::Builtin("openrouter".into()).step(model)]);
-                warnings.push(format!(
-                    "combo {name}: source combo replaced by reviewed official-only policy"
-                ));
+                if let Some(combo) = combos.get_mut(name) {
+                    combo["models"] =
+                        json!([
+                            upstream::ProviderIdentity::Builtin("openrouter".into()).step(model)
+                        ]);
+                    warnings.push(format!(
+                        "combo {name}: source combo replaced by reviewed official-only policy"
+                    ));
+                }
             }
         }
-        combos.insert(name, combo);
     }
     let nodes = array(&root, "providerNodes");
     let mut direct = direct::collect(&combos, nodes, &connections);
@@ -781,8 +790,7 @@ pub fn import_with_options(
         models.push(json!({"name":name,"aliases":[],"deployments":deployments}));
     }
     aliases::attach(&mut models, aliases, &mut warnings);
-    if let Some(options) = fallback {
-        let exclusions = fallback::exclusions(&root, &combos, &combo_ids)?;
+    if let (Some(options), Some(exclusions)) = (fallback, fallback_exclusions) {
         let credential = unique("omniroute-fallback", &mut ids);
         credentials.push(
             json!({"id":credential,"kind":"api_key","provider":"openai_compat","key":options.key}),
