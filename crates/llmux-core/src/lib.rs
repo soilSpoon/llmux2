@@ -1,6 +1,7 @@
 //! Priority routing, deployment limits, and HTTP execution.
 
 mod limits;
+mod stats;
 
 #[cfg(test)]
 mod tests;
@@ -20,6 +21,8 @@ use llmux_types::{
     BuildError, ContextOverflow, CredentialSource, Deployment, DeploymentIdx, ErrorKind,
     GatewayRequest, GatewayResponse, ProviderAdapter, ProviderRegistry, Support, UpstreamError,
 };
+use stats::AttemptStats;
+pub use stats::DeploymentStats;
 use std::{
     collections::HashMap,
     ops::Range,
@@ -80,6 +83,7 @@ struct Binding {
     auth: Arc<dyn CredentialSource>,
     disabled: Arc<AtomicBool>,
     limits: Arc<DeploymentLimits>,
+    stats: Option<Arc<AttemptStats>>,
 }
 
 struct ModelOrder {
@@ -120,6 +124,7 @@ impl Executor {
                     auth,
                     disabled: disabled.entry(dep.credential.clone()).or_default().clone(),
                     limits: Arc::new(DeploymentLimits::new(dep.quota)),
+                    stats: cfg.server.dashboard_key.is_some().then(Arc::default),
                 })
             })
             .collect::<Result<Box<[_]>, _>>()?;
@@ -172,6 +177,32 @@ impl Executor {
             orders,
             http: builder.build(connector),
         })
+    }
+
+    pub fn deployment_stats(&self) -> Vec<DeploymentStats<'_>> {
+        let now = Instant::now();
+        self.cfg
+            .models
+            .iter()
+            .flat_map(|model| {
+                model.deployments.iter().filter_map(move |&idx| {
+                    let dep = &self.cfg.deployments[index(idx)];
+                    let binding = &self.bindings[index(idx)];
+                    Some(
+                        binding.stats.as_ref()?.snapshot(
+                            &model.name,
+                            dep,
+                            binding.disabled.load(Ordering::Relaxed),
+                            binding
+                                .limits
+                                .cooldown_until(now)
+                                .map(|end| (end.duration_since(now).as_millis() as u64).max(1)),
+                            binding.limits.inflight(),
+                        ),
+                    )
+                })
+            })
+            .collect()
     }
 
     pub async fn execute(&self, req: GatewayRequest) -> Result<RoutedResponse, GatewayError> {
@@ -266,6 +297,9 @@ impl Executor {
                     let result = timeout_at(attempt_deadline, self.attempt(&req, dep, binding))
                         .await
                         .unwrap_or(Err(GatewayError::Client(UpstreamError::Timeout)));
+                    if let Some(stats) = &binding.stats {
+                        stats.record_attempt(result.is_ok());
+                    }
                     last_transient = None;
                     match result {
                         Ok(response) => {
@@ -394,18 +428,23 @@ impl Executor {
                         bytes_sent: 0,
                     }))?
                     .map_err(GatewayError::Client)?;
-                let events = stream::unfold(Some(events), {
-                    let idle_timeout = self.cfg.server.request_timeout.min(dep.timeout);
-                    move |events| async move {
-                        let mut events = events?;
-                        match timeout(idle_timeout, events.next()).await {
-                            Ok(Some(Ok(event))) => Some((Ok(event), Some(events))),
-                            Ok(Some(Err(err))) => Some((Err(err), None)),
-                            Ok(None) => None,
-                            Err(_) => Some((Err(UpstreamError::Timeout), None)),
+                let idle_timeout = self.cfg.server.request_timeout.min(dep.timeout);
+                let events = stream::unfold(
+                    Some((events, binding.stats.clone())),
+                    move |state| async move {
+                        let (mut events, stats) = state?;
+                        let error = match timeout(idle_timeout, events.next()).await {
+                            Ok(Some(Ok(event))) => return Some((Ok(event), Some((events, stats)))),
+                            Ok(Some(Err(err))) => err,
+                            Ok(None) => return None,
+                            Err(_) => UpstreamError::Timeout,
+                        };
+                        if let Some(stats) = &stats {
+                            stats.record_stream_error();
                         }
-                    }
-                });
+                        Some((Err(error), None))
+                    },
+                );
                 Ok(GatewayResponse::Stream(Box::pin(
                     stream::once(async { Ok(first) }).chain(events),
                 )))

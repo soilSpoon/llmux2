@@ -138,6 +138,25 @@ impl Fixture {
         max_attempts: usize,
         fallback_on_429: bool,
     ) -> Self {
+        Self::start_with_options(
+            first,
+            next,
+            primary_quota,
+            max_attempts,
+            fallback_on_429,
+            false,
+        )
+        .await
+    }
+
+    async fn start_with_options(
+        first: [Reply; 2],
+        next: [Reply; 2],
+        primary_quota: &str,
+        max_attempts: usize,
+        fallback_on_429: bool,
+        dashboard: bool,
+    ) -> Self {
         let [primary_first, secondary_first] = first;
         let [primary_next, secondary_next] = next;
         let primary = Arc::new(Mock {
@@ -173,6 +192,12 @@ impl Fixture {
             fs::write(secrets.path().join(key), format!("{key}\n")).unwrap();
         }
         let base = secrets.path().display();
+        let dashboard = if dashboard {
+            fs::write(secrets.path().join("dashboard"), "test-dashboard\n").unwrap();
+            format!("dashboard_key = \"file:{base}/dashboard\"")
+        } else {
+            String::new()
+        };
         let fallback_on = if fallback_on_429 {
             r#"["rate_limited", "quota_exhausted"]"#
         } else {
@@ -183,6 +208,7 @@ impl Fixture {
 [server]
 client_keys = ["file:{base}/test-client"]
 request_timeout_ms = 4000
+{dashboard}
 
 [routing]
 max_attempts = {max_attempts}
@@ -279,6 +305,19 @@ priority = 0
         .unwrap()
         .map(Body::new)
     }
+
+    async fn get(&self, path: &str, key: Option<&str>) -> Response {
+        let mut request = Request::get(format!("{}{path}", self.gateway.url()));
+        if let Some(key) = key {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {key}"));
+        }
+        Client::builder(TokioExecutor::new())
+            .build_http()
+            .request(request.body(Full::<Bytes>::default()).unwrap())
+            .await
+            .unwrap()
+            .map(Body::new)
+    }
 }
 
 fn check_route(response: &Response, deployment: &str, attempts: &str) {
@@ -294,6 +333,107 @@ async fn body(response: Response) -> String {
         .unwrap()
         .to_bytes();
     String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn dashboard_routes_are_absent_unless_configured() {
+    let fixture = Fixture::start(
+        [Reply::Complete, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    for path in [
+        "/dashboard",
+        "/dashboard/stats",
+        "/dashboard/app.css",
+        "/dashboard/app.js",
+    ] {
+        assert_eq!(
+            fixture.get(path, None).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+}
+
+#[tokio::test]
+async fn dashboard_reports_fallback_and_committed_stream_errors_without_exposing_secrets() {
+    let fixture = Fixture::start_with_options(
+        [Reply::Limit(60), Reply::Complete],
+        [Reply::Complete, Reply::AbortStream],
+        "quota = { rpm = 20, concurrent = 2 }",
+        4,
+        true,
+        true,
+    )
+    .await;
+    let page = fixture.get("/dashboard", None).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    assert!(page.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap()
+        .contains("frame-ancestors 'none'"));
+    assert!(body(page).await.contains("Traffic overview"));
+    assert!(body(fixture.get("/dashboard/app.js", None).await)
+        .await
+        .contains("/dashboard/stats"));
+    for key in [None, Some("test-client"), Some("wrong")] {
+        let response = fixture.get("/dashboard/stats", key).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+    let mut bad = fixture.request("test-dashboard", "alias", false).await;
+    assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+    bad = fixture.request("test-client", "unknown", false).await;
+    assert_eq!(bad.status(), StatusCode::NOT_FOUND);
+    check_route(
+        &fixture.request("test-client", "alias", false).await,
+        "d2",
+        "2",
+    );
+    let stream = fixture.request("test-client", "alias", true).await;
+    check_route(&stream, "d2", "1");
+    assert!(body(stream).await.contains("stream_broken"));
+    assert_eq!(fixture.counts(), [1, 2]);
+
+    let response = fixture
+        .get("/dashboard/stats", Some("test-dashboard"))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let output = body(response).await;
+    for private in [
+        "test-primary",
+        "test-secondary",
+        "test-client",
+        "test-dashboard",
+        "127.0.0.1",
+        "vendor-primary",
+        "Hello",
+    ] {
+        assert!(!output.contains(private));
+    }
+    let stats: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(stats["responses"]["ok"], 2);
+    assert_eq!(stats["responses"]["rejected"], 1);
+    assert_eq!(stats["responses"]["unavailable"], 0);
+    assert_eq!(stats["responses"]["failed"], 0);
+    assert!(stats["responses"]["ready_us"].as_u64().unwrap() > 0);
+
+    let rows = stats["deployments"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["model"], "shared");
+    assert_eq!(rows[0]["id"], "d1");
+    assert_eq!(rows[0]["routed"], 0);
+    assert_eq!(rows[0]["failed_attempts"], 1);
+    assert_eq!(rows[0]["rpm_limit"], 20);
+    assert_eq!(rows[0]["in_flight"], 0);
+    assert!(rows[0]["cooldown_ms"].as_u64().unwrap() > 0);
+    assert_eq!(rows[1]["id"], "d2");
+    assert_eq!(rows[1]["routed"], 2);
+    assert_eq!(rows[1]["failed_attempts"], 0);
+    assert_eq!(rows[1]["stream_errors"], 1);
+    assert!(rows[1]["cooldown_ms"].is_null());
 }
 
 #[tokio::test]

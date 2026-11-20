@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>llmux2 · Gateway dashboard</title>
+  <link rel="stylesheet" href="/dashboard/app.css">
+  <script src="/dashboard/app.js" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="shell masthead-inner">
+      <div class="brand">
+        <svg aria-hidden="true" width="36" height="36" viewBox="0 0 36 36" class="mark">
+          <rect x="1" y="1" width="34" height="34" rx="9"/>
+          <path d="M10 18h5m0 0 7-7h4m-11 7 7 7h4M15 18h11"/>
+        </svg>
+        <span>llmux2</span><span class="section-name">/ Operations</span>
+      </div>
+      <div class="session">
+        <span id="connection" class="pill" data-tone="neutral" role="status">Locked</span>
+        <button id="lock" type="button" class="quiet" hidden>Lock</button>
+      </div>
+    </div>
+  </header>
+  <main class="shell">
+    <section id="signin" class="signin panel" aria-labelledby="signin-title">
+      <div class="eyebrow">Read-only observability</div>
+      <h1 id="signin-title">Gateway dashboard</h1>
+      <p>Enter your dashboard key to see live traffic and routing. The key is held only while this page is open.</p>
+      <form id="key-form" autocomplete="off">
+        <label for="key">Dashboard key</label>
+        <input id="key" type="password" required spellcheck="false" autocomplete="off">
+        <button id="unlock" type="submit">Open dashboard</button>
+      </form>
+      <p id="signin-error" class="notice" role="alert"></p>
+    </section>
+    <div id="dashboard" hidden>
+      <header class="overview">
+        <div>
+          <div class="eyebrow">Gateway operations</div>
+          <h1>Traffic overview</h1>
+          <p>Requests, upstream routing, and active cooldowns.</p>
+        </div>
+        <div class="uptime"><span>INSTANCE UPTIME</span><strong id="uptime">—</strong></div>
+      </header>
+      <p id="connection-error" class="notice panel" hidden></p>
+      <section class="metrics" aria-label="Traffic metrics">
+        <article class="panel metric">
+          <h2>Responses / sec</h2><strong id="rps">—</strong>
+          <p id="total">Since startup · —</p>
+        </article>
+        <article class="panel metric">
+          <h2>Successful responses</h2><strong id="success">—</strong>
+          <p id="success-note">Since startup</p>
+        </article>
+        <article class="panel metric">
+          <h2>429 responses</h2><strong id="limited">—</strong>
+          <p id="errors-note">Since startup</p>
+        </article>
+        <article class="panel metric">
+          <h2>Response ready</h2><strong id="latency">—</strong>
+          <p>Mean · first event for streams</p>
+        </article>
+      </section>
+      <section class="panel traffic" aria-labelledby="traffic-title">
+        <div class="section-header">
+          <div><h2 id="traffic-title">Live traffic</h2><p>Responses per second · last 2 minutes in this tab</p></div>
+          <div class="legend" aria-hidden="true"><span class="good-dot">2xx</span><span class="warn-dot">Errors</span></div>
+        </div>
+        <div class="plot">
+          <div class="axis" aria-hidden="true"><span id="axis-max">1</span><span id="axis-mid">0.5</span><span>0</span></div>
+          <div class="chart">
+            <svg viewBox="0 0 600 120" preserveAspectRatio="none" role="img" aria-label="Traffic rate over time: successful and error responses">
+              <path class="grid" d="M0 1H600 M0 60H600 M0 119H600"/>
+              <path id="traffic-fill" class="fill"/>
+              <path id="traffic-ok" class="series good"/>
+              <path id="traffic-errors" class="series warn"/>
+            </svg>
+            <span id="chart-empty">Waiting for the next sample…</span>
+            <div class="time-axis" aria-hidden="true"><span>−2 min</span><span>Now</span></div>
+          </div>
+        </div>
+      </section>
+      <section class="panel routes" aria-labelledby="routes-title">
+        <div class="section-header">
+          <div><h2 id="routes-title">Upstream deployments</h2><p>Grouped by model, in routing priority order. Lower priority number wins.</p></div>
+          <span id="deployment-count" class="pill" data-tone="neutral"></span>
+        </div>
+        <div class="table-scroll" tabindex="0" role="region" aria-label="Deployment routing table">
+          <table>
+            <thead><tr>
+              <th scope="col">Deployment</th><th scope="col">Priority</th><th scope="col">State</th>
+              <th scope="col" class="numeric">Routed</th><th scope="col" class="numeric">Failed attempts</th>
+              <th scope="col" class="numeric">Stream errors</th><th scope="col">Local limits</th>
+            </tr></thead>
+          </table>
+        </div>
+        <p class="table-note">Routed includes committed streams. Stream errors are counted separately after the first event.</p>
+      </section>
+      <footer><span>Instance-local counters reset at restart.</span><span id="updated"></span></footer>
+    </div>
+  </main>
+</body>
+</html>

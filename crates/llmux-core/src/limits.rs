@@ -21,6 +21,11 @@ pub(super) struct DeploymentLimits {
 }
 
 impl DeploymentLimits {
+    pub fn inflight(&self) -> Option<u32> {
+        self.concurrent
+            .map(|_| self.inflight.load(Ordering::Relaxed))
+    }
+
     pub fn new(spec: QuotaSpec) -> Self {
         Self {
             baseline: Instant::now(),

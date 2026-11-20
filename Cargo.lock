@@ -447,6 +447,7 @@ dependencies = [
  "llmux-config",
  "llmux-testkit",
  "llmux-types",
+ "serde",
  "thiserror",
  "tokio",
 ]
