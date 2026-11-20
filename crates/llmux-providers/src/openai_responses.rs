@@ -499,6 +499,145 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chat_options_and_multipart_instructions_are_converted() {
+        let schema = json!({"name":"answer","schema":{"type":"object"},"strict":true});
+        let converted = chat_request(&json!({
+            "messages":[
+                {"role":"system","content":[{"type":"text","text":"First"},{"type":"text","text":"Second"}]},
+                {"role":"system","content":"Third"},
+                {"role":"developer","content":"Guide"},
+                {"role":"tool","tool_call_id":"c1","content":[{"type":"text","text":"Result"}]}
+            ],
+            "tool_choice":{"type":"function","function":{"name":"lookup"}},
+            "parallel_tool_calls":false,
+            "reasoning_effort":"high",
+            "response_format":{"type":"json_schema","json_schema":schema}
+        })).unwrap();
+        assert_eq!(converted["instructions"], "First\nSecond\n\nThird");
+        assert_eq!(
+            converted["input"],
+            json!([
+                {"role":"developer","content":"Guide"},
+                {"type":"function_call_output","call_id":"c1","output":"Result"}
+            ])
+        );
+        assert_eq!(
+            converted["tool_choice"],
+            json!({"type":"function","name":"lookup"})
+        );
+        assert_eq!(converted["parallel_tool_calls"], false);
+        assert_eq!(converted["reasoning"], json!({"effort":"high"}));
+        assert_eq!(
+            converted["text"]["format"],
+            json!({"type":"json_schema","name":"answer","schema":{"type":"object"},"strict":true})
+        );
+        for choice in ["auto", "none", "required"] {
+            let converted = chat_request(&json!({"messages":[],"tool_choice":choice,"reasoning":{"effort":"low"},"response_format":{"type":"json_object"}})).unwrap();
+            assert_eq!(converted["tool_choice"], choice);
+            assert_eq!(converted["reasoning"], json!({"effort":"low"}));
+            assert_eq!(converted["text"]["format"], json!({"type":"json_object"}));
+            assert_eq!(converted["input"], json!([]));
+        }
+    }
+
+    #[test]
+    fn invalid_chat_history_and_options_are_client_errors() {
+        for body in [
+            json!({"messages":[{"role":"unknown","content":"text"}]}),
+            json!({"messages":[{"role":"user","content":[{"type":"audio"}]}]}),
+            json!({"messages":[{"role":"assistant","tool_calls":[{"type":"custom"}]}]}),
+            json!({"messages":[{"role":"system","content":[{"text":5}]}]}),
+            json!({"messages":[],"tools":[{"type":"web_search"}]}),
+            json!({"messages":[],"tool_choice":{"type":"unsupported"}}),
+            json!({"messages":[],"response_format":{"type":"json_schema","json_schema":null}}),
+            json!({"messages":[{"role":"assistant","refusal":"No","content":[{"type":"image_url"}]}]}),
+        ] {
+            assert!(
+                matches!(chat_request(&body), Err(BuildError::InvalidBody)),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_responses_tools_are_validated() {
+        let body = json!({"input":[{"type":"additional_tools","tools":[{"type":"namespace","tools":[{"type":"function","name":"lookup"}]}]}],"tools":[{"type":"custom","name":"custom"},{"type":"web_search"},{"type":"web_search_preview"}]});
+        let normalized = normalize(
+            &serde_json::to_vec(&body).unwrap(),
+            "model",
+            InboundFormat::OpenAiResponses,
+        )
+        .unwrap();
+        assert_eq!(normalized["input"], body["input"]);
+        assert_eq!(normalized["tools"], body["tools"]);
+        assert_eq!(
+            normalize(b"{}", "model", InboundFormat::OpenAiResponses).unwrap()["input"],
+            json!([])
+        );
+        for body in [
+            json!([]),
+            json!({"input":42}),
+            json!({"tools":[{"type":"namespace"}]}),
+            json!({"input":[{"type":"additional_tools","tools":[{"type":"namespace","tools":[{"type":"file_search"}]}]}]}),
+        ] {
+            assert!(matches!(
+                normalize(
+                    &serde_json::to_vec(&body).unwrap(),
+                    "model",
+                    InboundFormat::OpenAiResponses
+                ),
+                Err(BuildError::InvalidBody)
+            ));
+        }
+    }
+
+    #[test]
+    fn stream_errors_keep_quota_and_rate_limit_classification() {
+        for code in [
+            "subscription_sharing_usage_limit_exceeded",
+            "subscription_sharing_usage_unavailable",
+            "insufficient_quota",
+        ] {
+            assert!(matches!(
+                stream_error(&json!({"response":{"error":{"code":code}}})),
+                UpstreamError::QuotaExhausted { .. }
+            ));
+        }
+        assert!(matches!(
+            stream_error(&json!({"error":{"code":"rate_limit_exceeded"}})),
+            UpstreamError::RateLimited { .. }
+        ));
+        assert!(matches!(
+            stream_error(&json!({"code":"server_error"})),
+            UpstreamError::Server {
+                status: StatusCode::BAD_GATEWAY
+            }
+        ));
+    }
+
+    #[test]
+    fn chat_completion_preserves_refusals_and_rejects_malformed_output() {
+        let complete = chat_complete(&json!({"id":"r1","model":"model","created_at":1,"output":[{"type":"message","content":[{"type":"output_text","text":"Sorry"},{"type":"refusal","refusal":"No"}]}]})).unwrap();
+        assert_eq!(
+            complete["choices"][0]["message"],
+            json!({"role":"assistant","content":"Sorry","refusal":"No"})
+        );
+        assert_eq!(complete["choices"][0]["finish_reason"], "stop");
+        assert!(complete["usage"].is_null());
+        assert!(
+            chat_complete(&json!({"output":[]})).unwrap()["choices"][0]["message"]["content"]
+                .is_null()
+        );
+        for response in [
+            json!({}),
+            json!({"output":[{"type":"message","content":null}]}),
+            json!({"output":[{"type":"message","content":[{"type":"refusal","refusal":5}]}]}),
+        ] {
+            assert!(chat_complete(&response).is_err());
+        }
+    }
+
+    #[test]
     fn chat_function_strictness_preserves_optional_arguments() {
         for strict in [None, Some(false), Some(true)] {
             let mut function = json!({"name":"test","parameters":{"type":"object","properties":{"optional":{"type":"string"}},"required":[]}});
