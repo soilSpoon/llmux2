@@ -180,6 +180,11 @@ fn gateway_error(err: GatewayError) -> Response {
             "invalid_request_error",
             "Model does not support streaming",
         ),
+        GatewayError::UnsupportedRequest => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Request uses fields or content the selected upstream cannot accept",
+        ),
         GatewayError::AllCandidatesExhausted { retry_after, .. } => rate_limited(retry_after),
         GatewayError::Client(UpstreamError::RateLimited { retry_after, .. }) => {
             rate_limited(retry_after.unwrap_or_default())

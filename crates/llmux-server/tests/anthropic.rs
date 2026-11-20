@@ -202,13 +202,17 @@ priority = {openai_priority}
     }
 
     async fn request(&self, streaming: bool) -> (Response<Body>, String) {
-        let payload = json!({
+        self.send(json!({
             "model": "assistant", "stream": streaming,
             "messages": [
                 {"role": "system", "content": "Be brief"},
                 {"role": "user", "content": "Hello"},
             ],
-        });
+        }))
+        .await
+    }
+
+    async fn send(&self, payload: Value) -> (Response<Body>, String) {
         let request = Request::post(format!("{}/v1/chat/completions", self.gateway.url()))
             .header(header::AUTHORIZATION, "Bearer test-client")
             .header(header::CONTENT_TYPE, "application/json")
@@ -313,6 +317,21 @@ async fn rate_limited_openai_fails_over_to_anthropic() {
     assert!(body.contains("Hi from Claude"));
     assert!(body.ends_with("data: [DONE]\n\n"));
     assert_eq!(fixture.counts(), [1, 1]);
+}
+
+#[tokio::test]
+async fn unconvertible_request_is_a_client_error() {
+    let fixture = Fixture::start((Reply::Ok, 0), (Reply::Ok, 10)).await;
+    let (response, body) = fixture
+        .send(json!({
+            "model": "assistant", "n": 2,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }))
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(fixture.counts(), [0, 0]);
 }
 
 #[test]

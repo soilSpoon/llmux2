@@ -14,8 +14,8 @@ use hyper_util::{
 use limits::{DeploymentLimits, Permit};
 use llmux_config::RuntimeConfig;
 use llmux_types::{
-    CredentialSource, Deployment, DeploymentIdx, ErrorKind, GatewayRequest, GatewayResponse,
-    ProviderAdapter, ProviderRegistry, Support, UpstreamError,
+    BuildError, CredentialSource, Deployment, DeploymentIdx, ErrorKind, GatewayRequest,
+    GatewayResponse, ProviderAdapter, ProviderRegistry, Support, UpstreamError,
 };
 use std::{
     collections::HashMap,
@@ -43,6 +43,8 @@ pub enum GatewayError {
     UnknownModel,
     #[error("model does not support streaming")]
     UnsupportedStream,
+    #[error("request cannot be converted for the selected upstream")]
+    UnsupportedRequest,
     #[error("all candidates are rate limited")]
     AllCandidatesExhausted {
         attempts: usize,
@@ -270,7 +272,10 @@ impl Executor {
             .adapter
             .build_request(req, dep, &auth)
             .await
-            .map_err(|_| GatewayError::Internal)?;
+            .map_err(|err| match err {
+                BuildError::InvalidBody => GatewayError::UnsupportedRequest,
+                _ => GatewayError::Internal,
+            })?;
         let response = self
             .http
             .request(upstream.map(Full::new))
