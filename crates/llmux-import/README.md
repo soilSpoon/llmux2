@@ -71,6 +71,23 @@ Gemini protocol endpoint. See https://ai.google.dev/gemini-api/docs/openai.
 Gemini connection overrides at Google's native `/v1beta` root are normalized
 to `/v1beta/openai`; overrides at other roots are skipped with a warning.
 
+AI Horde (`aihorde`) uses the official OpenAI-compatible
+`https://oai.aihorde.net/v1` endpoint, not its native asynchronous API. Active
+`no-auth`/`none` Horde connections use the documented anonymous key in a secret
+file; anonymous use may be restricted under load. API-key connections keep
+their own key; a missing API key is not silently replaced. Vendor/model IDs
+are preserved. Kilo (`kilo`, also OmniRoute's `kilocode` provider ID) uses
+`https://ai-gateway.kilo.ai/api/v1` with an API key. Anonymous Kilo is skipped:
+llmux2 cannot configure requests without an Authorization header.
+
+Skip precedence is: unusable/inactive, replacement policy, auth/key validation,
+then provider/URL validation (including loopback). Cloudflare direct/playground
+connections remain skipped with an official Workers AI replacement hint;
+DuckDuckGo/DeepAI bridges are dropped without an official replacement; HMS is
+skipped because custom headers are unsupported. Hints identify custom nodes
+by their provider prefix and contain only fixed documentation URLs, never
+connection-supplied URLs. Horde anonymous credentials still pass URL validation.
+
 Not imported: OAuth/token/cookie auth, encrypted credentials, unsupported
 providers/protocols (including custom Responses/custom-JSON nodes), custom chat
 paths/headers, wildcard models, legacy model aliases, per-key policies, shared

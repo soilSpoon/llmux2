@@ -1,5 +1,6 @@
 //! Import OmniRoute JSON exports and SQLite table dumps into a static llmux configuration.
 
+mod connection;
 mod db_dump;
 mod upstream;
 
@@ -53,6 +54,13 @@ pub const PROVIDERS: &[(&str, &str, &str)] = &[
         "https://generativelanguage.googleapis.com/v1beta/openai",
     ),
     ("morph", "openai_compat", "https://api.morphllm.com/v1"),
+    ("aihorde", "openai_compat", "https://oai.aihorde.net/v1"),
+    ("kilo", "openai_compat", "https://ai-gateway.kilo.ai/api/v1"),
+    (
+        "kilocode",
+        "openai_compat",
+        "https://ai-gateway.kilo.ai/api/v1",
+    ),
 ];
 
 fn string<'a>(value: &'a Value, field: &str) -> &'a str {
@@ -380,21 +388,13 @@ pub fn import(
     let mut source_ids = HashSet::new();
     for (index, c) in array(&root, "providerConnections").iter().enumerate() {
         let label = format!("connection {index} ({})", string(c, "id"));
-        let reason = if c["usable"] == false {
-            Some("usable: false")
-        } else if c["isActive"] == false {
-            Some("inactive")
-        } else if !matches!(string(c, "authType"), "apikey" | "api_key" | "api-key") {
-            Some("OAuth/token or unsupported auth")
-        } else if !valid_secret(c["apiKey"].as_str().unwrap_or("")) {
-            Some("missing, encrypted or invalid API key")
-        } else {
-            None
+        let selected_key = match connection::select_key(c, array(&root, "providerNodes")) {
+            Ok(key) => key,
+            Err(reason) => {
+                warnings.push(format!("{label}: skipped {reason}"));
+                continue;
+            }
         };
-        if let Some(reason) = reason {
-            warnings.push(format!("{label}: skipped {reason}"));
-            continue;
-        }
         let (kind, base_url) = match upstream::resolve(c, array(&root, "providerNodes")) {
             Ok(provider) => provider,
             Err(reason) => {
@@ -408,7 +408,12 @@ pub fn import(
             continue;
         }
         let id = unique(&format!("upstream-{source_id}"), &mut ids);
-        let key = write_secret(&dir, &id, c["apiKey"].as_str().unwrap())?;
+        let key = write_secret(&dir, &id, selected_key.value)?;
+        if selected_key.anonymous {
+            warnings.push(format!(
+                "{label}: AI Horde anonymous use may be restricted under load"
+            ));
+        }
         credentials.push(json!({"id":id,"kind":"api_key","provider":kind,"key":key}));
         connections.push(Connection {
             source_id: source_id.into(),
