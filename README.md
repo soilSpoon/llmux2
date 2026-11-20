@@ -133,6 +133,36 @@ cargo test --locked -p llmux-server --test chat -- --nocapture
 node --test crates/llmux-server/tests/dashboard.cjs
 ```
 
+## Live gateway comparison
+
+Run on the gateway host with Python 3.9+ (stdlib only), reference first, llmux second.
+Keep keys server-side: use `file:/absolute/path` or `env:VARIABLE`, never literal keys.
+
+```sh
+python3 bench/compare_gateways.py \
+  --gateway omniroute http://127.0.0.1:20128/v1 file:/private/omniroute-client.key \
+  --gateway llmux http://127.0.0.1:8090/v1 file:/private/llmux-client.key \
+  --coverage /private/coverage.json --top 25 --responses 2 \
+  --timeout 45 --max-requests 80 --output /private/compare-run-001
+```
+
+Or use repeated `--model NAME` / `--models-file PATH` (JSON array or one name per line).
+Coverage selects top-N traffic rows, then filters `present: false`; keep the snapshot fixed.
+Identical chat/stream bodies alternate A/B order; `--responses N` adds N Responses cases.
+The cap is checked before sending and counts HTTP requests, not internal fallback attempts.
+Read `results.json` / `report.html` in a new private output directory; review before sharing.
+- `match`: both succeed, not identical text; `llmux-only fail` / `omniroute-only fail`: only that side fails.
+- `both fail`: neither side succeeds in all cases; model verdicts require every case to succeed.
+- Single sample, not a speed ranking: all-result p50 includes errors; successful subsets can differ.
+- TTFT measures first content; streams require `[DONE]`. HTTP 200 with an error is not success.
+- Missing llmux attempts means fallback unknown ≠ false; attempts >1 proves multiple attempts.
+- Routing headers are evidence, not a complete trace; error classes do not prove error provenance.
+Learnings: API and dashboard ports differ—validate authenticated `/v1/models` first.
+Stored client keys may be encrypted; extract/decrypt readonly, server-side, into private files.
+Imported names can retain wrong upstream IDs or container-local URLs: import success ≠ usable routing.
+Tests (separate from Rust-only CI): `python3 -m unittest bench.test_compare_gateways` and
+`python3 -m py_compile bench/compare_gateways.py bench/test_compare_gateways.py`.
+
 ## Mock-upstream load benchmark
 
 On Linux with Python 3.10+, Cargo, and readable `/proc/<pid>/smaps_rollup`, run:
