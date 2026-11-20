@@ -160,35 +160,6 @@ fn validate_json(bytes: &[u8]) -> Result<()> {
     }
     Ok(())
 }
-#[cfg(test)]
-fn completion<F: FnMut() -> f64>(
-    streaming: bool,
-    chunks: &[&[u8]],
-    scheduled: Option<f64>,
-    timed: bool,
-    mut clock: F,
-) -> Result<Timing> {
-    let start = if timed {
-        scheduled.or_else(|| Some(clock()))
-    } else {
-        None
-    };
-    let mut parser = Completion::default();
-    if streaming {
-        for chunk in chunks {
-            let received = timed.then(&mut clock);
-            parser.feed(chunk, received, start)?;
-        }
-        parser.finish()?;
-    } else {
-        validate_json(&chunks.concat())?;
-    }
-    Ok((
-        timed.then(|| clock() - start.expect("timed start")),
-        parser.first,
-    ))
-}
-
 #[derive(Clone)]
 struct Chat {
     client: HttpClient,
@@ -225,13 +196,18 @@ impl Chat {
     async fn request(&self, scheduled: Option<Instant>, timed: bool) -> Result<Timing> {
         tokio::time::timeout(
             Duration::from_secs(15),
-            self.request_inner(scheduled, timed),
+            self.request_inner(scheduled, timed, Instant::now),
         )
         .await?
     }
-    async fn request_inner(&self, scheduled: Option<Instant>, timed: bool) -> Result<Timing> {
+    async fn request_inner(
+        &self,
+        scheduled: Option<Instant>,
+        timed: bool,
+        mut clock: impl FnMut() -> Instant,
+    ) -> Result<Timing> {
         let start = if timed {
-            scheduled.or_else(|| Some(Instant::now()))
+            scheduled.or_else(|| Some(clock()))
         } else {
             None
         };
@@ -243,7 +219,7 @@ impl Chat {
                 if let Some(bytes) = frame.data_ref() {
                     parser.feed(
                         bytes,
-                        start.map(|s| s.elapsed().as_secs_f64()),
+                        start.map(|s| clock().duration_since(s).as_secs_f64()),
                         start.map(|_| 0.0),
                     )?;
                 }
@@ -252,7 +228,10 @@ impl Chat {
         } else {
             validate_json(&body.collect().await?.to_bytes())?;
         }
-        Ok((start.map(|s| s.elapsed().as_secs_f64()), parser.first))
+        Ok((
+            start.map(|s| clock().duration_since(s).as_secs_f64()),
+            parser.first,
+        ))
     }
 }
 
@@ -650,31 +629,46 @@ mod tests {
             assert!(text.contains(expected), "{text}");
         }
     }
-    #[test]
-    fn untimed_json_request_does_not_read_latency_clock() {
+    fn chat(server: &llmux_testkit::TestServer, streaming: bool) -> Chat {
+        Chat {
+            client: Client::builder(TokioExecutor::new()).build_http(),
+            url: format!("{}/v1/chat/completions", server.url()),
+            model: "backend-model".into(),
+            key: "mock-backend".into(),
+            streaming,
+        }
+    }
+    #[tokio::test]
+    async fn untimed_json_request_does_not_read_latency_clock() {
+        let server = llmux_testkit::TestServer::start(llmux_testkit::mock_load_upstream::router(
+            false,
+            Duration::ZERO,
+        ))
+        .await
+        .unwrap();
         assert_eq!(
-            completion(
-                false,
-                &[br#"{"choices":[{"message":{"content":"xxxxxxxx"}}]}"#],
-                None,
-                false,
-                || panic!("untimed clock read")
-            )
-            .unwrap(),
+            chat(&server, false)
+                .request_inner(None, false, || panic!("untimed clock read"))
+                .await
+                .unwrap(),
             (None, None)
         );
     }
-    #[test]
-    fn json_latency_can_include_time_since_scheduled_arrival() {
+    #[tokio::test]
+    async fn json_latency_can_include_time_since_scheduled_arrival() {
+        let server = llmux_testkit::TestServer::start(llmux_testkit::mock_load_upstream::router(
+            false,
+            Duration::ZERO,
+        ))
+        .await
+        .unwrap();
+        let epoch = Instant::now();
         assert_eq!(
-            completion(
-                false,
-                &[br#"{"choices":[{"message":{"content":"xxxxxxxx"}}]}"#],
-                Some(1.0),
-                true,
-                || 3.0
-            )
-            .unwrap(),
+            chat(&server, false)
+                .request_inner(Some(epoch + Duration::from_secs(1)), true, || epoch
+                    + Duration::from_secs(3))
+                .await
+                .unwrap(),
             (Some(2.0), None)
         );
     }
@@ -684,16 +678,64 @@ mod tests {
         let results: Vec<_> = (0..4).map(|i| arrival(0.0, i, 1.0, now[i])).collect();
         assert_eq!(results, [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.25)]);
     }
-    #[test]
-    fn ttft_uses_complete_content_event_not_role_event() {
+    #[tokio::test]
+    async fn ttft_uses_complete_content_event_not_role_event() {
         let tail = format!(
             "\n{}",
             "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n".repeat(7)
         );
         let chunks:Vec<&[u8]>=vec![b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":",b"\"x\"}}]}\n",tail.as_bytes(),b"data: [DONE]\n\n"];
-        let mut ticks = (0..6).map(f64::from);
+        let chunks = chunks
+            .into_iter()
+            .map(Bytes::copy_from_slice)
+            .collect::<Vec<_>>();
+        let permits = Arc::new(Semaphore::new(0));
+        let gate = permits.clone();
+        let server = llmux_testkit::TestServer::start(axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let chunks = chunks.clone();
+                let gate = gate.clone();
+                async move {
+                    let stream = futures_util::stream::unfold(
+                        (chunks.into_iter(), gate, true),
+                        |(mut chunks, gate, first)| async move {
+                            let chunk = chunks.next()?;
+                            if !first {
+                                gate.acquire().await.unwrap().forget();
+                            }
+                            Some((
+                                Ok::<_, std::convert::Infallible>(chunk),
+                                (chunks, gate, false),
+                            ))
+                        },
+                    );
+                    (
+                        [("content-type", "text/event-stream")],
+                        axum::body::Body::from_stream(stream),
+                    )
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+        let epoch = Instant::now();
+        let mut ticks = 0;
         assert_eq!(
-            completion(true, &chunks, None, true, || ticks.next().unwrap()).unwrap(),
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                chat(&server, true).request_inner(None, true, || {
+                    let tick = ticks;
+                    ticks += 1;
+                    if tick > 0 {
+                        permits.add_permits(1);
+                    }
+                    epoch + Duration::from_secs(tick)
+                })
+            )
+            .await
+            .unwrap()
+            .unwrap(),
             (Some(5.0), Some(3.0))
         );
     }
