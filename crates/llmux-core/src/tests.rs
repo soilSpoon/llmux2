@@ -97,6 +97,23 @@ async fn fixture_with_context(
     refresh_fails: bool,
     max_context: [Option<u32>; 3],
 ) -> Fixture {
+    fixture_with_models(
+        errors,
+        refresh_fails,
+        max_context,
+        &[("model", &[0, 1, 2])],
+        Default::default(),
+    )
+    .await
+}
+
+async fn fixture_with_models(
+    errors: Vec<UpstreamError>,
+    refresh_fails: bool,
+    max_context: [Option<u32>; 3],
+    models: &[(&str, &[u32])],
+    shared_quota: llmux_types::QuotaSpec,
+) -> Fixture {
     let server = llmux_testkit::TestServer::start(axum::Router::new().fallback(|| async { "ok" }))
         .await
         .unwrap();
@@ -124,12 +141,17 @@ async fn fixture_with_context(
             priority: i as i32,
             weight: 1,
             billing: Default::default(),
-            quota: Default::default(),
+            quota: if i < 2 {
+                shared_quota
+            } else {
+                Default::default()
+            },
             timeout: Duration::from_secs(1),
             max_context: max_context[i as usize],
         })
         .collect();
     let cfg = RuntimeConfig {
+        model_allowed_keys: Default::default(),
         server: llmux_config::ServerConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             client_keys: Box::new([]),
@@ -149,14 +171,21 @@ async fn fixture_with_context(
         },
         api_keys: HashMap::new(),
         oauth: HashMap::new(),
-        model_names: HashMap::from([("model".into(), 0)]),
-        models: Box::new([CanonicalModel {
-            name: "model".into(),
-            strategy: Strategy::Priority,
-            capabilities: Capabilities::default(),
-            context_overflow: ContextOverflow::default(),
-            deployments: Box::new([DeploymentIdx(0), DeploymentIdx(1), DeploymentIdx(2)]),
-        }]),
+        model_names: models
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| (Arc::from(*name), i))
+            .collect(),
+        models: models
+            .iter()
+            .map(|(name, deployments)| CanonicalModel {
+                name: Arc::from(*name),
+                strategy: Strategy::Priority,
+                capabilities: Capabilities::default(),
+                context_overflow: ContextOverflow::default(),
+                deployments: deployments.iter().copied().map(DeploymentIdx).collect(),
+            })
+            .collect(),
         deployments,
     };
     let mut registry = ProviderRegistry::default();
@@ -430,4 +459,117 @@ async fn exhaustion_retry_hint_ignores_deployments_that_do_not_fit() {
         panic!("expected exhaustion")
     };
     assert!(retry_after > Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn repeated_rate_limits_lengthen_cooldown_until_a_success() {
+    let limited = || UpstreamError::RateLimited {
+        retry_after: None,
+        scope: llmux_types::LimitScope::Unknown,
+    };
+    let (executor, adapter, _, _server) = fixture(vec![limited()], false).await;
+    let cooldown = |executor: &Executor| {
+        let now = Instant::now();
+        executor.bindings[0]
+            .limits
+            .cooldown_until(now)
+            .map_or(Duration::ZERO, |end| end - now)
+    };
+    let served = |adapter: &Adapter| adapter.calls.lock().unwrap().last().unwrap().0.clone();
+
+    executor.execute(request()).await.unwrap();
+    assert_eq!(served(&adapter).as_ref(), "dep2");
+    assert!(cooldown(&executor) <= Duration::from_secs(1));
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    adapter.errors.lock().unwrap().push_back(limited());
+    executor.execute(request()).await.unwrap();
+    assert_eq!(served(&adapter).as_ref(), "dep2");
+    let second = cooldown(&executor);
+    assert!(
+        second > Duration::from_millis(1500) && second <= Duration::from_secs(2),
+        "second consecutive 429 should double the cooldown, got {second:?}"
+    );
+
+    tokio::time::sleep(second + Duration::from_millis(100)).await;
+    executor.execute(request()).await.unwrap();
+    assert_eq!(served(&adapter).as_ref(), "dep0");
+    adapter.errors.lock().unwrap().push_back(limited());
+    executor.execute(request()).await.unwrap();
+    assert!(
+        cooldown(&executor) <= Duration::from_secs(1),
+        "a success resets the backoff"
+    );
+}
+
+#[tokio::test]
+async fn rate_limit_cools_down_every_model_sharing_the_upstream_route() {
+    // dep0 and dep1 share provider, credential, base_url and upstream model.
+    let (executor, adapter, _, _server) = fixture_with_models(
+        vec![UpstreamError::RateLimited {
+            retry_after: Some(Duration::from_secs(3)),
+            scope: llmux_types::LimitScope::Requests,
+        }],
+        false,
+        [None; 3],
+        &[("a", &[0, 2]), ("b", &[1, 2])],
+        Default::default(),
+    )
+    .await;
+    let first = executor
+        .execute(GatewayRequest {
+            model: "a".into(),
+            ..request()
+        })
+        .await
+        .unwrap();
+    assert_eq!(first.deployment.as_ref(), "dep2");
+    let second = executor
+        .execute(GatewayRequest {
+            model: "b".into(),
+            ..request()
+        })
+        .await
+        .unwrap();
+    assert_eq!(second.deployment.as_ref(), "dep2");
+    let calls: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(calls, ["dep0", "dep2", "dep2"]);
+}
+
+#[tokio::test]
+async fn local_rpm_budget_is_shared_by_models_on_the_same_upstream_route() {
+    let (executor, adapter, _, _server) = fixture_with_models(
+        vec![],
+        false,
+        [None; 3],
+        &[("a", &[0, 2]), ("b", &[1, 2])],
+        llmux_types::QuotaSpec {
+            rpm: Some(1),
+            ..Default::default()
+        },
+    )
+    .await;
+    for model in ["a", "b"] {
+        executor
+            .execute(GatewayRequest {
+                model: model.into(),
+                ..request()
+            })
+            .await
+            .unwrap();
+    }
+    let calls: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(calls, ["dep0", "dep2"]);
 }

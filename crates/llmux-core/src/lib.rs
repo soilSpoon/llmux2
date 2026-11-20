@@ -118,6 +118,25 @@ impl Executor {
         Ok(())
     }
 
+    fn shared_limits<'a>(
+        shared: &mut Vec<(&'a Deployment, Arc<DeploymentLimits>)>,
+        dep: &'a Deployment,
+    ) -> Arc<DeploymentLimits> {
+        let same_route = |other: &&Deployment| {
+            other.provider == dep.provider
+                && other.credential == dep.credential
+                && other.base_url == dep.base_url
+                && other.upstream_model == dep.upstream_model
+                && other.quota == dep.quota
+        };
+        if let Some((_, limits)) = shared.iter().find(|(other, _)| same_route(other)) {
+            return limits.clone();
+        }
+        let limits = Arc::new(DeploymentLimits::new(dep.quota));
+        shared.push((dep, limits.clone()));
+        limits
+    }
+
     pub fn new(
         cfg: Arc<RuntimeConfig>,
         registry: &ProviderRegistry,
@@ -125,6 +144,8 @@ impl Executor {
     ) -> Result<Self, InitError> {
         Self::validate(&cfg, registry, &credentials.keys().cloned().collect())?;
         let mut disabled = HashMap::<Arc<str>, Arc<AtomicBool>>::new();
+        // Deployments that reach the same upstream route draw on one provider limit.
+        let mut shared_limits = Vec::<(&Deployment, Arc<DeploymentLimits>)>::new();
         let bindings = cfg
             .deployments
             .iter()
@@ -150,7 +171,7 @@ impl Executor {
                     adapter,
                     auth,
                     disabled,
-                    limits: Arc::new(DeploymentLimits::new(dep.quota)),
+                    limits: Self::shared_limits(&mut shared_limits, dep),
                     stats: cfg.server.dashboard_key.is_some().then(Arc::default),
                 })
             })
@@ -330,11 +351,12 @@ impl Executor {
                     last_transient = None;
                     match result {
                         Ok(response) => {
+                            binding.limits.succeeded();
                             return Ok(RoutedResponse {
                                 deployment: dep.id.clone(),
                                 attempts,
                                 response: hold_permit(response, permit),
-                            })
+                            });
                         }
                         Err(GatewayError::Client(UpstreamError::Auth { refreshable })) => {
                             if let Some(source) =
@@ -354,10 +376,11 @@ impl Executor {
                             retry_after,
                             ..
                         })) => {
-                            let wait = retry_after
-                                .unwrap_or(self.cfg.cooldown.default)
-                                .min(self.cfg.cooldown.max);
-                            binding.limits.cool_down(wait);
+                            binding.limits.limited(
+                                retry_after,
+                                self.cfg.cooldown.default,
+                                self.cfg.cooldown.max,
+                            );
                             if !self
                                 .cfg
                                 .routing
@@ -368,13 +391,13 @@ impl Executor {
                             }
                         }
                         Err(GatewayError::Client(UpstreamError::QuotaExhausted { reset_at })) => {
-                            let wait = reset_at
-                                .map(|reset| {
+                            binding.limits.limited(
+                                reset_at.map(|reset| {
                                     reset.duration_since(SystemTime::now()).unwrap_or_default()
-                                })
-                                .unwrap_or(self.cfg.cooldown.default)
-                                .min(self.cfg.cooldown.max);
-                            binding.limits.cool_down(wait);
+                                }),
+                                self.cfg.cooldown.default,
+                                self.cfg.cooldown.max,
+                            );
                             if !self
                                 .cfg
                                 .routing
@@ -385,9 +408,11 @@ impl Executor {
                             }
                         }
                         Err(GatewayError::Client(
+                            // A stream error here precedes the first downstream byte.
                             err @ (UpstreamError::Server { .. }
                             | UpstreamError::Timeout
-                            | UpstreamError::Connect),
+                            | UpstreamError::Connect
+                            | UpstreamError::StreamBroken { .. }),
                         )) => last_transient = Some(err),
                         Err(err) => return Err(err),
                     }

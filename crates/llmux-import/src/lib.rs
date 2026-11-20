@@ -1,8 +1,10 @@
 //! Import OmniRoute JSON exports and SQLite table dumps into a static llmux configuration.
 
+mod aliases;
 mod connection;
 mod db_dump;
 mod upstream;
+mod validation;
 
 use serde_json::{json, Value};
 use std::{
@@ -23,7 +25,8 @@ pub struct ImportReport {
 struct Connection {
     source_id: String,
     provider: String,
-    credential: String,
+    credential: Option<String>,
+    kind: String,
     base_url: String,
     priority: i64,
 }
@@ -314,9 +317,14 @@ impl Expander<'_> {
                 self.warnings.push(format!("combo {name} step {index}: truncated connections at 10000-deployment safety limit"));
             }
             for c in candidates.into_iter().take(10_000 - out.len()) {
-                out.push(
-                    json!({"credential":c.credential,"base_url":c.base_url,"upstream_model":model}),
-                );
+                let mut deployment = json!({"base_url":c.base_url,"upstream_model":model});
+                if let Some(credential) = &c.credential {
+                    deployment["credential"] = credential.clone().into();
+                } else {
+                    deployment["auth"] = "none".into();
+                    deployment["provider"] = c.kind.clone().into();
+                }
+                out.push(deployment);
             }
         }
         stack.pop();
@@ -388,7 +396,7 @@ pub fn import(
     let mut source_ids = HashSet::new();
     for (index, c) in array(&root, "providerConnections").iter().enumerate() {
         let label = format!("connection {index} ({})", string(c, "id"));
-        let selected_key = match connection::select_key(c, array(&root, "providerNodes")) {
+        let auth = match connection::select_auth(c, array(&root, "providerNodes")) {
             Ok(key) => key,
             Err(reason) => {
                 warnings.push(format!("{label}: skipped {reason}"));
@@ -407,18 +415,34 @@ pub fn import(
             warnings.push(format!("{label}: skipped missing/duplicate connection id"));
             continue;
         }
-        let id = unique(&format!("upstream-{source_id}"), &mut ids);
-        let key = write_secret(&dir, &id, selected_key.value)?;
-        if selected_key.anonymous {
-            warnings.push(format!(
-                "{label}: AI Horde anonymous use may be restricted under load"
-            ));
-        }
-        credentials.push(json!({"id":id,"kind":"api_key","provider":kind,"key":key}));
+        let credential = match auth {
+            connection::SelectedAuth::Key(value) => {
+                let id = unique(&format!("upstream-{source_id}"), &mut ids);
+                let key = write_secret(&dir, &id, value)?;
+                credentials.push(json!({"id":id,"kind":"api_key","provider":kind,"key":key}));
+                Some(id)
+            }
+            connection::SelectedAuth::None => {
+                if kind != "openai_compat" {
+                    warnings.push(format!(
+                        "{label}: skipped anonymous auth requires an OpenAI-compatible provider"
+                    ));
+                    continue;
+                }
+                let provider = connection::identity(c, array(&root, "providerNodes"));
+                if provider == "aihorde" {
+                    warnings.push(format!("{label}: AI Horde anonymous use may be restricted under load; imported without Authorization"));
+                } else {
+                    warnings.push(format!("{label}: Kilo anonymous access uses per-IP limits; imported without Authorization"));
+                }
+                None
+            }
+        };
         connections.push(Connection {
             source_id: source_id.into(),
             provider: string(c, "provider").into(),
-            credential: id,
+            credential,
+            kind,
             base_url,
             priority: c["priority"].as_i64().unwrap_or(0),
         });
@@ -433,6 +457,7 @@ pub fn import(
     }
     connections.sort_by_key(|c| c.priority);
     let mut combos = HashMap::new();
+    let mut combo_ids = HashMap::new();
     let mut order = Vec::new();
     for (i, entry) in array(&root, "combos").iter().enumerate() {
         let combo = if let Some(data) = entry.get("data") {
@@ -463,8 +488,15 @@ pub fn import(
             continue;
         }
         order.push(name.clone());
+        let id = string(entry, "id");
+        if !id.is_empty() {
+            combo_ids
+                .entry(id.to_owned())
+                .or_insert_with(|| name.clone());
+        }
         combos.insert(name, combo);
     }
+    let aliases = aliases::prepare(&root, &mut combos, &combo_ids, &mut order, &mut warnings);
     let mut models = Vec::new();
     let mut deployment_ids = HashSet::new();
     let mut deployment_count = 0;
@@ -502,15 +534,7 @@ pub fn import(
             json!({"name":name,"strategy":"priority","aliases":[],"deployments":deployments}),
         );
     }
-    if let Some(aliases) = root.get("modelAliases") {
-        if let Some(aliases) = aliases.as_object() {
-            for alias in aliases.keys() {
-                warnings.push(format!("alias {alias}: skipped legacy model alias; only combos become canonical models"));
-            }
-        } else {
-            warnings.push("ignored malformed modelAliases".into());
-        }
-    }
+    aliases::attach(&mut models, aliases, &mut warnings);
     if models.is_empty() {
         return Err("no importable models; no configuration written".into());
     }
@@ -537,17 +561,7 @@ pub fn import(
         );
     }
     let config = json!({"server":{"listen":"127.0.0.1:8080","client_keys":client_keys},"credentials":credentials,"models":models});
-    let mut validation = config.clone();
-    // Validate structure and URLs without requiring the fallback environment variable yet.
-    if client_count == 0 {
-        validation["server"]["client_keys"] = json!([credentials[0]["key"]]);
-    }
-    let validation =
-        toml::Value::try_from(&validation).map_err(|_| "could not encode configuration")?;
-    llmux_config::RuntimeConfig::parse(
-        &toml::to_string(&validation).map_err(|_| "could not encode configuration")?,
-    )
-    .map_err(|_| "generated configuration failed llmux validation (check upstream URLs)")?;
+    validation::validate(&config, client_count == 0, &dir)?;
     let value = toml::Value::try_from(&config).map_err(|_| "could not encode configuration")?;
     let content = toml::to_string_pretty(&value).map_err(|_| "could not encode configuration")?;
     let mut file = OpenOptions::new()

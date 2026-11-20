@@ -7,7 +7,7 @@ Rust gateway exposing multiple API-key upstreams under one OpenAI-compatible mod
 See [official free API providers](docs/free-providers.md) for importer-gap
 replacements, verified free-offer evidence, compatibility caveats, and configs.
 
-1. Copy `examples/llmux.example.toml` to `llmux.toml` and set the upstream base URLs and model IDs. Base URLs include the provider's API prefix, such as `/v1`; the adapter appends `/chat/completions`.
+1. Copy `examples/llmux.example.toml` to `llmux.toml` and set the upstream base URLs and model IDs. Base URLs include the provider's API prefix, such as `/v1`; the adapter appends `/chat/completions` (or `/responses` for `openai_responses`).
 2. Set the secrets named by the config in your environment (or use `file:/path/to/secret` references). The gateway rejects inline keys. Use a separate key for gateway clients.
 3. Start the server with `cargo run --locked -- llmux.toml`. It listens on loopback by default; if exposing it remotely, use a TLS reverse proxy.
 
@@ -91,7 +91,7 @@ in its stats. Omit `dashboard_key` to disable the routes and collection.
 
 ## Routing
 
-Lower numeric priority wins, with round-robin ordering among equal priorities. On an upstream HTTP 429, the gateway tries the next deployment and skips the limited deployment until its `Retry-After` (seconds or HTTP date) expires. Missing values use the configured default, and waits are capped by `cooldown.max_ms`. If none can serve the request, the gateway returns 429 with the earliest known retry delay. Optional local per-deployment RPM and concurrency limits also skip deployments without contacting them.
+Lower numeric priority wins, with round-robin ordering among equal priorities. On an upstream HTTP 429, the gateway tries the next deployment and skips the limited deployment until its `Retry-After` (seconds or HTTP date) expires. Missing values use the configured default, doubled for each consecutive 429 from that deployment until it serves a request again, and waits are capped by `cooldown.max_ms`. If none can serve the request, the gateway returns 429 with the earliest known retry delay. Optional local per-deployment RPM and concurrency limits also skip deployments without contacting them. Deployments under different models that share the same provider, credential, base URL, upstream model and quota share one cooldown and one set of local limits, so a 429 on one model's route is not immediately retried through another model.
 
 Each deployment may set `max_context` (prompt plus completion tokens), defaulting to the model's `capabilities.max_context`. Before routing, the gateway estimates prompt tokens (about 4 bytes of prompt text per token, ignoring base64 `data:` URLs) plus the requested output limit (`max_output_tokens` for Responses, `max_completion_tokens` else `max_tokens` for Chat), and skips deployments of that model that it would not fit. It never falls back to a different model: if no deployment fits, it returns 400 `context_length_exceeded`, naming the limit, without contacting upstream.
 
@@ -145,6 +145,65 @@ require reauthorization after restart. `env:` references are memory-only. Option
 with ChatGPT, use `https://auth.openai.com/api/accounts/oauth/token` as `token_url`,
 the issued client ID, `resource = "https://api.openai.com/v1"`, and omit `scopes`.
 A refreshable authentication error can trigger one on-demand refresh and retry for the attempted deployment, still subject to request and admission limits. If refresh fails or authentication is rejected again, the gateway disables that credential for routing and can try another eligible deployment.
+
+## Codex / Sign in with ChatGPT
+
+`provider = "openai_responses"` calls the public Responses endpoint with an OAuth
+bearer, never a ChatGPT backend endpoint. Use it **only for the owner's own account
+and requests**, not to share or resell ChatGPT plan capacity to gateway users.
+OpenAI describes this flow for [open-source and locally hosted apps](https://developers.openai.com/siwc/token-sharing-open-source);
+review the [preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations).
+The gateway's owner-only restriction is an additional project policy.
+
+Use the credential block printed by `llmux-login`, then add a dedicated model and
+its owner-key restriction as below. Replace the issued client ID and absolute
+refresh-token path with the values from your login. The default upstream base URL
+is `https://api.openai.com/v1`; choose an upstream model available to your account.
+Do not run login concurrently with a gateway using the same rotating token file.
+
+```toml
+[server]
+client_keys = ["env:LLMUX_OWNER_KEY", "env:LLMUX_OTHER_KEY"]
+
+[[credentials]]
+id = "codex"
+kind = "oauth"
+provider = "openai_responses"
+token_url = "https://auth.openai.com/api/accounts/oauth/token"
+client_id = "REPLACE_WITH_ISSUED_CLIENT_ID"
+refresh_token = "file:/absolute/path/to/.config/llmux/codex/refresh_token"
+resource = "https://api.openai.com/v1"
+
+[[models]]
+name = "owner-codex"
+allowed_keys = ["env:LLMUX_OWNER_KEY"]
+
+[[models.deployments]]
+id = "owner-codex-primary"
+credential = "codex"
+upstream_model = "REPLACE_WITH_ACCOUNT_MODEL_SLUG"
+# base_url = "https://api.openai.com/v1" # optional for this provider
+```
+
+`models.allowed_keys` is a nonempty list of `env:`/`file:` secret references whose
+resolved values must already be in `server.client_keys`. It applies to the whole
+canonical model, all aliases, and every deployment/fallback candidate. A different
+authenticated gateway key gets 403 before routing or contacting an upstream.
+Every model containing an OAuth `openai_responses` deployment **must** declare
+this restriction, even if that deployment is only a backup. Models without it
+remain available to all authenticated keys; routing never falls back across models.
+Do not put a Codex credential in a model intended for other users.
+
+Both `/v1/responses` and `/v1/chat/completions` are supported, with JSON or SSE
+downstream. Upstream always uses `store: false`, `stream: true`, and an input array;
+non-streaming callers receive the final `response.completed` object (or converted
+chat completion), including usage. Chat system messages become `instructions`.
+Unsupported preview fields (including output-token limits and sampling controls)
+are omitted, so they do not constrain upstream generation. Stateful conversation
+references, explicit Responses system items, and unsupported hosted tools are
+rejected with 400. An incomplete, failed, or interrupted stream is not successful;
+after SSE commitment errors terminate the stream without replaying the request.
+Anthropic inbound is not supported by this adapter.
 
 ## Development
 
