@@ -123,7 +123,10 @@ impl Fixture {
         }
     }
     fn deploy(&mut self) -> Result<String> {
-        self.ops.deploy(&self.binary, &self.config)
+        self.ops.deploy(&self.binary, &self.config, 0.0)
+    }
+    fn deploy_canary(&mut self, seconds: f64) -> Result<String> {
+        self.ops.deploy(&self.binary, &self.config, seconds)
     }
     fn called(&self, action: &str, slot: &str) -> bool {
         self.ops
@@ -247,6 +250,64 @@ fn cli_checks_new_unit_properties() {
             "ActiveState,NRestarts,MainPID",
             "llmux2@b.service"
         ]));
+}
+#[test]
+fn canary_window_observes_new_slot_before_handoff() {
+    let mut f = Fixture::new();
+    assert_eq!(f.deploy_canary(1.2).unwrap(), "b");
+    assert_eq!(f.ops.runtime.active, BTreeSet::from(["b".into()]));
+    assert_eq!(
+        f.ops
+            .runtime
+            .calls
+            .iter()
+            .filter(|v| v == &&["show", "b"])
+            .count(),
+        10
+    );
+    let waits: Vec<f64> = f.ops.runtime.waits.clone();
+    assert_eq!(waits.len(), 6 + 3);
+    assert_eq!(waits.iter().sum::<f64>(), 6.0 * 0.5 + 1.2);
+    let calls = &f.ops.runtime.calls;
+    let last_show = calls.iter().rposition(|v| v == &["show", "b"]).unwrap();
+    assert!(calls.iter().position(|v| v == &["stop", "a"]).unwrap() > last_show);
+    assert!(f.called("enable", "b"));
+}
+#[test]
+fn canary_failure_keeps_old_and_stops_new() {
+    for state in [
+        json!({"ActiveState":"failed","NRestarts":"0","MainPID":"1234"}),
+        json!({"ActiveState":"active","NRestarts":"1","MainPID":"1234"}),
+        json!({"ActiveState":"active","NRestarts":"0","MainPID":"5678"}),
+        json!({"ActiveState":"active","NRestarts":"0","MainPID":"0"}),
+    ] {
+        let mut f = Fixture::new();
+        f.ops.runtime.states =
+            VecDeque::from_iter(std::iter::repeat_with(stable).take(7).chain([state]));
+        let error = f.deploy_canary(2.0).unwrap_err().to_string();
+        assert!(error.contains("canary"), "{error}");
+        assert_eq!(f.ops.runtime.active, BTreeSet::from(["a".into()]));
+        assert!(f.called("stop", "b"));
+        assert!(!f.called("stop", "a"));
+        assert!(!f.temp.0.join("active.json").exists());
+    }
+}
+#[test]
+fn canary_window_also_runs_on_first_install() {
+    let mut f = Fixture::new();
+    f.ops.runtime.active.clear();
+    f.ops.runtime.states = VecDeque::from_iter(
+        std::iter::repeat_with(stable)
+            .take(7)
+            .chain([json!({"ActiveState":"failed","NRestarts":"0","MainPID":"1234"})]),
+    );
+    assert!(f
+        .deploy_canary(1.0)
+        .unwrap_err()
+        .to_string()
+        .contains("canary"));
+    assert!(f.ops.runtime.active.is_empty());
+    assert!(f.called("stop", "a"));
 }
 #[test]
 fn invalid_config_does_not_touch_units() {

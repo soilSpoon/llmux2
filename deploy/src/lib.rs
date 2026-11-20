@@ -151,7 +151,7 @@ impl<R: Runtime> Deployment<R> {
         }
         Ok(())
     }
-    pub fn deploy(&mut self, binary: &Path, config: &Path) -> Result<String> {
+    pub fn deploy(&mut self, binary: &Path, config: &Path, canary: f64) -> Result<String> {
         let resolve = |path: &Path| -> io::Result<PathBuf> {
             Ok(fs::canonicalize(path).unwrap_or(if path.is_absolute() {
                 path.to_owned()
@@ -190,7 +190,7 @@ impl<R: Runtime> Deployment<R> {
         let mut stopping_old = false;
         let result = (|| -> Result<()> {
             self.runtime.systemctl("start", idle)?;
-            let mut pid = None;
+            let mut last_pid = None;
             for sample in 0..7 {
                 if sample > 0 {
                     self.runtime.sleep(0.5);
@@ -202,14 +202,14 @@ impl<R: Runtime> Deployment<R> {
                     || current_pid.is_empty()
                     || !current_pid.bytes().all(|c| c.is_ascii_digit())
                     || !current_pid.bytes().any(|c| c != b'0')
-                    || pid.as_deref().is_some_and(|pid| pid != current_pid)
+                    || last_pid.as_deref().is_some_and(|pid| pid != current_pid)
                 {
                     return Err(
                         "new slot did not remain active without restarts during settle window"
                             .into(),
                     );
                 }
-                pid = Some(current_pid.to_owned());
+                last_pid = Some(current_pid.to_owned());
             }
             let mut healthy = false;
             for _ in 0..60 {
@@ -221,6 +221,24 @@ impl<R: Runtime> Deployment<R> {
             }
             if !healthy {
                 return Err("new slot health check timed out".into());
+            }
+            let pid = last_pid.unwrap_or_default();
+            let mut canary_left = canary;
+            while canary_left > 0.0 {
+                let step = canary_left.min(0.5);
+                self.runtime.sleep(step);
+                canary_left -= step;
+                let state = self.runtime.systemctl("show", idle)?;
+                let current_pid = state["MainPID"].as_str().unwrap_or("");
+                if state["ActiveState"] != "active"
+                    || state["NRestarts"] != "0"
+                    || current_pid.is_empty()
+                    || !current_pid.bytes().all(|c| c.is_ascii_digit())
+                    || !current_pid.bytes().any(|c| c != b'0')
+                    || current_pid != pid
+                {
+                    return Err("new slot did not remain stable during the canary window".into());
+                }
             }
             if let Some(old) = old {
                 stopping_old = true;
