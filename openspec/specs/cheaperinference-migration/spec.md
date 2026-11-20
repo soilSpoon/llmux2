@@ -38,17 +38,28 @@ THEN the row is skipped with a warning.
 
 ### Requirement: Reviewed Antigravity Gemini replacement
 
-The importer SHALL map only antigravity/gemini-3-flash to
-gemini-3-flash-preview on all eligible built-in Gemini API-key connections in
+The importer SHALL map antigravity/gemini-3-flash to
+gemini-3-flash-preview and antigravity/gemini-3.1-flash-lite to the GA
+gemini-3.1-flash-lite on all eligible built-in Gemini API-key connections in
 priority order, preserving aliases and combo references. Source Antigravity
 connection restrictions SHALL be replaced by the eligible Gemini set with a
 warning. Antigravity OAuth connections SHALL remain skipped. Ordinary OmniRoute
 fallback semantics SHALL apply after native deployments when enabled.
+No other Antigravity models SHALL be mapped. Both reviewed routes SHALL receive
+the Gemini endpoint's seed/user request-field stripping.
 
 #### Scenario: Reviewed Flash route
 
 WHEN a combo or alias resolves to antigravity/gemini-3-flash
 THEN it uses Gemini deployments followed by the optional OmniRoute fallback.
+
+#### Scenario: OCI-verified GA Flash Lite route
+
+WHEN a combo or alias resolves to antigravity/gemini-3.1-flash-lite
+THEN it uses gemini-3.1-flash-lite on eligible Gemini connections in priority
+order, strips seed/user, and appends the optional OmniRoute fallback last.
+OCI verified all five keys list the GA model and generateContent returns 200
+with modelVersion gemini-3.1-flash-lite.
 
 #### Scenario: No eligible Gemini connection
 

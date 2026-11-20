@@ -53,10 +53,13 @@ are sanitized and deduplicated. If there are no client keys, set
 
 Built-ins: openai, anthropic, openrouter, groq, deepseek (`ds` step alias),
 mistral, xai, together, fireworks, cerebras, gemini, morph, aihorde, kilo, kilocode.
-One reviewed Antigravity route is imported through existing Gemini API-key
+Two reviewed Antigravity routes are imported through existing Gemini API-key
 connections: `antigravity/gemini-3-flash` uses `gemini-3-flash-preview`, verified
 by the operator using Gemini `models.list` on OCI
 (https://ai.google.dev/api/models#method:-models.list).
+`antigravity/gemini-3.1-flash-lite` uses the GA `gemini-3.1-flash-lite`:
+OCI verified all five Gemini keys list it and `generateContent` returned 200
+with that `modelVersion`. Both routes receive Gemini's `seed`/`user` stripping.
 The direct name, aliases, and combo legs use all eligible built-in Gemini
 connections in priority order. Antigravity source connection pins/allowlists
 cannot transfer to Gemini and are replaced with that eligible set, with a warning;
