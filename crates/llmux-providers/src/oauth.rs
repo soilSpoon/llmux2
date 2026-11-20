@@ -170,14 +170,11 @@ impl Inner {
         }
         let result = tokio::time::timeout(
             self.config.request_timeout,
-            self.fetch(&state.refresh_token),
+            self.fetch(&mut state.refresh_token),
         )
         .await;
         state.succeeded = false;
-        if let Ok(Ok((token, rotated))) = result {
-            if let Some(rotated) = rotated {
-                state.refresh_token = rotated;
-            }
+        if let Ok(Ok(token)) = result {
             self.token.store(Some(Arc::new(token)));
             self.changed.notify_one();
             state.succeeded = true;
@@ -190,11 +187,11 @@ impl Inner {
         }
     }
 
-    async fn fetch(&self, refresh_token: &str) -> Result<(Token, Option<String>), AuthError> {
+    async fn fetch(&self, refresh_token: &mut String) -> Result<Token, AuthError> {
         let mut fields = vec![
             ("grant_type", "refresh_token"),
             ("client_id", &self.config.client_id),
-            ("refresh_token", refresh_token),
+            ("refresh_token", refresh_token.as_str()),
         ];
         if let Some(secret) = &self.config.client_secret {
             fields.push(("client_secret", secret));
@@ -234,6 +231,9 @@ impl Inner {
         }
         let response: Response =
             serde_json::from_slice(&bytes).map_err(|_| AuthError::RefreshFailed)?;
+        if let Some(rotated) = response.refresh_token.filter(|t| !t.is_empty()) {
+            *refresh_token = rotated;
+        }
         if !success
             || response.error.is_some()
             || !response
@@ -257,17 +257,14 @@ impl Inner {
             .ok_or(AuthError::RefreshFailed)?;
         // For short-lived tokens, avoid an immediate successful-refresh loop.
         let skew = self.config.refresh_skew.min(lifetime / 2);
-        Ok((
-            Token {
-                auth: AuthMaterial::Header {
-                    name: header::AUTHORIZATION,
-                    value,
-                },
-                expires,
-                refresh_at: expires - skew,
+        Ok(Token {
+            auth: AuthMaterial::Header {
+                name: header::AUTHORIZATION,
+                value,
             },
-            response.refresh_token.filter(|t| !t.is_empty()),
-        ))
+            expires,
+            refresh_at: expires - skew,
+        })
     }
 }
 
@@ -364,6 +361,9 @@ mod tests {
                 state.release.notified().await;
                 r#"{"access_token":"access","token_type":"Bearer","refresh_token":"cancel-rotated"}"#.into()
             }
+            5 => r#"{"access_token":"access","token_type":"Bearer","expires_in":0,"refresh_token":"rejected-rotated"}"#.into(),
+            6 => r#"{"access_token":"","token_type":"Bearer","refresh_token":"rejected-rotated"}"#.into(),
+            7 => r#"{"access_token":"access","token_type":"unsupported","refresh_token":"rejected-rotated"}"#.into(),
             _ => serde_json::json!({"access_token":"access", "token_type":"Bearer", "expires_in":state.lifetime.load(Ordering::Relaxed), "refresh_token":"rotated"}).to_string(),
         };
         (http::StatusCode::OK, body)
@@ -446,6 +446,24 @@ mod tests {
         let bodies = endpoint.bodies.lock().await;
         assert_eq!(bodies.len(), 3);
         assert!(bodies[2].contains("refresh_token=cancel-rotated"));
+    }
+
+    #[tokio::test]
+    async fn rejected_access_tokens_preserve_rotated_refresh_token() {
+        for mode in [5, 6, 7] {
+            let (_server, endpoint, config) = fixture(3600).await;
+            let source = OAuthCredentialSource::start(config).await.unwrap();
+            endpoint.mode.store(mode, Ordering::Relaxed);
+            assert!(matches!(
+                source.refresh().await,
+                Err(AuthError::RefreshFailed)
+            ));
+            endpoint.mode.store(0, Ordering::Relaxed);
+            source.refresh().await.unwrap();
+            let bodies = endpoint.bodies.lock().await;
+            assert_eq!(bodies.len(), 3);
+            assert!(bodies[2].contains("refresh_token=rejected-rotated"));
+        }
     }
 
     #[tokio::test]
