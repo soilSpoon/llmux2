@@ -12,3 +12,14 @@ pub use anthropic::Anthropic;
 pub use openai_compat::{OpenAiCompat, RequestMetadata, StaticKey};
 pub use openai_responses::OpenAiResponses;
 pub use truncate::{truncate_middle, Truncated};
+
+fn upstream_model<'a>(
+    req: &'a llmux_types::GatewayRequest,
+    dep: &'a llmux_types::Deployment,
+) -> &'a str {
+    if dep.upstream_model.as_ref() == "*" {
+        &req.model
+    } else {
+        &dep.upstream_model
+    }
+}

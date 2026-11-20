@@ -50,7 +50,7 @@ impl ProviderAdapter for OpenAiResponses {
         if self.supports(req.format) == Support::No {
             return Err(BuildError::UnsupportedFormat);
         }
-        let body = normalize(&req.body, &dep.upstream_model, req.format)?;
+        let body = normalize(&req.body, crate::upstream_model(req, dep), req.format)?;
         let mut parts = dep.base_url.clone().into_parts();
         parts.path_and_query =
             Some(format!("{}/responses", dep.base_url.path().trim_end_matches('/')).parse()?);

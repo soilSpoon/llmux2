@@ -63,6 +63,8 @@ pub struct RuntimeConfig {
     /// Quotas shared by every deployment that uses the credential.
     pub credential_quotas: HashMap<Arc<str>, QuotaSpec>,
     pub model_names: HashMap<Arc<str>, usize>,
+    pub catch_all: Option<usize>,
+    pub catch_all_exclude: Vec<String>,
     pub model_allowed_keys: HashMap<usize, Box<[Arc<str>]>>,
     pub models: Box<[CanonicalModel]>,
     pub deployments: Box<[Deployment]>,
@@ -195,6 +197,7 @@ enum RawCredential {
 #[serde(deny_unknown_fields)]
 struct RawModel {
     name: String,
+    exclude: Option<Vec<String>>,
     allowed_keys: Option<Vec<String>>,
     #[serde(default)]
     aliases: Vec<String>,
@@ -403,11 +406,34 @@ impl RawConfig {
             return Err(invalid("at least one model is required"));
         }
         let mut model_names = HashMap::new();
+        let mut catch_all = None;
+        let mut catch_all_exclude = Vec::new();
         let mut model_allowed_keys = HashMap::new();
         let mut canonical_models = Vec::new();
         let mut deployment_ids = HashSet::new();
         let mut deployments = Vec::new();
         for model in models {
+            let is_catch_all = model.name == "*";
+            if is_catch_all {
+                if catch_all.replace(canonical_models.len()).is_some()
+                    || !model.aliases.is_empty()
+                    || model.allowed_keys.is_some()
+                {
+                    return Err(invalid(
+                        "only one catch-all is allowed, without aliases or allowed_keys",
+                    ));
+                }
+                for pattern in model.exclude.unwrap_or_default() {
+                    if pattern.is_empty()
+                        || pattern.strip_suffix('*').unwrap_or(&pattern).contains('*')
+                    {
+                        return Err(invalid("exclude entries must be nonempty exact ids or prefixes with one trailing *"));
+                    }
+                    catch_all_exclude.push(pattern.to_ascii_lowercase());
+                }
+            } else if model.exclude.is_some() {
+                return Err(invalid("exclude is only valid on the catch-all model"));
+            }
             let allowed_keys = model
                 .allowed_keys
                 .as_ref()
@@ -428,10 +454,14 @@ impl RawConfig {
                 model_allowed_keys.insert(canonical_models.len(), keys);
             }
             let name: Arc<str> = model.name.into();
-            for alias in
-                std::iter::once(name.clone()).chain(model.aliases.into_iter().map(Arc::from))
+            for alias in std::iter::once(name.clone())
+                .chain(model.aliases.into_iter().map(Arc::from))
+                .filter(|_| !is_catch_all)
             {
-                if alias.is_empty() || model_names.insert(alias, canonical_models.len()).is_some() {
+                if alias.is_empty()
+                    || alias.as_ref() == "*"
+                    || model_names.insert(alias, canonical_models.len()).is_some()
+                {
                     return Err(invalid(
                         "model names and aliases must be nonempty and globally unique",
                     ));
@@ -481,6 +511,11 @@ impl RawConfig {
                     .ok_or_else(|| invalid("deployment requires base_url"))?;
                 if dep.upstream_model.is_empty() {
                     return Err(invalid("upstream_model must not be empty"));
+                }
+                if (dep.upstream_model == "*") != is_catch_all {
+                    return Err(invalid(
+                        "upstream_model must be * exactly for catch-all deployments",
+                    ));
                 }
                 if dep.max_context == Some(0) {
                     return Err(invalid("max_context must be positive"));
@@ -540,6 +575,8 @@ impl RawConfig {
             api_keys,
             oauth,
             model_names,
+            catch_all,
+            catch_all_exclude,
             model_allowed_keys,
             models: canonical_models.into_boxed_slice(),
             deployments: deployments.into_boxed_slice(),
@@ -722,6 +759,37 @@ upstream_model = "upstream"
     const REQUIRED: &str = r#"token_url = "https://example.com/token"
 client_id = "client"
 refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
+
+    #[test]
+    fn catch_all_config_validation() {
+        let base = config(REQUIRED);
+        let wildcard = base
+            .replace("name = \"model\"", "name = \"*\"")
+            .replace("upstream_model = \"upstream\"", "upstream_model = \"*\"");
+        assert!(RuntimeConfig::parse(&wildcard).is_ok());
+        let excluded = wildcard.replace(
+            "name = \"*\"",
+            "name = \"*\"\nexclude = [\"codex/*\", \"exact\"]",
+        );
+        assert!(RuntimeConfig::parse(&excluded).is_ok());
+        for input in [
+            wildcard.replace("name = \"*\"", "name = \"*\"\naliases = [\"alias\"]"),
+            wildcard.replace("name = \"*\"", "name = \"*\"\nallowed_keys = []"),
+            wildcard.replace("upstream_model = \"*\"", "upstream_model = \"fixed\""),
+            base.replace("upstream_model = \"upstream\"", "upstream_model = \"*\""),
+            base.replace("name = \"model\"", "name = \"model\"\nexclude = []"),
+            format!("{wildcard}\n[[models]]\nname = \"*\"\ndeployments = []"),
+        ] {
+            assert!(RuntimeConfig::parse(&input).is_err(), "accepted {input}");
+        }
+        for pattern in ["", "a*b", "a**", "*x"] {
+            let input = wildcard.replace(
+                "name = \"*\"",
+                &format!("name = \"*\"\nexclude = [{pattern:?}]"),
+            );
+            assert!(RuntimeConfig::parse(&input).is_err(), "accepted {pattern}");
+        }
+    }
 
     #[test]
     fn shutdown_timeout_validation() {

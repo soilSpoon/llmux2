@@ -264,10 +264,25 @@ impl Executor {
     }
 
     pub async fn execute(&self, req: GatewayRequest) -> Result<RoutedResponse, GatewayError> {
-        let &model_idx = self
+        let model_idx = self
             .cfg
             .model_names
             .get(req.model.as_ref())
+            .copied()
+            .or_else(|| {
+                let catch_all = self.cfg.catch_all?;
+                if req.model.as_ref() == "*" {
+                    return None;
+                }
+                let requested = req.model.to_ascii_lowercase();
+                let excluded = self.cfg.catch_all_exclude.iter().any(|pattern| {
+                    pattern.strip_suffix('*').map_or_else(
+                        || requested == *pattern,
+                        |prefix| requested.starts_with(prefix),
+                    )
+                });
+                (!excluded).then_some(catch_all)
+            })
             .ok_or(GatewayError::UnknownModel)?;
         let model = &self.cfg.models[model_idx];
         if req.stream && !model.capabilities.stream {

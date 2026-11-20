@@ -429,8 +429,8 @@ impl ProviderAdapter for Anthropic {
     ) -> Result<Request<Bytes>, BuildError> {
         let body = match self.supports(req.format) {
             Support::No => return Err(BuildError::UnsupportedFormat),
-            Support::Passthrough => rewrite_model(&req.body, &dep.upstream_model)?,
-            Support::Convert => convert_request(&req.body, &dep.upstream_model)?,
+            Support::Passthrough => rewrite_model(&req.body, crate::upstream_model(req, dep))?,
+            Support::Convert => convert_request(&req.body, crate::upstream_model(req, dep))?,
         };
         let mut parts = dep.base_url.clone().into_parts();
         parts.path_and_query =
