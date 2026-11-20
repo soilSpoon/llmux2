@@ -1,5 +1,5 @@
 use crate::{
-    openai_compat::{bad_gateway, collect, retry_after, rewrite_model},
+    openai_compat::{apply_auth, bad_gateway, collect, endpoint_uri, retry_after, rewrite_model},
     sse,
 };
 use async_trait::async_trait;
@@ -19,6 +19,9 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+const LIMIT_REMAINING_REQUESTS: &str = "anthropic-ratelimit-requests-remaining";
+const LIMIT_REMAINING_TOKENS: &str = "anthropic-ratelimit-tokens-remaining";
 
 pub struct Anthropic(ProviderKind);
 
@@ -432,10 +435,7 @@ impl ProviderAdapter for Anthropic {
             Support::Passthrough => rewrite_model(&req.body, crate::upstream_model(req, dep))?,
             Support::Convert => convert_request(&req.body, crate::upstream_model(req, dep))?,
         };
-        let mut parts = dep.base_url.clone().into_parts();
-        parts.path_and_query =
-            Some(format!("{}/messages", dep.base_url.path().trim_end_matches('/')).parse()?);
-        let uri = http::Uri::from_parts(parts).map_err(|e| BuildError::InvalidRequest(e.into()))?;
+        let uri = endpoint_uri(&dep.base_url, "/messages")?;
         let mut request = Request::builder()
             .method(Method::POST)
             .uri(uri)
@@ -453,18 +453,12 @@ impl ProviderAdapter for Anthropic {
         if req.format == InboundFormat::AnthropicMessages {
             request.headers_mut().extend(req.anthropic_headers.clone());
         }
-        let auth = match auth {
-            AuthMaterial::Bearer(key) => Some((
-                http::HeaderName::from_static(provider::ANTHROPIC_KEY_HEADER),
-                HeaderValue::from_str(key).map_err(|_| BuildError::InvalidAuth)?,
-            )),
-            AuthMaterial::Header { name, value } => Some((name.clone(), value.clone())),
-            AuthMaterial::None => None,
-        };
-        if let Some((name, mut value)) = auth {
-            value.set_sensitive(true);
-            request.headers_mut().insert(name, value);
-        }
+        apply_auth(
+            request.headers_mut(),
+            auth,
+            http::HeaderName::from_static(provider::ANTHROPIC_KEY_HEADER),
+            "",
+        )?;
         Ok(request)
     }
     async fn parse_response(
@@ -527,8 +521,8 @@ impl ProviderAdapter for Anthropic {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u32>().ok())
         };
-        let remaining_requests = count("anthropic-ratelimit-requests-remaining");
-        let remaining_tokens = count("anthropic-ratelimit-tokens-remaining");
+        let remaining_requests = count(LIMIT_REMAINING_REQUESTS);
+        let remaining_tokens = count(LIMIT_REMAINING_TOKENS);
         if remaining_requests.is_none() && remaining_tokens.is_none() {
             return None;
         }
