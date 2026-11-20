@@ -8,7 +8,7 @@ pub(super) const OFFICIAL_URL: &str = "https://api.morphllm.com/v1";
 // Mistral rejects logprobs for deepseek-v4-1-flash-1017. Reviewed exported combo names only.
 // OCI could not verify Numes logprobs (503): Morph precedes bridge replacements;
 // fast combos start with Morph, while base combos retain declared Numes first.
-pub(super) const LOGPROBS_COMBOS: &[&str] = &[
+const LOGPROBS_COMBOS: &[&str] = &[
     "deepseek-v4.1-flash",
     "deepseek-v4.1-flash-fast",
     "deepseek-v4.1-flash-1017",

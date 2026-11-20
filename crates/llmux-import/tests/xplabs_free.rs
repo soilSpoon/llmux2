@@ -52,9 +52,7 @@ fn reviewed_free_xplabs_model_is_prepended_ahead_of_paid_legs() {
     for (name, model) in [
         ("gpt-6-luna", "gpt-6-luna"),
         ("deepseek-v4.1-flash", "deepseek-v4.1-flash"),
-        ("deepseek-v4.1-flash-1017", "deepseek-v4.1-flash-1017"),
-        ("claude-haiku-5.5", "claude-haiku-5.5"),
-        ("qwen3.8-27b", "qwen3.8-27b"),
+        ("deepseek-v4.1-flash-fast", "deepseek-v4.1-flash"),
     ] {
         let (actual, warnings) = routes(&fixture(name, json!(["paid/a", "paid/b"])));
         assert_eq!(
@@ -75,13 +73,13 @@ fn reviewed_free_xplabs_model_is_prepended_ahead_of_paid_legs() {
 #[test]
 fn declared_xplabs_leg_moves_first_without_duplicating() {
     let (actual, _) = routes(&fixture(
-        "claude-haiku-5.5",
-        json!(["paid/a", "experlabs/claude-haiku-5.5", "paid/b"]),
+        "deepseek-v4.1-flash",
+        json!(["paid/a", "experlabs/deepseek-v4.1-flash", "paid/b"]),
     ));
     assert_eq!(
         actual,
         [
-            pair(XPLABS, "claude-haiku-5.5"),
+            pair(XPLABS, "deepseek-v4.1-flash"),
             pair("https://paid.example/v1", "a"),
             pair("https://paid.example/v1", "b"),
         ]
@@ -101,19 +99,33 @@ fn declared_xplabs_leg_moves_first_without_duplicating() {
 }
 
 #[test]
-fn verified_morph_logprobs_route_stays_ahead_of_xplabs() {
-    let (actual, _) = routes(&fixture(
-        "deepseek-v4.1-flash-fast",
-        json!(["paid/a", "morph/morph-dsv41flash-1017"]),
-    ));
-    assert_eq!(
-        actual,
-        [
-            pair("https://api.morphllm.com/v1", "morph-dsv41flash-1017"),
-            pair(XPLABS, "deepseek-v4.1-flash"),
-            pair("https://paid.example/v1", "a"),
-        ]
-    );
+fn free_xplabs_logprobs_route_leads_base_combo_and_follows_morph_in_fast_combo() {
+    let legs = json!(["paid/a", "morph/morph-dsv41flash-1017"]);
+    let morph = pair("https://api.morphllm.com/v1", "morph-dsv41flash-1017");
+    let free = pair(XPLABS, "deepseek-v4.1-flash");
+    let paid = pair("https://paid.example/v1", "a");
+    let (actual, _) = routes(&fixture("deepseek-v4.1-flash", legs.clone()));
+    assert_eq!(actual, [free.clone(), paid.clone(), morph.clone()]);
+    let (actual, _) = routes(&fixture("deepseek-v4.1-flash-fast", legs));
+    assert_eq!(actual, [morph, free, paid]);
+}
+
+#[test]
+fn billed_xplabs_models_keep_their_declared_position() {
+    for (name, model) in [
+        ("claude-haiku-5.5", "claude-haiku-5.5"),
+        ("qwen3.8-27b", "qwen3.8-27b"),
+        ("deepseek-v4.1-flash-1017", "deepseek-v4.1-flash-1017"),
+    ] {
+        let declared = format!("experlabs/{model}");
+        let (actual, warnings) = routes(&fixture(name, json!(["paid/a", declared])));
+        assert_eq!(
+            actual,
+            [pair("https://paid.example/v1", "a"), pair(XPLABS, model)],
+            "{name}"
+        );
+        assert!(warnings.iter().all(|w| !w.contains("XPLabs")));
+    }
 }
 
 #[test]
@@ -126,17 +138,17 @@ fn ineligible_connections_and_combos_are_unchanged() {
         json!({"authType":"oauth","accessToken":"synthetic-token"}),
         json!({"providerSpecificData":{"baseUrl":"https://other.example/v1"}}),
     ] {
-        let mut root = fixture("claude-haiku-5.5", json!(["paid/a"]));
+        let mut root = fixture("deepseek-v4.1-flash", json!(["paid/a"]));
         for (key, value) in edit.as_object().unwrap() {
             root["providerConnections"][1][key] = value.clone();
         }
         cases.push(root);
     }
-    let mut prefix = fixture("claude-haiku-5.5", json!(["paid/a"]));
+    let mut prefix = fixture("deepseek-v4.1-flash", json!(["paid/a"]));
     prefix["providerNodes"][1]["prefix"] = "other-gateway".into();
     cases.push(prefix);
-    cases.push(fixture("claude-haiku-5.5-thinking", json!(["paid/a"])));
-    let mut round_robin = fixture("claude-haiku-5.5", json!(["paid/a"]));
+    cases.push(fixture("deepseek-v4.1-flash-free", json!(["paid/a"])));
+    let mut round_robin = fixture("deepseek-v4.1-flash", json!(["paid/a"]));
     round_robin["combos"][0]["strategy"] = "round-robin".into();
     cases.push(round_robin);
     for root in cases {

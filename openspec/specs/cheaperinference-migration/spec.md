@@ -126,15 +126,18 @@ logprobs, reorder unrelated combos, or replace the optional final fallback.
 - **THEN** no reviewed logprobs-order policy is applied
 
 ### Requirement: Reviewed free XPLabs routes first
-For the reviewed source combos `gpt-6-luna`, `deepseek-v4.1-flash` (and its
-`-fast`), `deepseek-v4.1-flash-1017` (and its `-fast` and `-ultrafast`),
-`claude-haiku-5.5` and `qwen3.8-27b`, the importer SHALL place one deployment of
-the matching Experiential Labs (XPLabs) model first, pinned to an active, usable
-API-key connection of the custom `experlabs` node at
-`https://api.experientiallabs.ai/v1`. A declared leg for the same model and
-endpoint SHALL be moved instead of duplicated. In the reviewed Morph logprobs
-combos the XPLabs leg SHALL follow the verified Morph route. Other legs SHALL keep
-their relative order, and a warning SHALL be emitted when the order changes.
+For the reviewed source combos `gpt-6-luna`, `deepseek-v4.1-flash` and
+`deepseek-v4.1-flash-fast`, the importer SHALL place one deployment of the
+matching Experiential Labs (XPLabs) model (`gpt-6-luna` or
+`deepseek-v4.1-flash`) first, pinned to an active, usable API-key connection of
+the custom `experlabs` node at `https://api.experientiallabs.ai/v1`. In the fast
+combo it SHALL follow the verified Morph route. A declared leg for the same model
+and endpoint SHALL be moved instead of duplicated, other legs SHALL keep their
+relative order, and a warning SHALL be emitted when the order changes. This
+follows OCI verification that these models cost 0 on the existing key and that
+XPLabs DeepSeek returns logprobs. XPLabs models OCI observed billing
+(`claude-haiku-5.5`, `qwen3.8-27b`, `deepseek-v4.1-flash-1017`) SHALL keep their
+declared position.
 
 #### Scenario: Reviewed combo with an eligible XPLabs connection
 - **WHEN** a reviewed combo has paid legs and an eligible XPLabs connection exists
@@ -142,7 +145,7 @@ their relative order, and a warning SHALL be emitted when the order changes.
 
 #### Scenario: Ineligible connection, unreviewed combo or round-robin
 - **WHEN** the XPLabs connection is inactive, unusable, OAuth, on another host or
-  prefix, the combo is unreviewed, or the combo uses round-robin
+  prefix, the combo is unreviewed or billed, or the combo uses round-robin
 - **THEN** the combo's deployments are unchanged
 
 ### Requirement: Gemini OpenAI endpoint parameter compatibility

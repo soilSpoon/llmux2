@@ -4,21 +4,13 @@ use serde_json::{json, Value};
 pub(super) const BASE_URL: &str = "https://api.experientiallabs.ai/v1";
 const PREFIX: &str = "experlabs";
 
-// https://www.experientiallabs.ai/pricing: Luna and DeepSeek V4.1 Flash are on the standing
-// Free tier (10 RPM, 1M tokens/day shared); Haiku 5.5 and Qwen3.8 27B are $0 promotions.
-// Reviewed exported combo name -> XPLabs model id.
+// OCI verified usage.cost 0 on the existing key for these models, and logprobs on DeepSeek
+// (Free tier: 10 RPM, 1M tokens/day shared). Haiku 5.5, Qwen3.8 27B and the 1017 model
+// were billed, so their declared legs keep their place. Reviewed combo -> XPLabs model id.
 const FREE: &[(&str, &str)] = &[
     ("gpt-6-luna", "gpt-6-luna"),
     ("deepseek-v4.1-flash", "deepseek-v4.1-flash"),
     ("deepseek-v4.1-flash-fast", "deepseek-v4.1-flash"),
-    ("deepseek-v4.1-flash-1017", "deepseek-v4.1-flash-1017"),
-    ("deepseek-v4.1-flash-1017-fast", "deepseek-v4.1-flash-1017"),
-    (
-        "deepseek-v4.1-flash-1017-ultrafast",
-        "deepseek-v4.1-flash-1017",
-    ),
-    ("claude-haiku-5.5", "claude-haiku-5.5"),
-    ("qwen3.8-27b", "qwen3.8-27b"),
 ];
 
 /// The OmniRoute step for the reviewed free XPLabs model of `name`, pinned to an eligible
@@ -64,7 +56,7 @@ pub(super) fn step(
     Some(step)
 }
 
-/// Places `free` first, after any verified Morph logprobs route, dropping duplicate legs.
+/// Places `free` first (after the verified Morph route in fast combos), dropping duplicates.
 pub(super) fn place(
     name: &str,
     deployments: &mut Vec<Value>,
@@ -80,7 +72,7 @@ pub(super) fn place(
         a["base_url"] == b["base_url"] && a["upstream_model"] == b["upstream_model"]
     };
     deployments.retain(|dep| !free.iter().any(|f| same(f, dep)));
-    let at = if morph::LOGPROBS_COMBOS.contains(&name) {
+    let at = if name.ends_with("fast") {
         deployments
             .iter()
             .rposition(|dep| morph::is_verified(dep, connections))
