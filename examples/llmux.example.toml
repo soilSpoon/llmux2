@@ -19,6 +19,19 @@ kind = "api_key"
 provider = "openai_compat"
 key = "env:GROQ_API_KEY"
 
+# Alternatively, configure OAuth refresh-token credentials (see README):
+# [[credentials]]
+# id = "oauth-account"
+# kind = "oauth"
+# provider = "openai_compat"
+# token_url = "https://auth.example.com/oauth/token"
+# client_id = "gateway-client"
+# refresh_token = "env:UPSTREAM_REFRESH_TOKEN"
+# client_secret = "env:UPSTREAM_CLIENT_SECRET" # optional
+# scopes = ["inference"] # optional
+# refresh_skew_ms = 60000
+# request_timeout_ms = 30000
+
 [[credentials]]
 id = "together-key"
 kind = "api_key"

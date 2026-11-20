@@ -22,7 +22,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let config = RuntimeConfig::load(path)?;
     let address = config.server.listen;
-    let app = llmux_server::app(config)?;
+    let app = llmux_server::app(config).await?;
     let listener = TcpListener::bind(address).await?;
     eprintln!("llmux-server listening on {}", listener.local_addr()?);
     // SSE writes one small frame per event; Nagle would hold each behind the client's delayed ACK.
