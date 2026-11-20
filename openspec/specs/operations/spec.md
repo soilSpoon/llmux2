@@ -146,6 +146,25 @@ THEN PR policy SHALL use a separate small dependency cache rather than restoring
 the coverage job's workspace artifacts, and coverage SHALL keep its default Rust
 cache. xtask tests SHALL run in the coverage job rather than again in check.
 
+### Requirement: Rust benchmark tools
+
+The non-default `llmux-bench` workspace member SHALL provide `mock-upstream`,
+`compare-gateways`, and `live-reliability` subcommands. `cargo xtask bench` SHALL
+delegate to the release benchmark binary without depending on benchmark or
+gateway crates. Benchmark tests SHALL use local fake upstreams, not providers.
+
+#### Scenario: Comparable fixed-rate measurements
+
+WHEN measuring 1,000 RPS gateway overhead
+THEN the harness SHALL discard one direct/gateway warm-up pair, alternate timed
+route order, and compare the median paired p99 delta to the strict 1 ms target.
+
+#### Scenario: Safe comparison and reliability reports
+
+WHEN comparing two gateways or injecting reliability faults
+THEN the Rust tools SHALL preserve request caps, secret-reference inputs,
+redaction, offline mode, and JSON/HTML/Markdown report contracts.
+
 ### Requirement: Simple and extensible
 
 The codebase SHALL stay simple with low overhead, and be easy to extend and
