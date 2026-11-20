@@ -15,3 +15,9 @@ llmux-config.workspace = true
 llmux-types.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+axum.workspace = true
+hyper.workspace = true
+llmux-testkit.workspace = true

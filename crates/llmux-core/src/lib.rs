@@ -2,6 +2,9 @@
 
 mod limits;
 
+#[cfg(test)]
+mod tests;
+
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use http::StatusCode;
@@ -21,7 +24,7 @@ use std::{
     collections::HashMap,
     ops::Range,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, SystemTime},
@@ -65,6 +68,7 @@ type HttpClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 struct Binding {
     adapter: Arc<dyn ProviderAdapter>,
     auth: Arc<dyn CredentialSource>,
+    disabled: Arc<AtomicBool>,
     limits: Arc<DeploymentLimits>,
 }
 
@@ -86,6 +90,7 @@ impl Executor {
         registry: &ProviderRegistry,
         credentials: &HashMap<Arc<str>, Arc<dyn CredentialSource>>,
     ) -> Result<Self, InitError> {
+        let mut disabled = HashMap::<Arc<str>, Arc<AtomicBool>>::new();
         let bindings = cfg
             .deployments
             .iter()
@@ -101,6 +106,7 @@ impl Executor {
                 Ok(Binding {
                     adapter,
                     auth,
+                    disabled: disabled.entry(dep.credential.clone()).or_default().clone(),
                     limits: Arc::new(DeploymentLimits::new(dep.quota)),
                 })
             })
@@ -168,6 +174,7 @@ impl Executor {
         };
         let deadline = Instant::now() + self.cfg.server.request_timeout;
         let mut attempts = 0;
+        let mut last_transient = None;
         'groups: for group in &order.groups {
             let shift = sequence % group.len();
             let (before, after) = model.deployments[group.clone()].split_at(shift);
@@ -178,70 +185,101 @@ impl Executor {
                 let idx = index(idx);
                 let dep = &self.cfg.deployments[idx];
                 let binding = &self.bindings[idx];
-                if binding.adapter.supports(req.format) == Support::No {
+                if binding.disabled.load(Ordering::Relaxed)
+                    || binding.adapter.supports(req.format) == Support::No
+                {
                     continue;
                 }
                 let now = Instant::now();
                 if binding.limits.cooldown_until(now).is_some() {
+                    last_transient = None;
                     continue;
                 }
                 if now >= deadline {
                     return Err(GatewayError::Client(UpstreamError::Timeout));
                 }
-                let Some(permit) = binding.limits.admit() else {
-                    continue;
-                };
-
-                attempts += 1;
-                let attempt_deadline = deadline.min(now + dep.timeout);
-                match timeout_at(attempt_deadline, self.attempt(&req, dep, binding)).await {
-                    Ok(Ok(response)) => {
-                        return Ok(RoutedResponse {
-                            deployment: dep.id.clone(),
-                            attempts,
-                            response: hold_permit(response, permit),
-                        })
+                let mut refreshed = false;
+                loop {
+                    if attempts == self.cfg.routing.max_attempts {
+                        break 'groups;
                     }
-                    Ok(Err(GatewayError::Client(UpstreamError::RateLimited {
-                        retry_after,
-                        ..
-                    }))) => {
-                        let wait = retry_after
-                            .unwrap_or(self.cfg.cooldown.default)
-                            .min(self.cfg.cooldown.max);
-                        binding.limits.cool_down(wait);
-                        drop(permit);
-                        if !self
-                            .cfg
-                            .routing
-                            .fallback_on
-                            .contains(&ErrorKind::RateLimited)
-                        {
-                            break 'groups;
-                        }
-                    }
-                    Ok(Err(GatewayError::Client(UpstreamError::QuotaExhausted { reset_at }))) => {
-                        let wait = reset_at
-                            .map(|reset| {
-                                reset.duration_since(SystemTime::now()).unwrap_or_default()
+                    let Some(permit) = binding.limits.admit() else {
+                        last_transient = None;
+                        break;
+                    };
+                    attempts += 1;
+                    let attempt_deadline = deadline.min(Instant::now() + dep.timeout);
+                    let result = timeout_at(attempt_deadline, self.attempt(&req, dep, binding))
+                        .await
+                        .unwrap_or(Err(GatewayError::Client(UpstreamError::Timeout)));
+                    last_transient = None;
+                    match result {
+                        Ok(response) => {
+                            return Ok(RoutedResponse {
+                                deployment: dep.id.clone(),
+                                attempts,
+                                response: hold_permit(response, permit),
                             })
-                            .unwrap_or(self.cfg.cooldown.default)
-                            .min(self.cfg.cooldown.max);
-                        binding.limits.cool_down(wait);
-                        drop(permit);
-                        if !self
-                            .cfg
-                            .routing
-                            .fallback_on
-                            .contains(&ErrorKind::QuotaExhausted)
-                        {
-                            break 'groups;
                         }
+                        Err(GatewayError::Client(UpstreamError::Auth { refreshable })) => {
+                            if refreshable && !refreshed {
+                                refreshed = true;
+                                if matches!(
+                                    timeout_at(deadline, binding.auth.refresh()).await,
+                                    Ok(Ok(()))
+                                ) {
+                                    continue;
+                                }
+                            }
+                            binding.disabled.store(true, Ordering::Relaxed);
+                        }
+                        Err(GatewayError::Client(UpstreamError::RateLimited {
+                            retry_after,
+                            ..
+                        })) => {
+                            let wait = retry_after
+                                .unwrap_or(self.cfg.cooldown.default)
+                                .min(self.cfg.cooldown.max);
+                            binding.limits.cool_down(wait);
+                            if !self
+                                .cfg
+                                .routing
+                                .fallback_on
+                                .contains(&ErrorKind::RateLimited)
+                            {
+                                break 'groups;
+                            }
+                        }
+                        Err(GatewayError::Client(UpstreamError::QuotaExhausted { reset_at })) => {
+                            let wait = reset_at
+                                .map(|reset| {
+                                    reset.duration_since(SystemTime::now()).unwrap_or_default()
+                                })
+                                .unwrap_or(self.cfg.cooldown.default)
+                                .min(self.cfg.cooldown.max);
+                            binding.limits.cool_down(wait);
+                            if !self
+                                .cfg
+                                .routing
+                                .fallback_on
+                                .contains(&ErrorKind::QuotaExhausted)
+                            {
+                                break 'groups;
+                            }
+                        }
+                        Err(GatewayError::Client(
+                            err @ (UpstreamError::Server { .. }
+                            | UpstreamError::Timeout
+                            | UpstreamError::Connect),
+                        )) => last_transient = Some(err),
+                        Err(err) => return Err(err),
                     }
-                    Ok(Err(err)) => return Err(err),
-                    Err(_) => return Err(GatewayError::Client(UpstreamError::Timeout)),
+                    break;
                 }
             }
+        }
+        if let Some(err) = last_transient {
+            return Err(GatewayError::Client(err));
         }
         // The next request can use any compatible deployment, even if retries stopped early.
         let now = Instant::now();
@@ -249,10 +287,13 @@ impl Executor {
             .deployments
             .iter()
             .map(|idx| &self.bindings[index(*idx)])
-            .filter(|binding| binding.adapter.supports(req.format) != Support::No)
+            .filter(|binding| {
+                !binding.disabled.load(Ordering::Relaxed)
+                    && binding.adapter.supports(req.format) != Support::No
+            })
             .map(|binding| binding.limits.available_at(now))
             .min()
-            .ok_or(GatewayError::Internal)?;
+            .unwrap_or(now);
         Err(GatewayError::AllCandidatesExhausted {
             attempts,
             retry_after: earliest.saturating_duration_since(Instant::now()),
