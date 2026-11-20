@@ -272,7 +272,7 @@ impl PendingLogin {
         let state = random()?;
         let nonce = random()?;
         let verifier = random_n(flow.verifier_bytes)?;
-        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(&verifier));
+        let challenge = pkce_challenge(&verifier);
         let mut authorization = flow.endpoints.authorize.clone();
         {
             let mut query = authorization.query_pairs_mut();
@@ -417,6 +417,10 @@ impl PendingLogin {
         .await
         .map_err(|_| Error::Storage)?
     }
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier))
 }
 
 fn random() -> Result<String> {
@@ -612,6 +616,19 @@ fn saved_at_timestamp(seconds: i64) -> String {
 
 fn token_expired(exp: i64, now: i64) -> bool {
     exp <= now
+}
+
+#[cfg(test)]
+mod pkce_tests {
+    use super::*;
+
+    #[test]
+    fn pkce_s256_matches_rfc7636_appendix_b() {
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
 }
 
 #[cfg(test)]
