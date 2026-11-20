@@ -496,6 +496,7 @@ mod tests {
             credential: "key".into(),
             base_url: "https://example.com/v1".parse().unwrap(),
             upstream_model: "fixed".into(),
+            strip_request_fields: Box::default(),
             priority: 0,
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(10),
