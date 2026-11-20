@@ -391,6 +391,10 @@ impl Expander<'_> {
                 {
                     deployment["headers"] = c.headers.clone();
                 }
+                if c.provider.is_builtin("deepseek") {
+                    deployment["strip_request_fields"] =
+                        json!(["seed", "user", "safety_identifier", "reasoning.effort"]);
+                }
                 if c.policy == policy::ModelPolicy::Workers {
                     deployment["quota"] = json!({"rpm":1});
                 }

@@ -24,6 +24,18 @@ THEN its combos and direct routes load with those headers on each deployment.
 WHEN a connection has an explicitly empty customHeaders map
 THEN no node headers are inherited.
 
+### Requirement: DeepSeek parameter compatibility
+
+The importer SHALL configure built-in DeepSeek deployments to strip seed, user,
+safety_identifier, and reasoning.effort through the core strip_request_fields
+option. It SHALL preserve logprobs and top_logprobs, and leave other providers
+and custom nodes unchanged.
+
+#### Scenario: DeepSeek combo or direct route
+
+WHEN a route expands onto a built-in DeepSeek connection
+THEN the generated deployment loads with exactly those four stripped fields.
+
 ### Requirement: Exact API compatibility
 
 The gateway SHALL match the request arguments and response shapes

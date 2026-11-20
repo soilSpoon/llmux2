@@ -105,6 +105,45 @@ fn anonymous_custom_nodes_can_supply_authorization_headers_without_credentials()
 }
 
 #[test]
+fn deepseek_deployments_strip_only_the_four_rejected_fields_through_loader() {
+    use llmux_types::ChatRequestField;
+    let mut root = fixture();
+    root["providerConnections"].as_array_mut().unwrap().push(json!({"id":"deepseek", "provider":"deepseek", "authType":"apikey", "apiKey":"synthetic-deepseek"}));
+    root["combos"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name":"deepseek-combo", "models":["ds/deepseek-chat"]}));
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let config = RuntimeConfig::load(&output).unwrap();
+    let mut deepseek = 0;
+    for dep in &config.deployments {
+        if dep.credential.as_ref() == "upstream-deepseek" {
+            deepseek += 1;
+            assert_eq!(
+                dep.strip_request_fields.as_ref(),
+                &[
+                    ChatRequestField::Seed,
+                    ChatRequestField::User,
+                    ChatRequestField::SafetyIdentifier,
+                    ChatRequestField::ReasoningEffort
+                ]
+            );
+            assert!(!dep
+                .strip_request_fields
+                .contains(&ChatRequestField::Logprobs));
+            assert!(!dep
+                .strip_request_fields
+                .contains(&ChatRequestField::TopLogprobs));
+        } else {
+            assert!(dep.strip_request_fields.is_empty());
+        }
+    }
+    assert!(deepseek >= 2, "combo and direct deployments");
+}
+
+#[test]
 fn strips_custom_routing_segments_but_preserves_vendor_segments() {
     for (provider, model, expected) in [
         ("node", "gateway/deepseek/test", "deepseek/test"),
