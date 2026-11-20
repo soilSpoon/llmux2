@@ -14,6 +14,37 @@ const MAX_BODY: usize = 1024 * 1024;
 const MAX_EVENT: usize = 64 * 1024;
 const PROMPT: &str = "Reply with just OK.";
 
+fn timestamp(seconds: i64, nanos: u32) -> String {
+    use time::macros::format_description;
+
+    let format = if nanos == 0 {
+        format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]+00:00")
+    } else if nanos.is_multiple_of(1_000_000) {
+        format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]+00:00"
+        )
+    } else if nanos.is_multiple_of(1_000) {
+        format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]+00:00"
+        )
+    } else {
+        format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]+00:00"
+        )
+    };
+    time::OffsetDateTime::from_unix_timestamp(seconds)
+        .unwrap()
+        .replace_nanosecond(nanos)
+        .unwrap()
+        .format(format)
+        .unwrap()
+}
+
+fn now_timestamp() -> String {
+    let now = time::OffsetDateTime::now_utc();
+    timestamp(now.unix_timestamp(), now.nanosecond())
+}
+
 fn generate_cases(models: &Value, responses: i64) -> Result<Vec<Value>> {
     let models = models.as_array().ok_or("models JSON must be an array")?;
     if models.is_empty()
@@ -756,7 +787,7 @@ impl Sse {
 async fn send(gateway: &Value, case: &Value, timeout: f64, secrets: &[String]) -> Value {
     let start = Instant::now();
     let streaming = case["kind"] == "stream";
-    let mut record = json!({"gateway":gateway["name"],"model":case["model"],"kind":case["kind"],"status":null,"error_class":null,"error":null,"latency_ms":null,"ttft_ms":null,"done":if streaming {json!(false)} else {Value::Null},"deployment":null,"attempts":null,"fallback":null,"routing_headers":{},"started_at":chrono::Utc::now().to_rfc3339()});
+    let mut record = json!({"gateway":gateway["name"],"model":case["model"],"kind":case["kind"],"status":null,"error_class":null,"error":null,"latency_ms":null,"ttft_ms":null,"done":if streaming {json!(false)} else {Value::Null},"deployment":null,"attempts":null,"fallback":null,"routing_headers":{},"started_at":now_timestamp()});
     let mut parser = Sse {
         first_line: true,
         ..Sse::default()
@@ -1021,7 +1052,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         println!("{}/{} completed", i + 1, inputs.plan.len());
     }
     let mut report = aggregate(&rows, &names)?;
-    report["run"] = json!({"completed_at":chrono::Utc::now().to_rfc3339(),"timeout_s":inputs.timeout,"max_requests":inputs.cap,"ordering":"alternating pairs; sequential; no retries","latency_note":"one sample per gateway/case; includes errors; no speedup inference"});
+    report["run"] = json!({"completed_at":now_timestamp(),"timeout_s":inputs.timeout,"max_requests":inputs.cap,"ordering":"alternating pairs; sequential; no retries","latency_note":"one sample per gateway/case; includes errors; no speedup inference"});
     for (file, mut text) in [
         ("results.json", serde_json::to_string_pretty(&report)?),
         ("report.html", render_html(&report)),
