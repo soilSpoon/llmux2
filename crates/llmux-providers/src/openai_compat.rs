@@ -1,4 +1,4 @@
-use crate::{responses, sse};
+use crate::{messages, responses, sse};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use http::{
@@ -283,8 +283,7 @@ impl ProviderAdapter for OpenAiCompat {
     fn supports(&self, inbound: InboundFormat) -> Support {
         match inbound {
             InboundFormat::OpenAiChat => Support::Passthrough,
-            InboundFormat::OpenAiResponses => Support::Convert,
-            _ => Support::No,
+            InboundFormat::OpenAiResponses | InboundFormat::AnthropicMessages => Support::Convert,
         }
     }
 
@@ -309,10 +308,14 @@ impl ProviderAdapter for OpenAiCompat {
                     "application/json"
                 },
             )
-            .body(if req.format == InboundFormat::OpenAiResponses {
-                responses::request(&req.body, &dep.upstream_model)?
-            } else {
-                rewrite_model(&req.body, &dep.upstream_model)?
+            .body(match req.format {
+                InboundFormat::OpenAiResponses => {
+                    responses::request(&req.body, &dep.upstream_model)?
+                }
+                InboundFormat::AnthropicMessages => {
+                    messages::request(&req.body, &dep.upstream_model)?
+                }
+                InboundFormat::OpenAiChat => rewrite_model(&req.body, &dep.upstream_model)?,
             })?;
 
         match auth {
@@ -366,6 +369,9 @@ impl ProviderAdapter for OpenAiCompat {
                 return Err(bad_gateway());
             }
             let stream = sse::decode(body);
+            if req.format == InboundFormat::AnthropicMessages {
+                return Ok(GatewayResponse::Stream(messages::stream(stream)));
+            }
             Ok(GatewayResponse::Stream(
                 if req.format == InboundFormat::OpenAiResponses {
                     responses::stream(stream)
@@ -378,13 +384,15 @@ impl ProviderAdapter for OpenAiCompat {
             if let Some(error) = embedded_error(&body, &parts.headers, SystemTime::now()) {
                 return Err(error);
             }
-            let (body, usage) = if req.format == InboundFormat::OpenAiResponses {
-                responses::complete(&body).map_err(|()| bad_gateway())?
-            } else {
-                (body, None)
+            let (body, usage) = match req.format {
+                InboundFormat::OpenAiResponses => {
+                    responses::complete(&body).map_err(|()| bad_gateway())?
+                }
+                InboundFormat::AnthropicMessages => messages::complete(&body)?,
+                InboundFormat::OpenAiChat => (body, None),
             };
             let mut headers = parts.headers;
-            if req.format == InboundFormat::OpenAiResponses {
+            if req.format != InboundFormat::OpenAiChat {
                 headers.remove(header::CONTENT_LENGTH);
             }
             Ok(GatewayResponse::Complete {
@@ -685,6 +693,153 @@ pub(crate) fn retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Durati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn converts_anthropic_messages_json_and_stream_for_openai_chat() {
+        use futures_util::StreamExt;
+        use http_body_util::Full;
+        use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+        use llmux_testkit::TestServer;
+        use llmux_types::{Billing, DeploymentIdx, QuotaSpec, RequestId};
+        use serde_json::{json, Value};
+
+        let server = TestServer::start(axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                use axum::response::IntoResponse;
+                assert_eq!(body["model"], "chat-model");
+                assert_eq!(body["max_tokens"], 64);
+                assert_eq!(body["stop"], json!(["end"]));
+                assert_eq!(body["messages"][0], json!({"role":"system","content":"Be brief"}));
+                assert_eq!(body["messages"][1], json!({"role":"user","content":"Hello"}));
+                assert_eq!(body["tools"][0]["function"]["name"], "lookup");
+                assert_eq!(body["tool_choice"]["function"]["name"], "lookup");
+                if body["stream"] == true {
+                    assert_eq!(body["stream_options"]["include_usage"], true);
+                    (
+                        [(header::CONTENT_TYPE,"text/event-stream")],
+                        concat!(
+                            "data: {\"id\":\"chat-1\",\"model\":\"chat-model\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+                            "data: {\"id\":\"chat-1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+                            "data: {\"id\":\"chat-1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\"}}]}}]}\n\n",
+                            "data: {\"id\":\"chat-1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}\n\n",
+                            "data: [DONE]\n\n",
+                        ),
+                    ).into_response()
+                } else {
+                    axum::Json(json!({
+                        "id":"chat-1","model":"chat-model",
+                        "choices":[{"message":{"content":"Hi","tool_calls":[{"id":"call_1","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}],
+                        "usage":{"prompt_tokens":3,"completion_tokens":4}
+                    })).into_response()
+                }
+            }),
+        )).await.unwrap();
+        let adapter = OpenAiCompat::new("openai_compat");
+        assert_eq!(
+            adapter.supports(InboundFormat::AnthropicMessages),
+            Support::Convert
+        );
+        let deployment = Deployment {
+            idx: DeploymentIdx(0),
+            id: "d".into(),
+            provider: adapter.kind().clone(),
+            credential: "key".into(),
+            base_url: format!("{}/v1", server.url()).parse().unwrap(),
+            upstream_model: "chat-model".into(),
+            priority: 0,
+            weight: 1,
+            billing: Billing::default(),
+            quota: QuotaSpec::default(),
+            timeout: Duration::from_secs(5),
+            max_context: None,
+        };
+        let client = Client::builder(TokioExecutor::new()).build_http();
+        for stream in [false, true] {
+            let req = GatewayRequest {
+                format: InboundFormat::AnthropicMessages,
+                model: "alias".into(),
+                stream,
+                body: Bytes::from(
+                    json!({
+                        "model":"alias","stream":stream,"max_tokens":64,"system":"Be brief",
+                        "messages":[{"role":"user","content":"Hello"}],"stop_sequences":["end"],
+                        "tools":[{"name":"lookup","input_schema":{"type":"object"}}],
+                        "tool_choice":{"type":"tool","name":"lookup"}
+                    })
+                    .to_string(),
+                ),
+                parsed: Default::default(),
+                est_input_tokens: 0,
+                max_output_tokens: Some(64),
+                context_overflow: None,
+                request_id: RequestId("r".into()),
+            };
+            let upstream = adapter
+                .build_request(&req, &deployment, &AuthMaterial::None)
+                .await
+                .unwrap();
+            let upstream = client.request(upstream.map(Full::new)).await.unwrap();
+            match adapter
+                .parse_response(&req, &deployment, upstream)
+                .await
+                .unwrap()
+            {
+                GatewayResponse::Complete { body, .. } if !stream => {
+                    let message: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(
+                        message["content"],
+                        json!([
+                            {"type":"text","text":"Hi"},
+                            {"type":"tool_use","id":"call_1","name":"lookup","input":{}}
+                        ])
+                    );
+                    assert_eq!(message["stop_reason"], "tool_use");
+                    assert_eq!(
+                        message["usage"],
+                        json!({"input_tokens":3,"output_tokens":4})
+                    );
+                }
+                GatewayResponse::Stream(events) if stream => {
+                    let mut output = Vec::new();
+                    let mut events = events;
+                    while let Some(event) = events.next().await {
+                        let event = event.unwrap();
+                        let value: Value = serde_json::from_str(&event.data).unwrap();
+                        assert_eq!(event.event.as_deref(), value["type"].as_str());
+                        output.push(value);
+                    }
+                    let types: Vec<_> = output
+                        .iter()
+                        .map(|event| event["type"].as_str().unwrap())
+                        .collect();
+                    assert_eq!(
+                        types,
+                        [
+                            "message_start",
+                            "content_block_start",
+                            "content_block_delta",
+                            "content_block_stop",
+                            "content_block_start",
+                            "content_block_delta",
+                            "content_block_delta",
+                            "content_block_stop",
+                            "message_delta",
+                            "message_stop",
+                        ]
+                    );
+                    assert_eq!(output[2]["delta"]["text"], "Hi");
+                    assert_eq!(output[4]["content_block"]["name"], "lookup");
+                    assert_eq!(output[5]["delta"]["partial_json"], "{");
+                    assert_eq!(output[6]["delta"]["partial_json"], "}");
+                    assert_eq!(output[8]["delta"]["stop_reason"], "tool_use");
+                    assert_eq!(output[8]["usage"]["output_tokens"], 4);
+                }
+                _ => panic!("incorrect response format"),
+            }
+        }
+    }
 
     fn classify(status: u16, body: &str) -> UpstreamError {
         classify_error(

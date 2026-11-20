@@ -1,4 +1,5 @@
 use crate::{
+    messages,
     openai_compat::{bad_gateway, classify_error, collect_error},
     sse, OpenAiCompat,
 };
@@ -37,8 +38,7 @@ impl ProviderAdapter for OpenAiResponses {
     fn supports(&self, inbound: InboundFormat) -> Support {
         match inbound {
             InboundFormat::OpenAiResponses => Support::Passthrough,
-            InboundFormat::OpenAiChat => Support::Convert,
-            _ => Support::No,
+            InboundFormat::OpenAiChat | InboundFormat::AnthropicMessages => Support::Convert,
         }
     }
     async fn build_request(
@@ -107,7 +107,9 @@ impl ProviderAdapter for OpenAiResponses {
         let stream = validated(sse::decode(body));
         if req.stream {
             return Ok(GatewayResponse::Stream(
-                if req.format == InboundFormat::OpenAiChat {
+                if req.format == InboundFormat::AnthropicMessages {
+                    messages::stream(chat_stream(stream, true))
+                } else if req.format == InboundFormat::OpenAiChat {
                     let include_usage = serde_json::from_slice::<Value>(&req.body)
                         .map_err(|_| bad_gateway())?["stream_options"]["include_usage"]
                         == true;
@@ -123,10 +125,12 @@ impl ProviderAdapter for OpenAiResponses {
             if value["type"] == "response.completed" {
                 let response = &value["response"];
                 let usage = usage(response);
-                let response = if req.format == InboundFormat::OpenAiChat {
-                    chat_complete(response)?
-                } else {
-                    response.clone()
+                let response = match req.format {
+                    InboundFormat::OpenAiChat => chat_complete(response)?,
+                    InboundFormat::AnthropicMessages => {
+                        messages::complete_chat(&chat_complete(response)?)?.0
+                    }
+                    InboundFormat::OpenAiResponses => response.clone(),
                 };
                 return Ok(GatewayResponse::Complete {
                     status: StatusCode::OK,
@@ -163,7 +167,11 @@ const OMIT: &[&str] = &[
 ];
 
 fn normalize(body: &[u8], model: &str, format: InboundFormat) -> Result<Value, BuildError> {
-    let mut value: Value = serde_json::from_slice(body).map_err(|_| BuildError::InvalidBody)?;
+    let mut value: Value = if format == InboundFormat::AnthropicMessages {
+        messages::chat_request(body, model)?
+    } else {
+        serde_json::from_slice(body).map_err(|_| BuildError::InvalidBody)?
+    };
     if !value.is_object() {
         return Err(BuildError::InvalidBody);
     }
@@ -173,7 +181,7 @@ fn normalize(body: &[u8], model: &str, format: InboundFormat) -> Result<Value, B
     {
         return Err(BuildError::InvalidBody);
     }
-    if format == InboundFormat::OpenAiChat {
+    if format != InboundFormat::OpenAiResponses {
         value = chat_request(&value)?;
     }
     let object = value.as_object_mut().ok_or(BuildError::InvalidBody)?;
@@ -497,6 +505,24 @@ fn chat_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn converts_anthropic_messages_for_responses_deployments() {
+        assert_eq!(
+            OpenAiResponses::new().supports(InboundFormat::AnthropicMessages),
+            Support::Convert,
+        );
+        let normalized = normalize(
+            br#"{"model":"alias","max_tokens":64,"system":"Be brief","messages":[{"role":"user","content":"Hello"}]}"#,
+            "codex-model",
+            InboundFormat::AnthropicMessages,
+        ).unwrap();
+        assert_eq!(normalized["model"], "codex-model");
+        assert_eq!(normalized["instructions"], "Be brief");
+        assert_eq!(normalized["input"][0]["role"], "user");
+        assert_eq!(normalized["stream"], true);
+        assert_eq!(normalized["store"], false);
+    }
 
     #[test]
     fn chat_options_and_multipart_instructions_are_converted() {

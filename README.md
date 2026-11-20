@@ -172,7 +172,7 @@ are omitted, so they do not constrain upstream generation. Stateful conversation
 references, explicit Responses system items, and unsupported hosted tools are
 rejected with 400. An incomplete, failed, or interrupted stream is not successful;
 after SSE commitment errors terminate the stream without replaying the request.
-Anthropic inbound is not supported by this adapter.
+Anthropic Messages requests can also be converted through this adapter, with the same model key restrictions and Codex limitations as Chat Completions.
 
 ## Development
 
