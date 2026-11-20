@@ -40,8 +40,10 @@ Not imported: OAuth/token/cookie auth, encrypted credentials, unsupported
 providers/protocols (including custom Responses/custom-JSON nodes), custom chat
 paths/headers, wildcard models, legacy model aliases, per-key policies, shared
 account quotas, global priority, runtime state, and combo config/transforms.
-Gateway keys grant unrestricted llmux access: review policy differences before
-using them. Provider-specific model transformations (e.g. Fireworks model-prefix
+Only unrestricted active gateway keys are imported. Keys with model/connection/
+combo/endpoint/scope restrictions, schedules, expiry/revocation, bans, rate/session/
+spending limits or other recognized access-limiting policies are skipped, never
+promoted to unrestricted llmux access. Provider-specific model transformations (e.g. Fireworks model-prefix
 rewrites) are not applied: combo models must contain the actual upstream ID.
 The importer validates generated URLs/config with llmux-config before writing;
 it does not contact upstream providers or validate that credentials work.

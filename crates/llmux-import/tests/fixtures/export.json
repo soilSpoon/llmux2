@@ -27,7 +27,8 @@
   ],
   "apiKeys": [
     {"id": "client", "key": "test-client-secret", "isActive": true},
-    {"id": "disabled", "key": "test-disabled-client-secret", "isActive": false}
+    {"id": "disabled", "key": "test-disabled-client-secret", "isActive": false},
+    {"id": "restricted", "key": "test-restricted-client-secret", "isActive": true, "allowedModels": ["priority"]}
   ],
   "modelAliases": {"legacy-alias": "openai/gpt-test"},
   "settings": {"ignored": true}

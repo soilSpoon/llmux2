@@ -86,6 +86,11 @@ fn imports_and_validates_real_config() {
         })
         .collect::<Vec<_>>();
     assert_eq!(secrets.len(), 6);
+    assert!(!secrets.iter().any(|s| s == "test-restricted-client-secret"));
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.contains("client key 2: skipped restricted")));
     for secret in [
         "test-openai-slow-secret",
         "test-openai-fast-secret",
@@ -289,4 +294,69 @@ fn refuses_symlink_secret_directories() {
     fs::create_dir(&target).unwrap();
     std::os::unix::fs::symlink(target, dir.path().join("secrets")).unwrap();
     assert!(llmux_import::import(FIXTURE, &dir.path().join("out.toml"), None).is_err());
+}
+
+#[test]
+fn restricted_client_policies_fail_closed() {
+    for policy in [
+        json!({"allowedModels":["one"]}),
+        json!({"blockedModels":["one"]}),
+        json!({"modelAccessMode":"restricted"}),
+        json!({"allowedCombos":["one"]}),
+        json!({"allowedConnections":["one"]}),
+        json!({"allowedQuotas":["one"]}),
+        json!({"ipAllowlist":["127.0.0.1"]}),
+        json!({"scopes":["read"]}),
+        json!({"allowedEndpoints":["chat"]}),
+        json!({"accessSchedule":{}}),
+        json!({"rateLimits":[{}]}),
+        json!({"maxRequestsPerDay":1}),
+        json!({"maxRequestsPerMinute":1}),
+        json!({"maxSessions":1}),
+        json!({"throttleDelayMs":1}),
+        json!({"expiresAt":"2099-01-01"}),
+        json!({"revokedAt":"2026-01-01"}),
+        json!({"isBanned":true}),
+        json!({"usageLimitEnabled":true}),
+        json!({"dailyUsageLimitUsd":1}),
+        json!({"weeklyUsageLimitUsd":1}),
+        json!({"fiveHourUsageLimitUsd":1}),
+        json!({"disableNonPublicModels":true}),
+        json!({"catalogScope":"combos"}),
+        json!({"forcedModel":"one"}),
+        json!({"allowAutoCombos":false}),
+        json!({"allowCcDiscoveryAliases":false}),
+        json!({"allowedModels":"malformed"}),
+        json!({"allowed_models":["one"]}),
+        json!({"is_active":0}),
+        json!({"source":"sso"}),
+    ] {
+        let mut root: Value = serde_json::from_str(FIXTURE).unwrap();
+        let mut key = policy;
+        key["key"] = "restricted-secret".into();
+        root["apiKeys"] = json!([key]);
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out.toml");
+        let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+        assert_eq!(report.client_keys, 0, "policy: {key}");
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.contains("skipped restricted")));
+        assert!(!dir.path().join("secrets/client-0").exists());
+        assert!(fs::read_to_string(output)
+            .unwrap()
+            .contains("env:LLMUX_CLIENT_KEY"));
+    }
+    let mut root: Value = serde_json::from_str(FIXTURE).unwrap();
+    root["apiKeys"] = json!([{"key":"unrestricted-secret", "isActive":true,
+        "allowedModels":[], "blockedModels":[], "allowedCombos":[], "allowedConnections":[],
+        "allowedQuotas":[], "scopes":[], "ipAllowlist":[], "allowedEndpoints":[],
+        "modelAccessMode":"all", "catalogScope":"all", "maxSessions":0,
+        "expiresAt":null, "isBanned":false, "usageLimitEnabled":0,
+        "allowAutoCombos":true, "allowCcDiscoveryAliases":true}]);
+    let dir = tempfile::tempdir().unwrap();
+    let report =
+        llmux_import::import(&root.to_string(), &dir.path().join("out.toml"), None).unwrap();
+    assert_eq!(report.client_keys, 1);
 }

@@ -81,6 +81,42 @@ fn valid_secret(secret: &str) -> bool {
         && secret.bytes().all(|b| b.is_ascii_graphic())
 }
 
+fn unrestricted_client_key(key: &Value) -> bool {
+    let Some(fields) = key.as_object() else {
+        return false;
+    };
+    fields.iter().all(|(field, value)| {
+        let field = field.replace('_', "").to_ascii_lowercase();
+        if value.is_null() {
+            return true;
+        }
+        match field.as_str() {
+            "allowedmodels" | "blockedmodels" | "allowedcombos" | "allowedconnections"
+            | "allowedquotas" | "ipallowlist" | "scopes" | "allowedendpoints" | "ratelimits" => {
+                value.as_array().is_some_and(Vec::is_empty)
+            }
+            "modelaccessmode" | "catalogscope" => value.as_str() == Some("all"),
+            "isactive" | "allowautocombos" | "allowccdiscoveryaliases" => {
+                value == true || value.as_u64() == Some(1)
+            }
+            "isbanned" | "disablenonpublicmodels" | "usagelimitenabled" => {
+                value == false || value.as_u64() == Some(0)
+            }
+            "maxrequestsperday"
+            | "maxrequestsperminute"
+            | "throttledelayms"
+            | "maxsessions"
+            | "dailyusagelimitusd"
+            | "weeklyusagelimitusd"
+            | "fivehourusagelimitusd" => value.as_f64() == Some(0.0),
+            "accessschedule" | "revokedat" | "expiresat" | "forcedmodel" | "machineid"
+            | "teamid" | "groupid" => value.as_str() == Some(""),
+            "source" => value.as_str().is_some_and(|s| s != "sso"),
+            _ => true,
+        }
+    })
+}
+
 fn write_secret(dir: &Path, id: &str, secret: &str) -> Result<String, String> {
     let path = dir.join(id);
     let mut options = OpenOptions::new();
@@ -467,11 +503,12 @@ pub fn import(
             ));
             continue;
         }
+        if !unrestricted_client_key(key) {
+            warnings.push(format!("client key {i}: skipped restricted or malformed per-key access policy; llmux keys grant unrestricted access"));
+            continue;
+        }
         let id = unique(&format!("client-{i}"), &mut ids);
         client_keys.push(write_secret(&dir, &id, key["key"].as_str().unwrap())?);
-        warnings.push(format!(
-            "client key {i}: imported authentication only; per-key policies are not imported"
-        ));
     }
     let client_count = client_keys.len();
     if client_keys.is_empty() {
