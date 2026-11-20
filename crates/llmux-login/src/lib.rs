@@ -360,10 +360,6 @@ fn parse_callback(query: &str, pending: &CallbackState) -> Result<Callback> {
             return Err(Error::Callback);
         }
     }
-    let state = fields.get("state").ok_or(Error::Callback)?;
-    if !bool::from(state.as_bytes().ct_eq(pending.expected_state.as_bytes())) {
-        return Err(Error::Callback);
-    }
     if let Some(error) = fields.get("error") {
         return Err(if error == "access_denied" {
             Error::AccessDenied
@@ -395,7 +391,16 @@ async fn handle_callback(
     State(state): State<Arc<CallbackState>>,
     RawQuery(query): RawQuery,
 ) -> (::http::StatusCode, &'static str) {
-    let result = parse_callback(query.as_deref().unwrap_or(""), &state);
+    let query = query.as_deref().unwrap_or("");
+    let mut states =
+        url::form_urlencoded::parse(query.as_bytes()).filter(|(key, _)| key == "state");
+    let matches_state = states.next().is_some_and(|(_, value)| {
+        bool::from(value.as_bytes().ct_eq(state.expected_state.as_bytes()))
+    });
+    if !matches_state || states.next().is_some() {
+        return (::http::StatusCode::BAD_REQUEST, "Invalid callback state.");
+    }
+    let result = parse_callback(query, &state);
     let status = if result.is_ok() {
         ::http::StatusCode::OK
     } else {

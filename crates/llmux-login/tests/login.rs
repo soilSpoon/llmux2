@@ -251,26 +251,62 @@ async fn first_login_files_snippet_and_returning_login() {
 }
 
 #[tokio::test]
+async fn invalid_callback_state_keeps_waiting_for_valid_callback() {
+    let (_server, fake, endpoints) = fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    let pending = PendingLogin::start(dir.path(), endpoints).await.unwrap();
+    let params = params(&pending);
+    prepare(&fake, &params).await;
+    let complete = tokio::spawn(pending.finish());
+    for fields in [
+        vec![("error", "access_denied")],
+        vec![("state", "wrong"), ("error", "access_denied")],
+        vec![("state", &params["state"]), ("state", "wrong")],
+    ] {
+        assert_eq!(callback(&params, &fields).await, StatusCode::BAD_REQUEST);
+        assert!(!complete.is_finished(), "invalid state ended pending login");
+        assert_eq!(fake.lock().await.exchanges, 0);
+        assert!(!dir.path().join("credentials.json").exists());
+        assert!(!dir.path().join("refresh_token").exists());
+    }
+    assert_eq!(
+        callback(
+            &params,
+            &[
+                ("state", &params["state"]),
+                ("code", "code +&"),
+                ("client_id", "oaiapp_issued"),
+            ],
+        )
+        .await,
+        StatusCode::OK
+    );
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), complete)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.credentials.client_id, "oaiapp_issued");
+    assert_eq!(fake.lock().await.exchanges, 1);
+    assert!(dir.path().join("credentials.json").exists());
+}
+
+#[tokio::test]
 async fn callback_failures_do_not_exchange_or_write_credentials() {
-    for mode in ["state", "denied", "missing", "dynamic", "duplicate"] {
+    for mode in ["denied", "missing", "dynamic", "duplicate"] {
         let (_server, fake, endpoints) = fixture().await;
         let dir = tempfile::tempdir().unwrap();
         let pending = PendingLogin::start(dir.path(), endpoints).await.unwrap();
         let params = params(&pending);
-        let state = if mode == "state" {
-            "wrong"
-        } else {
-            &params["state"]
-        };
+        let state = params["state"].as_str();
         let mut fields = vec![("state", state), ("code", "code +&")];
         match mode {
             "denied" => fields.push(("error", "access_denied")),
             "dynamic" => fields.push(("client_id", "dynamic_agent_client")),
             "duplicate" => {
-                fields.push(("state", state));
+                fields.push(("code", "duplicate"));
                 fields.push(("client_id", "oaiapp_issued"));
             }
-            "state" => fields.push(("client_id", "oaiapp_issued")),
             _ => {}
         }
         let complete = tokio::spawn(pending.finish());
