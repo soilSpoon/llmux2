@@ -26,9 +26,10 @@ key = "env:GROQ_API_KEY"
 # provider = "openai_compat"
 # token_url = "https://auth.example.com/oauth/token"
 # client_id = "gateway-client"
-# refresh_token = "env:UPSTREAM_REFRESH_TOKEN"
+# refresh_token = "file:/path/to/refresh-token" # rotations atomically rewrite this file (0600 on Unix)
 # client_secret = "env:UPSTREAM_CLIENT_SECRET" # optional
 # scopes = ["inference"] # optional
+# resource = "https://api.openai.com/v1" # optional HTTPS URL; omit scopes for Sign in with ChatGPT
 # refresh_skew_ms = 60000
 # request_timeout_ms = 30000
 

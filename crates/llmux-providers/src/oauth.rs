@@ -13,7 +13,9 @@ use hyper_util::{
 use llmux_types::{AuthError, AuthMaterial, CredentialSource};
 use serde::Deserialize;
 use std::{
+    io::Write,
     net::IpAddr,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Weak,
@@ -33,6 +35,11 @@ pub struct OAuthConfig {
     pub client_secret: Option<String>,
     pub refresh_token: String,
     pub scopes: Option<Vec<String>>,
+    /// Additional form fields; standard OAuth refresh fields cannot be overridden.
+    pub extra_params: Vec<(String, String)>,
+    /// Best-effort atomic storage for rotated refresh tokens. Failures retain the
+    /// in-memory token, but the application may need to reauthorize after restart.
+    pub refresh_token_path: Option<PathBuf>,
     pub refresh_skew: Duration,
     pub request_timeout: Duration,
 }
@@ -45,6 +52,8 @@ impl OAuthConfig {
             refresh_token,
             client_secret: None,
             scopes: None,
+            extra_params: Vec::new(),
+            refresh_token_path: None,
             refresh_skew: Duration::from_secs(60),
             request_timeout: Duration::from_secs(30),
         }
@@ -55,6 +64,15 @@ struct Token {
     auth: AuthMaterial,
     expires: Instant,
     refresh_at: Instant,
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: Option<String>,
+    token_type: Option<String>,
+    expires_in: Option<u64>,
+    refresh_token: Option<String>,
+    error: Option<String>,
 }
 
 struct RefreshState {
@@ -97,6 +115,12 @@ impl OAuthCredentialSource {
             || !(uri.scheme_str() == Some("https")
                 || (uri.scheme_str() == Some("http") && loopback))
             || config.request_timeout.is_zero()
+            || config.extra_params.iter().any(|(key, _)| {
+                matches!(
+                    key.as_str(),
+                    "grant_type" | "client_id" | "client_secret" | "refresh_token" | "scope"
+                )
+            })
         {
             return Err(AuthError::RefreshFailed);
         }
@@ -170,14 +194,23 @@ impl Inner {
         }
         let result = tokio::time::timeout(
             self.config.request_timeout,
-            self.fetch(&mut state.refresh_token),
+            self.fetch(&state.refresh_token),
         )
         .await;
         state.succeeded = false;
-        if let Ok(Ok(token)) = result {
-            self.token.store(Some(Arc::new(token)));
-            self.changed.notify_one();
-            state.succeeded = true;
+        if let Ok(Ok((mut response, started, success))) = result {
+            if let Some(rotated) = response.refresh_token.take().filter(|t| !t.is_empty()) {
+                state.refresh_token = rotated;
+                if let Some(path) = self.config.refresh_token_path.clone() {
+                    let token = state.refresh_token.clone();
+                    let _ = tokio::task::spawn_blocking(move || persist_token(&path, &token)).await;
+                }
+            }
+            if let Ok(token) = self.validate_response(response, started, success) {
+                self.token.store(Some(Arc::new(token)));
+                self.changed.notify_one();
+                state.succeeded = true;
+            }
         }
         self.generation.fetch_add(1, Ordering::Release);
         if state.succeeded {
@@ -187,11 +220,14 @@ impl Inner {
         }
     }
 
-    async fn fetch(&self, refresh_token: &mut String) -> Result<Token, AuthError> {
+    async fn fetch(
+        &self,
+        refresh_token: &str,
+    ) -> Result<(TokenResponse, Instant, bool), AuthError> {
         let mut fields = vec![
             ("grant_type", "refresh_token"),
             ("client_id", &self.config.client_id),
-            ("refresh_token", refresh_token.as_str()),
+            ("refresh_token", refresh_token),
         ];
         if let Some(secret) = &self.config.client_secret {
             fields.push(("client_secret", secret));
@@ -200,9 +236,15 @@ impl Inner {
         if let Some(scope) = &scope {
             fields.push(("scope", scope));
         }
+        fields.extend(
+            self.config
+                .extra_params
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        );
         let body = fields
             .into_iter()
-            .map(|(k, v)| format!("{k}={}", encode(v)))
+            .map(|(k, v)| format!("{}={}", encode(k), encode(v)))
             .collect::<Vec<_>>()
             .join("&");
         let request = Request::post(self.uri.clone())
@@ -221,19 +263,17 @@ impl Inner {
             .await
             .map_err(|_| AuthError::RefreshFailed)?
             .to_bytes();
-        #[derive(Deserialize)]
-        struct Response {
-            access_token: Option<String>,
-            token_type: Option<String>,
-            expires_in: Option<u64>,
-            refresh_token: Option<String>,
-            error: Option<String>,
-        }
-        let response: Response =
+        let response: TokenResponse =
             serde_json::from_slice(&bytes).map_err(|_| AuthError::RefreshFailed)?;
-        if let Some(rotated) = response.refresh_token.filter(|t| !t.is_empty()) {
-            *refresh_token = rotated;
-        }
+        Ok((response, started, success))
+    }
+
+    fn validate_response(
+        &self,
+        response: TokenResponse,
+        started: Instant,
+        success: bool,
+    ) -> Result<Token, AuthError> {
         if !success
             || response.error.is_some()
             || !response
@@ -266,6 +306,26 @@ impl Inner {
             refresh_at: expires - skew,
         })
     }
+}
+
+fn persist_token(path: &Path, token: &str) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(token.as_bytes())?;
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 async fn background(weak: Weak<Inner>) {
@@ -396,6 +456,78 @@ mod tests {
         let source = OAuthCredentialSource::start(config).await.unwrap();
         assert!(source.current().is_ok());
         assert_eq!(endpoint.bodies.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn extra_form_parameters_and_collisions() {
+        let (_server, endpoint, mut config) = fixture(3600).await;
+        config.scopes = None;
+        config.extra_params = vec![("resource".into(), "https://api.openai.com/v1".into())];
+        let source = OAuthCredentialSource::start(config).await.unwrap();
+        source.refresh().await.unwrap();
+        for body in endpoint.bodies.lock().await.iter() {
+            assert!(body.ends_with("&resource=https%3A%2F%2Fapi.openai.com%2Fv1"));
+            assert!(!body.contains("scope="));
+        }
+        for key in [
+            "grant_type",
+            "client_id",
+            "client_secret",
+            "refresh_token",
+            "scope",
+        ] {
+            let mut config = OAuthConfig::new(
+                format!("{}/token", _server.url()),
+                "id".into(),
+                "refresh".into(),
+            );
+            config.extra_params = vec![(key.into(), "override".into())];
+            assert!(matches!(
+                OAuthCredentialSource::start(config).await,
+                Err(AuthError::RefreshFailed)
+            ));
+        }
+        assert_eq!(endpoint.bodies.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rotation_is_persisted_atomically_with_private_permissions() {
+        let (_server, endpoint, mut config) = fixture(3600).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refresh");
+        std::fs::write(&path, "old").unwrap();
+        config.refresh_token_path = Some(path.clone());
+        let source = OAuthCredentialSource::start(config).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "rotated");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        endpoint.mode.store(5, Ordering::Relaxed);
+        assert!(matches!(
+            source.refresh().await,
+            Err(AuthError::RefreshFailed)
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "rejected-rotated");
+        endpoint.mode.store(3, Ordering::Relaxed);
+        source.refresh().await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "rejected-rotated");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_retains_in_memory_rotation() {
+        let (_server, endpoint, mut config) = fixture(3600).await;
+        let dir = tempfile::tempdir().unwrap();
+        config.refresh_token_path = Some(dir.path().join("missing").join("refresh"));
+        let source = OAuthCredentialSource::start(config).await.unwrap();
+        source.refresh().await.unwrap();
+        assert!(endpoint.bodies.lock().await[1].contains("refresh_token=rotated"));
+        assert!(source.current().is_ok());
     }
 
     #[tokio::test]

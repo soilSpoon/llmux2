@@ -482,6 +482,7 @@ dependencies = [
  "memchr",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

@@ -10,7 +10,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -68,6 +68,8 @@ pub struct OAuthCredential {
     pub refresh_token: Arc<str>,
     pub client_secret: Option<Arc<str>>,
     pub scopes: Option<Vec<String>>,
+    pub resource: Option<String>,
+    pub refresh_token_path: Option<PathBuf>,
     pub refresh_skew: Duration,
     pub request_timeout: Duration,
 }
@@ -170,6 +172,7 @@ enum RawCredential {
         refresh_token: Option<String>,
         client_secret: Option<String>,
         scopes: Option<Vec<String>>,
+        resource: Option<String>,
         refresh_skew_ms: Option<u64>,
         request_timeout_ms: Option<u64>,
     },
@@ -280,6 +283,7 @@ impl RawConfig {
                     refresh_token,
                     client_secret,
                     scopes,
+                    resource,
                     refresh_skew_ms,
                     request_timeout_ms,
                     ..
@@ -287,8 +291,21 @@ impl RawConfig {
                     let token_url = required_oauth(token_url, "token_url")?;
                     upstream_uri(&token_url).map_err(|_| invalid("oauth token_url must be HTTPS (HTTP only for loopback), without credentials, query or fragment"))?;
                     let client_id = required_oauth(client_id, "client_id")?;
-                    let refresh_token =
-                        resolve_secret(&required_oauth(refresh_token, "refresh_token")?)?;
+                    let reference = required_oauth(refresh_token, "refresh_token")?;
+                    let refresh_token = resolve_secret(&reference)?;
+                    let refresh_token_path = reference.strip_prefix("file:").map(PathBuf::from);
+                    if let Some(resource) = &resource {
+                        let valid = resource.parse::<Uri>().is_ok_and(|uri| {
+                            uri.scheme_str() == Some("https")
+                                && uri.authority().is_some_and(|a| {
+                                    !a.host().is_empty() && !a.as_str().contains('@')
+                                })
+                                && !resource.contains('#')
+                        });
+                        if !valid {
+                            return Err(invalid("oauth resource must be an absolute HTTPS URL without credentials or fragment"));
+                        }
+                    }
                     let client_secret = client_secret.as_deref().map(resolve_secret).transpose()?;
                     let scopes = scopes.filter(|scopes| !scopes.is_empty());
                     if scopes.as_ref().is_some_and(|scopes| {
@@ -317,6 +334,8 @@ impl RawConfig {
                             refresh_token,
                             client_secret,
                             scopes,
+                            resource,
+                            refresh_token_path,
                             refresh_skew: Duration::from_millis(refresh_skew_ms),
                             request_timeout: timeout(request_timeout_ms.unwrap_or(30_000))?,
                         },
@@ -560,6 +579,31 @@ refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
         assert_eq!(credential.scopes.as_deref().unwrap(), ["read", "write"]);
         assert_eq!(credential.refresh_skew, Duration::ZERO);
         assert_eq!(credential.request_timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn oauth_resource_validation() {
+        let parsed = RuntimeConfig::parse(&config(REQUIRED)).unwrap();
+        assert!(parsed.oauth["oauth"].resource.is_none());
+        assert!(parsed.oauth["oauth"].refresh_token_path.is_none());
+        let parsed = RuntimeConfig::parse(&config(&format!(
+            "{REQUIRED}\nresource = \"https://api.openai.com/v1\""
+        )))
+        .unwrap();
+        assert_eq!(
+            parsed.oauth["oauth"].resource.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        for resource in [
+            "",
+            "relative/path",
+            "http://api.openai.com/v1",
+            "https:///",
+            "https://user:secret@example.com/v1",
+            "https://example.com/v1#fragment",
+        ] {
+            assert!(error(&format!("{REQUIRED}\nresource = {resource:?}")).contains("resource"));
+        }
     }
 
     #[test]
