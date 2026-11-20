@@ -1,5 +1,6 @@
 //! Import OmniRoute JSON exports and SQLite table dumps into a static llmux configuration.
 
+mod aliases;
 mod connection;
 mod db_dump;
 mod upstream;
@@ -433,6 +434,7 @@ pub fn import(
     }
     connections.sort_by_key(|c| c.priority);
     let mut combos = HashMap::new();
+    let mut combo_ids = HashMap::new();
     let mut order = Vec::new();
     for (i, entry) in array(&root, "combos").iter().enumerate() {
         let combo = if let Some(data) = entry.get("data") {
@@ -463,8 +465,15 @@ pub fn import(
             continue;
         }
         order.push(name.clone());
+        let id = string(entry, "id");
+        if !id.is_empty() {
+            combo_ids
+                .entry(id.to_owned())
+                .or_insert_with(|| name.clone());
+        }
         combos.insert(name, combo);
     }
+    let aliases = aliases::prepare(&root, &mut combos, &combo_ids, &mut order, &mut warnings);
     let mut models = Vec::new();
     let mut deployment_ids = HashSet::new();
     let mut deployment_count = 0;
@@ -502,15 +511,7 @@ pub fn import(
             json!({"name":name,"strategy":"priority","aliases":[],"deployments":deployments}),
         );
     }
-    if let Some(aliases) = root.get("modelAliases") {
-        if let Some(aliases) = aliases.as_object() {
-            for alias in aliases.keys() {
-                warnings.push(format!("alias {alias}: skipped legacy model alias; only combos become canonical models"));
-            }
-        } else {
-            warnings.push("ignored malformed modelAliases".into());
-        }
-    }
+    aliases::attach(&mut models, aliases, &mut warnings);
     if models.is_empty() {
         return Err("no importable models; no configuration written".into());
     }

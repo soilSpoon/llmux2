@@ -42,6 +42,8 @@ environment variable to a strong key distinct from the gateway client keys,
 and restart llmux2. Open `http://127.0.0.1:8080/dashboard` (or the configured
 gateway address) and enter the dashboard key. Use TLS when accessing it
 remotely. The page keeps the key in memory until you lock or close it.
+The dashboard UI is in Korean. It defaults to a light theme and remembers
+the theme you choose in this browser; the dashboard key is never stored.
 
 The dashboard shows response rate, status counts, mean time to response
 (first upstream event for streams), and routed requests, failed attempts,
@@ -58,7 +60,7 @@ in its stats. Omit `dashboard_key` to disable the routes and collection.
 
 ## Routing
 
-Lower numeric priority wins, with round-robin ordering among equal priorities. On an upstream HTTP 429, the gateway tries the next deployment and skips the limited deployment until its `Retry-After` (seconds or HTTP date) expires. Missing values use the configured default, doubled for each consecutive 429 from that deployment until it serves a request again, and waits are capped by `cooldown.max_ms`. If none can serve the request, the gateway returns 429 with the earliest known retry delay. Optional local per-deployment RPM and concurrency limits also skip deployments without contacting them.
+Lower numeric priority wins, with round-robin ordering among equal priorities. On an upstream HTTP 429, the gateway tries the next deployment and skips the limited deployment until its `Retry-After` (seconds or HTTP date) expires. Missing values use the configured default, doubled for each consecutive 429 from that deployment until it serves a request again, and waits are capped by `cooldown.max_ms`. If none can serve the request, the gateway returns 429 with the earliest known retry delay. Optional local per-deployment RPM and concurrency limits also skip deployments without contacting them. Deployments under different models that share the same provider, credential, base URL, upstream model and quota share one cooldown and one set of local limits, so a 429 on one model's route is not immediately retried through another model.
 
 Each deployment may set `max_context` (prompt plus completion tokens), defaulting to the model's `capabilities.max_context`. Before routing, the gateway estimates prompt tokens (about 4 bytes of prompt text per token, ignoring base64 `data:` URLs) plus the requested output limit (`max_output_tokens` for Responses, `max_completion_tokens` else `max_tokens` for Chat), and skips deployments of that model that it would not fit. It never falls back to a different model: if no deployment fits, it returns 400 `context_length_exceeded`, naming the limit, without contacting upstream.
 
