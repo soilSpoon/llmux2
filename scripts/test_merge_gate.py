@@ -27,6 +27,13 @@ def marker(sha=SHA, verdict='pass', reviewer='independent'):
 
 
 class MergeGateTest(unittest.TestCase):
+    def test_queued_rerun_without_timestamps_blocks(self):
+        data = fixture()
+        data['checks'][0].update(id=1, started_at='2026-01-01T00:00:00Z')
+        data['checks'].append(dict(data['checks'][0], id=2, started_at=None,
+                                   completed_at=None, status='queued', conclusion=None))
+        self.assertIn('check check still running', evaluate(data, ['check'], POLICY))
+
     def test_cancelled_then_success(self):
         data = fixture()
         data['checks'] += [dict(data['checks'][0], id=2, conclusion='cancelled'),

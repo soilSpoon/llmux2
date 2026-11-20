@@ -33,9 +33,7 @@ def evaluate(data, required, policy):
         errors.append('GitHub has not reported the PR mergeable (conflict or unknown).')
 
     latest_checks = {}
-    for check in sorted(data['checks'], key=lambda c: (
-            c.get('started_at') or c.get('completed_at') or '',
-            c.get('completed_at') or '', c.get('id', 0))):
+    for check in sorted(data['checks'], key=lambda c: c.get('id', 0)):
         if check['head_sha'] == sha:
             latest_checks[check['name']] = check
     checks = list(latest_checks.values())
