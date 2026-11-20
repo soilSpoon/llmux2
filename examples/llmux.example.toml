@@ -1,0 +1,49 @@
+[server]
+listen = "127.0.0.1:8080"
+client_keys = ["env:LLMUX_CLIENT_KEY"]
+request_timeout_ms = 120000
+expose_routing_headers = true
+
+[routing]
+default_strategy = "priority"
+max_attempts = 2
+fallback_on = ["rate_limited"]
+
+[cooldown]
+default_ms = 30000
+max_ms = 3600000
+
+[[credentials]]
+id = "groq-key"
+kind = "api_key"
+provider = "openai_compat"
+key = "env:GROQ_API_KEY"
+
+[[credentials]]
+id = "together-key"
+kind = "api_key"
+provider = "openai_compat"
+key = "env:TOGETHER_API_KEY"
+
+[[models]]
+name = "llama-3.3-70b"
+aliases = ["llama-70b"]
+capabilities = { stream = true }
+
+[[models.deployments]]
+id = "groq-llama70b"
+credential = "groq-key"
+base_url = "https://api.groq.com/openai/v1"
+upstream_model = "llama-3.3-70b-versatile"
+priority = 0
+billing = "free"
+timeout_ms = 30000
+
+[[models.deployments]]
+id = "together-llama70b"
+credential = "together-key"
+base_url = "https://api.together.xyz/v1"
+upstream_model = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+priority = 10
+billing = "pay_as_you_go"
+timeout_ms = 30000
