@@ -11,15 +11,6 @@ pub struct ProviderKind(pub Arc<str>);
 pub struct RequestId(pub Arc<str>);
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Billing {
-    Free,
-    Subscription,
-    #[default]
-    PayAsYouGo,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct QuotaSpec {
     pub rpm: Option<u32>,
@@ -29,21 +20,10 @@ pub struct QuotaSpec {
     pub concurrent: Option<u32>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Strategy {
-    #[default]
-    Priority,
-    Weighted,
-    LeastUsed,
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Capabilities {
     pub stream: bool,
-    pub tools: bool,
-    pub vision: bool,
     pub max_context: Option<u32>,
 }
 
@@ -51,8 +31,6 @@ impl Default for Capabilities {
     fn default() -> Self {
         Self {
             stream: true,
-            tools: false,
-            vision: false,
             max_context: None,
         }
     }
@@ -68,8 +46,6 @@ pub struct Deployment {
     pub base_url: http::Uri,
     pub upstream_model: Arc<str>,
     pub priority: i32,
-    pub weight: u32,
-    pub billing: Billing,
     pub quota: QuotaSpec,
     pub timeout: Duration,
     /// Context window in tokens (prompt plus completion); `None` is unchecked.
@@ -100,7 +76,6 @@ impl ContextOverflow {
 #[derive(Debug)]
 pub struct CanonicalModel {
     pub name: Arc<str>,
-    pub strategy: Strategy,
     pub capabilities: Capabilities,
     pub context_overflow: ContextOverflow,
     /// Sorted by ascending priority.

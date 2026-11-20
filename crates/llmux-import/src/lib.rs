@@ -524,9 +524,7 @@ pub fn import(
             dep["priority"] = if strategy == "round-robin" { 0 } else { i }.into();
         }
         deployment_count += deployments.len();
-        models.push(
-            json!({"name":name,"strategy":"priority","aliases":[],"deployments":deployments}),
-        );
+        models.push(json!({"name":name,"aliases":[],"deployments":deployments}));
     }
     aliases::attach(&mut models, aliases, &mut warnings);
     if models.is_empty() {

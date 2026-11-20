@@ -187,7 +187,7 @@ fn message(id: &str, text: &str, status: &str) -> Value {
     json!({"id":id,"type":"message","role":"assistant","status":status,"content":[text_part(text)]})
 }
 
-pub(crate) fn complete(body: &[u8]) -> Result<(Bytes, Option<Usage>), ()> {
+pub(crate) fn complete(body: &[u8]) -> Result<Bytes, ()> {
     let chat: Value = serde_json::from_slice(body).map_err(|_| ())?;
     let choice = chat["choices"].get(0).ok_or(())?;
     let msg = choice.get("message").ok_or(())?;
@@ -222,10 +222,7 @@ pub(crate) fn complete(body: &[u8]) -> Result<(Bytes, Option<Usage>), ()> {
         item["status"] = json!(status);
     }
     let response = envelope(&chat, output, status, reason);
-    Ok((
-        Bytes::from(serde_json::to_vec(&response).map_err(|_| ())?),
-        usage(&chat["usage"]),
-    ))
+    Ok(Bytes::from(serde_json::to_vec(&response).map_err(|_| ())?))
 }
 
 #[derive(Default)]
@@ -545,15 +542,8 @@ mod tests {
     #[test]
     fn complete_text_tools_and_length() {
         let fixture = br#"{"id":"chat1","created":42,"model":"m","choices":[{"message":{"content":"hello","tool_calls":[{"id":"a","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"length"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}"#;
-        let (body, tokens) = complete(fixture).unwrap();
+        let body = complete(fixture).unwrap();
         let response: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            tokens,
-            Some(Usage {
-                input_tokens: 2,
-                output_tokens: 3
-            })
-        );
         assert_eq!(response["status"], "incomplete");
         assert_eq!(
             response["incomplete_details"]["reason"],
@@ -564,11 +554,10 @@ mod tests {
         assert_eq!(response["output"][0]["status"], "incomplete");
         assert_eq!(response["output"][1]["status"], "incomplete");
         assert_eq!(response["usage"]["total_tokens"], 5);
-        let (body, tokens) = complete(
+        let body = complete(
             br#"{"id":"x","choices":[{"message":{"content":null},"finish_reason":"stop"}]}"#,
         )
         .unwrap();
-        assert!(tokens.is_none());
         assert_eq!(
             serde_json::from_slice::<Value>(&body).unwrap()["output"],
             json!([])
@@ -582,7 +571,7 @@ mod tests {
     #[test]
     fn preserves_refusals() {
         for content in [Value::Null, json!("preface")] {
-            let (body, _) = complete(&serde_json::to_vec(&json!({"id":"r","choices":[{"message":{"content":content,"refusal":"cannot help"},"finish_reason":"stop"}]})).unwrap()).unwrap();
+            let body = complete(&serde_json::to_vec(&json!({"id":"r","choices":[{"message":{"content":content,"refusal":"cannot help"},"finish_reason":"stop"}]})).unwrap()).unwrap();
             let response: Value = serde_json::from_slice(&body).unwrap();
             let parts = response["output"][0]["content"].as_array().unwrap();
             assert_eq!(
@@ -634,7 +623,7 @@ mod tests {
     #[test]
     fn replays_converted_refusal_response() {
         for content in [Value::Null, json!("preface")] {
-            let (body, _) = complete(&serde_json::to_vec(&json!({"id":"r","choices":[{"message":{"content":content,"refusal":"cannot help"},"finish_reason":"stop"}]})).unwrap()).unwrap();
+            let body = complete(&serde_json::to_vec(&json!({"id":"r","choices":[{"message":{"content":content,"refusal":"cannot help"},"finish_reason":"stop"}]})).unwrap()).unwrap();
             let response: Value = serde_json::from_slice(&body).unwrap();
             let chat = convert(json!({"input":response["output"]}));
             assert_eq!(chat["messages"][0]["refusal"], "cannot help");
@@ -754,7 +743,7 @@ mod tests {
             json!({"content":null}),
             json!({"content":"partial","refusal":"blocked","tool_calls":[{"id":"a","function":{"name":"lookup","arguments":"{"}}]}),
         ] {
-            let (body, _) = complete(
+            let body = complete(
                 &serde_json::to_vec(
                     &json!({"id":"r","choices":[{"message":msg,"finish_reason":"content_filter"}]}),
                 )

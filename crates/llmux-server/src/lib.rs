@@ -259,7 +259,6 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
         max_output_tokens: metadata.max_output_tokens,
         context_overflow,
         body,
-        parsed: Default::default(),
         request_id: request_id.clone(),
     };
 
