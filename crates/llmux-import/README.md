@@ -82,6 +82,16 @@ upstream model; model vendor segments such as `openai/` are preserved. Repeated
 node routing segments are stripped, matching OmniRoute's resolver.
 Connection `providerSpecificData.baseUrl` wins over the node/catalog URL;
 chat/message endpoint suffixes are removed because llmux appends them.
+Node `customHeaders` (`custom_headers_json` in table dumps) become per-deployment
+headers. Connection `providerSpecificData.customHeaders` replaces the whole node
+map, including an explicitly empty map, rather than merging individual keys.
+All values are written to 0600 files and referenced with `file:`; input strings
+beginning `env:` or `file:` are treated as literal upstream values, not opened.
+Malformed, invalid, or forbidden headers skip the connection with a content-free
+warning. Core header validation applies: credentialed deployments cannot override
+Authorization or their adapter's credential header; custom OpenAI-compatible
+nodes explicitly using `authType = "none"` may provide Authorization without a
+credential. Remove custom headers to roll back; no header values appear in TOML.
 Loopback, localhost (including subdomains), unspecified addresses, and mapped
 IPv4 loopback addresses are skipped with a warning before writing credentials.
 This does not test DNS resolution or network reachability. Morph is imported
@@ -109,8 +119,8 @@ are normalized to its official chat facade; other Horde roots are rejected.
 Skip precedence is: unusable/inactive, replacement policy, auth/key validation,
 then provider/URL validation (including loopback). Without explicit Workers AI
 opt-in, Cloudflare direct/playground connections remain skipped with an official replacement hint;
-DuckDuckGo/DeepAI bridges are dropped without an official replacement; HMS is
-skipped because custom headers are unsupported. Hints identify custom nodes
+DuckDuckGo/DeepAI bridges are dropped without an official replacement. HMS uses
+the compatible-node header support above. Hints identify custom nodes
 by their provider prefix and contain only fixed documentation URLs, never
 connection-supplied URLs. Anonymous connections still pass provider/URL validation.
 When an anonymous-only import has no client keys, loader validation uses a

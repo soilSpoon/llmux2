@@ -1,0 +1,17 @@
+[package]
+name = "llmux2-ops"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+libc = "0.2"
+
+[[bin]]
+name = "llmux2-deploy"
+path = "src/bin/deploy.rs"
+
+[[bin]]
+name = "llmux2-guard"
+path = "src/bin/guard.rs"

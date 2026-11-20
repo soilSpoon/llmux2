@@ -345,7 +345,7 @@ fn skip_precedence_is_explicit_and_replacement_warnings_are_static() {
             "none",
             "",
             "kilo",
-            "unknown/non-compatible provider",
+            "loopback/localhost upstream",
         ),
         (
             "cloudflare-playground",
@@ -380,7 +380,7 @@ fn skip_precedence_is_explicit_and_replacement_warnings_are_static() {
             "apikey",
             "",
             "hms",
-            "custom headers unsupported in llmux2",
+            "missing, encrypted or invalid API key",
         ),
         (
             "aihorde",

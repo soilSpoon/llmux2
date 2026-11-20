@@ -37,6 +37,18 @@ Credentials use `provider = "openai"` or `"openai_compat"` for OpenAI-compatible
 
 Use `POST /v1/messages` for Anthropic Messages JSON and SSE on Anthropic deployments. Authenticate with a gateway client key in `x-api-key` or `Authorization: Bearer`.
 
+Deployments may set `headers = { "X-Custom" = "literal value", "X-Secret" = "file:/private/header" }`.
+Values can be literal or `env:`/`file:` references resolved at configuration load
+time (terminal CR/LF from reference files is trimmed). Use references for secrets.
+Headers apply on every upstream attempt, are marked sensitive, and are not logged.
+Invalid names/values, duplicate case-insensitive names, hop-by-hop/framing headers
+(`Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`, `TE`,
+`Trailer`, `Upgrade`, `Proxy-Connection`, `HTTP2-Settings`), and proxy authentication headers are rejected.
+`Authorization` and the adapter credential header (`x-api-key` for Anthropic)
+cannot be overridden on credentialed deployments. Explicit `auth = "none"`
+deployments may supply their own Authorization instead. Existing configs are
+unchanged; remove `headers` to roll back custom headers.
+
 Chat requests converted to Anthropic return one choice even when `n` asks for more. For converted Anthropic Chat streams, set `stream_options.include_usage` to `true` for a separate usage chunk just before `[DONE]`, or `false` to omit usage. Without this option, usage remains on the finish chunk. Reported cache reads appear in `usage.prompt_tokens_details.cached_tokens` and cache writes in `usage.cache_creation_input_tokens`.
 
 ## Health, shutdown and deployment
@@ -69,6 +81,12 @@ probe; only a successful HTTP 200 sends WATCHDOG=1. See the
 [user-systemd deployment guide](deploy/README.md) for install, recovery,
 migration and rollback instructions, including the host's TCP queue migration
 sysctl.
+
+Deployment uses standalone `llmux2-deploy` and `llmux2-guard` binaries from the
+non-default `llmux2-ops` workspace package. Build them with
+`cargo build --locked --release -p llmux-server -p llmux2-ops`; production hosts
+need neither Python nor Cargo. Installed binary paths and systemd units are
+unchanged; see the guide above for installation commands.
 
 ## Live dashboard
 
@@ -421,8 +439,9 @@ node --test crates/llmux-server/tests/dashboard.cjs
 ```
 
 In CI, `coverage` runs the Rust unit and integration tests once with coverage
-instrumentation, while `check` runs Rust doctests, lint, and the dashboard and
-deployment tooling tests. The `xtask` workspace member contains CI policy tools
+instrumentation, including `llmux2-ops` deployment tests, while `check` runs Rust
+doctests, lint, dashboard tests, and the remaining Python repository tooling tests
+(including the merge gate). The `xtask` workspace member contains CI policy tools
 and repository-file checks; its tests run in `coverage`, not again in `check`.
 Use `cargo test --locked --workspace` to run all Rust
 tests locally without instrumentation.

@@ -219,6 +219,8 @@ struct RawModel {
 #[serde(deny_unknown_fields)]
 struct RawDeployment {
     #[serde(default)]
+    headers: HashMap<String, String>,
+    #[serde(default)]
     fallback: bool,
     id: String,
     credential: Option<String>,
@@ -560,6 +562,11 @@ impl RawConfig {
                 );
                 candidates.push(idx);
                 deployments.push(Deployment {
+                    headers: deployment_headers(
+                        dep.headers,
+                        dep.auth.is_some(),
+                        provider.0.as_ref(),
+                    )?,
                     fallback: dep.fallback || is_catch_all,
                     idx,
                     id,
@@ -655,7 +662,72 @@ fn upstream_uri(value: &str) -> Result<Uri, ConfigError> {
     Err(invalid("base_url must be HTTPS (HTTP is allowed only for loopback) with no credentials, query or fragment"))
 }
 
+fn deployment_headers(
+    raw: HashMap<String, String>,
+    anonymous: bool,
+    provider: &str,
+) -> Result<http::HeaderMap, ConfigError> {
+    let mut headers = http::HeaderMap::new();
+    for (name, reference) in raw {
+        let value = if reference.starts_with("env:") || reference.starts_with("file:") {
+            resolve_reference(&reference)?
+        } else {
+            reference
+        };
+        let (name, value) = validate_deployment_header(&name, &value, anonymous, provider)?;
+        if headers.insert(name, value).is_some() {
+            return Err(invalid("duplicate deployment header"));
+        }
+    }
+    Ok(headers)
+}
+
+pub fn validate_deployment_header(
+    name: &str,
+    value: &str,
+    anonymous: bool,
+    provider: &str,
+) -> Result<(http::HeaderName, http::HeaderValue), ConfigError> {
+    let name = http::HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| invalid("invalid deployment header name"))?;
+    if matches!(
+        name.as_str(),
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "proxy-authorization"
+            | "proxy-authenticate"
+            | "proxy-connection"
+            | "http2-settings"
+    ) || (!anonymous
+        && (name == http::header::AUTHORIZATION
+            || (provider == provider::ANTHROPIC && name == "x-api-key")))
+    {
+        return Err(invalid("forbidden deployment header"));
+    }
+    let mut value = http::HeaderValue::from_str(value)
+        .map_err(|_| invalid("invalid deployment header value"))?;
+    value.set_sensitive(true);
+    Ok((name, value))
+}
+
 fn resolve_secret(reference: &str) -> Result<Arc<str>, ConfigError> {
+    let value = resolve_reference(reference)?;
+    let val = value.as_str();
+    if val.is_empty() || !val.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(invalid(
+            "secrets must be nonempty, printable ASCII without whitespace",
+        ));
+    }
+    Ok(Arc::from(val))
+}
+
+fn resolve_reference(reference: &str) -> Result<String, ConfigError> {
     let value = if let Some(name) = reference
         .strip_prefix("env:")
         .filter(|name| !name.is_empty())
@@ -674,17 +746,72 @@ fn resolve_secret(reference: &str) -> Result<Arc<str>, ConfigError> {
         ));
     };
     let val = value.trim_end_matches(['\r', '\n']);
-    if val.is_empty() || !val.bytes().all(|byte| byte.is_ascii_graphic()) {
-        return Err(invalid(
-            "secrets must be nonempty, printable ASCII without whitespace",
-        ));
-    }
-    Ok(Arc::from(val))
+    Ok(val.to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deployment_headers_resolve_and_reject_unsafe_values() {
+        let base = config(REQUIRED);
+        let loaded = RuntimeConfig::parse(&format!(
+            "{base}\nheaders = {{ x-test = \"env:LLMUX_CONFIG_OAUTH_TEST_SECRET\" }}\n"
+        ));
+        assert!(loaded.is_ok(), "custom headers must load");
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.deployments[0].headers["x-test"], "test-secret");
+        assert!(loaded.deployments[0].headers["x-test"].is_sensitive());
+        assert!(!format!("{:?}", loaded.deployments[0]).contains("test-secret"));
+        assert!(RuntimeConfig::parse(&format!("{base}\nheaders = {{}}\n")).is_ok());
+        assert!(
+            validate_deployment_header("x-api-key", "value", false, provider::ANTHROPIC).is_err()
+        );
+        assert!(validate_deployment_header(
+            "authorization",
+            "value",
+            true,
+            provider::OPENAI_COMPAT
+        )
+        .is_ok());
+        for name in [
+            "Host",
+            "Content-Length",
+            "Transfer-Encoding",
+            "Connection",
+            "Keep-Alive",
+            "TE",
+            "Trailer",
+            "Upgrade",
+            "Proxy-Authorization",
+            "Proxy-Connection",
+            "HTTP2-Settings",
+            "Authorization",
+            "bad name",
+        ] {
+            assert!(
+                RuntimeConfig::parse(&format!("{base}\nheaders = {{ \"{name}\" = \"value\" }}\n"))
+                    .is_err(),
+                "{name}"
+            );
+        }
+        assert!(RuntimeConfig::parse(&format!(
+            "{base}\nheaders = {{ x-test = \"bad\\r\\nvalue\" }}\n"
+        ))
+        .is_err());
+        for reference in [
+            "env:LLMUX_MISSING_CUSTOM_HEADER_TEST",
+            "file:/nonexistent/llmux-header",
+        ] {
+            let error = RuntimeConfig::parse(&format!(
+                "{base}\nheaders = {{ x-test = \"{reference}\" }}\n"
+            ))
+            .err()
+            .unwrap();
+            assert!(!error.to_string().contains(reference));
+        }
+    }
 
     #[test]
     fn anonymous_auth_requires_explicit_unambiguous_opt_in() {

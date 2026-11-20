@@ -958,6 +958,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "llmux2-ops"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+]
+
+[[package]]
 name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
