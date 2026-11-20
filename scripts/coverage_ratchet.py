@@ -10,7 +10,10 @@ RAISE_HINT_MARGIN = 1.0
 
 
 def parse_floor(text):
-    return float(text.strip())
+    floor = float(text.strip())
+    if not 0.0 <= floor <= 100.0:
+        raise ValueError(f"{FLOOR_FILE} must be a percentage between 0 and 100, got {text.strip()!r}")
+    return floor
 
 
 def line_percent(report):

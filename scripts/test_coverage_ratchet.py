@@ -32,6 +32,11 @@ class RatchetTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             coverage_ratchet.parse_floor("")
 
+    def test_floor_must_be_a_finite_percentage(self):
+        for text in ("nan", "inf", "-1", "100.1"):
+            with self.assertRaises(ValueError, msg=text):
+                coverage_ratchet.parse_floor(text)
+
 
 if __name__ == "__main__":
     unittest.main()
