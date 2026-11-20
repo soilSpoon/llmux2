@@ -207,7 +207,9 @@ def send(gateway, case, timeout, secrets):
                 if not isinstance(choice, dict):
                     raise ValueError("invalid SSE choice")
                 delta = choice.get("delta", {})
-                if isinstance(delta, dict) and delta.get("content") and record["ttft_ms"] is None:
+                if not isinstance(delta, dict):
+                    raise ValueError("invalid SSE delta")
+                if delta.get("content") and record["ttft_ms"] is None:
                     record["ttft_ms"] = round((time.monotonic() - start) * 1000, 3)
 
         while True:
@@ -255,10 +257,8 @@ def send(gateway, case, timeout, secrets):
             if not 200 <= response.status < 300 and message is None:
                 message = "HTTP %d (non-JSON error body omitted)" % response.status
             elif code is None and 200 <= response.status < 300:
-                valid = isinstance(data, dict) and (
-                    isinstance(data.get("choices"), list) and bool(data["choices"])
-                    if case["kind"] != "responses" else
-                    isinstance(data.get("output"), list) and bool(data["output"]))
+                items = data.get('output' if case['kind'] == 'responses' else 'choices') if isinstance(data, dict) else None
+                valid = isinstance(items, list) and bool(items) and all(isinstance(item, dict) for item in items)
                 if not valid:
                     transport, message = "connection", "invalid success payload (body omitted)"
     except (socket.timeout, TimeoutError):

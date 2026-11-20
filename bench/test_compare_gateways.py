@@ -253,6 +253,9 @@ class TransportTest(unittest.TestCase):
                 if req['model'] == 'slow':
                     time.sleep(0.15)
                 if req.get("stream"):
+                    if req['model'] == 'invalid-delta':
+                        self.wfile.write(b'data: {"choices":[{"delta":1}]}\n\ndata: [DONE]\n\n')
+                        return
                     if req['model'] in ('cr-only', 'bom-error'):
                         if req['model'] == 'bom-error':
                             self.wfile.write(b'\xef\xbb\xbfdata: {"error":{"code":"unknown_model","message":"rejected"}}\r\rdata: [DONE]\r\r')
@@ -268,6 +271,10 @@ class TransportTest(unittest.TestCase):
                     self.wfile.write(b'data: {"choices":[{"delta":{"content":"secret-response-text"}}]}\r\n\r\n')
                     if req["model"] != "broken":
                         self.wfile.write(b'data: [DONE]\r\n\r\n')
+                elif req['model'] in ('scalar-items', 'empty-items'):
+                    field = 'output' if self.path.endswith('/responses') else 'choices'
+                    items = [1] if req['model'] == 'scalar-items' else []
+                    self.wfile.write(json.dumps({field: items}).encode())
                 elif req["model"] == "bad":
                     self.wfile.write(b'{"error":{"message":"sk-secret1234567890123456789", "code":"unknown_model"}}')
                 elif self.path.endswith('/responses'):
@@ -335,6 +342,16 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(row['error_class'], 'ok')
         self.assertIsNone(row['error'])
         self.assertNotIn('secret-response-text', json.dumps(row))
+
+    def test_invalid_success_collections_and_stream_deltas_fail(self):
+        for model in ('scalar-items', 'empty-items'):
+            cases = compare.generate_cases([model], responses=1)
+            for case in (cases[0], cases[-1]):
+                with self.subTest(model=model, kind=case['kind']):
+                    row = compare.send(self.gateway, case, 2, [])
+                    self.assertEqual(row['error_class'], 'connection')
+        row = compare.send(self.gateway, compare.generate_cases(['invalid-delta'])[1], 2, [])
+        self.assertEqual(row['error_class'], 'connection')
 
 
 if __name__ == "__main__":
