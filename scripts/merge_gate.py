@@ -44,12 +44,14 @@ def evaluate(data, required, policy):
                    and c['conclusion'] == 'success' for c in checks):
             errors.append(f'Required check {context!r} has no completed successful run on {sha}.')
     for check in checks:
+        if check['status'] != 'completed':
+            errors.append(f'check {check["name"]} still running')
         if check['conclusion'] in ('failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale'):
             errors.append(f'Check {check["name"]!r} failed: {check["conclusion"]}.')
     if any(t['isResolved'] is not True for t in data['threads']):
         errors.append('Unresolved review threads remain.')
 
-    reviews = [r for r in data['reviews'] if r['state'] != 'PENDING']
+    reviews = [r for r in data['reviews'] if r['state'] not in ('PENDING', 'DISMISSED')]
     def unavailable(review):
         login = reviewer_login(review)
         return any(m.lower() in (review.get('body') or '').lower()
@@ -69,7 +71,7 @@ def evaluate(data, required, policy):
                 for m in policy['blocking_markers'].get(login, [])):
             errors.append(f'Latest review by {login} is blocking.')
 
-    authors = AUTHOR.findall(pr.get('body') or '')
+    authors = AUTHOR.findall((pr.get('body') or '').replace('\r\n', '\n'))
     if len(authors) != 1:
         errors.append('PR body must contain exactly one Author-Session: <id> line.')
     markers = [m.groups() for c in sorted(data['comments'], key=lambda c: c['id'])

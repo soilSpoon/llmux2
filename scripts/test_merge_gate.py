@@ -27,9 +27,35 @@ def marker(sha=SHA, verdict='pass', reviewer='independent'):
 
 
 class MergeGateTest(unittest.TestCase):
+    def test_cancelled_then_success(self):
+        data = fixture()
+        data['checks'] += [dict(data['checks'][0], id=2, conclusion='cancelled'),
+                           dict(data['checks'][0], id=3)]
+        self.assertEqual(evaluate(data, ['check'], POLICY), [])
+
+    def test_optional_check_still_running(self):
+        data = fixture()
+        data['checks'].append(dict(data['checks'][0], name='CodeSolar Review',
+                                   status='in_progress', conclusion=None))
+        self.assertIn('check CodeSolar Review still running', evaluate(data, ['check'], POLICY))
+
+    def test_crlf_author_session(self):
+        data = fixture()
+        data['pr']['body'] = 'Author-Session: author\r\nMore text\r\n'
+        self.assertEqual(evaluate(data, ['check'], POLICY), [])
+
+    def test_dismissed_reviews_do_not_count(self):
+        data = fixture()
+        data['reviews'][0]['state'] = 'DISMISSED'
+        self.assertTrue(evaluate(data, ['check'], POLICY))
+        data = fixture()
+        data['reviews'].append({'id': 2, 'user': {'login': 'codesolarlght'},
+                                'state': 'DISMISSED', 'body': 'Changes recommended'})
+        self.assertEqual(evaluate(data, ['check'], POLICY), [])
+
     def test_latest_check_run_wins(self):
         for name in ('check', 'extra'):
-            for conclusion, passes in [('success', True), ('failure', False), (None, name == 'extra')]:
+            for conclusion, passes in [('success', True), ('failure', False), (None, False)]:
                 with self.subTest(name=name, conclusion=conclusion):
                     data = fixture()
                     data['checks'] += [
