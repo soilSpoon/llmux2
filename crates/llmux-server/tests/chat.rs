@@ -31,6 +31,7 @@ enum Reply {
     Limit(u64),
     Quota(Option<u64>),
     Complete,
+    NegotiatedStream(Value),
     ResponseStream { complete: bool },
     AbortStream,
     GatedStream(Arc<Semaphore>),
@@ -85,6 +86,17 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
             "object": "chat.completion",
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello!"}, "finish_reason": "stop"}],
         })).into_response(),
+        Reply::NegotiatedStream(expected) => {
+            assert_eq!(request, expected);
+            (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}\n\n",
+                    "data: [DONE]\n\n",
+                ),
+            ).into_response()
+        }
         Reply::ResponseStream { complete } => {
             assert_eq!(request["stream"], true);
             assert_eq!(request["stream_options"]["include_usage"], true);
@@ -333,6 +345,64 @@ async fn body(response: Response) -> String {
         .unwrap()
         .to_bytes();
     String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn model_discovery_lists_exact_routable_ids_and_requires_authentication() {
+    let fixture = Fixture::start(
+        [Reply::Complete, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let denied = fixture.get("/v1/models", None).await;
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(denied.headers()[header::WWW_AUTHENTICATE], "Bearer");
+    let response = fixture.get("/v1/models", Some("test-client")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let list: Value = serde_json::from_str(&body(response).await).unwrap();
+    assert_eq!(
+        list,
+        json!({"object": "list", "data": [
+            {"id":"alias","object":"model","created":0,"owned_by":"llmux2"},
+            {"id":"shared","object":"model","created":0,"owned_by":"llmux2"}
+        ]})
+    );
+    assert_eq!(fixture.counts(), [0, 0]);
+    for model in list["data"].as_array().unwrap() {
+        let response = fixture
+            .request("test-client", model["id"].as_str().unwrap(), false)
+            .await;
+        check_route(&response, "d1", "1");
+    }
+}
+
+#[tokio::test]
+async fn openai_chat_preserves_documented_and_extension_parameters_and_usage() {
+    let request = json!({
+        "model":"alias","messages":[{"role":"user","content":"Hello"}],
+        "stream":true,"stream_options":{"include_usage":true},"max_completion_tokens":16,
+        "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+        "tool_choice":"auto","response_format":{"type":"json_object"},"reasoning_effort":"low",
+        "reasoning":{"effort":"low"},"user":"opaque-id","seed":7,"n":1,"logprobs":true,
+        "vendor_option":{"model":"leave-me-alone"}
+    });
+    let mut expected = request.clone();
+    expected["model"] = json!("vendor-primary");
+    let fixture = Fixture::start(
+        [Reply::NegotiatedStream(expected), Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture
+        .post("/v1/chat/completions", "test-client", request.to_string())
+        .await;
+    check_route(&response, "d1", "1");
+    let output = body(response).await;
+    assert!(output.ends_with(
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}\n\ndata: [DONE]\n\n"
+    ));
 }
 
 #[tokio::test]
@@ -774,8 +844,8 @@ async fn invalid_client_key_unknown_model_and_upstream_400_do_not_fail_over() {
     let bad_request = fixture.request("test-client", "shared", false).await;
     assert_eq!(bad_request.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        body(bad_request).await,
-        r#"{"error":{"message":"bad input"}}"#
+        serde_json::from_str::<Value>(&body(bad_request).await).unwrap(),
+        json!({"error":{"message":"bad input","type":"invalid_request_error","param":null,"code":"upstream_client_error"}})
     );
     assert_eq!(fixture.counts(), [1, 0]);
 }
