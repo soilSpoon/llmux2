@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 use http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use llmux_types::{
-    AuthMaterial, BoxStream, BuildError, Deployment, GatewayRequest, GatewayResponse,
+    provider, AuthMaterial, BoxStream, BuildError, Deployment, GatewayRequest, GatewayResponse,
     InboundFormat, LimitObservation, ProviderAdapter, ProviderKind, SseEvent, Support,
     UpstreamError, Usage,
 };
@@ -20,7 +20,7 @@ pub struct OpenAiResponses(ProviderKind);
 
 impl Default for OpenAiResponses {
     fn default() -> Self {
-        Self(ProviderKind("openai_responses".into()))
+        Self(ProviderKind(provider::OPENAI_RESPONSES.into()))
     }
 }
 
@@ -130,7 +130,7 @@ impl ProviderAdapter for OpenAiResponses {
         Err(bad_gateway())
     }
     fn observe_limits(&self, headers: &HeaderMap) -> Option<LimitObservation> {
-        OpenAiCompat::new("openai_responses").observe_limits(headers)
+        OpenAiCompat::new(provider::OPENAI_RESPONSES).observe_limits(headers)
     }
 }
 

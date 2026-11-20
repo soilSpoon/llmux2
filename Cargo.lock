@@ -781,6 +781,7 @@ version = "0.1.0"
 dependencies = [
  "http",
  "llmux-config",
+ "llmux-types",
  "serde_json",
  "tempfile",
  "toml",
@@ -800,6 +801,7 @@ dependencies = [
  "hyper-util",
  "jsonwebtoken",
  "llmux-testkit",
+ "llmux-types",
  "rand",
  "serde",
  "serde_json",
@@ -837,6 +839,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "url",
 ]
 
 [[package]]
@@ -878,10 +881,14 @@ dependencies = [
  "bytes",
  "futures-core",
  "http",
+ "http-body-util",
  "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "once_cell",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 

@@ -1,7 +1,6 @@
 use crate::{Credentials, Error, Result};
 use std::{
-    fs,
-    io::{self, Write},
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -18,7 +17,8 @@ pub(crate) fn prepare(dir: &Path) -> Result<(PathBuf, String, Option<Credentials
         Ok(host) => host,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let host = format!("urn:uuid:{}", uuid::Uuid::new_v4());
-            let file = temporary(&host_path, host.as_bytes()).map_err(|_| Error::Storage)?;
+            let file = llmux_types::private_tempfile(&host_path, host.as_bytes())
+                .map_err(|_| Error::Storage)?;
             match file.persist_noclobber(&host_path) {
                 Ok(_) => host,
                 Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
@@ -44,34 +44,22 @@ pub(crate) fn prepare(dir: &Path) -> Result<(PathBuf, String, Option<Credentials
     Ok((dir, host, previous))
 }
 
-fn temporary(path: &Path, bytes: &[u8]) -> io::Result<tempfile::NamedTempFile> {
-    let mut file = tempfile::NamedTempFile::new_in(
-        path.parent()
-            .ok_or_else(|| io::Error::other("missing parent"))?,
-    )?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.as_file()
-            .set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
-    file.write_all(bytes)?;
-    file.as_file().sync_all()?;
-    Ok(file)
-}
-
 pub(crate) fn save(dir: &Path, credentials: &Credentials) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(credentials).map_err(|_| Error::Storage)?;
-    let refresh_path = dir.join("refresh_token");
-    let record_path = dir.join("credentials.json");
-    let refresh = temporary(&refresh_path, credentials.refresh_token.as_bytes())
+    // Stage both files before replacing either destination: a partial pair
+    // (new refresh_token, old credentials.json) would corrupt the login state.
+    let refresh = llmux_types::private_tempfile(
+        &dir.join("refresh_token"),
+        credentials.refresh_token.as_bytes(),
+    )
+    .map_err(|_| Error::Storage)?;
+    let record = llmux_types::private_tempfile(&dir.join("credentials.json"), &bytes)
         .map_err(|_| Error::Storage)?;
-    let record = temporary(&record_path, &bytes).map_err(|_| Error::Storage)?;
-    refresh.persist(refresh_path).map_err(|_| Error::Storage)?;
-    record.persist(record_path).map_err(|_| Error::Storage)?;
-    #[cfg(unix)]
-    fs::File::open(dir)
-        .and_then(|dir| dir.sync_all())
+    refresh
+        .persist(&*dir.join("refresh_token"))
         .map_err(|_| Error::Storage)?;
-    Ok(())
+    record
+        .persist(&*dir.join("credentials.json"))
+        .map_err(|_| Error::Storage)?;
+    llmux_types::sync_dir(dir).map_err(|_| Error::Storage)
 }

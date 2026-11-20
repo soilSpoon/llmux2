@@ -179,6 +179,45 @@ with ChatGPT, use `https://auth.openai.com/api/accounts/oauth/token` as `token_u
 the issued client ID, `resource = "https://api.openai.com/v1"`, and omit `scopes`.
 A refreshable authentication error can trigger one on-demand refresh and retry for the attempted deployment, still subject to request and admission limits. If refresh fails or authentication is rejected again, the gateway disables that credential for routing and can try another eligible deployment.
 
+## Import from OmniRoute
+
+Import an OmniRoute JSON export or SQLite table dump into a new configuration:
+
+```sh
+cargo run -p llmux-import -- \
+  --input /private/omniroute-export.json \
+  --output /private/llmux.toml \
+  --secrets-dir /private/llmux-secrets
+```
+
+For a staged cutover, optionally add both flags:
+
+```sh
+  --omniroute-fallback http://127.0.0.1:20128/v1 \
+  --omniroute-key file:/private/omniroute-client.key
+```
+
+The key must be an `env:VARIABLE` or `file:/path` reference, never a literal.
+The importer writes only that reference, not its value, to the TOML. Referenced
+secrets must be available during import because the generated config is checked
+with the gateway's config parser. URLs must use HTTPS, or HTTP on loopback, with
+no credentials, query, or fragment. Existing output and secret files are never
+overwritten.
+
+Each non-Codex, unrestricted imported model gets an OmniRoute deployment after
+all its native deployments, forwarding its llmux model name as the OmniRoute ID.
+The catch-all forwards otherwise unknown IDs unchanged. Its exclusions cover
+Codex provider IDs and node prefixes, Codex-reaching combos and alias chains,
+enabled mapping patterns, and names/aliases of models with `allowed_keys`.
+Codex-reaching models and models with `allowed_keys` get no fallback leg.
+Exclusions are conservative: even a lower-precedence mapping that can reach
+Codex is excluded. If such a pattern cannot be represented as an exact ID or a
+prefix with one trailing `*` (for example, `owner-?` or `owner-*-suffix`), import
+fails rather than opening a routing gap. Review the emitted `exclude` list
+before cutover. Omitting both flags preserves the existing import output;
+remove the generated fallback credential, deployments, and catch-all to roll
+back to native-only routing.
+
 ## Codex / Sign in with ChatGPT
 
 `provider = "openai_responses"` calls the public Responses endpoint with an OAuth
@@ -237,6 +276,42 @@ references, explicit Responses system items, and unsupported hosted tools are
 rejected with 400. An incomplete, failed, or interrupted stream is not successful;
 after SSE commitment errors terminate the stream without replaying the request.
 Anthropic Messages requests can also be converted through this adapter, with the same model key restrictions and Codex limitations as Chat Completions.
+
+## xAI OAuth (api.x.ai)
+
+Sign in with xAI uses the public Grok CLI OAuth client (authorization-code
+PKCE on `auth.x.ai`) and serves `api.x.ai` through `provider = "openai_compat"`,
+the same pattern OmniRoute uses for its `xai-oauth` provider.
+
+Run `cargo run -p llmux-login -- xai --dir ~/.config/llmux/xai` (the directory
+is optional). It opens the browser with a private sign-in URL, listens for the
+callback on `127.0.0.1:56121/callback` (falling back to a free port), validates
+the ES256 ID token against xAI's JWKS, requires the `api:access` scope, and
+writes `credentials.json` and `refresh_token` with owner-only permissions. Paste
+the printed credential block into `llmux.toml`, then point a deployment at it:
+
+```toml
+[[credentials]]
+id = "xai"
+kind = "oauth"
+provider = "openai_compat"
+token_url = "https://auth.x.ai/oauth2/token"
+client_id = "b1a00492-073a-47ea-816f-4c329264a828" # public Grok CLI client
+refresh_token = "file:/absolute/path/to/.config/llmux/xai/refresh_token"
+
+[[models]]
+name = "grok-4.7"
+
+[[models.deployments]]
+id = "xai-grok-4.7"
+credential = "xai"
+base_url = "https://api.x.ai/v1"
+upstream_model = "grok-4.7"
+```
+
+Do not run login concurrently with a gateway using the same rotating token file.
+Unlike Codex, an xAI credential needs no `allowed_keys` restriction unless
+your own policy wants one.
 
 ## Development
 

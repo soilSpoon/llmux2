@@ -2,7 +2,7 @@
 
 use http::Uri;
 use llmux_types::{
-    CanonicalModel, Capabilities, ContextOverflow, Deployment, DeploymentIdx, ErrorKind,
+    provider, CanonicalModel, Capabilities, ContextOverflow, Deployment, DeploymentIdx, ErrorKind,
     ProviderKind, QuotaSpec,
 };
 use serde::Deserialize;
@@ -482,7 +482,7 @@ impl RawConfig {
                 }
                 let provider = match (&dep.auth, &dep.credential, &dep.provider) {
                     (Some(DeploymentAuth::None), None, Some(provider))
-                        if matches!(provider.as_str(), "openai" | "openai_compat") =>
+                        if matches!(provider.as_str(), provider::OPENAI | provider::OPENAI_COMPAT) =>
                     {
                         ProviderKind(provider.as_str().into())
                     }
@@ -492,7 +492,7 @@ impl RawConfig {
                         .ok_or_else(|| invalid("deployment references an unknown credential"))?,
                     _ => return Err(invalid("deployment requires a credential, or auth = 'none' with an OpenAI-compatible provider; do not combine them")),
                 };
-                if provider.0.as_ref() == "openai_responses"
+                if provider.0.as_ref() == provider::OPENAI_RESPONSES
                     && dep
                         .credential
                         .as_deref()
@@ -505,7 +505,7 @@ impl RawConfig {
                     .base_url
                     .as_deref()
                     .or_else(|| {
-                        (provider.0.as_ref() == "openai_responses")
+                        (provider.0.as_ref() == provider::OPENAI_RESPONSES)
                             .then_some("https://api.openai.com/v1")
                     })
                     .ok_or_else(|| invalid("deployment requires base_url"))?;
@@ -610,14 +610,8 @@ fn timeout(ms: u64) -> Result<Duration, ConfigError> {
 
 fn upstream_uri(value: &str) -> Result<Uri, ConfigError> {
     if let Ok(uri) = value.parse::<Uri>() {
-        if let (Some(authority), Some(scheme)) = (uri.authority(), uri.scheme_str()) {
-            let loopback = authority
-                .host()
-                .trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-                || authority.host().eq_ignore_ascii_case("localhost");
-            if (scheme == "https" || (scheme == "http" && loopback))
+        if let (Some(authority), Some(_)) = (uri.authority(), uri.scheme_str()) {
+            if llmux_types::is_https_or_loopback_http(&uri)
                 && !authority.as_str().contains('@')
                 && uri.query().is_none()
                 && !value.contains('#')

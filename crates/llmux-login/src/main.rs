@@ -1,4 +1,4 @@
-use llmux_login::{Endpoints, PendingLogin};
+use llmux_login::{Endpoints, Flow, PendingLogin};
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -9,29 +9,72 @@ async fn main() {
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut args = std::env::args_os().skip(1);
+fn usage() -> &'static str {
+    "usage: llmux-login [codex|xai] [--dir DIR]\n\
+     codex: Continue with ChatGPT. Default dir: ~/.config/llmux/codex/\n\
+     xai: Continue with xAI (api.x.ai). Default dir: ~/.config/llmux/xai/\n\
+     Use separate directories for different account/workspace registrations."
+}
+
+fn endpoints(provider: &str) -> Result<Endpoints, &'static str> {
+    match provider {
+        "codex" => Ok(Endpoints::default()),
+        "xai" => Ok(Endpoints {
+            authorize: url::Url::parse("https://auth.x.ai/oauth2/authorize").unwrap(),
+            token: url::Url::parse("https://auth.x.ai/oauth2/token").unwrap(),
+            issuer: url::Url::parse("https://auth.x.ai").unwrap(),
+        }),
+        _ => Err(usage()),
+    }
+}
+
+fn parse_args(
+    args: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(Option<String>, Option<PathBuf>), Box<dyn std::error::Error + Send + Sync>> {
     let mut dir = None;
+    let mut provider = None;
+    let mut args = args.peekable();
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--dir") if dir.is_none() => {
                 dir = Some(PathBuf::from(args.next().ok_or("--dir requires a path")?))
             }
-            Some("--help" | "-h") => {
-                println!("usage: llmux-login [--dir DIR]\nContinue with ChatGPT. Default: ~/.config/llmux/codex/\nUse separate directories for different account/workspace registrations.");
-                return Ok(());
+            Some("codex" | "xai") if provider.is_none() => {
+                provider = Some(arg.to_str().unwrap().to_owned())
             }
-            _ => return Err("usage: llmux-login [--dir DIR]".into()),
+            Some("--help" | "-h") => {
+                println!("{}", usage());
+                std::process::exit(0);
+            }
+            _ => return Err(usage().into()),
         }
     }
+    Ok((provider, dir))
+}
+
+fn default_dir(provider: &str) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(
+        PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set; specify --dir")?)
+            .join(format!(".config/llmux/{provider}")),
+    )
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (provider, dir) = parse_args(std::env::args_os().skip(1))?;
+    let provider = provider.as_deref().unwrap_or("codex");
     let dir = match dir {
         Some(dir) => dir,
-        None => PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set; specify --dir")?)
-            .join(".config/llmux/codex"),
+        None => default_dir(provider)?,
     };
-    let mut pending = PendingLogin::start(&dir, Endpoints::default()).await?;
+    let flow = match provider {
+        "codex" => Flow::codex(endpoints(provider)?),
+        "xai" => Flow::xai(endpoints(provider)?),
+        _ => return Err(usage().into()),
+    };
+    let mut pending = PendingLogin::start(&dir, flow.clone()).await?;
+    let label = if provider == "xai" { "xAI" } else { "ChatGPT" };
     let result = loop {
-        println!("Continue with ChatGPT:\n{}\nThis private sign-in URL may contain account hints; do not share it.", pending.authorization_url());
+        println!("Continue with {label}:\n{}\nThis private sign-in URL may contain account hints; do not share it.", pending.authorization_url());
         if webbrowser::open(pending.authorization_url().as_str()).is_err() {
             eprintln!("Could not open the browser. Open the URL above manually.");
         }
@@ -39,8 +82,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(result) => break result,
             Err(error) => {
                 if let Some(client) = error.retry_client_id() {
-                    eprintln!("Authorization code expired or was already used; restarting sign-in with the issued client ID.");
-                    pending = PendingLogin::retry(&dir, Endpoints::default(), client).await?;
+                    eprintln!(
+                        "Authorization code expired or was already used; restarting sign-in."
+                    );
+                    pending = PendingLogin::retry(&dir, flow.clone(), client).await?;
                 } else {
                     return Err(error.into());
                 }
@@ -52,4 +97,52 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         result.snippet
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn args(values: &[&str]) -> impl Iterator<Item = OsString> {
+        values
+            .iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn provider_selection_defaults_to_codex() {
+        assert_eq!(parse_args(args(&[])).unwrap(), (None, None));
+        assert_eq!(
+            parse_args(args(&["xai"])).unwrap(),
+            (Some("xai".into()), None)
+        );
+        assert_eq!(
+            parse_args(args(&["codex", "--dir", "/tmp/d"])).unwrap(),
+            (Some("codex".into()), Some(PathBuf::from("/tmp/d")))
+        );
+        assert!(parse_args(args(&["gitlab"])).is_err());
+        assert!(parse_args(args(&["xai", "codex"])).is_err());
+        assert!(parse_args(args(&["--dir"])).is_err());
+    }
+
+    #[test]
+    fn provider_endpoints_and_dirs() {
+        let xai = endpoints("xai").unwrap();
+        assert_eq!(xai.issuer.as_str(), "https://auth.x.ai/");
+        assert_eq!(xai.authorize.as_str(), "https://auth.x.ai/oauth2/authorize");
+        let codex = endpoints("codex").unwrap();
+        assert!(codex
+            .authorize
+            .as_str()
+            .starts_with("https://auth.openai.com/"));
+        assert!(default_dir("xai").unwrap().ends_with(".config/llmux/xai"));
+        assert!(default_dir("codex")
+            .unwrap()
+            .ends_with(".config/llmux/codex"));
+        assert!(Flow::codex(codex).dynamic());
+        assert!(!Flow::xai(xai).dynamic());
+    }
 }

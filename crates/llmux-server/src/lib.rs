@@ -28,7 +28,7 @@ use llmux_providers::{
     StaticKey,
 };
 use llmux_types::{
-    ContextOverflow, CredentialSource, GatewayRequest, GatewayResponse, InboundFormat,
+    provider, ContextOverflow, CredentialSource, GatewayRequest, GatewayResponse, InboundFormat,
     ProviderRegistry, RequestId, UpstreamError,
 };
 use serde_json::{json, value::RawValue, Value};
@@ -40,8 +40,7 @@ const DEPLOYMENT_HEADER: HeaderName = HeaderName::from_static("x-llmux-deploymen
 const ATTEMPTS_HEADER: HeaderName = HeaderName::from_static("x-llmux-attempts");
 const CONTEXT_OVERFLOW_HEADER: HeaderName = HeaderName::from_static("x-llmux-context-overflow");
 const DROPPED_MESSAGES_HEADER: HeaderName = HeaderName::from_static("x-llmux-dropped-messages");
-const ANTHROPIC: &str = "anthropic";
-const ANTHROPIC_KEY_HEADER: HeaderName = HeaderName::from_static("x-api-key");
+const ANTHROPIC_KEY_HEADER: HeaderName = HeaderName::from_static(provider::ANTHROPIC_KEY_HEADER);
 
 struct AppState {
     config: Arc<RuntimeConfig>,
@@ -51,10 +50,10 @@ struct AppState {
 
 fn provider_registry() -> ProviderRegistry {
     let mut registry = ProviderRegistry::default();
-    for kind in ["openai", "openai_compat"] {
+    for kind in [provider::OPENAI, provider::OPENAI_COMPAT] {
         registry.register(Arc::new(OpenAiCompat::new(kind)));
     }
-    registry.register(Arc::new(Anthropic::new(ANTHROPIC)));
+    registry.register(Arc::new(Anthropic::new(provider::ANTHROPIC)));
     registry.register(Arc::new(OpenAiResponses::new()));
     registry
 }
@@ -66,7 +65,7 @@ fn static_sources(
     std::mem::take(&mut config.api_keys)
         .into_iter()
         .map(|(id, ApiKey { provider, key })| {
-            let source = if &*provider.0 == ANTHROPIC {
+            let source = if &*provider.0 == provider::ANTHROPIC {
                 StaticKey::header(ANTHROPIC_KEY_HEADER, &key)?
             } else {
                 StaticKey::bearer(&key)?
