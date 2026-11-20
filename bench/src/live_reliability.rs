@@ -664,7 +664,7 @@ impl Reply {
             })
             .count()
     }
-    fn summary(&self) -> String {
+    fn summary(&self, secrets: &[String]) -> String {
         let mut s = format!(
             "{} dep={} attempts={} {:.1}s",
             self.status,
@@ -686,8 +686,7 @@ impl Reply {
         }
         if self.status != 200 {
             s.push(' ');
-            s += &self
-                .body
+            s += &redact(&self.body, secrets)
                 .chars()
                 .take(160)
                 .collect::<String>()
@@ -880,7 +879,7 @@ impl Suite<'_> {
                 && (!stream || r.done() && !r.broken()),
             format!(
                 "{} primary_upstream={:?} fallback_upstream={:?}",
-                r.summary(),
+                r.summary(self.secrets),
                 p.statuses(),
                 f.statuses()
             ),
@@ -905,7 +904,11 @@ impl Suite<'_> {
             &format!("{name}:{}", target.name),
             &format!("invalid key at {} -> fallback", target.describe()),
             r.status == 200 && r.deployment() == "fallback" && f.hits() == 1,
-            format!("{} primary_upstream={:?}", r.summary(), p.statuses()),
+            format!(
+                "{} primary_upstream={:?}",
+                r.summary(self.secrets),
+                p.statuses()
+            ),
         );
         let hits = p.hits();
         let r = gw.request("rel", false, false).await?;
@@ -913,7 +916,11 @@ impl Suite<'_> {
             &format!("{name}_disabled:{}", target.name),
             "rejected credential is not retried on the next request",
             r.status == 200 && r.deployment() == "fallback" && p.hits() == hits,
-            format!("{} primary_hits={}", r.summary(), p.hits() - hits),
+            format!(
+                "{} primary_hits={}",
+                r.summary(self.secrets),
+                p.hits() - hits
+            ),
         );
         Ok(())
     }
@@ -929,7 +936,11 @@ impl Suite<'_> {
                 && r.deployment() == "fallback"
                 && r.attempts() == 1
                 && p.hits() == hits,
-            format!("{} primary_hits={}", r.summary(), p.hits() - hits),
+            format!(
+                "{} primary_hits={}",
+                r.summary(self.secrets),
+                p.hits() - hits
+            ),
         );
         p.fault("pass");
         tokio::time::sleep(Duration::from_millis(if cfg!(test) { 1100 } else { 4500 })).await;
@@ -938,7 +949,7 @@ impl Suite<'_> {
             "rate_limit_cooldown_expires",
             "after Retry-After the primary is used again",
             r.status == 200 && r.deployment() == "primary",
-            r.summary(),
+            r.summary(self.secrets),
         );
         drop(gw);
         for (name, status, body) in [
@@ -969,7 +980,7 @@ impl Suite<'_> {
                 &format!("{name}_cooldown"),
                 "quota cooldown keeps primary out of rotation",
                 r.status == 200 && r.deployment() == "fallback" && p.hits() == hits,
-                r.summary(),
+                r.summary(self.secrets),
             );
         }
         let (gw, p, _) = self
@@ -984,7 +995,11 @@ impl Suite<'_> {
                 && second.deployment() == "fallback"
                 && second.attempts() == 1
                 && p.hits() == 1,
-            format!("{} | {}", first.summary(), second.summary()),
+            format!(
+                "{} | {}",
+                first.summary(self.secrets),
+                second.summary(self.secrets)
+            ),
         );
         drop(gw);
         let (url, _) = self.lab.route(
@@ -1009,7 +1024,11 @@ impl Suite<'_> {
             "all_rate_limited",
             "every deployment 429 -> gateway 429 with earliest Retry-After (3s)",
             r.status == 429 && retry.is_some_and(|n| (1..=3).contains(&n)),
-            format!("{} retry-after={}", r.summary(), retry.unwrap_or(0)),
+            format!(
+                "{} retry-after={}",
+                r.summary(self.secrets),
+                retry.unwrap_or(0)
+            ),
         );
         drop(gw);
         self.shared_cooldown().await?;
@@ -1075,7 +1094,7 @@ impl Suite<'_> {
                     && r.deployment() == "fallback"
                     && r.attempts() == 2
                     && r.seconds < 30.0,
-                r.summary(),
+                r.summary(self.secrets),
             );
         }
         for (name, fault, options, extra, expect) in [
@@ -1104,7 +1123,7 @@ impl Suite<'_> {
             self.failover(name, expect, fault, options, extra, (true, false))
                 .await?;
         }
-        for (name,fault,extra,expect) in [("stream_midstream_cut","cut",json!({}),"stream: primary cut after 2 events -> committed stream ends with stream_broken error, no replay on fallback"),("stream_idle_stall","stall",json!({"timeout_ms":deployment_timeout(4000)}),"stream: primary stalls after 2 events -> stream_broken after the 4s idle timeout, no replay")] {let (gw,_,f)=self.pair(fault,json!({"cut_after_events":2,"seconds":30}),extra).await?;let r=gw.request("rel",true,false).await?;self.check(name,expect,r.status==200 && r.deployment()=="primary" && r.broken() && f.hits()==0 && if fault=="cut" {!r.done() && r.events()>=1}else{r.seconds<20.0},format!("{} fallback_hits={}",r.summary(),f.hits()));}
+        for (name,fault,extra,expect) in [("stream_midstream_cut","cut",json!({}),"stream: primary cut after 2 events -> committed stream ends with stream_broken error, no replay on fallback"),("stream_idle_stall","stall",json!({"timeout_ms":deployment_timeout(4000)}),"stream: primary stalls after 2 events -> stream_broken after the 4s idle timeout, no replay")] {let (gw,_,f)=self.pair(fault,json!({"cut_after_events":2,"seconds":30}),extra).await?;let r=gw.request("rel",true,false).await?;self.check(name,expect,r.status==200 && r.deployment()=="primary" && r.broken() && f.hits()==0 && if fault=="cut" {!r.done() && r.events()>=1}else{r.seconds<20.0},format!("{} fallback_hits={}",r.summary(self.secrets),f.hits()));}
         if self.fallback.provider == "anthropic" {
             self.skip(
                 "responses_429_failover",
@@ -1150,7 +1169,7 @@ impl Suite<'_> {
         let gw=self.gateway(vec![],vec![pc,fc],Some(json!([{"name":"rel-a","deployments":[pa,fa]},{"name":"rel-b","deployments":[pb,fb]}]))).await?;
         let first = gw.request("rel-a", false, false).await?;
         let second = gw.request("rel-b", false, false).await?;
-        self.check("shared_route_cooldown","429 on model A's route -> model B, which lists the same provider/key/model, skips that route",first.deployment()=="a-fallback" && second.deployment()=="b-fallback" && second.attempts()==1 && p.hits()==1,format!("{} | {} primary_hits={}",first.summary(),second.summary(),p.hits()));
+        self.check("shared_route_cooldown","429 on model A's route -> model B, which lists the same provider/key/model, skips that route",first.deployment()=="a-fallback" && second.deployment()=="b-fallback" && second.attempts()==1 && p.hits()==1,format!("{} | {} primary_hits={}",first.summary(self.secrets),second.summary(self.secrets),p.hits()));
         Ok(())
     }
     async fn oauth(&mut self, key: &str) -> Result<()> {
@@ -1179,7 +1198,7 @@ impl Suite<'_> {
             "oauth_initial_token",
             "startup token is accepted by the real provider",
             r.status == 200 && r.deployment() == "primary",
-            r.summary(),
+            r.summary(self.secrets),
         );
         let grants = {
             let mut auth = self.lab.state.auth.lock().expect("auth lock");
@@ -1192,7 +1211,7 @@ impl Suite<'_> {
             "oauth_refresh_on_401",
             "revoked token -> one refresh -> same deployment succeeds (attempts 2)",
             r.status == 200 && r.deployment() == "primary" && r.attempts() == 2 && refreshes == 1,
-            format!("{} refreshes={refreshes}", r.summary()),
+            format!("{} refreshes={refreshes}", r.summary(self.secrets)),
         );
         {
             let mut auth = self.lab.state.auth.lock().expect("auth lock");
@@ -1204,7 +1223,7 @@ impl Suite<'_> {
             "oauth_refresh_failure_failover",
             "revoked token and refresh rejected -> fallback",
             r.status == 200 && r.deployment() == "fallback",
-            r.summary(),
+            r.summary(self.secrets),
         );
         let hits = p.hits();
         let r = gw.request("rel", false, false).await?;
@@ -1212,7 +1231,7 @@ impl Suite<'_> {
             "oauth_disabled_after_failure",
             "credential with failed refresh is skipped next time",
             r.status == 200 && r.deployment() == "fallback" && p.hits() == hits,
-            r.summary(),
+            r.summary(self.secrets),
         );
         Ok(())
     }
@@ -1280,7 +1299,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         let config = json!({"server":{"request_timeout_ms":60000},"routing":{"max_attempts":1},"credentials":[{"id":"c","kind":"api_key","provider":target.provider,"key":target.key_ref}],"models":[{"name":"rel","deployments":[{"id":"d","credential":"c","base_url":url,"upstream_model":target.upstream_model}]}]});
         let gw = Gateway::start(Path::new(&binary), config).await?;
         let r = gw.request("rel", false, false).await?;
-        let observed = redact(&r.summary(), &secrets);
+        let observed = redact(&r.summary(&secrets), &secrets);
         println!("PROBE {:<60} {observed}", target.describe());
         probes.push(json!({"target":target.describe(),"healthy":r.status==200,"observed":observed,"upstream":route.statuses()}));
     }
@@ -1363,6 +1382,24 @@ fn private_report(path: &Path, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn error_summary_redacts_full_body_before_truncating() {
+        let secret = "ZXCVBBOUNDARYKEY987654321".to_owned();
+        let secrets = vec![secret.clone()];
+        let reply = Reply {
+            status: 502,
+            headers: BTreeMap::new(),
+            body: format!("{}{} trailing error", "a".repeat(154), secret),
+            seconds: 0.0,
+            stream: false,
+        };
+        let observed = redact(&reply.summary(&secrets), &secrets);
+        assert!(
+            !observed.contains(&secret[..6]),
+            "secret fragment leaked: {observed}"
+        );
+        assert!(observed.contains("[REDAC"));
+    }
     const CONFIG: &str = r#"
     [server]
     listen = "127.0.0.1:8090"
