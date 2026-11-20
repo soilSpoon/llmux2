@@ -28,8 +28,12 @@ fn run() -> Result<(), String> {
         eprintln!("warning: {warning}");
     }
     eprintln!(
-        "imported {} models, {} deployments, {} credentials, {} client keys",
-        report.models, report.deployments, report.credentials, report.client_keys
+        "imported {} models, {} deployments, {} connections, {} credentials, {} client keys",
+        report.models,
+        report.deployments,
+        report.connections,
+        report.credentials,
+        report.client_keys
     );
     Ok(())
 }

@@ -15,6 +15,7 @@ pub struct ImportReport {
     pub warnings: Vec<String>,
     pub models: usize,
     pub deployments: usize,
+    pub connections: usize,
     pub credentials: usize,
     pub client_keys: usize,
 }
@@ -22,7 +23,8 @@ pub struct ImportReport {
 struct Connection {
     source_id: String,
     provider: String,
-    credential: String,
+    credential: Option<String>,
+    kind: String,
     base_url: String,
     priority: i64,
 }
@@ -53,6 +55,13 @@ pub const PROVIDERS: &[(&str, &str, &str)] = &[
         "https://generativelanguage.googleapis.com/v1beta/openai",
     ),
     ("morph", "openai_compat", "https://api.morphllm.com/v1"),
+    ("kilo", "openai_compat", "https://ai-gateway.kilo.ai/api/v1"),
+    (
+        "kilo-free",
+        "openai_compat",
+        "https://ai-gateway.kilo.ai/api/v1",
+    ),
+    ("aihorde", "openai_compat", "https://oai.aihorde.net/v1"),
 ];
 
 fn string<'a>(value: &'a Value, field: &str) -> &'a str {
@@ -306,9 +315,14 @@ impl Expander<'_> {
                 self.warnings.push(format!("combo {name} step {index}: truncated connections at 10000-deployment safety limit"));
             }
             for c in candidates.into_iter().take(10_000 - out.len()) {
-                out.push(
-                    json!({"credential":c.credential,"base_url":c.base_url,"upstream_model":model}),
-                );
+                let mut deployment = json!({"base_url":c.base_url,"upstream_model":model});
+                if let Some(credential) = &c.credential {
+                    deployment["credential"] = credential.clone().into();
+                } else {
+                    deployment["auth"] = "none".into();
+                    deployment["provider"] = c.kind.clone().into();
+                }
+                out.push(deployment);
             }
         }
         stack.pop();
@@ -380,13 +394,14 @@ pub fn import(
     let mut source_ids = HashSet::new();
     for (index, c) in array(&root, "providerConnections").iter().enumerate() {
         let label = format!("connection {index} ({})", string(c, "id"));
+        let anonymous = matches!(string(c, "authType"), "no-auth" | "none");
         let reason = if c["usable"] == false {
             Some("usable: false")
         } else if c["isActive"] == false {
             Some("inactive")
-        } else if !matches!(string(c, "authType"), "apikey" | "api_key" | "api-key") {
+        } else if !anonymous && !matches!(string(c, "authType"), "apikey" | "api_key" | "api-key") {
             Some("OAuth/token or unsupported auth")
-        } else if !valid_secret(c["apiKey"].as_str().unwrap_or("")) {
+        } else if !anonymous && !valid_secret(c["apiKey"].as_str().unwrap_or("")) {
             Some("missing, encrypted or invalid API key")
         } else {
             None
@@ -402,18 +417,34 @@ pub fn import(
                 continue;
             }
         };
+        if anonymous
+            && (kind != "openai_compat"
+                || !matches!(
+                    base_url.as_str(),
+                    "https://ai-gateway.kilo.ai/api/v1" | "https://oai.aihorde.net/v1"
+                ))
+        {
+            warnings.push(format!("{label}: skipped undocumented anonymous endpoint"));
+            continue;
+        }
         let source_id = string(c, "id");
         if source_id.is_empty() || !source_ids.insert(source_id.to_owned()) {
             warnings.push(format!("{label}: skipped missing/duplicate connection id"));
             continue;
         }
-        let id = unique(&format!("upstream-{source_id}"), &mut ids);
-        let key = write_secret(&dir, &id, c["apiKey"].as_str().unwrap())?;
-        credentials.push(json!({"id":id,"kind":"api_key","provider":kind,"key":key}));
+        let credential = if anonymous {
+            None
+        } else {
+            let id = unique(&format!("upstream-{source_id}"), &mut ids);
+            let key = write_secret(&dir, &id, c["apiKey"].as_str().unwrap())?;
+            credentials.push(json!({"id":id,"kind":"api_key","provider":kind,"key":key}));
+            Some(id)
+        };
         connections.push(Connection {
             source_id: source_id.into(),
             provider: string(c, "provider").into(),
-            credential: id,
+            credential,
+            kind,
             base_url,
             priority: c["priority"].as_i64().unwrap_or(0),
         });
@@ -534,15 +565,31 @@ pub fn import(
     let config = json!({"server":{"listen":"127.0.0.1:8080","client_keys":client_keys},"credentials":credentials,"models":models});
     let mut validation = config.clone();
     // Validate structure and URLs without requiring the fallback environment variable yet.
+    let validation_secret = if client_count == 0 && credentials.is_empty() {
+        Some(write_secret(
+            &dir,
+            "validation-client",
+            "validation-client",
+        )?)
+    } else {
+        None
+    };
     if client_count == 0 {
-        validation["server"]["client_keys"] = json!([credentials[0]["key"]]);
+        validation["server"]["client_keys"] = json!([validation_secret
+            .as_ref()
+            .map_or_else(|| credentials[0]["key"].as_str().unwrap(), String::as_str)]);
     }
     let validation =
         toml::Value::try_from(&validation).map_err(|_| "could not encode configuration")?;
-    llmux_config::RuntimeConfig::parse(
+    let validation_result = llmux_config::RuntimeConfig::parse(
         &toml::to_string(&validation).map_err(|_| "could not encode configuration")?,
-    )
-    .map_err(|_| "generated configuration failed llmux validation (check upstream URLs)")?;
+    );
+    if validation_secret.is_some() {
+        fs::remove_file(dir.join("validation-client"))
+            .map_err(|_| "could not remove validation secret")?;
+    }
+    validation_result
+        .map_err(|_| "generated configuration failed llmux validation (check upstream URLs)")?;
     let value = toml::Value::try_from(&config).map_err(|_| "could not encode configuration")?;
     let content = toml::to_string_pretty(&value).map_err(|_| "could not encode configuration")?;
     let mut file = OpenOptions::new()
@@ -556,6 +603,7 @@ pub fn import(
         warnings,
         models: models.len(),
         deployments: deployment_count,
+        connections: connections.len(),
         credentials: credentials.len(),
         client_keys: client_count,
     })

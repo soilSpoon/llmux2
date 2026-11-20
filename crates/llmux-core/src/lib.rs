@@ -18,8 +18,9 @@ use hyper_util::{
 use limits::{DeploymentLimits, Permit};
 use llmux_config::RuntimeConfig;
 use llmux_types::{
-    BuildError, ContextOverflow, CredentialSource, Deployment, DeploymentIdx, ErrorKind,
-    GatewayRequest, GatewayResponse, ProviderAdapter, ProviderRegistry, Support, UpstreamError,
+    AuthMaterial, BuildError, ContextOverflow, CredentialSource, Deployment, DeploymentIdx,
+    ErrorKind, GatewayRequest, GatewayResponse, ProviderAdapter, ProviderRegistry, Support,
+    UpstreamError,
 };
 use stats::AttemptStats;
 pub use stats::DeploymentStats;
@@ -80,7 +81,7 @@ type HttpClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
 struct Binding {
     adapter: Arc<dyn ProviderAdapter>,
-    auth: Arc<dyn CredentialSource>,
+    auth: Option<Arc<dyn CredentialSource>>,
     disabled: Arc<AtomicBool>,
     limits: Arc<DeploymentLimits>,
     stats: Option<Arc<AttemptStats>>,
@@ -115,14 +116,24 @@ impl Executor {
                     .get(&dep.provider)
                     .ok_or_else(|| InitError::UnknownProvider(dep.provider.0.clone()))?
                     .clone();
-                let auth = credentials
-                    .get(&dep.credential)
-                    .ok_or(InitError::MissingCredential)?
-                    .clone();
+                let auth = dep
+                    .credential
+                    .as_ref()
+                    .map(|id| {
+                        credentials
+                            .get(id)
+                            .cloned()
+                            .ok_or(InitError::MissingCredential)
+                    })
+                    .transpose()?;
+                let disabled = dep.credential.as_ref().map_or_else(
+                    || Arc::new(AtomicBool::new(false)),
+                    |id| disabled.entry(id.clone()).or_default().clone(),
+                );
                 Ok(Binding {
                     adapter,
                     auth,
-                    disabled: disabled.entry(dep.credential.clone()).or_default().clone(),
+                    disabled,
                     limits: Arc::new(DeploymentLimits::new(dep.quota)),
                     stats: cfg.server.dashboard_key.is_some().then(Arc::default),
                 })
@@ -310,10 +321,12 @@ impl Executor {
                             })
                         }
                         Err(GatewayError::Client(UpstreamError::Auth { refreshable })) => {
-                            if refreshable && !refreshed {
+                            if let Some(source) =
+                                binding.auth.as_ref().filter(|_| refreshable && !refreshed)
+                            {
                                 refreshed = true;
                                 if matches!(
-                                    timeout_at(deadline, binding.auth.refresh()).await,
+                                    timeout_at(deadline, source.refresh()).await,
                                     Ok(Ok(()))
                                 ) {
                                     continue;
@@ -395,7 +408,11 @@ impl Executor {
         dep: &Deployment,
         binding: &Binding,
     ) -> Result<GatewayResponse, GatewayError> {
-        let auth = binding.auth.current().map_err(|_| GatewayError::Internal)?;
+        let auth = binding
+            .auth
+            .as_ref()
+            .map_or(Ok(AuthMaterial::None), |source| source.current())
+            .map_err(|_| GatewayError::Internal)?;
         let upstream = binding
             .adapter
             .build_request(req, dep, &auth)

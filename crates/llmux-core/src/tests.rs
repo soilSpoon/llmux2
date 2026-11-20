@@ -114,11 +114,11 @@ async fn fixture_with_context(
             idx: DeploymentIdx(i),
             id: format!("dep{i}").into(),
             provider: adapter.kind.clone(),
-            credential: if i < 2 {
+            credential: Some(if i < 2 {
                 "first".into()
             } else {
                 "second".into()
-            },
+            }),
             base_url: server.url().parse().unwrap(),
             upstream_model: "upstream".into(),
             priority: i as i32,
