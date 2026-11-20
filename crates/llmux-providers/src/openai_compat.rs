@@ -433,7 +433,9 @@ pub(crate) async fn collect(body: Incoming) -> Result<Bytes, UpstreamError> {
         .map_err(|_| bad_gateway())
 }
 
-async fn collect_error<B: hyper::body::Body<Data = Bytes> + Unpin>(mut body: B) -> Bytes {
+pub(crate) async fn collect_error<B: hyper::body::Body<Data = Bytes> + Unpin>(
+    mut body: B,
+) -> Bytes {
     let mut bytes = BytesMut::new();
     let deadline = tokio::time::Instant::now() + ERROR_BODY_TIMEOUT;
     while bytes.len() < MAX_ERROR_BYTES {
@@ -497,7 +499,7 @@ fn error_details(body: &[u8]) -> serde_json::Value {
         .unwrap_or_default()
 }
 
-fn classify_error(
+pub(crate) fn classify_error(
     status: StatusCode,
     headers: &HeaderMap,
     body: Bytes,

@@ -151,6 +151,7 @@ async fn fixture_with_models(
         })
         .collect();
     let cfg = RuntimeConfig {
+        model_allowed_keys: Default::default(),
         server: llmux_config::ServerConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             client_keys: Box::new([]),
