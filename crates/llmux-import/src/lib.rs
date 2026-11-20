@@ -1,6 +1,7 @@
 //! Import OmniRoute JSON exports and SQLite table dumps into a static llmux configuration.
 
 mod aliases;
+mod bridge;
 mod connection;
 mod context;
 mod db_dump;
@@ -335,11 +336,26 @@ impl Expander<'_> {
             }
             let antigravity =
                 p.is_builtin("antigravity") && replacements::antigravity(model).is_some();
+            let bridge = self
+                .policy
+                .openrouter_replacements
+                .then(|| bridge::source(&p, self.nodes))
+                .flatten();
+            let redirected = antigravity || bridge.is_some();
             let replacement = if antigravity {
                 if !pinned.is_empty() || !allowed.is_empty() {
                     self.warnings.push(format!("combo {name} step {index}: reviewed Antigravity replacement uses eligible Gemini connections instead of source connection restrictions"));
                 }
                 replacements::antigravity(model)
+            } else if let Some(source) = bridge {
+                let Some(replacement) = bridge::find(source, model) else {
+                    self.warnings.push(format!("combo {name} step {index}: no reviewed bridge replacement for {source}/{model}"));
+                    continue;
+                };
+                if !pinned.is_empty() || !allowed.is_empty() {
+                    self.warnings.push(format!("combo {name} step {index}: reviewed bridge replacement uses eligible official connections instead of source connection restrictions"));
+                }
+                Some(replacement)
             } else if p.is_builtin("openrouter") && self.policy.openrouter_replacements {
                 let replacement = replacements::find(model);
                 if replacement.is_none() || !pinned.is_empty() || !allowed.is_empty() {
@@ -357,10 +373,12 @@ impl Expander<'_> {
                     replacement.map_or(c.provider == p, |r| {
                         if antigravity {
                             replacements::antigravity_connection(r, c)
+                        } else if bridge.is_some() {
+                            bridge::matches(r, c)
                         } else {
                             replacements::matches(r, c)
                         }
-                    }) && if antigravity {
+                    }) && if redirected {
                         true
                     } else if !pinned.is_empty() {
                         c.source_id == pinned
@@ -390,7 +408,7 @@ impl Expander<'_> {
             }
             for id in allowed
                 .iter()
-                .filter(|_| !antigravity)
+                .filter(|_| !redirected)
                 .filter_map(Value::as_str)
             {
                 if !self
@@ -417,6 +435,9 @@ impl Expander<'_> {
                     }
                 };
                 let mut deployment = json!({"base_url":c.base_url,"upstream_model":model});
+                if bridge.is_some() {
+                    deployment["_bridge_replacement"] = true.into();
+                }
                 if let Some(limit) = self.context.limit(&c.provider, &model) {
                     deployment["max_context"] = limit.into();
                 }
@@ -777,6 +798,7 @@ pub fn import_with_options(
     replacements::seed_antigravity(&mut direct, &connections);
     if policy.openrouter_replacements {
         replacements::seed(&mut direct, &connections);
+        bridge::seed(&mut direct, nodes, &connections);
     }
     let mut unavailable_combos = HashSet::new();
     if policy.openrouter_replacements {
@@ -919,6 +941,11 @@ pub fn import_with_options(
                     policy: &policy,
                 }
                 .expand(&name, &mut Vec::new(), &mut deployments);
+            }
+        }
+        for deployment in &mut deployments {
+            if let Some(fields) = deployment.as_object_mut() {
+                fields.remove("_bridge_replacement");
             }
         }
         if deployments.is_empty() {

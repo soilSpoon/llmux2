@@ -1,4 +1,5 @@
 use llmux_config::RuntimeConfig;
+use llmux_import::ImportOptions;
 use serde_json::{json, Value};
 
 fn fixture() -> Value {
@@ -15,6 +16,74 @@ fn fixture() -> Value {
         "combos":[{"name":"plain", "models":["other/first", "vibe/deepseek-v4-1-flash-1017", "other/middle", "morph/morph-dsv41flash-1017", "other/last"]}],
         "apiKeys":[{"key":"synthetic-client"}]
     })
+}
+
+#[test]
+fn reviewed_morph_precedes_bridge_replacements_but_base_keeps_declared_numes_first() {
+    for name in [
+        "deepseek-v4.1-flash-fast",
+        "deepseek-v4.1-flash-1017-fast",
+        "deepseek-v4.1-flash-1017-ultrafast",
+        "deepseek-v4.1-flash",
+        "deepseek-v4.1-flash-1017",
+        "plain",
+    ] {
+        let mut root = fixture();
+        root["providerNodes"].as_array_mut().unwrap().extend([
+            json!({"id":"deepai-node","prefix":"deepai","type":"openai-compatible","baseUrl":"http://127.0.0.1:8790/deepai/v1"}),
+            json!({"id":"numes-node","prefix":"numes","type":"openai-compatible","baseUrl":"https://api.numes.ai/api/v1"}),
+        ]);
+        root["providerConnections"].as_array_mut().unwrap().push(json!({"id":"numes","provider":"numes-node","authType":"apikey","apiKey":"synthetic-numes"}));
+        root["combos"][0] = json!({"name":name,"models":["deepai/deepseek-v4.1-flash", "numes/declared-numes", "vibe/deepseek-v4-1-flash-1017", "morph/morph-dsv41flash-1017", "other/last"]});
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.toml");
+        llmux_import::import_with_options(
+            &root.to_string(),
+            &out,
+            None,
+            &ImportOptions {
+                openrouter_replacements: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let config = RuntimeConfig::load(&out).unwrap();
+        let model = &config.models[*config.model_names.get(name).unwrap()];
+        let actual: Vec<_> = model
+            .deployments
+            .iter()
+            .map(|i| config.deployments[i.0 as usize].upstream_model.as_ref())
+            .collect();
+        let expected = if name.ends_with("fast") {
+            vec![
+                "morph-dsv41flash-1017",
+                "deepseek/deepseek-v4.1-flash",
+                "declared-numes",
+                "deepseek-v4-1-flash-1017",
+                "last",
+            ]
+        } else if name == "plain" {
+            vec![
+                "deepseek/deepseek-v4.1-flash",
+                "declared-numes",
+                "deepseek-v4-1-flash-1017",
+                "morph-dsv41flash-1017",
+                "last",
+            ]
+        } else {
+            vec![
+                "declared-numes",
+                "morph-dsv41flash-1017",
+                "deepseek/deepseek-v4.1-flash",
+                "deepseek-v4-1-flash-1017",
+                "last",
+            ]
+        };
+        assert_eq!(actual, expected, "{name}");
+        assert!(!std::fs::read_to_string(out)
+            .unwrap()
+            .contains("_bridge_replacement"));
+    }
 }
 
 #[test]
@@ -95,7 +164,16 @@ fn reviewed_flash_combos_move_only_verified_morph_ahead_of_mistral() {
             let reorder = name != "plain" && morph_model == Some("morph-dsv41flash-1017");
             let mut expected = vec!["first", "deepseek-v4-1-flash-1017", "middle"];
             if let Some(model) = morph_model {
-                expected.insert(if reorder { 1 } else { 3 }, model);
+                expected.insert(
+                    if reorder && name.ends_with("fast") {
+                        0
+                    } else if reorder {
+                        1
+                    } else {
+                        3
+                    },
+                    model,
+                );
             }
             expected.push("last");
             assert_eq!(actual, expected, "{name}");
