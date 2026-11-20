@@ -47,8 +47,12 @@ pub(super) fn model_target<'a>(step: &'a Value, nodes: &'a [Value]) -> Option<(&
         .as_str()
         .unwrap_or_else(|| string(step, "model"))
         .trim();
-    let provider_id = match string(step, "providerId") {
-        "" => string(step, "provider"),
+    let resolved = string(step, "_resolvedProviderId");
+    let provider_id = match resolved {
+        "" => match string(step, "providerId") {
+            "" => string(step, "provider"),
+            id => id,
+        },
         id => id,
     };
     let (provider, model) = if provider_id.is_empty() {
@@ -56,17 +60,18 @@ pub(super) fn model_target<'a>(step: &'a Value, nodes: &'a [Value]) -> Option<(&
     } else {
         (provider_id, raw)
     };
-    let canonical = if string(step, "providerId").is_empty() {
+    let canonical = if resolved.is_empty() {
         canonical_provider(provider, nodes)
     } else {
-        provider_id
+        resolved
     };
-    let model =
-        if !provider_id.is_empty() || nodes.iter().any(|node| string(node, "id") == canonical) {
-            model_id(model, canonical, nodes)
-        } else {
-            model
-        };
+    let model = if resolved.is_empty()
+        && (!provider_id.is_empty() || nodes.iter().any(|node| string(node, "id") == canonical))
+    {
+        model_id(model, canonical, nodes)
+    } else {
+        model
+    };
     if provider.is_empty()
         || model.is_empty()
         || model.contains('*')
