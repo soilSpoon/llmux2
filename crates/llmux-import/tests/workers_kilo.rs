@@ -36,6 +36,46 @@ fn success(output: &std::process::Output) -> String {
 }
 
 #[test]
+fn unavailable_mapping_blocks_retained_openrouter_combo_and_dependents() {
+    for target in ["missing", "empty"] {
+        let mut root = fixture();
+        let name = "openrouter/anthropic/claude-fable-5.2";
+        root["providerConnections"].as_array_mut().unwrap().push(json!({"id":"anthropic","provider":"anthropic","authType":"apikey","apiKey":"synthetic-anthropic-key"}));
+        root["combos"].as_array_mut().unwrap().extend([
+            json!({"id":"original","name":name,"models":["openai/unverified"]}),
+            json!({"id":"empty","name":"empty","models":[]}),
+            json!({"name":"nested","models":[{"kind":"combo-ref","comboName":name}]}),
+            json!({"name":"bare-nested","models":[name]}),
+        ]);
+        root["modelAliases"] =
+            json!({"dependent":name,"chain":"dependent","prefixed":format!("combo/{name}")});
+        root["modelComboMappings"] =
+            json!([{"pattern":name,"comboId":target,"priority":100,"enabled":true}]);
+        let dir = tempfile::tempdir().unwrap();
+        let warnings = success(&run(
+            &root,
+            dir.path(),
+            &[("--openrouter-replacements", dir.path())],
+        ));
+        let config = RuntimeConfig::load(dir.path().join("out.toml")).unwrap();
+        for name in [
+            name,
+            "dependent",
+            "chain",
+            "prefixed",
+            "nested",
+            "bare-nested",
+        ] {
+            assert!(
+                !config.model_names.contains_key(name),
+                "unexpected {name}: target {target}"
+            );
+        }
+        assert!(warnings.contains("target unavailable (winning mapping)"));
+    }
+}
+
+#[test]
 fn workers_shorthand_only_connections_match_canonical_and_alias_legs() {
     for (alias, canonical) in [
         ("cfpd", "cloudflare-direct"),

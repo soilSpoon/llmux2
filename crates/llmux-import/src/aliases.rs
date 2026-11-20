@@ -83,6 +83,14 @@ pub(super) fn prepare(
     });
     let mut names: BTreeSet<_> = aliases.keys().cloned().collect();
     names.extend(direct.keys().cloned());
+    if official_replacements {
+        names.extend(
+            combos
+                .keys()
+                .filter(|name| name.starts_with("openrouter/"))
+                .cloned(),
+        );
+    }
     for row in &mappings {
         let pattern = string(row, "pattern");
         if exact(pattern) {
@@ -95,21 +103,35 @@ pub(super) fn prepare(
     }
     let mut unavailable = HashSet::new();
     for name in names {
+        let mapping = mappings
+            .iter()
+            .find(|row| matches(string(row, "pattern"), &name));
+        let target = mapping.and_then(|mapping| {
+            combo_ids.get(string(mapping, "comboId")).filter(|name| {
+                combos
+                    .get(*name)
+                    .is_some_and(|combo| combo["isActive"] != false)
+                    && !unavailable_combos.is_some_and(|unavailable| unavailable.contains(*name))
+            })
+        });
+        if official_replacements
+            && name.starts_with("openrouter/")
+            && mapping.is_some()
+            && target.is_none()
+        {
+            warnings.push(format!(
+                "alias {name}: target unavailable (winning mapping)"
+            ));
+            aliases.remove(&name);
+            unavailable.insert(name);
+            continue;
+        }
         if combos.contains_key(&name) {
             warnings.push(format!("alias {name}: collision; existing combo wins"));
             aliases.remove(&name);
             continue;
         }
-        if let Some(mapping) = mappings
-            .iter()
-            .find(|row| matches(string(row, "pattern"), &name))
-        {
-            let target = combo_ids.get(string(mapping, "comboId")).filter(|name| {
-                combos
-                    .get(*name)
-                    .is_some_and(|combo| combo["isActive"] != false)
-                    && !unavailable_combos.is_some_and(|unavailable| unavailable.contains(*name))
-            });
+        if mapping.is_some() {
             if let Some(target) = target {
                 if official_replacements && name.starts_with("openrouter/") {
                     aliases.remove(&name);

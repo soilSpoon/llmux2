@@ -640,6 +640,11 @@ pub fn import_with_options(
             .openrouter_replacements
             .then_some(&unavailable_combos),
     );
+    for name in &unavailable_aliases {
+        if let Some(combo) = combos.get_mut(name) {
+            combo["models"] = json!([]);
+        }
+    }
     direct.extend(direct::collect(&synthetic, nodes, &connections));
     for (name, model) in direct {
         let official = policy.openrouter_replacements
