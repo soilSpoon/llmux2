@@ -223,10 +223,13 @@ priority = 0
             b.url(),
             a.url()
         );
-        let gateway =
-            TestServer::start(llmux_server::app(RuntimeConfig::parse(&config).unwrap()).unwrap())
+        let gateway = TestServer::start(
+            llmux_server::app(RuntimeConfig::parse(&config).unwrap())
                 .await
-                .unwrap();
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         Self {
             primary,
             secondary,

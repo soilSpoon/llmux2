@@ -56,9 +56,20 @@ pub struct RuntimeConfig {
     pub routing: RoutingConfig,
     pub cooldown: CooldownConfig,
     pub api_keys: HashMap<Arc<str>, ApiKey>,
+    pub oauth: HashMap<Arc<str>, OAuthCredential>,
     pub model_names: HashMap<Arc<str>, usize>,
     pub models: Box<[CanonicalModel]>,
     pub deployments: Box<[Deployment]>,
+}
+
+pub struct OAuthCredential {
+    pub token_url: String,
+    pub client_id: String,
+    pub refresh_token: Arc<str>,
+    pub client_secret: Option<Arc<str>>,
+    pub scopes: Option<Vec<String>>,
+    pub refresh_skew: Duration,
+    pub request_timeout: Duration,
 }
 
 impl RuntimeConfig {
@@ -151,6 +162,17 @@ enum RawCredential {
         provider: String,
         key: String,
     },
+    Oauth {
+        id: String,
+        provider: String,
+        token_url: Option<String>,
+        client_id: Option<String>,
+        refresh_token: Option<String>,
+        client_secret: Option<String>,
+        scopes: Option<Vec<String>>,
+        refresh_skew_ms: Option<u64>,
+        request_timeout_ms: Option<u64>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -225,22 +247,79 @@ impl RawConfig {
 
         let mut provider_kinds = HashMap::new();
         let mut api_keys = HashMap::new();
-        for RawCredential::ApiKey { id, provider, key } in credentials {
+        let mut oauth = HashMap::new();
+        for credential in credentials {
+            let (id, provider) = match &credential {
+                RawCredential::ApiKey { id, provider, .. }
+                | RawCredential::Oauth { id, provider, .. } => (id, provider),
+            };
             if id.is_empty() || provider.is_empty() || provider_kinds.contains_key(id.as_str()) {
                 return Err(invalid(
                     "credential IDs must be unique and IDs and providers must be nonempty",
                 ));
             }
-            let id: Arc<str> = id.into();
-            let provider = ProviderKind(provider.into());
+            let id: Arc<str> = id.as_str().into();
+            let provider = ProviderKind(provider.as_str().into());
             provider_kinds.insert(id.clone(), provider.clone());
-            api_keys.insert(
-                id,
-                ApiKey {
-                    provider,
-                    key: resolve_secret(&key)?,
-                },
-            );
+            match credential {
+                RawCredential::ApiKey { key, .. } => {
+                    api_keys.insert(
+                        id,
+                        ApiKey {
+                            provider,
+                            key: resolve_secret(&key)?,
+                        },
+                    );
+                }
+                RawCredential::Oauth {
+                    token_url,
+                    client_id,
+                    refresh_token,
+                    client_secret,
+                    scopes,
+                    refresh_skew_ms,
+                    request_timeout_ms,
+                    ..
+                } => {
+                    let token_url = required_oauth(token_url, "token_url")?;
+                    upstream_uri(&token_url).map_err(|_| invalid("oauth token_url must be HTTPS (HTTP only for loopback), without credentials, query or fragment"))?;
+                    let client_id = required_oauth(client_id, "client_id")?;
+                    let refresh_token =
+                        resolve_secret(&required_oauth(refresh_token, "refresh_token")?)?;
+                    let client_secret = client_secret.as_deref().map(resolve_secret).transpose()?;
+                    let scopes = scopes.filter(|scopes| !scopes.is_empty());
+                    if scopes.as_ref().is_some_and(|scopes| {
+                        scopes.iter().any(|scope| {
+                            scope.is_empty()
+                                || !scope.bytes().all(|b| {
+                                    b == 0x21
+                                        || (0x23..=0x5b).contains(&b)
+                                        || (0x5d..=0x7e).contains(&b)
+                                })
+                        })
+                    }) {
+                        return Err(invalid(
+                            "oauth scopes must contain nonempty OAuth scope tokens",
+                        ));
+                    }
+                    let refresh_skew_ms = refresh_skew_ms.unwrap_or(60_000);
+                    if refresh_skew_ms > MAX_TIMEOUT_MS {
+                        return Err(invalid("oauth refresh_skew_ms must be at most 86400000"));
+                    }
+                    oauth.insert(
+                        id,
+                        OAuthCredential {
+                            token_url,
+                            client_id,
+                            refresh_token,
+                            client_secret,
+                            scopes,
+                            refresh_skew: Duration::from_millis(refresh_skew_ms),
+                            request_timeout: timeout(request_timeout_ms.unwrap_or(30_000))?,
+                        },
+                    );
+                }
+            }
         }
 
         if models.is_empty() {
@@ -334,6 +413,7 @@ impl RawConfig {
                 max: Duration::from_millis(cooldown.max_ms),
             },
             api_keys,
+            oauth,
             model_names,
             models: canonical_models.into_boxed_slice(),
             deployments: deployments.into_boxed_slice(),
@@ -343,6 +423,12 @@ impl RawConfig {
 
 fn invalid(message: &str) -> ConfigError {
     ConfigError::Invalid(message.to_owned())
+}
+
+fn required_oauth(value: Option<String>, field: &str) -> Result<String, ConfigError> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| invalid(&format!("oauth {field} is required and must be nonempty")))
 }
 
 fn valid_identifier(id: &str) -> bool {
@@ -405,4 +491,107 @@ fn resolve_secret(reference: &str) -> Result<Arc<str>, ConfigError> {
         ));
     }
     Ok(Arc::from(val))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(fields: &str) -> String {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| std::env::set_var("LLMUX_CONFIG_OAUTH_TEST_SECRET", "test-secret"));
+        format!(
+            r#"
+[server]
+client_keys = ["env:LLMUX_CONFIG_OAUTH_TEST_SECRET"]
+[[credentials]]
+id = "oauth"
+kind = "oauth"
+provider = "openai_compat"
+{fields}
+[[models]]
+name = "model"
+[[models.deployments]]
+id = "deployment"
+credential = "oauth"
+base_url = "https://example.com/v1"
+upstream_model = "upstream"
+"#
+        )
+    }
+
+    const REQUIRED: &str = r#"token_url = "https://example.com/token"
+client_id = "client"
+refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
+
+    fn error(fields: &str) -> String {
+        RuntimeConfig::parse(&config(fields))
+            .err()
+            .expect("invalid config")
+            .to_string()
+    }
+
+    #[test]
+    fn oauth_defaults_and_options() {
+        let parsed = RuntimeConfig::parse(&config(REQUIRED)).unwrap();
+        let credential = &parsed.oauth["oauth"];
+        assert!(parsed.api_keys.is_empty());
+        assert_eq!(credential.token_url, "https://example.com/token");
+        assert_eq!(credential.client_id, "client");
+        assert_eq!(&*credential.refresh_token, "test-secret");
+        assert!(credential.client_secret.is_none());
+        assert!(credential.scopes.is_none());
+        assert_eq!(credential.refresh_skew, Duration::from_secs(60));
+        assert_eq!(credential.request_timeout, Duration::from_secs(30));
+        let parsed = RuntimeConfig::parse(&config(&format!("{REQUIRED}\nclient_secret = \"env:LLMUX_CONFIG_OAUTH_TEST_SECRET\"\nscopes = [\"read\", \"write\"]\nrefresh_skew_ms = 0\nrequest_timeout_ms = 1000"))).unwrap();
+        let credential = &parsed.oauth["oauth"];
+        assert_eq!(credential.client_secret.as_deref(), Some("test-secret"));
+        assert_eq!(credential.scopes.as_deref().unwrap(), ["read", "write"]);
+        assert_eq!(credential.refresh_skew, Duration::ZERO);
+        assert_eq!(credential.request_timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn oauth_empty_scopes_are_absent() {
+        let parsed = RuntimeConfig::parse(&config(&format!("{REQUIRED}\nscopes = []"))).unwrap();
+        assert!(parsed.oauth["oauth"].scopes.is_none());
+    }
+
+    #[test]
+    fn oauth_required_fields_are_clear_and_nonempty() {
+        for field in ["token_url", "client_id", "refresh_token"] {
+            let fields = REQUIRED
+                .lines()
+                .filter(|line| !line.starts_with(field))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(error(&fields).contains(&format!("oauth {field} is required")));
+            assert!(error(&format!("{fields}\n{field} = \"\""))
+                .contains(&format!("oauth {field} is required")));
+        }
+    }
+
+    #[test]
+    fn oauth_rejects_invalid_endpoint_secrets_and_options() {
+        for url in [
+            "http://example.com/token",
+            "not-a-url",
+            "https://user:secret@example.com/token",
+        ] {
+            assert!(error(&REQUIRED.replace("https://example.com/token", url))
+                .contains("oauth token_url"));
+        }
+        assert!(
+            error(&REQUIRED.replace("env:LLMUX_CONFIG_OAUTH_TEST_SECRET", "inline-secret"))
+                .contains("not literal values")
+        );
+        assert!(
+            error(&format!("{REQUIRED}\nclient_secret = \"inline-secret\""))
+                .contains("not literal values")
+        );
+        assert!(error(&format!("{REQUIRED}\nscopes = [\"\"]")).contains("oauth scopes"));
+        assert!(error(&format!("{REQUIRED}\nrequest_timeout_ms = 0")).contains("timeouts"));
+        assert!(error(&format!("{REQUIRED}\nrefresh_skew_ms = 86400001"))
+            .contains("oauth refresh_skew_ms"));
+    }
 }

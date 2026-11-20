@@ -184,10 +184,13 @@ priority = {openai_priority}
             a.url(),
             o.url()
         );
-        let gateway =
-            TestServer::start(llmux_server::app(RuntimeConfig::parse(&config).unwrap()).unwrap())
+        let gateway = TestServer::start(
+            llmux_server::app(RuntimeConfig::parse(&config).unwrap())
                 .await
-                .unwrap();
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         Self {
             anthropic,
             openai,
@@ -334,8 +337,8 @@ async fn unconvertible_request_is_a_client_error() {
     assert_eq!(fixture.counts(), [0, 0]);
 }
 
-#[test]
-fn unregistered_provider_fails_at_startup() {
+#[tokio::test]
+async fn unregistered_provider_fails_at_startup() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("key"), "k").unwrap();
     let base = dir.path().display();
@@ -361,7 +364,7 @@ upstream_model = "claude"
 "#
     ))
     .unwrap();
-    let err = llmux_server::app(config).err().unwrap();
+    let err = llmux_server::app(config).await.err().unwrap();
     assert_eq!(
         err.to_string(),
         "no registered adapter for provider anthropik"

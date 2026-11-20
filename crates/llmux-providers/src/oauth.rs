@@ -86,7 +86,7 @@ impl OAuthCredentialSource {
             .parse()
             .map_err(|_| AuthError::RefreshFailed)?;
         let loopback = uri.host().is_some_and(|host| {
-            host == "localhost"
+            host.eq_ignore_ascii_case("localhost")
                 || host
                     .trim_matches(['[', ']'])
                     .parse::<IpAddr>()
@@ -387,6 +387,15 @@ mod tests {
         config.client_secret = Some("secret=&".into());
         config.scopes = Some(vec!["one".into(), "two".into()]);
         (server, state, config)
+    }
+
+    #[tokio::test]
+    async fn accepts_case_insensitive_localhost_endpoint() {
+        let (_server, endpoint, mut config) = fixture(3600).await;
+        config.token_url = config.token_url.replace("127.0.0.1", "LOCALHOST");
+        let source = OAuthCredentialSource::start(config).await.unwrap();
+        assert!(source.current().is_ok());
+        assert_eq!(endpoint.bodies.lock().await.len(), 1);
     }
 
     #[tokio::test]

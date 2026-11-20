@@ -15,6 +15,7 @@ use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use http_body_util::LengthLimitError;
 use llmux_config::{ApiKey, RuntimeConfig};
 use llmux_core::{Executor, GatewayError};
+use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
 use llmux_providers::{Anthropic, OpenAiChatMetadata, OpenAiCompat, StaticKey};
 use llmux_types::{
     CredentialSource, GatewayRequest, GatewayResponse, InboundFormat, ProviderRegistry, RequestId,
@@ -35,13 +36,13 @@ struct AppState {
     executor: Executor,
 }
 
-pub fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Send + Sync>> {
+pub async fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Send + Sync>> {
     let mut registry = ProviderRegistry::default();
     for kind in ["openai", "openai_compat"] {
         registry.register(Arc::new(OpenAiCompat::new(kind)));
     }
     registry.register(Arc::new(Anthropic::new(ANTHROPIC)));
-    let sources = std::mem::take(&mut config.api_keys)
+    let mut sources = std::mem::take(&mut config.api_keys)
         .into_iter()
         .map(|(id, ApiKey { provider, key })| {
             let source = if &*provider.0 == ANTHROPIC {
@@ -51,7 +52,19 @@ pub fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Send + S
             };
             Ok((id, Arc::new(source) as Arc<dyn CredentialSource>))
         })
-        .collect::<Result<_, llmux_types::BuildError>>()?;
+        .collect::<Result<std::collections::HashMap<_, _>, llmux_types::BuildError>>()?;
+    for (id, credential) in std::mem::take(&mut config.oauth) {
+        let mut oauth = OAuthConfig::new(
+            credential.token_url,
+            credential.client_id,
+            credential.refresh_token.to_string(),
+        );
+        oauth.client_secret = credential.client_secret.map(|secret| secret.to_string());
+        oauth.scopes = credential.scopes;
+        oauth.refresh_skew = credential.refresh_skew;
+        oauth.request_timeout = credential.request_timeout;
+        sources.insert(id, Arc::new(OAuthCredentialSource::start(oauth).await?));
+    }
 
     let config = Arc::new(config);
     let executor = Executor::new(config.clone(), &registry, &sources)?;

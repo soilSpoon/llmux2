@@ -34,14 +34,43 @@ Lower numeric priority wins, with round-robin ordering among equal priorities. O
 
 `x-llmux-deployment` and `x-llmux-attempts` identify the winning deployment and number of HTTP attempts (not skipped deployments). Set `server.expose_routing_headers = false` to hide them. A stream commits on its first complete SSE event; after that, failures end the stream with an error payload rather than replaying the request.
 
-The MVP does not wire OAuth into server configuration, or implement multi-format routing, hot reload, circuit breakers, or failover on errors other than 429. The providers crate offers an OAuth 2.0 refresh-token credential source for programmatic use. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local RPM uses a bounded per-deployment sliding window only when configured.
+The MVP does not implement multi-format routing, hot reload, circuit breakers, or failover on errors other than 429. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local RPM uses a bounded per-deployment sliding window only when configured.
+
+## Credentials
+
+Credentials support `kind = "api_key"` (with a `key` secret reference) and
+`kind = "oauth"` (OAuth 2.0 refresh-token grant). Deployments select either by
+credential `id`. Both use `provider = "openai"` or `"openai_compat"` in the server.
+
+```toml
+[[credentials]]
+id = "oauth-account"
+kind = "oauth"
+provider = "openai_compat"
+token_url = "https://auth.example.com/oauth/token"
+client_id = "gateway-client"
+refresh_token = "env:UPSTREAM_REFRESH_TOKEN"
+client_secret = "env:UPSTREAM_CLIENT_SECRET" # optional for public clients
+scopes = ["inference"] # optional
+refresh_skew_ms = 60000 # optional; default 60 seconds, zero allowed
+request_timeout_ms = 30000 # optional; default 30 seconds
+```
+
+`token_url`, `client_id`, and `refresh_token` are required and nonempty. Secrets
+must be `env:` or `file:` references, never inline values. Token endpoints require
+HTTPS (HTTP is allowed only on loopback), with no userinfo, query or fragment.
+Timeouts are 1–86400000 ms; refresh skew is 0–86400000 ms. OAuth startup fetches
+the initial access token and fails if that request fails. Access tokens are cached
+and refreshed in the background; rotated refresh tokens are kept in memory only,
+so persist them externally before restarting if your provider invalidates old ones.
+Authentication-error fallback / on-demand refresh retries are not implemented.
 
 ## Development
 
 - `llmux-types` defines the shared model, IR, and provider contracts.
 - `llmux-config` parses and validates TOML and secret references.
 - `llmux-core` selects deployments, enforces limits, and executes attempts.
-- `llmux-providers` implements the OpenAI-compatible and Anthropic Messages adapters with static API-key and OAuth refresh-token credential sources (OAuth configuration wiring is not yet available), including Responses-to-Chat-Completions conversion.
+- `llmux-providers` implements the OpenAI-compatible and Anthropic Messages adapters with static API-key and OAuth refresh-token credential sources, including Responses-to-Chat-Completions conversion.
 - `llmux-server` assembles those crates and serves the HTTP API.
 - `llmux-testkit` provides loopback HTTP fixtures.
 
