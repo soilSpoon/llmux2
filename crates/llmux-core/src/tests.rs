@@ -131,6 +131,26 @@ async fn fixture_with_models(
     models: &[(&str, &[u32])],
     shared_quota: llmux_types::QuotaSpec,
 ) -> Fixture {
+    fixture_full(
+        errors,
+        refresh_fails,
+        max_context,
+        models,
+        shared_quota,
+        Default::default(),
+    )
+    .await
+}
+
+/// `second_quota` is the quota of credential "second", used only by dep2.
+async fn fixture_full(
+    errors: Vec<UpstreamError>,
+    refresh_fails: bool,
+    max_context: [Option<u32>; 3],
+    models: &[(&str, &[u32])],
+    shared_quota: llmux_types::QuotaSpec,
+    second_quota: llmux_types::QuotaSpec,
+) -> Fixture {
     let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
     let served_status = status.clone();
     let server = llmux_testkit::TestServer::start(axum::Router::new().fallback(move || {
@@ -195,6 +215,7 @@ async fn fixture_with_models(
             max: Duration::from_secs(5),
         },
         api_keys: HashMap::new(),
+        credential_quotas: HashMap::from([("second".into(), second_quota)]),
         oauth: HashMap::new(),
         model_names: models
             .iter()
@@ -501,12 +522,17 @@ async fn repeated_rate_limits_lengthen_cooldown_until_a_success() {
             .map_or(Duration::ZERO, |end| end - now)
     };
     let served = |adapter: &Adapter| adapter.calls.lock().unwrap().last().unwrap().0.clone();
+    let elapse = |duration| async move {
+        tokio::time::pause();
+        tokio::time::advance(duration).await;
+        tokio::time::resume();
+    };
 
     executor.execute(request()).await.unwrap();
     assert_eq!(served(&adapter).as_ref(), "dep2");
     assert!(cooldown(&executor) <= Duration::from_secs(1));
 
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    elapse(Duration::from_millis(1100)).await;
     adapter.errors.lock().unwrap().push_back(limited());
     executor.execute(request()).await.unwrap();
     assert_eq!(served(&adapter).as_ref(), "dep2");
@@ -516,7 +542,7 @@ async fn repeated_rate_limits_lengthen_cooldown_until_a_success() {
         "second consecutive 429 should double the cooldown, got {second:?}"
     );
 
-    tokio::time::sleep(second + Duration::from_millis(100)).await;
+    elapse(second + Duration::from_millis(100)).await;
     executor.execute(request()).await.unwrap();
     assert_eq!(served(&adapter).as_ref(), "dep0");
     adapter.errors.lock().unwrap().push_back(limited());
@@ -790,4 +816,26 @@ async fn after_a_cooldown_other_requests_fall_back_while_a_probe_is_open() {
     );
     drop(probe);
     assert_eq!(adapter.calls.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn credential_quota_limits_the_credentials_deployments() {
+    let (executor, adapter, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("model", &[2])],
+        Default::default(),
+        llmux_types::QuotaSpec {
+            rpm: Some(1),
+            ..Default::default()
+        },
+    )
+    .await;
+    executor.execute(request()).await.unwrap();
+    assert!(matches!(
+        executor.execute(request()).await,
+        Err(GatewayError::AllCandidatesExhausted { .. })
+    ));
+    assert_eq!(adapter.calls.lock().unwrap().len(), 1);
 }

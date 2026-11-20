@@ -18,7 +18,7 @@ pub(super) struct DeploymentLimits {
     cooldown_until_ns: AtomicU64,
     concurrent: Option<u32>,
     inflight: AtomicU32,
-    windows: Box<[Window]>,
+    windows: Box<[Arc<Window>]>,
     limit_strikes: AtomicU32,
     /// After a limit, one request at a time probes the deployment until one succeeds.
     probe: AtomicBool,
@@ -30,28 +30,22 @@ impl DeploymentLimits {
             .map(|_| self.inflight.load(Ordering::Relaxed))
     }
 
+    #[cfg(test)]
     pub fn new(spec: QuotaSpec) -> Self {
+        Self::with_shared(spec, &[])
+    }
+
+    /// `shared` windows, such as a credential's quota, also bound this deployment.
+    pub fn with_shared(spec: QuotaSpec, shared: &[Arc<Window>]) -> Self {
         Self {
             baseline: Instant::now(),
             cooldown_until_ns: AtomicU64::new(0),
             concurrent: spec.concurrent,
             inflight: AtomicU32::new(0),
-            windows: [
-                (spec.rpm, MINUTE, Unit::Requests),
-                (spec.rpd, DAY, Unit::Requests),
-                (spec.tpm, MINUTE, Unit::Tokens),
-                (spec.tpd, DAY, Unit::Tokens),
-            ]
-            .into_iter()
-            .filter_map(|(max, span, unit)| {
-                max.map(|max| Window {
-                    max: u64::from(max),
-                    span,
-                    unit,
-                    used: Mutex::default(),
-                })
-            })
-            .collect(),
+            windows: Window::for_quota(spec)
+                .into_iter()
+                .chain(shared.iter().cloned())
+                .collect(),
             limit_strikes: AtomicU32::new(0),
             probe: AtomicBool::new(false),
         }
@@ -196,7 +190,7 @@ impl Unit {
 }
 
 /// Sliding window of admitted requests or estimated tokens.
-struct Window {
+pub(super) struct Window {
     max: u64,
     span: Duration,
     unit: Unit,
@@ -210,6 +204,27 @@ struct Usage {
 }
 
 impl Window {
+    pub fn for_quota(spec: QuotaSpec) -> Vec<Arc<Self>> {
+        [
+            (spec.rpm, MINUTE, Unit::Requests),
+            (spec.rpd, DAY, Unit::Requests),
+            (spec.tpm, MINUTE, Unit::Tokens),
+            (spec.tpd, DAY, Unit::Tokens),
+        ]
+        .into_iter()
+        .filter_map(|(max, span, unit)| {
+            max.map(|max| {
+                Arc::new(Self {
+                    max: u64::from(max),
+                    span,
+                    unit,
+                    used: Mutex::default(),
+                })
+            })
+        })
+        .collect()
+    }
+
     fn lock(&self, now: Instant) -> std::sync::MutexGuard<'_, Usage> {
         let mut used = self.used.lock().unwrap_or_else(|err| err.into_inner());
         while let Some(&(at, cost)) = used.entries.front() {
@@ -407,5 +422,29 @@ mod tests {
             a.is_some() && b.is_some(),
             "a success restores full traffic"
         );
+    }
+
+    #[test]
+    fn deployments_sharing_a_key_quota_draw_on_one_window() {
+        let key = Window::for_quota(QuotaSpec {
+            rpm: Some(1),
+            tpd: Some(1_000),
+            ..QuotaSpec::default()
+        });
+        let a = Arc::new(DeploymentLimits::with_shared(QuotaSpec::default(), &key));
+        let b = Arc::new(DeploymentLimits::with_shared(
+            QuotaSpec {
+                rpm: Some(10),
+                ..QuotaSpec::default()
+            },
+            &key,
+        ));
+        let now = Instant::now();
+        assert!(a.admit(10).is_some());
+        assert!(
+            b.admit(10).is_none(),
+            "the key's rpm is shared across its deployments"
+        );
+        assert!(b.available_at(now, 1) >= now + Duration::from_secs(59));
     }
 }
