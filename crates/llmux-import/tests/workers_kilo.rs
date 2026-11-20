@@ -106,6 +106,55 @@ fn official_replacements_and_rejected_openrouter_routes_never_get_fallback() {
 }
 
 #[test]
+fn nested_codex_namespaced_openai_combo_is_excluded_without_replacements() {
+    let mut root = fixture();
+    root["combos"].as_array_mut().unwrap().extend([
+        json!({"name":"codex/owner-label","models":["openai/test"]}),
+        json!({"name":"nested-owner","models":[{"kind":"combo-ref","comboName":"codex/owner-label"}]}),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("fallback-key");
+    fs::write(&key, "synthetic-fallback-key").unwrap();
+    let key = format!("file:{}", key.display());
+    success(&run(
+        &root,
+        dir.path(),
+        &[
+            (
+                "--omniroute-fallback",
+                Path::new("http://127.0.0.1:20128/v1"),
+            ),
+            ("--omniroute-key", Path::new(&key)),
+        ],
+    ));
+    let config = RuntimeConfig::load(dir.path().join("out.toml")).unwrap();
+    for name in ["codex/owner-label", "nested-owner"] {
+        let model = &config.models[config.model_names[name]];
+        assert_eq!(model.deployments.len(), 1, "fallback on {name}");
+        assert_eq!(
+            config.deployments[model.deployments[0].0 as usize]
+                .base_url
+                .to_string(),
+            "https://api.openai.com/v1"
+        );
+        assert!(
+            config
+                .catch_all_exclude
+                .iter()
+                .any(|pattern| pattern == name),
+            "catch-all permits {name}"
+        );
+    }
+    assert!(config.catch_all.is_some());
+    assert_eq!(
+        config.models[config.model_names["baseline"]]
+            .deployments
+            .len(),
+        2
+    );
+}
+
+#[test]
 fn replacement_rewriting_preserves_source_codex_fallback_exclusions() {
     let mut root = fixture();
     let name = "openrouter/anthropic/claude-fable-5.2";
