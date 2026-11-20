@@ -56,6 +56,7 @@ client_id = "gateway-client"
 refresh_token = "env:UPSTREAM_REFRESH_TOKEN"
 client_secret = "env:UPSTREAM_CLIENT_SECRET" # optional for public clients
 scopes = ["inference"] # optional
+resource = "https://api.openai.com/v1" # optional; omit scopes for Sign in with ChatGPT
 refresh_skew_ms = 60000 # optional; default 60 seconds, zero allowed
 request_timeout_ms = 30000 # optional; default 30 seconds
 ```
@@ -65,8 +66,13 @@ must be `env:` or `file:` references, never inline values. Token endpoints requi
 HTTPS (HTTP is allowed only on loopback), with no userinfo, query or fragment.
 Timeouts are 1–86400000 ms; refresh skew is 0–86400000 ms. OAuth startup fetches
 the initial access token and fails if that request fails. Access tokens are cached
-and refreshed in the background; rotated refresh tokens are kept in memory only,
-so persist them externally before restarting if your provider invalidates old ones.
+and refreshed in the background. For `refresh_token = "file:/path/to/token"`, rotations
+atomically replace that file (mode 0600 on Unix), so restarts use the latest token.
+The directory must be writable; a failed write retains the token in memory but may
+require reauthorization after restart. `env:` references are memory-only. Optional
+`resource` must be an absolute HTTPS URL without credentials or fragment. For Sign in
+with ChatGPT, use `https://auth.openai.com/api/accounts/oauth/token` as `token_url`,
+the issued client ID, `resource = "https://api.openai.com/v1"`, and omit `scopes`.
 Authentication-error fallback / on-demand refresh retries are not implemented.
 
 ## Development
