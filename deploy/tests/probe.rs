@@ -518,3 +518,12 @@ fn empty_catalog_with_pinned_models_still_verifies() {
     assert_eq!(report["checks"][2]["name"], "chat:pinned");
     stop.send(()).unwrap();
 }
+
+#[test]
+fn empty_models_pin_is_an_argument_error() {
+    let home = Home::new();
+    let output = home.run(&["--models", ""]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--models"));
+}

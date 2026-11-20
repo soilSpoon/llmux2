@@ -77,14 +77,16 @@ fn parse(args: &[OsString]) -> std::result::Result<Option<Options>, String> {
             "--key-file" => options.key_file = take(&mut index, flag)?.into(),
             "--state-file" => options.state_file = take(&mut index, flag)?.into(),
             "--models" => {
-                options.models = Some(
-                    take(&mut index, flag)?
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|m| !m.is_empty())
-                        .map(str::to_string)
-                        .collect(),
-                )
+                let models: Vec<String> = take(&mut index, flag)?
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if models.is_empty() {
+                    return Err("argument --models: expected at least one model".to_string());
+                }
+                options.models = Some(models)
             }
             "--per-run" => {
                 options.per_run = take(&mut index, flag)?
