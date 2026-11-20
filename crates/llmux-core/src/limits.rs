@@ -101,12 +101,13 @@ impl DeploymentLimits {
         self.baseline + Duration::from_nanos(offset_ns.max(previous))
     }
 
-    pub fn available_at(&self, now: Instant) -> Instant {
+    pub fn available_at(&self, now: Instant, tokens: u64) -> Instant {
         let mut ready = self.cooldown_until(now).unwrap_or(now);
         for window in self.windows.iter() {
             let used = window.lock(now);
-            if used.total >= window.max {
-                ready = ready.max(used.free_at(window.max - 1, window.span));
+            let cost = window.unit.cost(tokens);
+            if used.total > 0 && used.total + cost > window.max {
+                ready = ready.max(used.free_at(window.max.saturating_sub(cost), window.span));
             }
         }
         if self
@@ -153,8 +154,10 @@ impl DeploymentLimits {
         }
         for (window, used) in &mut windows {
             let cost = window.unit.cost(tokens);
-            used.entries.push_back((now, cost));
-            used.total += cost;
+            if cost > 0 {
+                used.entries.push_back((now, cost));
+                used.total += cost;
+            }
         }
         Some(permit)
     }
@@ -242,7 +245,7 @@ mod tests {
         let now = Instant::now();
         let permit = limits.admit(0).unwrap();
         assert!(limits.admit(0).is_none());
-        assert_eq!(limits.available_at(now), now + CONCURRENCY_RETRY);
+        assert_eq!(limits.available_at(now, 1), now + CONCURRENCY_RETRY);
         drop(permit);
         assert!(limits.admit(0).is_some());
     }
@@ -330,7 +333,7 @@ mod tests {
             let now = Instant::now();
             assert!(limits.admit(10).is_some());
             assert!(limits.admit(1).is_none(), "{spec:?} is a daily quota");
-            assert!(limits.available_at(now) >= now + Duration::from_secs(86_399));
+            assert!(limits.available_at(now, 1) >= now + Duration::from_secs(86_399));
         }
     }
 
@@ -342,5 +345,29 @@ mod tests {
         }));
         assert!(limits.admit(500).is_some());
         assert!(limits.admit(1).is_none());
+    }
+
+    #[test]
+    fn token_quota_retry_time_accounts_for_the_request_size() {
+        let limits = Arc::new(DeploymentLimits::new(QuotaSpec {
+            tpm: Some(100),
+            ..QuotaSpec::default()
+        }));
+        let now = Instant::now();
+        assert!(limits.admit(60).is_some());
+        assert!(limits.available_at(now, 60) >= now + Duration::from_secs(59));
+        assert_eq!(limits.available_at(now, 40), now);
+    }
+
+    #[test]
+    fn zero_token_requests_leave_no_token_window_entries() {
+        let limits = Arc::new(DeploymentLimits::new(QuotaSpec {
+            tpd: Some(10),
+            ..QuotaSpec::default()
+        }));
+        for _ in 0..3 {
+            assert!(limits.admit(0).is_some());
+        }
+        assert!(limits.windows[0].lock(Instant::now()).entries.is_empty());
     }
 }

@@ -720,3 +720,36 @@ async fn repeated_limit_errors_after_stream_start_back_off() {
         "a stream that started then hit a limit is not a success: {cooldowns:?}"
     );
 }
+
+#[tokio::test]
+async fn token_quota_skips_a_deployment_without_calling_it() {
+    let (executor, adapter, _, _server) = fixture_with_models(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("model", &[0, 1, 2])],
+        llmux_types::QuotaSpec {
+            tpm: Some(100),
+            ..Default::default()
+        },
+    )
+    .await;
+    let sized = || GatewayRequest {
+        est_input_tokens: 60,
+        ..request()
+    };
+    executor.execute(sized()).await.unwrap();
+    executor.execute(sized()).await.unwrap();
+    let served: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(
+        served,
+        ["dep0", "dep2"],
+        "60 + 60 tokens exceed tpm = 100 on dep0"
+    );
+}
