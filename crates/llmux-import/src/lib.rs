@@ -109,6 +109,16 @@ fn array<'a>(value: &'a Value, field: &str) -> &'a [Value] {
     value[field].as_array().map(Vec::as_slice).unwrap_or(&[])
 }
 
+fn deepseek_model(model: &str) -> bool {
+    let mut parts = model.rsplit('/');
+    let leaf = parts.next().unwrap_or_default();
+    !leaf.is_empty()
+        && ((leaf.len() > "deepseek-".len() && leaf.to_ascii_lowercase().starts_with("deepseek-"))
+            || parts.any(|part| {
+                part.eq_ignore_ascii_case("deepseek") || part.eq_ignore_ascii_case("deepseek-ai")
+            }))
+}
+
 fn unique(raw: &str, used: &mut HashSet<String>) -> String {
     let base: String = raw
         .chars()
@@ -413,10 +423,6 @@ impl Expander<'_> {
                     .is_some_and(|headers| !headers.is_empty())
                 {
                     deployment["headers"] = c.headers.clone();
-                }
-                if c.provider.is_builtin("deepseek") {
-                    deployment["strip_request_fields"] =
-                        json!(["seed", "user", "safety_identifier", "reasoning.effort"]);
                 }
                 if c.policy == policy::ModelPolicy::Workers {
                     deployment["quota"] = json!({"rpm":1});
@@ -917,6 +923,26 @@ pub fn import_with_options(
             .iter()
             .map(|model| array(model, "deployments").len())
             .sum();
+    }
+    let credential_providers: HashMap<_, _> = credentials
+        .iter()
+        .map(|credential| (string(credential, "id"), string(credential, "provider")))
+        .collect();
+    for model in &mut models {
+        if let Some(deployments) = model["deployments"].as_array_mut() {
+            for deployment in deployments {
+                let provider = credential_providers
+                    .get(string(deployment, "credential"))
+                    .copied()
+                    .unwrap_or_else(|| string(deployment, "provider"));
+                if matches!(provider, KIND_OPENAI | KIND_OPENAI_COMPAT)
+                    && deepseek_model(string(deployment, "upstream_model"))
+                {
+                    deployment["strip_request_fields"] =
+                        json!(["seed", "user", "safety_identifier", "reasoning.effort"]);
+                }
+            }
+        }
     }
     if models.is_empty() {
         return Err("no importable models; no configuration written".into());

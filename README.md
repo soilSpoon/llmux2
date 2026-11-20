@@ -440,8 +440,8 @@ node --test crates/llmux-server/tests/dashboard.cjs
 
 In CI, `coverage` runs the Rust unit and integration tests once with coverage
 instrumentation, including `llmux2-ops` deployment tests, while `check` runs Rust
-doctests, lint, dashboard tests, and the remaining Python repository tooling tests
-(including the merge gate). The `xtask` workspace member contains CI policy tools
+doctests, lint, and dashboard tests. Merge-gate tests also run in `coverage`.
+The `xtask` workspace member contains CI policy tools
 and repository-file checks; its tests run in `coverage`, not again in `check`.
 Use `cargo test --locked --workspace` to run all Rust
 tests locally without instrumentation.
@@ -456,6 +456,14 @@ behind subcommands of this one binary. Benchmarks live in the separate,
 non-default `llmux-bench` member; `cargo xtask bench` delegates to
 `cargo run --release --locked -p llmux-bench --` without adding gateway or
 benchmark dependencies to xtask.
+
+Run `cargo xtask merge-gate <n>` from a trusted, up-to-date main checkout for the
+read-only autonomous merge preflight. It uses the authenticated `gh api` CLI and
+the checked-in ruleset and merge policy; API errors, unknown mergeability,
+unfinished latest checks, and missing fresh independent evidence fail closed.
+Only a passing gate prints `Merge gate passed for PR #N at <sha>.` and exits 0.
+This command does not merge; follow AGENTS.md and pass that exact SHA to the merge
+command. Bootstrap changes to the gate require independent review before use.
 
 PR policy uses its own small `xtask` Rust dependency cache with default save
 behavior, so later PR body edits can reuse it without restoring the gateway's
