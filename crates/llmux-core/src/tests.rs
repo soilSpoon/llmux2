@@ -131,6 +131,26 @@ async fn fixture_with_models(
     models: &[(&str, &[u32])],
     shared_quota: llmux_types::QuotaSpec,
 ) -> Fixture {
+    fixture_full(
+        errors,
+        refresh_fails,
+        max_context,
+        models,
+        shared_quota,
+        Default::default(),
+    )
+    .await
+}
+
+/// `second_quota` is the quota of credential "second", used only by dep2.
+async fn fixture_full(
+    errors: Vec<UpstreamError>,
+    refresh_fails: bool,
+    max_context: [Option<u32>; 3],
+    models: &[(&str, &[u32])],
+    shared_quota: llmux_types::QuotaSpec,
+    second_quota: llmux_types::QuotaSpec,
+) -> Fixture {
     let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
     let served_status = status.clone();
     let server = llmux_testkit::TestServer::start(axum::Router::new().fallback(move || {
@@ -195,6 +215,7 @@ async fn fixture_with_models(
             max: Duration::from_secs(5),
         },
         api_keys: HashMap::new(),
+        credential_quotas: HashMap::from([("second".into(), second_quota)]),
         oauth: HashMap::new(),
         model_names: models
             .iter()
@@ -754,4 +775,26 @@ async fn token_quota_skips_a_deployment_without_calling_it() {
         ["dep0", "dep2"],
         "60 + 60 tokens exceed tpm = 100 on dep0"
     );
+}
+
+#[tokio::test]
+async fn credential_quota_limits_the_credentials_deployments() {
+    let (executor, adapter, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("model", &[2])],
+        Default::default(),
+        llmux_types::QuotaSpec {
+            rpm: Some(1),
+            ..Default::default()
+        },
+    )
+    .await;
+    executor.execute(request()).await.unwrap();
+    assert!(matches!(
+        executor.execute(request()).await,
+        Err(GatewayError::AllCandidatesExhausted { .. })
+    ));
+    assert_eq!(adapter.calls.lock().unwrap().len(), 1);
 }

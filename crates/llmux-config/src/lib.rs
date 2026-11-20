@@ -60,6 +60,8 @@ pub struct RuntimeConfig {
     pub cooldown: CooldownConfig,
     pub api_keys: HashMap<Arc<str>, ApiKey>,
     pub oauth: HashMap<Arc<str>, OAuthCredential>,
+    /// Quotas shared by every deployment that uses the credential.
+    pub credential_quotas: HashMap<Arc<str>, QuotaSpec>,
     pub model_names: HashMap<Arc<str>, usize>,
     pub model_allowed_keys: HashMap<usize, Box<[Arc<str>]>>,
     pub models: Box<[CanonicalModel]>,
@@ -174,6 +176,8 @@ enum RawCredential {
         id: String,
         provider: String,
         key: String,
+        #[serde(default)]
+        quota: QuotaSpec,
     },
     Oauth {
         id: String,
@@ -186,6 +190,8 @@ enum RawCredential {
         resource: Option<String>,
         refresh_skew_ms: Option<u64>,
         request_timeout_ms: Option<u64>,
+        #[serde(default)]
+        quota: QuotaSpec,
     },
 }
 
@@ -290,11 +296,29 @@ impl RawConfig {
         let mut provider_kinds = HashMap::new();
         let mut api_keys = HashMap::new();
         let mut oauth = HashMap::new();
+        let mut credential_quotas = HashMap::new();
         for credential in credentials {
-            let (id, provider) = match &credential {
-                RawCredential::ApiKey { id, provider, .. }
-                | RawCredential::Oauth { id, provider, .. } => (id, provider),
+            let (id, provider, quota) = match &credential {
+                RawCredential::ApiKey {
+                    id,
+                    provider,
+                    quota,
+                    ..
+                }
+                | RawCredential::Oauth {
+                    id,
+                    provider,
+                    quota,
+                    ..
+                } => (id, provider, *quota),
             };
+            if quota.concurrent.is_some()
+                || [quota.rpm, quota.rpd, quota.tpm, quota.tpd].contains(&Some(0))
+            {
+                return Err(invalid(
+                    "credential quota supports positive rpm, rpd, tpm and tpd only",
+                ));
+            }
             if id.is_empty() || provider.is_empty() || provider_kinds.contains_key(id.as_str()) {
                 return Err(invalid(
                     "credential IDs must be unique and IDs and providers must be nonempty",
@@ -303,6 +327,9 @@ impl RawConfig {
             let id: Arc<str> = id.as_str().into();
             let provider = ProviderKind(provider.as_str().into());
             provider_kinds.insert(id.clone(), provider.clone());
+            if quota != QuotaSpec::default() {
+                credential_quotas.insert(id.clone(), quota);
+            }
             match credential {
                 RawCredential::ApiKey { key, .. } => {
                     api_keys.insert(
@@ -508,6 +535,7 @@ impl RawConfig {
         }
 
         Ok(RuntimeConfig {
+            credential_quotas,
             server: ServerConfig {
                 listen: server.listen,
                 client_keys,
