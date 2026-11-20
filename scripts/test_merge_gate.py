@@ -6,6 +6,7 @@ from merge_gate import evaluate, fetch, main, pages
 
 SHA = 'a' * 40
 POLICY = {'blocking_markers': {'codesolarlght': ['Changes recommended']},
+          'verifier_logins': ['devin-ai-integration', 'soilspoon'],
           'unable_to_review_markers': {'copilot': ['quota exceeded']}}
 
 
@@ -18,7 +19,7 @@ def fixture():
             'threads': [{'isResolved': True}],
             'reviews': [{'id': 1, 'user': {'login': 'devin-ai-integration'},
                          'commit_id': SHA, 'state': 'COMMENTED', 'body': ''}],
-            'comments': [{'id': 1, 'body': marker()}]}
+            'comments': [{'id': 1, 'user': {'login': 'devin-ai-integration[bot]'}, 'body': marker()}]}
 
 
 def marker(sha=SHA, verdict='pass', reviewer='independent'):
@@ -26,6 +27,11 @@ def marker(sha=SHA, verdict='pass', reviewer='independent'):
 
 
 class MergeGateTest(unittest.TestCase):
+    def test_untrusted_verifier_is_ignored(self):
+        data = fixture()
+        data['comments'][0]['user']['login'] = 'outsider'
+        self.assertTrue(evaluate(data, ['check'], POLICY))
+
     def test_pass(self):
         self.assertEqual(evaluate(fixture(), ['check'], POLICY), [])
 
@@ -58,7 +64,7 @@ class MergeGateTest(unittest.TestCase):
             'no_verification': lambda d: d.update(comments=[]),
             'old_verification': lambda d: d['comments'][0].update(body=marker(sha='b' * 40)),
             'self': lambda d: d['comments'][0].update(body=marker(reviewer='author')),
-            'failed_verification': lambda d: d['comments'].append({'id': 2, 'body': marker(verdict='fail')}),
+            'failed_verification': lambda d: d['comments'].append({'id': 2, 'user': {'login': 'soilSpoon'}, 'body': marker(verdict='fail')}),
             'no_author': lambda d: d['pr'].update(body=''),
             'ambiguous_author': lambda d: d['pr'].update(body='Author-Session: a\nAuthor-Session: b'),
         }
@@ -78,6 +84,8 @@ class MergeGateTest(unittest.TestCase):
         data['comments'] += [{'id': 2, 'body': marker(verdict='fail')},
                              {'id': 3, 'body': marker()},
                              {'id': 4, 'body': marker(sha='b' * 40, verdict='fail')}]
+        for comment in data['comments']:
+            comment['user'] = {'login': 'soilSpoon'}
         self.assertEqual(evaluate(data, ['check'], POLICY), [])
 
     def test_rest_pagination(self):

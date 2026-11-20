@@ -67,6 +67,7 @@ def evaluate(data, required, policy):
     if len(authors) != 1:
         errors.append('PR body must contain exactly one Author-Session: <id> line.')
     markers = [m.groups() for c in sorted(data['comments'], key=lambda c: c['id'])
+               if reviewer_login(c) in policy['verifier_logins']
                for m in MARKER.finditer(c.get('body') or '') if m.group(1) == sha]
     if not markers:
         errors.append('No independent verification marker for the head SHA.')
