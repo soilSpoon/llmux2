@@ -748,12 +748,14 @@ name = "llmux-bench"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures-util",
  "http-body-util",
  "hyper",
  "hyper-rustls",
  "hyper-util",
  "serde_json",
  "tokio",
+ "toml",
  "url",
 ]
 

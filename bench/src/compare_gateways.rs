@@ -104,6 +104,7 @@ fn classify(status: Option<u16>, code: Option<&str>, transport: Option<&str>) ->
     if let Some(transport) = transport {
         return transport.into();
     }
+    let has_code = code.is_some();
     let code = code.unwrap_or("");
     if status == Some(429)
         || [
@@ -130,7 +131,7 @@ fn classify(status: Option<u16>, code: Option<&str>, transport: Option<&str>) ->
         || ["500", "502", "503", "504", "server_error"].contains(&code)
     {
         "upstream_5xx"
-    } else if !code.is_empty() || status.is_some_and(|s| s >= 400) {
+    } else if has_code || status.is_some_and(|s| s >= 400) {
         "upstream_4xx"
     } else if status.is_some_and(|s| (200..300).contains(&s)) {
         "ok"

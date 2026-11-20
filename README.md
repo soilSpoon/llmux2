@@ -360,7 +360,10 @@ on an LLVM coverage JSON report to enforce `.github/coverage-floor`; optional
 `BASE_SHA` also prevents lowering the committed floor. Both commands exit 0 on
 success and 1 on failure. `xtask` is not a default workspace member and depends
 only on `serde_json`, not the gateway crates. New tools belong in separate modules
-behind subcommands of this one binary.
+behind subcommands of this one binary. Benchmarks live in the separate,
+non-default `llmux-bench` member; `cargo xtask bench` delegates to
+`cargo run --release --locked -p llmux-bench --` without adding gateway or
+benchmark dependencies to xtask.
 
 PR policy uses its own small `xtask` Rust dependency cache with default save
 behavior, so later PR body edits can reuse it without restoring the gateway's
@@ -369,11 +372,11 @@ cache. The xtask binary itself is cheap to rebuild from cached dependencies.
 
 ## Live gateway comparison
 
-Run on the gateway host with Python 3.9+ (stdlib only), reference first, llmux second.
+Run on the gateway host with Cargo, reference first, llmux second.
 Keep keys server-side: use `file:/absolute/path` or `env:VARIABLE`, never literal keys.
 
 ```sh
-python3 bench/compare_gateways.py \
+cargo xtask bench compare-gateways \
   --gateway omniroute http://127.0.0.1:20128/v1 file:/private/omniroute-client.key \
   --gateway llmux http://127.0.0.1:8090/v1 file:/private/llmux-client.key \
   --coverage /private/coverage.json --top 25 --responses 2 \
@@ -394,15 +397,27 @@ Read `results.json` / `report.html` in a new private output directory; review be
 Learnings: API and dashboard ports differ—validate authenticated `/v1/models` first.
 Stored client keys may be encrypted; extract/decrypt readonly, server-side, into private files.
 Imported names can retain wrong upstream IDs or container-local URLs: import success ≠ usable routing.
-Run just the comparison harness tests with `python3 -m unittest bench.test_compare_gateways`.
-Check Python syntax with `python3 -m py_compile bench/compare_gateways.py bench/test_compare_gateways.py`.
+Run the comparison harness tests with `cargo test --locked -p llmux-bench compare_gateways`.
+
+## Live reliability scenarios
+
+Run `cargo xtask bench live-reliability --offline` against local fake providers,
+or pass `--config /private/llmux.toml` to exercise its real API-key providers.
+The release gateway must already be built (`cargo build --release --locked -p llmux-server`);
+`--binary PATH` selects another binary. Optional `--primary HOST`, `--fallback HOST`,
+and `--bad-key-hosts all|none|HOST,HOST` select targets. Each scenario starts a fresh
+gateway and injects faults through a loopback proxy. Keys stay in the source
+secret files; reports redact known secrets and bearer tokens. `--out DIRECTORY`
+(default `live-reliability`) writes `report.json` and `report.md`; failures or
+fewer than two healthy targets produce a nonzero exit status. Tests use only
+offline providers.
 
 ## Mock-upstream load benchmark
 
-On Linux with Python 3.10+, Cargo, and readable `/proc/<pid>/smaps_rollup`, run:
+On Linux with Cargo and readable `/proc/<pid>/smaps_rollup`, run:
 
 ```sh
-python3 bench/mock_upstream.py
+cargo xtask bench mock-upstream
 ```
 
 The command builds the release gateway and the `llmux-testkit` Axum mock, starts and stops them

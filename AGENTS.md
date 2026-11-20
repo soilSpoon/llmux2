@@ -34,7 +34,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 cargo xtask pr-policy # PR_BODY, BASE_SHA, HEAD_SHA
 cargo xtask coverage-ratchet coverage.json # optional BASE_SHA
-python3 -B -m unittest discover -s bench -v
+cargo test --locked -p llmux-bench
 python3 -B -m unittest discover -s scripts -v
 ```
 

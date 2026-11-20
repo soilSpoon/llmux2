@@ -83,22 +83,26 @@ impl Server {
         let line = rx
             .recv_timeout(Duration::from_secs(15))??
             .ok_or("server produced no startup output")?;
-        let prefix = format!(
-            "{} listening on ",
-            binary
-                .file_name()
-                .ok_or("missing binary name")?
-                .to_string_lossy()
-        );
-        server.address = line
-            .strip_prefix(&prefix)
-            .ok_or_else(|| format!("server failed to start: {line}"))?
-            .to_owned();
+        server.address = startup_address(binary, &line)?;
         Ok(server)
     }
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
+}
+fn startup_address(binary: &Path, line: &str) -> Result<String> {
+    let prefix = format!(
+        "{} listening on ",
+        binary
+            .file_name()
+            .ok_or("missing binary name")?
+            .to_string_lossy()
+    );
+    Ok(line
+        .strip_prefix(&prefix)
+        .or_else(|| line.strip_prefix("llmux-server listening on "))
+        .ok_or_else(|| format!("server failed to start: {line}"))?
+        .to_owned())
 }
 impl Drop for Server {
     fn drop(&mut self) {
@@ -110,6 +114,7 @@ impl Drop for Server {
 pub struct Directory(pub PathBuf);
 impl Directory {
     pub fn new() -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
@@ -117,12 +122,37 @@ impl Directory {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir(&path)?;
+        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
         Ok(Self(path))
     }
 }
 impl Drop for Directory {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn custom_gateway_binary_can_be_renamed() {
+        assert_eq!(
+            startup_address(
+                Path::new("/private/gateway"),
+                "llmux-server listening on 127.0.0.1:1234"
+            )
+            .unwrap(),
+            "127.0.0.1:1234"
+        );
+        assert_eq!(
+            startup_address(
+                Path::new("mock_load_upstream"),
+                "mock_load_upstream listening on 127.0.0.1:5678"
+            )
+            .unwrap(),
+            "127.0.0.1:5678"
+        );
+        assert!(startup_address(Path::new("llmux-server"), "invalid config").is_err());
     }
 }
