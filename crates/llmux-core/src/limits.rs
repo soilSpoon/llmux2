@@ -18,7 +18,7 @@ pub(super) struct DeploymentLimits {
     cooldown_until_ns: AtomicU64,
     concurrent: Option<u32>,
     inflight: AtomicU32,
-    windows: Box<[Window]>,
+    windows: Box<[Arc<Window>]>,
     limit_strikes: AtomicU32,
 }
 
@@ -28,32 +28,22 @@ impl DeploymentLimits {
             .map(|_| self.inflight.load(Ordering::Relaxed))
     }
 
-    pub fn with_shared(spec: QuotaSpec, _shared: &[Arc<Window>]) -> Self {
-        Self::new(spec)
+    #[cfg(test)]
+    pub fn new(spec: QuotaSpec) -> Self {
+        Self::with_shared(spec, &[])
     }
 
-    pub fn new(spec: QuotaSpec) -> Self {
+    /// `shared` windows, such as a credential's quota, also bound this deployment.
+    pub fn with_shared(spec: QuotaSpec, shared: &[Arc<Window>]) -> Self {
         Self {
             baseline: Instant::now(),
             cooldown_until_ns: AtomicU64::new(0),
             concurrent: spec.concurrent,
             inflight: AtomicU32::new(0),
-            windows: [
-                (spec.rpm, MINUTE, Unit::Requests),
-                (spec.rpd, DAY, Unit::Requests),
-                (spec.tpm, MINUTE, Unit::Tokens),
-                (spec.tpd, DAY, Unit::Tokens),
-            ]
-            .into_iter()
-            .filter_map(|(max, span, unit)| {
-                max.map(|max| Window {
-                    max: u64::from(max),
-                    span,
-                    unit,
-                    used: Mutex::default(),
-                })
-            })
-            .collect(),
+            windows: Window::for_quota(spec)
+                .into_iter()
+                .chain(shared.iter().cloned())
+                .collect(),
             limit_strikes: AtomicU32::new(0),
         }
     }
@@ -197,8 +187,25 @@ struct Usage {
 }
 
 impl Window {
-    pub fn for_quota(_spec: QuotaSpec) -> Vec<Arc<Self>> {
-        Vec::new()
+    pub fn for_quota(spec: QuotaSpec) -> Vec<Arc<Self>> {
+        [
+            (spec.rpm, MINUTE, Unit::Requests),
+            (spec.rpd, DAY, Unit::Requests),
+            (spec.tpm, MINUTE, Unit::Tokens),
+            (spec.tpd, DAY, Unit::Tokens),
+        ]
+        .into_iter()
+        .filter_map(|(max, span, unit)| {
+            max.map(|max| {
+                Arc::new(Self {
+                    max: u64::from(max),
+                    span,
+                    unit,
+                    used: Mutex::default(),
+                })
+            })
+        })
+        .collect()
     }
 
     fn lock(&self, now: Instant) -> std::sync::MutexGuard<'_, Usage> {

@@ -15,7 +15,7 @@ use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::{TokioExecutor, TokioTimer},
 };
-use limits::{DeploymentLimits, Permit};
+use limits::{DeploymentLimits, Permit, Window};
 use llmux_config::RuntimeConfig;
 use llmux_types::{
     AuthMaterial, BuildError, ContextOverflow, CredentialSource, Deployment, DeploymentIdx,
@@ -104,6 +104,7 @@ pub struct Executor {
 impl Executor {
     fn shared_limits<'a>(
         shared: &mut Vec<(&'a Deployment, Arc<DeploymentLimits>)>,
+        key_windows: &HashMap<Arc<str>, Vec<Arc<Window>>>,
         dep: &'a Deployment,
     ) -> Arc<DeploymentLimits> {
         let same_route = |other: &&Deployment| {
@@ -116,7 +117,10 @@ impl Executor {
         if let Some((_, limits)) = shared.iter().find(|(other, _)| same_route(other)) {
             return limits.clone();
         }
-        let limits = Arc::new(DeploymentLimits::new(dep.quota));
+        let key = key_windows
+            .get(&dep.credential)
+            .map_or(&[][..], Vec::as_slice);
+        let limits = Arc::new(DeploymentLimits::with_shared(dep.quota, key));
         shared.push((dep, limits.clone()));
         limits
     }
@@ -129,6 +133,12 @@ impl Executor {
         let mut disabled = HashMap::<Arc<str>, Arc<AtomicBool>>::new();
         // Deployments that reach the same upstream route draw on one provider limit.
         let mut shared_limits = Vec::<(&Deployment, Arc<DeploymentLimits>)>::new();
+        // A credential's quota is one set of windows shared by all of its deployments.
+        let key_windows: HashMap<Arc<str>, Vec<Arc<Window>>> = cfg
+            .credential_quotas
+            .iter()
+            .map(|(id, quota)| (id.clone(), Window::for_quota(*quota)))
+            .collect();
         let bindings = cfg
             .deployments
             .iter()
@@ -154,7 +164,7 @@ impl Executor {
                     adapter,
                     auth,
                     disabled,
-                    limits: Self::shared_limits(&mut shared_limits, dep),
+                    limits: Self::shared_limits(&mut shared_limits, &key_windows, dep),
                     stats: cfg.server.dashboard_key.is_some().then(Arc::default),
                 })
             })
