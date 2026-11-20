@@ -62,6 +62,13 @@ pub(crate) fn with_chat_usage(
                 yield event;
                 return;
             }
+            // Delta chunks carry no "usage" key; skip the DOM parse and forward them
+            // untouched. Only usage-bearing chunks (or every chunk when include=true
+            // rewrites usage:null) need the Value walk.
+            if !include && !event.data.contains("\"usage\"") {
+                yield event;
+                continue;
+            }
             if let Ok(Value::Object(mut chunk)) = serde_json::from_str(&event.data) {
                 if let Some(choices) = chunk.get("choices").and_then(Value::as_array) {
                     let empty = choices.is_empty();
@@ -242,5 +249,40 @@ mod tests {
         let mut parser = Parser::default();
         let mut oversized = Bytes::from(vec![b'a'; MAX_EVENT_BYTES + 1]);
         assert!(parser.next(&mut oversized).is_err());
+    }
+
+    #[tokio::test]
+    async fn excluded_usage_forwards_plain_deltas_untouched() {
+        let delta = r#"{"choices":[{"delta":{"content":"hi"}}]}"#;
+        let events: BoxStream<'static, Result<SseEvent, UpstreamError>> =
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(SseEvent {
+                    event: None,
+                    data: delta.into(),
+                }),
+                Ok(SseEvent {
+                    event: None,
+                    data: r#"{"choices":[{"delta":{"content":"x"}}],"usage":{"total":1}}"#.into(),
+                }),
+                Ok(SseEvent {
+                    event: None,
+                    data: r#"{"choices":[],"usage":{"total":10}}"#.into(),
+                }),
+                Ok(SseEvent {
+                    event: None,
+                    data: "[DONE]".into(),
+                }),
+            ]));
+        let out = with_chat_usage(events, false).collect::<Vec<_>>().await;
+        assert_eq!(out.len(), 3);
+        // No "usage" key: byte-identical, no DOM rewrite.
+        assert_eq!(out[0].as_ref().unwrap().data, delta);
+        // Real usage key: stripped from a non-empty chunk.
+        assert_eq!(
+            out[1].as_ref().unwrap().data,
+            r#"{"choices":[{"delta":{"content":"x"}}]}"#
+        );
+        // Empty-choices usage chunk stays swallowed.
+        assert_eq!(out[2].as_ref().unwrap().data, "[DONE]");
     }
 }
