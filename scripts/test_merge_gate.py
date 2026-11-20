@@ -29,6 +29,20 @@ def marker(sha=SHA, verdict='pass', reviewer='independent'):
 
 
 class MergeGateTest(unittest.TestCase):
+    def test_untrusted_status_cannot_displace_devin_status(self):
+        for state in ('pending', 'failure', 'error'):
+            with self.subTest(state=state):
+                data = fixture()
+                data['statuses'] = [
+                    {'id': 1, 'context': 'Devin Review', 'state': state,
+                     'creator': {'login': 'Devin-AI-Integration[bot]'}},
+                    {'id': 2, 'context': 'Devin Review', 'state': 'success',
+                     'creator': {'login': 'other-integration[bot]'}}]
+                self.assertIn(f'Devin Review status is {state}', evaluate(data, ['check'], POLICY))
+        data['statuses'][0]['state'] = 'success'
+        data['statuses'][1]['state'] = 'failure'
+        self.assertEqual(evaluate(data, ['check'], POLICY), [])
+
     def test_devin_status_success_without_review(self):
         data = fixture()
         data['reviews'] = []

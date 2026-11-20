@@ -38,6 +38,7 @@ containing a configured real-review body marker, or a successful latest head
 commit status for the configured context created by that app. A latest pending,
 failed, or errored status SHALL block even if a marked review exists.
 Author thread replies SHALL NOT satisfy that evidence.
+Statuses from other creators SHALL be ignored before selecting the latest Devin status.
 Empty-body COMMENTED reviews SHALL NOT supersede a reviewer's blocking review.
 Only the latest run of each head check name SHALL determine its outcome.
 Every latest head check SHALL be completed before merging.
