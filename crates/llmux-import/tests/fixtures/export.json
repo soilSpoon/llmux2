@@ -13,7 +13,7 @@
     {"id": "oauth", "provider": "openai", "authType": "oauth", "accessToken": "test-oauth-secret", "refreshToken": "test-refresh-secret"},
     {"id": "inactive", "provider": "openai", "authType": "apikey", "apiKey": "test-inactive-secret", "isActive": false},
     {"id": "encrypted", "provider": "openai", "authType": "apikey", "apiKey": "enc:v1:encrypted-secret"},
-    {"id": "unknown", "provider": "gemini", "authType": "apikey", "apiKey": "test-unknown-secret"}
+    {"id": "unknown", "provider": "unsupported-test", "authType": "apikey", "apiKey": "test-unknown-secret"}
   ],
   "combos": [
     {"name": "priority", "strategy": "priority", "models": ["openai/gpt-test", {"model": "org/model", "providerId": "groq"}, "local/vendor/model", "unknown/missing"]},

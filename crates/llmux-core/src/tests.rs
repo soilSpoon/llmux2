@@ -136,6 +136,7 @@ async fn fixture_with_context(
             client_keys: Box::new([]),
             request_timeout: Duration::from_secs(5),
             expose_routing_headers: true,
+            dashboard_key: None,
         },
         routing: llmux_config::RoutingConfig {
             max_attempts: 4,

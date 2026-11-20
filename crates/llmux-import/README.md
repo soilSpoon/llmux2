@@ -23,7 +23,8 @@ malformed values fail without printing their contents. Connections and steps
 marked `usable: false` are skipped with warnings in either input format.
 Other dump roots (including `key_value`, model mappings, and overrides) are
 ignored with one summary warning. Provider-specific base URL overrides are
-not applied. No table-dump contents are required as repository fixtures.
+applied before node/catalog defaults. No table-dump contents are required as
+repository fixtures.
 
 Redacted credential placeholders with printable non-whitespace ASCII are
 treated as opaque credentials and written only to secret files, never TOML or
@@ -50,11 +51,42 @@ are sanitized and deduplicated. If there are no client keys, set
 `LLMUX_CLIENT_KEY` before starting the server.
 
 Built-ins: openai, anthropic, openrouter, groq, deepseek (`ds` step alias),
-mistral, xai, together, fireworks, cerebras. The URL/protocol table comes from
+mistral, xai, together, fireworks, cerebras, gemini, morph. The URL/protocol table comes from
 OmniRoute `open-sse/config/providers/registry/<provider>/index.ts`.
 Custom `openai-compatible` chat and `anthropic-compatible` nodes use `baseUrl`;
 custom prefix aliases are resolved. llmux appends `/chat/completions` or
 `/messages`, so built-in URLs omit that suffix, retaining `/v1` where present.
+For custom nodes, routing prefixes/internal node IDs are stripped from the
+upstream model; model vendor segments such as `openai/` are preserved. Repeated
+node routing segments are stripped, matching OmniRoute's resolver.
+Connection `providerSpecificData.baseUrl` wins over the node/catalog URL;
+chat/message endpoint suffixes are removed because llmux appends them.
+Loopback, localhost (including subdomains), unspecified addresses, and mapped
+IPv4 loopback addresses are skipped with a warning before writing credentials.
+This does not test DNS resolution or network reachability. Morph is imported
+only at its official `https://api.morphllm.com/v1` endpoint.
+Gemini uses Google's documented OpenAI-compatible endpoint
+`https://generativelanguage.googleapis.com/v1beta/openai`, not OmniRoute's native
+Gemini protocol endpoint. See https://ai.google.dev/gemini-api/docs/openai.
+Gemini connection overrides at Google's native `/v1beta` root are normalized
+to `/v1beta/openai`; overrides at other roots are skipped with a warning.
+
+AI Horde (`aihorde`) uses the official OpenAI-compatible
+`https://oai.aihorde.net/v1` endpoint, not its native asynchronous API. Active
+`no-auth`/`none` Horde connections use the documented anonymous key in a secret
+file; anonymous use may be restricted under load. API-key connections keep
+their own key; a missing API key is not silently replaced. Vendor/model IDs
+are preserved. Kilo (`kilo`, also OmniRoute's `kilocode` provider ID) uses
+`https://ai-gateway.kilo.ai/api/v1` with an API key. Anonymous Kilo is skipped:
+llmux2 cannot configure requests without an Authorization header.
+
+Skip precedence is: unusable/inactive, replacement policy, auth/key validation,
+then provider/URL validation (including loopback). Cloudflare direct/playground
+connections remain skipped with an official Workers AI replacement hint;
+DuckDuckGo/DeepAI bridges are dropped without an official replacement; HMS is
+skipped because custom headers are unsupported. Hints identify custom nodes
+by their provider prefix and contain only fixed documentation URLs, never
+connection-supplied URLs. Horde anonymous credentials still pass URL validation.
 
 Not imported: OAuth/token/cookie auth, encrypted credentials, unsupported
 providers/protocols (including custom Responses/custom-JSON nodes), custom chat

@@ -31,10 +31,12 @@ enum Reply {
     Limit(u64),
     Quota(Option<u64>),
     Complete,
+    NegotiatedStream(Value),
     ResponseStream { complete: bool },
     AbortStream,
     GatedStream(Arc<Semaphore>),
     BadRequest,
+    StructuredBadRequest(Value),
     ContextLength,
     HtmlPayloadTooLarge,
 }
@@ -85,6 +87,17 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
             "object": "chat.completion",
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello!"}, "finish_reason": "stop"}],
         })).into_response(),
+        Reply::NegotiatedStream(expected) => {
+            assert_eq!(request, expected);
+            (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}\n\n",
+                    "data: [DONE]\n\n",
+                ),
+            ).into_response()
+        }
         Reply::ResponseStream { complete } => {
             assert_eq!(request["stream"], true);
             assert_eq!(request["stream_options"]["include_usage"], true);
@@ -113,6 +126,7 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
         Reply::BadRequest => (
             StatusCode::BAD_REQUEST, Json(json!({"error": {"message": "bad input"}})),
         ).into_response(),
+        Reply::StructuredBadRequest(payload) => (StatusCode::BAD_REQUEST, Json(payload)).into_response(),
         Reply::HtmlPayloadTooLarge => (
             StatusCode::PAYLOAD_TOO_LARGE, axum::response::Html("<h1>Proxy error</h1>"),
         ).into_response(),
@@ -137,6 +151,25 @@ impl Fixture {
         primary_quota: &str,
         max_attempts: usize,
         fallback_on_429: bool,
+    ) -> Self {
+        Self::start_with_options(
+            first,
+            next,
+            primary_quota,
+            max_attempts,
+            fallback_on_429,
+            false,
+        )
+        .await
+    }
+
+    async fn start_with_options(
+        first: [Reply; 2],
+        next: [Reply; 2],
+        primary_quota: &str,
+        max_attempts: usize,
+        fallback_on_429: bool,
+        dashboard: bool,
     ) -> Self {
         let [primary_first, secondary_first] = first;
         let [primary_next, secondary_next] = next;
@@ -173,6 +206,12 @@ impl Fixture {
             fs::write(secrets.path().join(key), format!("{key}\n")).unwrap();
         }
         let base = secrets.path().display();
+        let dashboard = if dashboard {
+            fs::write(secrets.path().join("dashboard"), "test-dashboard\n").unwrap();
+            format!("dashboard_key = \"file:{base}/dashboard\"")
+        } else {
+            String::new()
+        };
         let fallback_on = if fallback_on_429 {
             r#"["rate_limited", "quota_exhausted"]"#
         } else {
@@ -183,6 +222,7 @@ impl Fixture {
 [server]
 client_keys = ["file:{base}/test-client"]
 request_timeout_ms = 4000
+{dashboard}
 
 [routing]
 max_attempts = {max_attempts}
@@ -279,6 +319,19 @@ priority = 0
         .unwrap()
         .map(Body::new)
     }
+
+    async fn get(&self, path: &str, key: Option<&str>) -> Response {
+        let mut request = Request::get(format!("{}{path}", self.gateway.url()));
+        if let Some(key) = key {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {key}"));
+        }
+        Client::builder(TokioExecutor::new())
+            .build_http()
+            .request(request.body(Full::<Bytes>::default()).unwrap())
+            .await
+            .unwrap()
+            .map(Body::new)
+    }
 }
 
 fn check_route(response: &Response, deployment: &str, attempts: &str) {
@@ -294,6 +347,165 @@ async fn body(response: Response) -> String {
         .unwrap()
         .to_bytes();
     String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn model_discovery_lists_exact_routable_ids_and_requires_authentication() {
+    let fixture = Fixture::start(
+        [Reply::Complete, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let denied = fixture.get("/v1/models", None).await;
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(denied.headers()[header::WWW_AUTHENTICATE], "Bearer");
+    let response = fixture.get("/v1/models", Some("test-client")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let list: Value = serde_json::from_str(&body(response).await).unwrap();
+    assert_eq!(
+        list,
+        json!({"object": "list", "data": [
+            {"id":"alias","object":"model","created":0,"owned_by":"llmux2"},
+            {"id":"shared","object":"model","created":0,"owned_by":"llmux2"}
+        ]})
+    );
+    assert_eq!(fixture.counts(), [0, 0]);
+    for model in list["data"].as_array().unwrap() {
+        let response = fixture
+            .request("test-client", model["id"].as_str().unwrap(), false)
+            .await;
+        check_route(&response, "d1", "1");
+    }
+}
+
+#[tokio::test]
+async fn openai_chat_preserves_documented_and_extension_parameters_and_usage() {
+    let request = json!({
+        "model":"alias","messages":[{"role":"user","content":"Hello"}],
+        "stream":true,"stream_options":{"include_usage":true},"max_completion_tokens":16,
+        "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+        "tool_choice":"auto","response_format":{"type":"json_object"},"reasoning_effort":"low",
+        "reasoning":{"effort":"low"},"user":"opaque-id","seed":7,"n":1,"logprobs":true,
+        "vendor_option":{"model":"leave-me-alone"}
+    });
+    let mut expected = request.clone();
+    expected["model"] = json!("vendor-primary");
+    let fixture = Fixture::start(
+        [Reply::NegotiatedStream(expected), Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture
+        .post("/v1/chat/completions", "test-client", request.to_string())
+        .await;
+    check_route(&response, "d1", "1");
+    let output = body(response).await;
+    assert!(output.ends_with(
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}\n\ndata: [DONE]\n\n"
+    ));
+}
+
+#[tokio::test]
+async fn dashboard_routes_are_absent_unless_configured() {
+    let fixture = Fixture::start(
+        [Reply::Complete, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    for path in [
+        "/dashboard",
+        "/dashboard/stats",
+        "/dashboard/app.css",
+        "/dashboard/app.js",
+    ] {
+        assert_eq!(
+            fixture.get(path, None).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+}
+
+#[tokio::test]
+async fn dashboard_reports_fallback_and_committed_stream_errors_without_exposing_secrets() {
+    let fixture = Fixture::start_with_options(
+        [Reply::Limit(60), Reply::Complete],
+        [Reply::Complete, Reply::AbortStream],
+        "quota = { rpm = 20, concurrent = 2 }",
+        4,
+        true,
+        true,
+    )
+    .await;
+    let page = fixture.get("/dashboard", None).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    assert!(page.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap()
+        .contains("frame-ancestors 'none'"));
+    assert!(body(page).await.contains("Traffic overview"));
+    assert!(body(fixture.get("/dashboard/app.js", None).await)
+        .await
+        .contains("/dashboard/stats"));
+    for key in [None, Some("test-client"), Some("wrong")] {
+        let response = fixture.get("/dashboard/stats", key).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+    let mut bad = fixture.request("test-dashboard", "alias", false).await;
+    assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+    bad = fixture.request("test-client", "unknown", false).await;
+    assert_eq!(bad.status(), StatusCode::NOT_FOUND);
+    check_route(
+        &fixture.request("test-client", "alias", false).await,
+        "d2",
+        "2",
+    );
+    let stream = fixture.request("test-client", "alias", true).await;
+    check_route(&stream, "d2", "1");
+    assert!(body(stream).await.contains("stream_broken"));
+    assert_eq!(fixture.counts(), [1, 2]);
+
+    let response = fixture
+        .get("/dashboard/stats", Some("test-dashboard"))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let output = body(response).await;
+    for private in [
+        "test-primary",
+        "test-secondary",
+        "test-client",
+        "test-dashboard",
+        "127.0.0.1",
+        "vendor-primary",
+        "Hello",
+    ] {
+        assert!(!output.contains(private));
+    }
+    let stats: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(stats["responses"]["ok"], 2);
+    assert_eq!(stats["responses"]["rejected"], 1);
+    assert_eq!(stats["responses"]["unavailable"], 0);
+    assert_eq!(stats["responses"]["failed"], 0);
+    assert!(stats["responses"]["ready_us"].as_u64().unwrap() > 0);
+
+    let rows = stats["deployments"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["model"], "shared");
+    assert_eq!(rows[0]["id"], "d1");
+    assert_eq!(rows[0]["routed"], 0);
+    assert_eq!(rows[0]["failed_attempts"], 1);
+    assert_eq!(rows[0]["rpm_limit"], 20);
+    assert_eq!(rows[0]["in_flight"], 0);
+    assert!(rows[0]["cooldown_ms"].as_u64().unwrap() > 0);
+    assert_eq!(rows[1]["id"], "d2");
+    assert_eq!(rows[1]["routed"], 2);
+    assert_eq!(rows[1]["failed_attempts"], 0);
+    assert_eq!(rows[1]["stream_errors"], 1);
+    assert!(rows[1]["cooldown_ms"].is_null());
 }
 
 #[tokio::test]
@@ -634,10 +846,40 @@ async fn invalid_client_key_unknown_model_and_upstream_400_do_not_fail_over() {
     let bad_request = fixture.request("test-client", "shared", false).await;
     assert_eq!(bad_request.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        body(bad_request).await,
-        r#"{"error":{"message":"bad input"}}"#
+        serde_json::from_str::<Value>(&body(bad_request).await).unwrap(),
+        json!({"error":{"message":"bad input","type":"invalid_request_error","param":null,"code":"upstream_client_error"}})
     );
     assert_eq!(fixture.counts(), [1, 0]);
+}
+
+#[tokio::test]
+async fn upstream_error_preserves_details_without_a_string_message() {
+    let first = json!({
+        "error": {
+            "type":"invalid_request_error","code":"unsupported_parameter",
+            "param":"reasoning_effort","provider_detail":{"supported":["low"]}
+        },
+        "request_id":"vendor-123"
+    });
+    let mut next = first.clone();
+    next["error"]["message"] = json!(123);
+    let fixture = Fixture::start(
+        [Reply::StructuredBadRequest(first.clone()), Reply::Complete],
+        [Reply::StructuredBadRequest(next), Reply::Complete],
+        "",
+    )
+    .await;
+    let mut expected = first;
+    expected["error"]["message"] = json!("Upstream rejected the request");
+    for _ in 0..2 {
+        let response = fixture.request("test-client", "shared", false).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body(response).await).unwrap(),
+            expected
+        );
+    }
+    assert_eq!(fixture.counts(), [2, 0]);
 }
 
 #[tokio::test]

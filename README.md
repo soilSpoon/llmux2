@@ -20,6 +20,8 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
 
 For Chat Completions on OpenAI-compatible upstreams, the gateway rewrites only the top-level request model. Other request fields and successful response payloads pass through.
 
+Use authenticated `GET /v1/models` to list the exact model IDs accepted by the gateway. The list contains configured model names and aliases, not upstream deployment names or the full CheaperInference catalog.
+
 ```sh
 curl -sS http://127.0.0.1:8080/v1/responses \
   -H "Authorization: Bearer $LLMUX_CLIENT_KEY" \
@@ -27,9 +29,32 @@ curl -sS http://127.0.0.1:8080/v1/responses \
   -d '{"model":"llama-70b","input":"Hello"}'
 ```
 
-The Responses route translates requests to Chat Completions on OpenAI-compatible upstreams and converts replies back. Stateful Responses conversations and built-in non-function tools are unsupported. For SSE on either route, add `"stream":true` and use `curl -N`.
+The Responses route translates requests to Chat Completions on OpenAI-compatible upstreams and converts replies back. It accepts reasoning effort as either `reasoning.effort` or `reasoning_effort`; conflicting values are rejected. Stateful Responses conversations and built-in non-function tools are unsupported. For SSE on either route, add `"stream":true` and use `curl -N`.
 
 Credentials use `provider = "openai"` or `"openai_compat"` for OpenAI-compatible upstreams, or `provider = "anthropic"` for the Anthropic Messages API. Anthropic deployments use a base URL such as `https://api.anthropic.com/v1` (the adapter appends `/messages`) and send the key as `x-api-key`. The gateway converts chat requests, JSON responses and SSE chunks between the OpenAI Chat and Anthropic formats, so a model can mix both kinds of deployments and fail over between them.
+
+For converted Anthropic Chat streams, set `stream_options.include_usage` to `true` for a separate usage chunk just before `[DONE]`, or `false` to omit usage. Without this option, usage remains on the finish chunk. Reported cache reads appear in `usage.prompt_tokens_details.cached_tokens` and cache writes in `usage.cache_creation_input_tokens`.
+
+## Live dashboard
+
+Add `dashboard_key = "env:LLMUX_DASHBOARD_KEY"` to `[server]`, set that
+environment variable to a strong key distinct from the gateway client keys,
+and restart llmux2. Open `http://127.0.0.1:8080/dashboard` (or the configured
+gateway address) and enter the dashboard key. Use TLS when accessing it
+remotely. The page keeps the key in memory until you lock or close it.
+
+The dashboard shows response rate, status counts, mean time to response
+(first upstream event for streams), and routed requests, failed attempts,
+stream errors and cooldowns per deployment. In-flight counts are shown
+where a concurrency limit is configured. A 429 that successfully fails
+over appears as a failed attempt, not a gateway 429. Gateway counts cover
+authorized requests to the chat and Responses endpoints. They count
+responses when ready, not when downstream transfer finishes.
+
+Metrics stay in memory on each instance and reset on restart. The chart
+starts collecting when opened; it polls every two seconds. The dashboard
+does not collect prompts, responses, upstream URLs or credential values
+in its stats. Omit `dashboard_key` to disable the routes and collection.
 
 ## Routing
 
@@ -44,6 +69,16 @@ Rejecting is the default. To trim instead, set `context_overflow = "middle-out"`
 Before a response is committed, the gateway can fail over on upstream server, connection, and timeout errors within its attempt and time limits. Rate-limit and quota-exhaustion failover are controlled by `routing.fallback_on` and enabled by default. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local RPM uses a bounded per-deployment sliding window only when configured.
 
 ## Credentials
+
+OpenAI-compatible deployments can explicitly opt into anonymous access with
+`auth = "none"` and `provider = "openai_compat"`, omitting `credential`. They
+send no upstream Authorization header. Omitting a credential without this opt-in,
+or combining it with `auth = "none"`, is a configuration error. Keyed deployments
+keep their existing `credential = "id"` spelling. A model can mix both forms,
+with independent deployment limits and cooldowns; see the
+[mixed Kilo example](docs/free-providers.md#kilo-gateway-mixed-anonymous-and-keyed).
+Use anonymous access only when the upstream officially documents it. Multiple
+anonymous deployments do not multiply a provider's per-IP quota.
 
 Credentials support `kind = "api_key"` (with a `key` secret reference) and
 `kind = "oauth"` (OAuth 2.0 refresh-token grant). Deployments select either by
@@ -139,6 +174,23 @@ Anthropic inbound is not supported by this adapter.
 
 ## Development
 
+### Sign in with ChatGPT
+
+Run `cargo run -p llmux-login -- --dir ~/.config/llmux/codex` (the directory is
+optional). The command opens the system browser and also prints a private sign-in
+URL. Do not share that URL: returning sign-ins include a retained ID-token hint.
+The loopback callback uses `127.0.0.1:1455/auth/callback`, falling back to a free port.
+
+After validating the ID token and ChatGPT plan permission, the command atomically
+writes owner-only `credentials.json` and `refresh_token` files and prints a TOML
+credential snippet. A stable `host_id` survives restarts. Re-running with the same
+directory reauthorizes its saved client/account; use a separate directory to add a
+different account or workspace. Treat the entire directory as sensitive, never
+commit it, and do not run concurrent login/gateway processes for the same session.
+The snippet targets `provider = "openai_responses"` and sets
+`resource = "https://api.openai.com/v1"`, matching the OAuth configuration schema.
+The Responses upstream adapter remains separate work.
+
 See the [engineering standards](AGENTS.md) for test-first development, reliability checks, and PR evidence.
 
 - `llmux-types` defines the shared model, IR, and provider contracts.
@@ -151,7 +203,38 @@ See the [engineering standards](AGENTS.md) for test-first development, reliabili
 ```sh
 cargo test --locked --workspace
 cargo test --locked -p llmux-server --test chat -- --nocapture
+node --test crates/llmux-server/tests/dashboard.cjs
 ```
+
+## Live gateway comparison
+
+Run on the gateway host with Python 3.9+ (stdlib only), reference first, llmux second.
+Keep keys server-side: use `file:/absolute/path` or `env:VARIABLE`, never literal keys.
+
+```sh
+python3 bench/compare_gateways.py \
+  --gateway omniroute http://127.0.0.1:20128/v1 file:/private/omniroute-client.key \
+  --gateway llmux http://127.0.0.1:8090/v1 file:/private/llmux-client.key \
+  --coverage /private/coverage.json --top 25 --responses 2 \
+  --timeout 45 --max-requests 80 --output /private/compare-run-001
+```
+
+Or use repeated `--model NAME` / `--models-file PATH` (JSON array or one name per line).
+Coverage selects top-N traffic rows, then filters `present: false`; keep the snapshot fixed.
+Identical chat/stream bodies alternate A/B order; `--responses N` adds N Responses cases.
+The cap is checked before sending and counts HTTP requests, not internal fallback attempts.
+Read `results.json` / `report.html` in a new private output directory; review before sharing.
+- `match`: both succeed, not identical text; `llmux-only fail` / `omniroute-only fail`: only that side fails.
+- `both fail`: neither side succeeds in all cases; model verdicts require every case to succeed.
+- Single sample, not a speed ranking: all-result p50 includes errors; successful subsets can differ.
+- TTFT measures first content; streams require `[DONE]`. HTTP 200 with an error is not success.
+- Missing llmux attempts means fallback unknown ≠ false; attempts >1 proves multiple attempts.
+- Routing headers are evidence, not a complete trace; error classes do not prove error provenance.
+Learnings: API and dashboard ports differ—validate authenticated `/v1/models` first.
+Stored client keys may be encrypted; extract/decrypt readonly, server-side, into private files.
+Imported names can retain wrong upstream IDs or container-local URLs: import success ≠ usable routing.
+Tests (separate from Rust-only CI): `python3 -m unittest bench.test_compare_gateways` and
+`python3 -m py_compile bench/compare_gateways.py bench/test_compare_gateways.py`.
 
 ## Mock-upstream load benchmark
 

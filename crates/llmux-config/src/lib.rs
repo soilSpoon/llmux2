@@ -34,6 +34,7 @@ pub struct ServerConfig {
     pub client_keys: Box<[Arc<str>]>,
     pub request_timeout: Duration,
     pub expose_routing_headers: bool,
+    pub dashboard_key: Option<Arc<str>>,
 }
 
 pub struct RoutingConfig {
@@ -97,6 +98,7 @@ struct RawConfig {
     routing: RawRouting,
     #[serde(default)]
     cooldown: RawCooldown,
+    #[serde(default)]
     credentials: Vec<RawCredential>,
     models: Vec<RawModel>,
 }
@@ -108,6 +110,7 @@ struct RawServer {
     client_keys: Vec<String>,
     request_timeout_ms: u64,
     expose_routing_headers: bool,
+    dashboard_key: Option<String>,
 }
 
 impl Default for RawServer {
@@ -117,6 +120,7 @@ impl Default for RawServer {
             client_keys: Vec::new(),
             request_timeout_ms: DEFAULT_TIMEOUT_MS,
             expose_routing_headers: true,
+            dashboard_key: None,
         }
     }
 }
@@ -198,7 +202,9 @@ struct RawModel {
 #[serde(deny_unknown_fields)]
 struct RawDeployment {
     id: String,
-    credential: String,
+    credential: Option<String>,
+    auth: Option<DeploymentAuth>,
+    provider: Option<String>,
     base_url: Option<String>,
     upstream_model: String,
     #[serde(default)]
@@ -210,6 +216,12 @@ struct RawDeployment {
     quota: QuotaSpec,
     timeout_ms: Option<u64>,
     max_context: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DeploymentAuth {
+    None,
 }
 
 impl RawConfig {
@@ -232,6 +244,19 @@ impl RawConfig {
             .iter()
             .map(|key| resolve_secret(key))
             .collect::<Result<Box<[_]>, _>>()?;
+        let dashboard_key = server
+            .dashboard_key
+            .as_deref()
+            .map(resolve_secret)
+            .transpose()?;
+        if dashboard_key
+            .as_ref()
+            .is_some_and(|key| client_keys.contains(key))
+        {
+            return Err(invalid(
+                "server.dashboard_key must differ from server.client_keys",
+            ));
+        }
         if routing.max_attempts == 0 {
             return Err(invalid("routing.max_attempts must be positive"));
         }
@@ -400,12 +425,23 @@ impl RawConfig {
                 if !valid_identifier(&id) || !deployment_ids.insert(id.clone()) {
                     return Err(invalid("deployment IDs must be unique and use ASCII letters, digits, '.', '_' or '-'"));
                 }
-                let provider = provider_kinds
-                    .get(dep.credential.as_str())
-                    .cloned()
-                    .ok_or_else(|| invalid("deployment references an unknown credential"))?;
+                let provider = match (&dep.auth, &dep.credential, &dep.provider) {
+                    (Some(DeploymentAuth::None), None, Some(provider))
+                        if matches!(provider.as_str(), "openai" | "openai_compat") =>
+                    {
+                        ProviderKind(provider.as_str().into())
+                    }
+                    (None, Some(credential), None) => provider_kinds
+                        .get(credential.as_str())
+                        .cloned()
+                        .ok_or_else(|| invalid("deployment references an unknown credential"))?,
+                    _ => return Err(invalid("deployment requires a credential, or auth = 'none' with an OpenAI-compatible provider; do not combine them")),
+                };
                 if provider.0.as_ref() == "openai_responses"
-                    && oauth.contains_key(dep.credential.as_str())
+                    && dep
+                        .credential
+                        .as_deref()
+                        .is_some_and(|id| oauth.contains_key(id))
                     && !model_allowed_keys.contains_key(&canonical_models.len())
                 {
                     return Err(invalid("OAuth openai_responses models require allowed_keys for the owner's gateway keys"));
@@ -441,7 +477,7 @@ impl RawConfig {
                     idx,
                     id,
                     provider,
-                    credential: dep.credential.into(),
+                    credential: dep.credential.unwrap_or_default().into(),
                     base_url: upstream_uri(base_url)?,
                     upstream_model: dep.upstream_model.into(),
                     priority: dep.priority,
@@ -469,6 +505,7 @@ impl RawConfig {
                 client_keys,
                 request_timeout,
                 expose_routing_headers: server.expose_routing_headers,
+                dashboard_key,
             },
             routing: RoutingConfig {
                 max_attempts: routing.max_attempts,
@@ -563,6 +600,33 @@ fn resolve_secret(reference: &str) -> Result<Arc<str>, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anonymous_auth_requires_explicit_unambiguous_opt_in() {
+        let _ = self::config("");
+        let prefix = "[server]\nclient_keys = [\"env:LLMUX_CONFIG_OAUTH_TEST_SECRET\"]\n";
+        let config = |auth: &str| {
+            format!("{prefix}\n[[models]]\nname = \"test\"\n[[models.deployments]]\nid = \"anonymous\"\nbase_url = \"https://example.com/v1\"\nupstream_model = \"test\"\n{auth}\n")
+        };
+        assert!(super::RuntimeConfig::parse(&config(
+            "auth = \"none\"\nprovider = \"openai_compat\""
+        ))
+        .is_ok());
+        for auth in [
+            "",
+            "provider = \"openai_compat\"",
+            "auth = \"none\"",
+            "auth = \"none\"\nprovider = \"anthropic\"",
+            "auth = \"typo\"\nprovider = \"openai_compat\"",
+            "auth = \"none\"\nprovider = \"openai_compat\"\ncredential = \"missing\"",
+            "credential = \"missing\"",
+        ] {
+            assert!(
+                super::RuntimeConfig::parse(&config(auth)).is_err(),
+                "{auth}"
+            );
+        }
+    }
 
     fn config(fields: &str) -> String {
         static INIT: std::sync::Once = std::sync::Once::new();

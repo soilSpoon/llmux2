@@ -102,7 +102,12 @@ pub(crate) fn request(body: &[u8], model: &str) -> Result<Bytes, BuildError> {
     if let Some(value) = obj.get("max_output_tokens") {
         out["max_completion_tokens"] = value.clone();
     }
-    if let Some(value) = body.pointer("/reasoning/effort") {
+    let effort = body.pointer("/reasoning/effort").filter(|v| !v.is_null());
+    let alias = obj.get("reasoning_effort").filter(|v| !v.is_null());
+    if matches!((effort, alias), (Some(a), Some(b)) if a != b) {
+        return Err(BuildError::InvalidBody);
+    }
+    if let Some(value) = effort.or(alias) {
         out["reasoning_effort"] = value.clone();
     }
     if let Some(format) = body.pointer("/text/format") {
@@ -462,6 +467,26 @@ mod tests {
         assert!(result.get("store").is_none());
         assert_eq!(convert(json!({"input":[]}))["messages"], json!([]));
         assert_eq!(convert(json!({"input":""}))["messages"][0]["content"], "");
+    }
+
+    #[test]
+    fn top_level_reasoning_effort_alias() {
+        assert_eq!(
+            convert(json!({"input":"hello","reasoning_effort":"high"}))["reasoning_effort"],
+            "high"
+        );
+        assert_eq!(
+            convert(
+                json!({"input":"hello","reasoning_effort":"high","reasoning":{"effort":"high"}})
+            )["reasoning_effort"],
+            "high"
+        );
+        let conflict =
+            json!({"input":"hello","reasoning_effort":"high","reasoning":{"effort":"low"}});
+        assert!(matches!(
+            request(conflict.to_string().as_bytes(), "upstream"),
+            Err(BuildError::InvalidBody)
+        ));
     }
 
     #[test]

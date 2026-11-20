@@ -13,6 +13,7 @@ hyper-rustls.workspace = true
 hyper-util.workspace = true
 llmux-config.workspace = true
 llmux-types.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
