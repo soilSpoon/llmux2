@@ -145,6 +145,7 @@ async fn fixture_with_models(
         models,
         shared_quota,
         Default::default(),
+        false,
     )
     .await
 }
@@ -157,6 +158,7 @@ async fn fixture_full(
     models: &[(&str, &[u32])],
     shared_quota: llmux_types::QuotaSpec,
     second_quota: llmux_types::QuotaSpec,
+    split_routes: bool,
 ) -> Fixture {
     let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
     let served_status = status.clone();
@@ -191,7 +193,12 @@ async fn fixture_full(
                 "second".into()
             },
             base_url: server.url().parse().unwrap(),
-            upstream_model: "upstream".into(),
+            upstream_model: if split_routes && i == 1 {
+                "upstream-1"
+            } else {
+                "upstream"
+            }
+            .into(),
             strip_request_fields: Box::default(),
             priority: i as i32,
             quota: if i < 2 {
@@ -869,6 +876,7 @@ async fn credential_quota_limits_the_credentials_deployments() {
             rpm: Some(1),
             ..Default::default()
         },
+        false,
     )
     .await;
     executor.execute(request()).await.unwrap();
@@ -877,4 +885,76 @@ async fn credential_quota_limits_the_credentials_deployments() {
         Err(GatewayError::AllCandidatesExhausted { .. })
     ));
     assert_eq!(adapter.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn exhausted_quota_cools_every_deployment_on_the_credential() {
+    let (executor, adapter, _, _server) = fixture_full(
+        vec![UpstreamError::QuotaExhausted { reset_at: None }],
+        false,
+        [None; 3],
+        &[("a", &[0]), ("b", &[1, 2])],
+        Default::default(),
+        Default::default(),
+        true,
+    )
+    .await;
+    let to = |model: &str| GatewayRequest {
+        model: model.into(),
+        ..request()
+    };
+    assert!(executor.execute(to("a")).await.is_err());
+    executor.execute(to("b")).await.unwrap();
+    let served: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(
+        served,
+        ["dep0", "dep2"],
+        "dep1 shares dep0's exhausted credential"
+    );
+}
+
+#[tokio::test]
+async fn credential_peers_cool_only_until_the_quota_resets() {
+    let (executor, adapter, _, _server) = fixture_full(
+        vec![UpstreamError::QuotaExhausted {
+            reset_at: Some(SystemTime::now() + Duration::from_millis(50)),
+        }],
+        false,
+        [None; 3],
+        &[("a", &[0]), ("b", &[1, 2])],
+        Default::default(),
+        Default::default(),
+        true,
+    )
+    .await;
+    *adapter.observed.lock().unwrap() = Some(LimitObservation {
+        remaining_requests: Some(0),
+        reset_requests: Some(Duration::from_secs(10)),
+        ..LimitObservation::default()
+    });
+    let to = |model: &str| GatewayRequest {
+        model: model.into(),
+        ..request()
+    };
+    assert!(executor.execute(to("a")).await.is_err());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    executor.execute(to("b")).await.unwrap();
+    let served: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(
+        served,
+        ["dep0", "dep1"],
+        "dep0's own route limit is not the key's"
+    );
 }

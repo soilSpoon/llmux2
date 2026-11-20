@@ -83,6 +83,8 @@ struct Binding {
     auth: Option<Arc<dyn CredentialSource>>,
     disabled: Arc<AtomicBool>,
     limits: Arc<DeploymentLimits>,
+    /// Other routes on the same credential, cooled together when its quota runs out.
+    key_peers: Box<[Arc<DeploymentLimits>]>,
     stats: Option<Arc<AttemptStats>>,
 }
 
@@ -157,7 +159,7 @@ impl Executor {
             .iter()
             .map(|(id, quota)| (id.clone(), Window::for_quota(*quota)))
             .collect();
-        let bindings = cfg
+        let mut bindings = cfg
             .deployments
             .iter()
             .map(|dep| {
@@ -183,10 +185,29 @@ impl Executor {
                     auth,
                     disabled,
                     limits: Self::shared_limits(&mut shared_limits, &key_windows, dep),
+                    key_peers: Box::default(),
                     stats: cfg.server.dashboard_key.is_some().then(Arc::default),
                 })
             })
             .collect::<Result<Box<[_]>, _>>()?;
+        let mut by_key = HashMap::<&str, Vec<Arc<DeploymentLimits>>>::new();
+        for (dep, binding) in cfg.deployments.iter().zip(bindings.iter()) {
+            if !dep.credential.is_empty() {
+                let peers = by_key.entry(&dep.credential).or_default();
+                if !peers.iter().any(|peer| Arc::ptr_eq(peer, &binding.limits)) {
+                    peers.push(binding.limits.clone());
+                }
+            }
+        }
+        for (dep, binding) in cfg.deployments.iter().zip(bindings.iter_mut()) {
+            if let Some(peers) = by_key.get(&*dep.credential) {
+                binding.key_peers = peers
+                    .iter()
+                    .filter(|peer| !Arc::ptr_eq(peer, &binding.limits))
+                    .cloned()
+                    .collect();
+            }
+        }
         // A credential without deployments is still manageable: keep a
         // flag for every configured credential, not only deployed ones.
         for id in credentials.keys() {
@@ -486,13 +507,23 @@ impl Executor {
                             }
                         }
                         Err(GatewayError::Client(UpstreamError::QuotaExhausted { reset_at })) => {
-                            binding.limits.limited(
-                                reset_at.map(|reset| {
-                                    reset.duration_since(SystemTime::now()).unwrap_or_default()
-                                }),
+                            let hint = reset_at.map(|reset| {
+                                reset.duration_since(SystemTime::now()).unwrap_or_default()
+                            });
+                            let until = binding.limits.limited(
+                                hint,
                                 self.cfg.cooldown.default,
                                 self.cfg.cooldown.max,
                             );
+                            // Peers wait for the key's reset, not this route's own limits.
+                            for peer in &binding.key_peers {
+                                match hint {
+                                    Some(wait) => {
+                                        peer.cool_down(wait.min(self.cfg.cooldown.max));
+                                    }
+                                    None => peer.cool_down_until(until),
+                                }
+                            }
                             if !self
                                 .cfg
                                 .routing
