@@ -239,9 +239,7 @@ impl RawConfig {
         } = self;
         let request_timeout = timeout(server.request_timeout_ms)?;
         if server.drain_grace_ms > 10_000 {
-            return Err(invalid(
-                "server.drain_grace_ms must be between 0 and 10000",
-            ));
+            return Err(invalid("server.drain_grace_ms must be between 0 and 10000"));
         }
         if server.client_keys.is_empty() {
             return Err(invalid(

@@ -1,4 +1,5 @@
 use axum::{body::Body, routing::get, Router};
+use futures_util::StreamExt;
 use http::Request;
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
@@ -125,6 +126,71 @@ async fn drains_stream() {
 #[tokio::test]
 async fn shutdown_is_bounded() {
     drain_test(false, true).await;
+}
+
+#[tokio::test]
+async fn shutdown_timeout_ends_active_sse_body() {
+    let router = Router::new().route(
+        "/events",
+        get(|| async {
+            axum::response::Sse::new(
+                futures_util::stream::once(async {
+                    Ok::<_, std::convert::Infallible>(
+                        axum::response::sse::Event::default().data("started"),
+                    )
+                })
+                .chain(futures_util::stream::pending()),
+            )
+        }),
+    );
+    let listener = llmux_server::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, shutdown) = oneshot::channel();
+    let task = tokio::spawn(llmux_server::serve(
+        listener,
+        router,
+        async {
+            let _ = shutdown.await;
+        },
+        Duration::from_millis(30),
+        Duration::ZERO,
+    ));
+    let mut response = Client::builder(TokioExecutor::new())
+        .build_http()
+        .request(
+            Request::get(format!("http://{address}/events"))
+                .body(Full::<axum::body::Bytes>::default())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers()[http::header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    let first = timeout(Duration::from_secs(2), response.body_mut().frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert_eq!(first, "data: started\n\n");
+    stop.send(()).unwrap();
+    timeout(Duration::from_secs(2), task)
+        .await
+        .expect("serve must exit after shutdown timeout")
+        .unwrap()
+        .unwrap();
+    let end = timeout(Duration::from_millis(250), response.body_mut().frame())
+        .await
+        .expect("shutdown timeout must end the active SSE body");
+    assert!(
+        end.is_none() || end.unwrap().is_err(),
+        "shutdown must not emit more SSE data"
+    );
 }
 
 async fn get_on_connection(
