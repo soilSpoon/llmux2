@@ -35,6 +35,7 @@ struct Adapter {
     kind: ProviderKind,
     errors: Mutex<VecDeque<UpstreamError>>,
     observed: Mutex<Option<LimitObservation>>,
+    status: Arc<std::sync::atomic::AtomicU16>,
     calls: Mutex<Vec<(Arc<str>, Arc<str>)>>,
 }
 
@@ -119,13 +120,19 @@ async fn fixture_with_models(
     models: &[(&str, &[u32])],
     shared_quota: llmux_types::QuotaSpec,
 ) -> Fixture {
-    let server = llmux_testkit::TestServer::start(axum::Router::new().fallback(|| async { "ok" }))
-        .await
-        .unwrap();
+    let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
+    let served_status = status.clone();
+    let server = llmux_testkit::TestServer::start(axum::Router::new().fallback(move || {
+        let status = StatusCode::from_u16(served_status.load(Ordering::Relaxed)).unwrap();
+        async move { (status, "ok") }
+    }))
+    .await
+    .unwrap();
     let adapter = Arc::new(Adapter {
         kind: ProviderKind("test".into()),
         errors: Mutex::new(errors.into()),
         observed: Mutex::new(None),
+        status,
         calls: Mutex::new(Vec::new()),
     });
     let credential = Arc::new(Credential {
@@ -616,4 +623,20 @@ async fn remaining_rate_limit_headers_keep_the_deployment() {
     executor.execute(request()).await.unwrap();
     let second = executor.execute(request()).await.unwrap();
     assert_eq!(second.deployment.as_ref(), "dep0");
+}
+
+#[tokio::test]
+async fn rate_limit_headers_on_error_responses_do_not_cool_down() {
+    let (executor, adapter, _, _server) = fixture(Vec::new(), false).await;
+    adapter.status.store(400, Ordering::Relaxed);
+    *adapter.observed.lock().unwrap() = Some(LimitObservation {
+        remaining_requests: Some(0),
+        reset_requests: Some(Duration::from_secs(3)),
+        ..LimitObservation::default()
+    });
+    executor.execute(request()).await.unwrap();
+    assert!(executor.bindings[0]
+        .limits
+        .cooldown_until(Instant::now())
+        .is_none());
 }
