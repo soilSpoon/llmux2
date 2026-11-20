@@ -6,6 +6,7 @@ mod context;
 mod db_dump;
 mod direct;
 mod fallback;
+mod morph;
 mod policy;
 mod replacements;
 mod upstream;
@@ -574,7 +575,7 @@ pub fn import_with_options(
                 policy.workers.as_ref().unwrap().base_url.clone(),
             ))
         } else {
-            upstream::resolve(c, array(&root, "providerNodes"))
+            upstream::resolve(c, array(&root, "providerNodes"), &mut warnings)
         } {
             Ok(provider) => provider,
             Err(reason) => {
@@ -894,6 +895,7 @@ pub fn import_with_options(
             policy: &policy,
         }
         .expand(&name, &mut Vec::new(), &mut deployments);
+        morph::order(&name, &mut deployments, &connections, nodes, &mut warnings);
         if deployments.is_empty() {
             warnings.push(format!("combo {name}: skipped: no deployments"));
             continue;

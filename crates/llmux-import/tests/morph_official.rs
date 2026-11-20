@@ -1,0 +1,118 @@
+use llmux_config::RuntimeConfig;
+use serde_json::{json, Value};
+
+fn fixture() -> Value {
+    json!({
+        "providerConnections": [
+            {"id":"morph", "provider":"morph", "authType":"apikey", "apiKey":"synthetic-morph", "providerSpecificData":{"baseUrl":"http://127.0.0.1:8790/morph/v1"}},
+            {"id":"vibe", "provider":"vibe-node", "authType":"apikey", "apiKey":"synthetic-vibe"},
+            {"id":"other", "provider":"other-node", "authType":"apikey", "apiKey":"synthetic-other"}
+        ],
+        "providerNodes": [
+            {"id":"vibe-node", "prefix":"vibe", "type":"openai-compatible", "baseUrl":"https://api.mistral.ai/v1"},
+            {"id":"other-node", "prefix":"other", "type":"openai-compatible", "baseUrl":"https://example.com/v1"}
+        ],
+        "combos":[{"name":"plain", "models":["other/first", "vibe/deepseek-v4-1-flash-1017", "other/middle", "morph/morph-dsv41flash-1017", "other/last"]}],
+        "apiKeys":[{"key":"synthetic-client"}]
+    })
+}
+
+#[test]
+fn morph_official_loopback_policy_is_builtin_only_and_preserves_other_rejections() {
+    for (provider, url, expected) in [
+        ("morph", "http://127.0.0.1:8790/morph/v1", true),
+        ("morph", "http://LOCALHOST.:8790/morph/v1", true),
+        ("morph", "http://[::1]:8790/morph/v1", true),
+        ("morph", "https://api.morphllm.com/v1", true),
+        ("morph", "http://0.0.0.0:8790/morph/v1", false),
+        ("morph", "https://unofficial.example/v1", false),
+        ("other-node", "http://127.0.0.1:8790/morph/v1", false),
+    ] {
+        let mut root = fixture();
+        root["providerConnections"][0]["provider"] = json!(provider);
+        root["providerConnections"][0]["providerSpecificData"]["baseUrl"] = json!(url);
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out.toml");
+        let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+        let config = RuntimeConfig::load(&output).unwrap();
+        let imported: Vec<_> = config
+            .deployments
+            .iter()
+            .filter(|d| d.credential.as_ref() == "upstream-morph")
+            .collect();
+        assert_eq!(!imported.is_empty(), expected, "{provider}: {url}");
+        for dep in imported {
+            assert_eq!(dep.base_url.to_string(), "https://api.morphllm.com/v1");
+            assert!(dep.strip_request_fields.is_empty());
+        }
+        assert_eq!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("reviewed Morph loopback")),
+            expected && url != "https://api.morphllm.com/v1"
+        );
+        assert!(!report.warnings.join("\n").contains("synthetic-morph"));
+    }
+}
+
+#[test]
+fn reviewed_flash_combos_move_only_verified_morph_ahead_of_mistral() {
+    for name in [
+        "deepseek-v4.1-flash",
+        "deepseek-v4.1-flash-fast",
+        "deepseek-v4.1-flash-1017",
+        "deepseek-v4.1-flash-1017-fast",
+        "deepseek-v4.1-flash-1017-ultrafast",
+        "plain",
+    ] {
+        for morph_model in [Some("morph-dsv41flash-1017"), Some("morph-other"), None] {
+            let mut root = fixture();
+            root["combos"][0]["name"] = json!(name);
+            if let Some(model) = morph_model {
+                root["combos"][0]["models"][3] = json!(format!("morph/{model}"));
+            } else {
+                root["combos"][0]["models"]
+                    .as_array_mut()
+                    .unwrap()
+                    .remove(3);
+            }
+            root["modelAliases"] = json!({"public-alias":name});
+            let dir = tempfile::tempdir().unwrap();
+            let output = dir.path().join("out.toml");
+            let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+            let config = RuntimeConfig::load(output).unwrap();
+            let model = config
+                .models
+                .iter()
+                .find(|m| m.name.as_ref() == name)
+                .unwrap();
+            let actual: Vec<_> = model
+                .deployments
+                .iter()
+                .map(|i| config.deployments[i.0 as usize].upstream_model.as_ref())
+                .collect();
+            let reorder = name != "plain" && morph_model == Some("morph-dsv41flash-1017");
+            let mut expected = vec!["first", "deepseek-v4-1-flash-1017", "middle"];
+            if let Some(model) = morph_model {
+                expected.insert(if reorder { 1 } else { 3 }, model);
+            }
+            expected.push("last");
+            assert_eq!(actual, expected, "{name}");
+            assert_eq!(
+                config.model_names.get("public-alias"),
+                config.model_names.get(name)
+            );
+            assert_eq!(
+                report
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("reviewed Morph logprobs order")),
+                reorder
+            );
+            for (priority, i) in model.deployments.iter().enumerate() {
+                assert_eq!(config.deployments[i.0 as usize].priority, priority as i32);
+            }
+        }
+    }
+}

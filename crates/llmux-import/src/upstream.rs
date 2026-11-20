@@ -137,7 +137,7 @@ pub(super) fn model_target<'a>(
     Some((canonical, model))
 }
 
-fn local_host(url: &str) -> bool {
+fn local_host(url: &str, include_unspecified: bool) -> bool {
     let Ok(uri) = url.parse::<Uri>() else {
         return false;
     };
@@ -150,13 +150,13 @@ fn local_host(url: &str) -> bool {
         return true;
     }
     match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Ok(IpAddr::V4(ip)) => ip.is_loopback() || include_unspecified && ip.is_unspecified(),
         Ok(IpAddr::V6(ip)) => {
             ip.is_loopback()
-                || ip.is_unspecified()
-                || ip
-                    .to_ipv4_mapped()
-                    .is_some_and(|ip| ip.is_loopback() || ip.is_unspecified())
+                || include_unspecified && ip.is_unspecified()
+                || ip.to_ipv4_mapped().is_some_and(|ip| {
+                    ip.is_loopback() || include_unspecified && ip.is_unspecified()
+                })
         }
         Err(_) => false,
     }
@@ -201,6 +201,7 @@ fn horde_base_url(url: &str) -> Result<&'static str, &'static str> {
 pub(super) fn resolve(
     connection: &Value,
     nodes: &[Value],
+    warnings: &mut Vec<String>,
 ) -> Result<(String, String), &'static str> {
     let id = string(connection, "provider");
     let (kind, fallback) = if let Some((_, kind, url)) = PROVIDERS.iter().find(|(p, _, _)| *p == id)
@@ -236,9 +237,16 @@ pub(super) fn resolve(
     if url.is_empty() {
         return Err("missing upstream base URL");
     }
-    if local_host(url) {
+    let url = if ProviderIdentity::connection(id, nodes).is_builtin("morph")
+        && local_host(url, false)
+    {
+        warnings.push(format!("connection {}: reviewed Morph loopback override replaced with official https://api.morphllm.com/v1", string(connection, "id")));
+        super::morph::OFFICIAL_URL
+    } else if local_host(url, true) {
         return Err("loopback/localhost upstream; configure a reachable connection base URL");
-    }
+    } else {
+        url
+    };
     let suffix = if kind == KIND_ANTHROPIC {
         "/messages"
     } else {
