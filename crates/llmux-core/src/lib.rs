@@ -454,6 +454,14 @@ impl Executor {
             .request(upstream.map(Full::new))
             .await
             .map_err(|_| GatewayError::Client(UpstreamError::Connect))?;
+        if let Some(observed) = response
+            .status()
+            .is_success()
+            .then(|| binding.adapter.observe_limits(response.headers()))
+            .flatten()
+        {
+            binding.limits.observe(observed, self.cfg.cooldown.max);
+        }
         let response = binding
             .adapter
             .parse_response(req, dep, response)

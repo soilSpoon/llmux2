@@ -4,7 +4,7 @@ use http::{HeaderMap, Request, Response};
 use hyper::body::Incoming;
 use llmux_types::{
     AuthError, AuthMaterial, BuildError, CanonicalModel, Capabilities, ContextOverflow,
-    InboundFormat, ProviderKind, RequestId, SseEvent, Strategy,
+    InboundFormat, LimitObservation, ProviderKind, RequestId, SseEvent, Strategy,
 };
 use std::{collections::VecDeque, sync::Mutex};
 
@@ -34,6 +34,8 @@ impl CredentialSource for Credential {
 struct Adapter {
     kind: ProviderKind,
     errors: Mutex<VecDeque<UpstreamError>>,
+    observed: Mutex<Option<LimitObservation>>,
+    status: Arc<std::sync::atomic::AtomicU16>,
     stream_errors: Mutex<VecDeque<UpstreamError>>,
     calls: Mutex<Vec<(Arc<str>, Arc<str>)>>,
 }
@@ -42,6 +44,10 @@ struct Adapter {
 impl ProviderAdapter for Adapter {
     fn kind(&self) -> &ProviderKind {
         &self.kind
+    }
+
+    fn observe_limits(&self, _: &HeaderMap) -> Option<LimitObservation> {
+        self.observed.lock().unwrap().take()
     }
 
     fn supports(&self, _: InboundFormat) -> Support {
@@ -125,12 +131,19 @@ async fn fixture_with_models(
     models: &[(&str, &[u32])],
     shared_quota: llmux_types::QuotaSpec,
 ) -> Fixture {
-    let server = llmux_testkit::TestServer::start(axum::Router::new().fallback(|| async { "ok" }))
-        .await
-        .unwrap();
+    let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
+    let served_status = status.clone();
+    let server = llmux_testkit::TestServer::start(axum::Router::new().fallback(move || {
+        let status = StatusCode::from_u16(served_status.load(Ordering::Relaxed)).unwrap();
+        async move { (status, "ok") }
+    }))
+    .await
+    .unwrap();
     let adapter = Arc::new(Adapter {
         kind: ProviderKind("test".into()),
         errors: Mutex::new(errors.into()),
+        observed: Mutex::new(None),
+        status,
         stream_errors: Mutex::new(VecDeque::new()),
         calls: Mutex::new(Vec::new()),
     });
@@ -582,6 +595,62 @@ async fn local_rpm_budget_is_shared_by_models_on_the_same_upstream_route() {
         .map(|(dep, _)| dep.to_string())
         .collect();
     assert_eq!(calls, ["dep0", "dep2"]);
+}
+
+#[tokio::test]
+async fn exhausted_rate_limit_headers_skip_the_deployment_until_reset() {
+    for observed in [
+        LimitObservation {
+            remaining_requests: Some(0),
+            reset_requests: Some(Duration::from_secs(3)),
+            ..LimitObservation::default()
+        },
+        LimitObservation {
+            remaining_tokens: Some(0),
+            reset_tokens: Some(Duration::from_secs(3)),
+            ..LimitObservation::default()
+        },
+    ] {
+        let (executor, adapter, _, _server) = fixture(Vec::new(), false).await;
+        *adapter.observed.lock().unwrap() = Some(observed);
+        let first = executor.execute(request()).await.unwrap();
+        assert_eq!(first.deployment.as_ref(), "dep0");
+        let second = executor.execute(request()).await.unwrap();
+        assert_eq!(
+            second.deployment.as_ref(),
+            "dep2",
+            "a success reporting zero remaining requests or tokens must not be retried before reset"
+        );
+    }
+}
+
+#[tokio::test]
+async fn remaining_rate_limit_headers_keep_the_deployment() {
+    let (executor, adapter, _, _server) = fixture(Vec::new(), false).await;
+    *adapter.observed.lock().unwrap() = Some(LimitObservation {
+        remaining_requests: Some(1),
+        reset_requests: Some(Duration::from_secs(3)),
+        ..LimitObservation::default()
+    });
+    executor.execute(request()).await.unwrap();
+    let second = executor.execute(request()).await.unwrap();
+    assert_eq!(second.deployment.as_ref(), "dep0");
+}
+
+#[tokio::test]
+async fn rate_limit_headers_on_error_responses_do_not_cool_down() {
+    let (executor, adapter, _, _server) = fixture(Vec::new(), false).await;
+    adapter.status.store(400, Ordering::Relaxed);
+    *adapter.observed.lock().unwrap() = Some(LimitObservation {
+        remaining_requests: Some(0),
+        reset_requests: Some(Duration::from_secs(3)),
+        ..LimitObservation::default()
+    });
+    executor.execute(request()).await.unwrap();
+    assert!(executor.bindings[0]
+        .limits
+        .cooldown_until(Instant::now())
+        .is_none());
 }
 
 #[tokio::test]
