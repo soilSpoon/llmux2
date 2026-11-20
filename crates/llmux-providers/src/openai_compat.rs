@@ -22,6 +22,8 @@ use std::{
 };
 
 const MAX_COMPLETE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ERROR_BYTES: usize = 64 * 1024;
+const MAX_RETRY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Deserialize)]
 struct RawChatMetadata<'a> {
@@ -182,25 +184,14 @@ impl ProviderAdapter for OpenAiCompat {
     ) -> Result<GatewayResponse, UpstreamError> {
         let (parts, body) = resp.into_parts();
         let status = parts.status;
-        match status {
-            StatusCode::TOO_MANY_REQUESTS => {
-                return Err(UpstreamError::RateLimited {
-                    retry_after: retry_after(&parts.headers, SystemTime::now()),
-                    scope: LimitScope::Unknown,
-                });
-            }
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                return Err(UpstreamError::Auth { refreshable: false });
-            }
-            _ if status.is_client_error() => {
-                return Err(UpstreamError::BadRequest {
-                    status,
-                    body: collect(body).await?,
-                });
-            }
-            _ if status.is_server_error() => return Err(UpstreamError::Server { status }),
-            _ if !status.is_success() => return Err(bad_gateway()),
-            _ => {}
+        if !status.is_success() {
+            let body = collect_error(body).await;
+            return Err(classify_error(
+                status,
+                &parts.headers,
+                body,
+                SystemTime::now(),
+            ));
         }
 
         if req.stream {
@@ -220,10 +211,14 @@ impl ProviderAdapter for OpenAiCompat {
             }
             Ok(GatewayResponse::Stream(sse::decode(body)))
         } else {
+            let body = collect(body).await?;
+            if let Some(error) = embedded_error(&body, &parts.headers, SystemTime::now()) {
+                return Err(error);
+            }
             Ok(GatewayResponse::Complete {
                 status,
                 headers: parts.headers,
-                body: collect(body).await?,
+                body,
                 usage: None,
             })
         }
@@ -238,13 +233,22 @@ impl ProviderAdapter for OpenAiCompat {
         };
         let remaining_requests = count("x-ratelimit-remaining-requests");
         let remaining_tokens = count("x-ratelimit-remaining-tokens");
-        if remaining_requests.is_none() && remaining_tokens.is_none() {
+        let reset_requests =
+            header_text(headers, "x-ratelimit-reset-requests").and_then(parse_duration);
+        let reset_tokens =
+            header_text(headers, "x-ratelimit-reset-tokens").and_then(parse_duration);
+        if remaining_requests.is_none()
+            && remaining_tokens.is_none()
+            && reset_requests.is_none()
+            && reset_tokens.is_none()
+        {
             return None;
         }
         Some(LimitObservation {
             remaining_requests,
             remaining_tokens,
-            ..LimitObservation::default()
+            reset_requests,
+            reset_tokens,
         })
     }
 }
@@ -257,6 +261,214 @@ async fn collect(body: Incoming) -> Result<Bytes, UpstreamError> {
         .map_err(|_| bad_gateway())
 }
 
+async fn collect_error<B: hyper::body::Body<Data = Bytes> + Unpin>(mut body: B) -> Bytes {
+    let mut bytes = BytesMut::new();
+    while bytes.len() < MAX_ERROR_BYTES {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    let len = data.len().min(MAX_ERROR_BYTES - bytes.len());
+                    bytes.extend_from_slice(&data[..len]);
+                }
+            }
+            _ => break,
+        }
+    }
+    bytes.freeze()
+}
+
+fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name)?.to_str().ok().map(str::trim)
+}
+
+fn parse_duration(mut value: &str) -> Option<Duration> {
+    let mut seconds = 0.0_f64;
+    if value.is_empty() {
+        return None;
+    }
+    while !value.is_empty() {
+        let end = value.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+        let number = value[..end].parse::<f64>().ok()?;
+        value = &value[end..];
+        let (unit, scale) = if value.starts_with("ms") {
+            (2, 0.001)
+        } else {
+            (
+                1,
+                match value.as_bytes().first()? {
+                    b's' => 1.0,
+                    b'm' => 60.0,
+                    b'h' => 3600.0,
+                    b'd' => 86400.0,
+                    _ => return None,
+                },
+            )
+        };
+        seconds += number * scale;
+        value = &value[unit..];
+    }
+    Some(Duration::from_secs_f64(
+        seconds.min(MAX_RETRY.as_secs_f64()),
+    ))
+}
+
+fn error_details(body: &[u8]) -> serde_json::Value {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|mut value| value.get_mut("error").map(serde_json::Value::take))
+        .unwrap_or_default()
+}
+
+fn classify_error(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: Bytes,
+    now: SystemTime,
+) -> UpstreamError {
+    let details = error_details(&body);
+    let code = details
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let kind = details
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let message = details
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let scope = if header_text(headers, "x-ratelimit-remaining-requests") == Some("0") {
+        LimitScope::Requests
+    } else if header_text(headers, "x-ratelimit-remaining-tokens") == Some("0")
+        || message.contains("tokens per")
+        || kind.contains("tokens")
+        || code.contains("tokens")
+    {
+        LimitScope::Tokens
+    } else if message.contains("requests per")
+        || kind.contains("requests")
+        || code.contains("requests")
+    {
+        LimitScope::Requests
+    } else {
+        LimitScope::Unknown
+    };
+    let wait = retry_after(headers, now)
+        .or_else(|| {
+            header_text(headers, "retry-after-ms")?
+                .parse::<f64>()
+                .ok()
+                .filter(|n| n.is_finite() && *n >= 0.0)
+                .map(|n| Duration::from_secs_f64((n / 1000.0).min(MAX_RETRY.as_secs_f64())))
+        })
+        .or_else(|| match scope {
+            LimitScope::Requests => {
+                header_text(headers, "x-ratelimit-reset-requests").and_then(parse_duration)
+            }
+            LimitScope::Tokens => {
+                header_text(headers, "x-ratelimit-reset-tokens").and_then(parse_duration)
+            }
+            LimitScope::Unknown => None,
+        });
+    let quota = [code, kind].iter().any(|marker| {
+        matches!(
+            *marker,
+            "insufficient_quota"
+                | "quota_exceeded"
+                | "quota_exhausted"
+                | "billing_hard_limit_reached"
+                | "billing_not_active"
+                | "insufficient_balance"
+                | "credit_balance_too_low"
+                | "credits_exhausted"
+        )
+    });
+    match status.as_u16() {
+        402 => UpstreamError::QuotaExhausted {
+            reset_at: wait.and_then(|wait| now.checked_add(wait)),
+        },
+        429 if quota => UpstreamError::QuotaExhausted {
+            reset_at: wait.and_then(|wait| now.checked_add(wait)),
+        },
+        429 => UpstreamError::RateLimited {
+            retry_after: wait,
+            scope,
+        },
+        401 => UpstreamError::Auth { refreshable: true },
+        403 => UpstreamError::Auth { refreshable: false },
+        408 => UpstreamError::Timeout,
+        400 | 413 | 422
+            if code == "context_length_exceeded"
+                || kind == "context_length_exceeded"
+                || message.contains("maximum context length")
+                || message.contains("too many tokens")
+                || message.contains("context window exceeded") =>
+        {
+            UpstreamError::ContextLength
+        }
+        500..=599 => UpstreamError::Server { status },
+        400..=499 => UpstreamError::BadRequest { status, body },
+        _ => bad_gateway(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ResponseEnvelope<'a> {
+    #[serde(borrow)]
+    error: Option<&'a RawValue>,
+    #[serde(borrow)]
+    choices: Option<&'a RawValue>,
+}
+
+fn embedded_error(body: &Bytes, headers: &HeaderMap, now: SystemTime) -> Option<UpstreamError> {
+    // Normal completions only pay for a byte scan; suspect envelopes borrow raw fields.
+    if memchr::memmem::find(body, b"\"error\"").is_none() && !body.contains(&b'\\') {
+        return None;
+    }
+    let envelope: ResponseEnvelope<'_> = serde_json::from_slice(body).ok()?;
+    if envelope.choices.is_some() || !envelope.error?.get().starts_with('{') {
+        return None;
+    }
+    let bounded = body.slice(..body.len().min(MAX_ERROR_BYTES));
+    let details = error_details(&bounded);
+    let status = ["status", "status_code", "code"]
+        .iter()
+        .find_map(|key| {
+            let value = details.get(*key)?;
+            let number = value
+                .as_u64()
+                .and_then(|n| u16::try_from(n).ok())
+                .or_else(|| value.as_str()?.parse().ok())?;
+            StatusCode::from_u16(number)
+                .ok()
+                .filter(|s| s.is_client_error() || s.is_server_error())
+        })
+        .unwrap_or_else(|| {
+            let code = details
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let kind = details
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if [code, kind].iter().any(|v| {
+                v.contains("quota")
+                    || v.contains("rate_limit")
+                    || v.contains("billing")
+                    || v.contains("balance")
+                    || v.contains("credits")
+            }) {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::BAD_REQUEST
+            }
+        });
+    Some(classify_error(status, headers, bounded, now))
+}
+
 fn bad_gateway() -> UpstreamError {
     UpstreamError::Server {
         status: StatusCode::BAD_GATEWAY,
@@ -266,15 +478,294 @@ fn bad_gateway() -> UpstreamError {
 fn retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
     let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
     if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)));
+        return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)).min(MAX_RETRY));
     }
     let date = httpdate::parse_http_date(value).ok()?;
-    Some(date.duration_since(now).unwrap_or_default())
+    Some(date.duration_since(now).unwrap_or_default().min(MAX_RETRY))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn classify(status: u16, body: &str) -> UpstreamError {
+        classify_error(
+            StatusCode::from_u16(status).unwrap(),
+            &HeaderMap::new(),
+            Bytes::copy_from_slice(body.as_bytes()),
+            SystemTime::UNIX_EPOCH,
+        )
+    }
+
+    #[test]
+    fn classifies_status_even_without_a_valid_body() {
+        for body in ["", "not json", r#"{"error":null}"#] {
+            assert!(matches!(
+                classify(401, body),
+                UpstreamError::Auth { refreshable: true }
+            ));
+            assert!(matches!(
+                classify(403, body),
+                UpstreamError::Auth { refreshable: false }
+            ));
+            assert!(matches!(
+                classify(402, body),
+                UpstreamError::QuotaExhausted { reset_at: None }
+            ));
+            assert!(matches!(classify(408, body), UpstreamError::Timeout));
+            assert!(matches!(
+                classify(429, body),
+                UpstreamError::RateLimited {
+                    scope: LimitScope::Unknown,
+                    retry_after: None
+                }
+            ));
+            for status in [500, 503, 529, 599] {
+                assert!(
+                    matches!(classify(status, body), UpstreamError::Server { status: s } if s.as_u16() == status)
+                );
+            }
+            for status in [400, 404, 413, 422] {
+                assert!(
+                    matches!(classify(status, body), UpstreamError::BadRequest { status: s, body: b } if s.as_u16() == status && b == body)
+                );
+            }
+            assert!(matches!(
+                classify(302, body),
+                UpstreamError::Server {
+                    status: StatusCode::BAD_GATEWAY
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn recognizes_quota_and_context_markers() {
+        for field in ["code", "type"] {
+            for marker in [
+                "insufficient_quota",
+                "quota_exceeded",
+                "quota_exhausted",
+                "billing_hard_limit_reached",
+                "billing_not_active",
+                "insufficient_balance",
+                "credit_balance_too_low",
+                "credits_exhausted",
+            ] {
+                let body = format!(r#"{{"error":{{"{field}":"{marker}"}}}}"#);
+                assert!(
+                    matches!(classify(429, &body), UpstreamError::QuotaExhausted { .. }),
+                    "{body}"
+                );
+            }
+        }
+        for status in [400, 413, 422] {
+            for details in [
+                r#""code":"context_length_exceeded""#,
+                r#""message":"Maximum context length is 4096""#,
+                r#""message":"Too many tokens in prompt""#,
+            ] {
+                assert!(matches!(
+                    classify(status, &format!(r#"{{"error":{{{details}}}}}"#)),
+                    UpstreamError::ContextLength
+                ));
+            }
+        }
+        assert!(matches!(
+            classify(400, r#"{"error":{"message":"invalid token"}}"#),
+            UpstreamError::BadRequest { .. }
+        ));
+    }
+
+    #[test]
+    fn parses_bounded_durations_and_rejects_malformed_values() {
+        for (value, millis) in [
+            ("1s", 1000),
+            ("6m0s", 360000),
+            ("20ms", 20),
+            ("1h2m3.5s", 3723500),
+            ("0s", 0),
+        ] {
+            assert_eq!(
+                parse_duration(value),
+                Some(Duration::from_millis(millis)),
+                "{value}"
+            );
+        }
+        for value in ["", "-1s", "NaNs", "1", "1s garbage", "1.2.3s", "1xs"] {
+            assert_eq!(parse_duration(value), None, "{value}");
+        }
+        assert_eq!(parse_duration("999999999999999999999999h"), Some(MAX_RETRY));
+    }
+
+    #[test]
+    fn rate_limit_scope_and_retry_precedence() {
+        let mut headers = HeaderMap::new();
+        let now = SystemTime::UNIX_EPOCH;
+        let body =
+            Bytes::from_static(br#"{"error":{"message":"Rate limit on tokens per minute"}}"#);
+        let check = |headers: &HeaderMap, scope, wait| {
+            assert!(
+                matches!(classify_error(StatusCode::TOO_MANY_REQUESTS, headers, body.clone(), now), UpstreamError::RateLimited { scope: s, retry_after: w } if s == scope && w == wait)
+            );
+        };
+        check(&headers, LimitScope::Tokens, None);
+        headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("20ms"));
+        check(
+            &headers,
+            LimitScope::Tokens,
+            Some(Duration::from_millis(20)),
+        );
+        headers.insert(
+            "x-ratelimit-remaining-requests",
+            HeaderValue::from_static("0"),
+        );
+        headers.insert(
+            "x-ratelimit-reset-requests",
+            HeaderValue::from_static("6m0s"),
+        );
+        check(
+            &headers,
+            LimitScope::Requests,
+            Some(Duration::from_secs(360)),
+        );
+        headers.insert("retry-after-ms", HeaderValue::from_static("1250"));
+        check(
+            &headers,
+            LimitScope::Requests,
+            Some(Duration::from_millis(1250)),
+        );
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
+        check(&headers, LimitScope::Requests, Some(Duration::from_secs(2)));
+        assert!(
+            matches!(classify_error(StatusCode::TOO_MANY_REQUESTS, &headers, Bytes::from_static(br#"{"error":{"code":"insufficient_quota"}}"#), now), UpstreamError::QuotaExhausted { reset_at: Some(reset) } if reset == now + Duration::from_secs(2))
+        );
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("bad"));
+        headers.insert("retry-after-ms", HeaderValue::from_static("NaN"));
+        check(
+            &headers,
+            LimitScope::Requests,
+            Some(Duration::from_secs(360)),
+        );
+        headers.insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_static("999999999999999999999999"),
+        );
+        check(&headers, LimitScope::Requests, Some(MAX_RETRY));
+    }
+
+    #[test]
+    fn observations_include_resets_without_counts_and_ignore_bad_headers() {
+        let adapter = OpenAiCompat::new("test");
+        let mut headers = HeaderMap::new();
+        assert_eq!(adapter.observe_limits(&headers), None);
+        headers.insert(
+            "x-ratelimit-remaining-requests",
+            HeaderValue::from_static("invalid"),
+        );
+        headers.insert(
+            "x-ratelimit-reset-tokens",
+            HeaderValue::from_static("invalid"),
+        );
+        assert_eq!(adapter.observe_limits(&headers), None);
+        headers.insert(
+            "x-ratelimit-reset-requests",
+            HeaderValue::from_static("1h2m3.5s"),
+        );
+        assert_eq!(
+            adapter.observe_limits(&headers).unwrap().reset_requests,
+            Some(Duration::from_millis(3723500))
+        );
+        headers.insert(
+            "x-ratelimit-remaining-requests",
+            HeaderValue::from_static("0"),
+        );
+        headers.insert(
+            "x-ratelimit-remaining-tokens",
+            HeaderValue::from_static("42"),
+        );
+        headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("20ms"));
+        assert_eq!(
+            adapter.observe_limits(&headers),
+            Some(LimitObservation {
+                remaining_requests: Some(0),
+                remaining_tokens: Some(42),
+                reset_requests: Some(Duration::from_millis(3723500)),
+                reset_tokens: Some(Duration::from_millis(20))
+            })
+        );
+    }
+
+    #[test]
+    fn detects_only_error_envelopes_without_choices() {
+        let headers = HeaderMap::new();
+        let now = SystemTime::UNIX_EPOCH;
+        for raw in [
+            "",
+            "not json",
+            r#"{"choices":[]}"#,
+            r#"{"choices":[],"error":{"code":429}}"#,
+            r#"{"error":"not an object"}"#,
+            r#"{"message":"error"}"#,
+        ] {
+            assert!(
+                embedded_error(&Bytes::copy_from_slice(raw.as_bytes()), &headers, now).is_none()
+            );
+        }
+        for (raw, kind) in [
+            (
+                r#"{"error":{"code":"insufficient_quota"}}"#,
+                llmux_types::ErrorKind::QuotaExhausted,
+            ),
+            (
+                r#"{"error":{"code":429}}"#,
+                llmux_types::ErrorKind::RateLimited,
+            ),
+            (r#"{"error":{"status":401}}"#, llmux_types::ErrorKind::Auth),
+            (
+                r#"{"error":{"status_code":"529"}}"#,
+                llmux_types::ErrorKind::ServerError,
+            ),
+            (
+                r#"{"error":{"code":"context_length_exceeded"}}"#,
+                llmux_types::ErrorKind::ContextLength,
+            ),
+            (
+                r#"{"err\u006fr":{"message":"invalid"}}"#,
+                llmux_types::ErrorKind::BadRequest,
+            ),
+        ] {
+            assert_eq!(
+                embedded_error(&Bytes::copy_from_slice(raw.as_bytes()), &headers, now)
+                    .unwrap()
+                    .kind(),
+                kind,
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn error_collection_is_bounded_and_retains_partial_bytes_on_failure() {
+        use futures_util::FutureExt;
+        use http_body_util::{Full, StreamBody};
+        use hyper::body::Frame;
+        let body = Full::new(Bytes::from(vec![b'x'; MAX_ERROR_BYTES + 1]));
+        assert_eq!(
+            collect_error(body).now_or_never().unwrap().len(),
+            MAX_ERROR_BYTES
+        );
+        let frames = futures_util::stream::iter([
+            Ok(Frame::data(Bytes::from_static(b"partial"))),
+            Err(std::io::Error::other("read failed")),
+        ]);
+        assert_eq!(
+            collect_error(StreamBody::new(frames))
+                .now_or_never()
+                .unwrap(),
+            "partial"
+        );
+    }
 
     #[test]
     fn replaces_only_the_top_level_model_and_preserves_raw_fields() {
