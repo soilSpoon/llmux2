@@ -1,3 +1,4 @@
+use crate::sse;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use llmux_types::{BoxStream, BuildError, SseEvent, UpstreamError, Usage};
@@ -251,7 +252,7 @@ impl Translator {
 
     fn push(&mut self, data: &str) -> Result<Vec<SseEvent>, ()> {
         let mut events = Vec::new();
-        if data == "[DONE]" {
+        if data == sse::DONE {
             if !self.started {
                 return Err(());
             }
@@ -424,7 +425,7 @@ pub(crate) fn stream(
         let mut bytes_sent = 0;
         while let Some(event) = upstream.next().await {
             let event = event?;
-            let done = event.data == "[DONE]";
+            let done = event.data == sse::DONE;
             for translated in translator.push(&event.data).map_err(|()| UpstreamError::StreamBroken { bytes_sent })? {
                 bytes_sent += translated.data.len() as u64;
                 yield translated;

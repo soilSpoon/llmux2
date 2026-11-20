@@ -376,17 +376,7 @@ impl ProviderAdapter for OpenAiCompat {
         }
 
         if req.stream {
-            let is_sse = parts
-                .headers
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| {
-                    v.split(';')
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .eq_ignore_ascii_case("text/event-stream")
-                });
+            let is_sse = sse::is_event_stream(&parts.headers);
             if !is_sse {
                 return Err(bad_gateway());
             }
