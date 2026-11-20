@@ -4,33 +4,81 @@ use llmux_types::provider::{ANTHROPIC as KIND_ANTHROPIC, OPENAI_COMPAT as KIND_O
 use serde_json::{json, Value};
 use std::net::IpAddr;
 
-pub(super) const PROVIDER_ALIASES: &[(&str, &str)] = &[("ds", "deepseek"), ("kc", "kilocode")];
+pub(super) const PROVIDER_ALIASES: &[(&str, &str)] = &[
+    ("ds", "deepseek"),
+    ("kc", "kilocode"),
+    ("cfpd", "cloudflare-direct"),
+    ("cfp", "cloudflare-playground"),
+];
 
-pub(super) fn canonical_provider<'a>(provider: &'a str, nodes: &'a [Value]) -> &'a str {
-    if let Some((_, canonical)) = PROVIDER_ALIASES
-        .iter()
-        .find(|(alias, _)| *alias == provider)
-    {
-        return canonical;
-    }
-    nodes
-        .iter()
-        .find(|node| string(node, "prefix") == provider)
-        .map(|node| string(node, "id"))
-        .unwrap_or(provider)
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(super) enum ProviderIdentity {
+    Builtin(String),
+    Custom(String),
 }
 
-pub(super) fn model_id<'a>(raw: &'a str, provider: &str, nodes: &[Value]) -> &'a str {
-    let node = nodes.iter().find(|node| string(node, "id") == provider);
+impl ProviderIdentity {
+    pub(super) fn as_str(&self) -> &str {
+        match self {
+            Self::Builtin(id) | Self::Custom(id) => id,
+        }
+    }
+
+    pub(super) fn is_builtin(&self, id: &str) -> bool {
+        matches!(self, Self::Builtin(value) if value == id)
+    }
+
+    pub(super) fn connection(provider: &str, nodes: &[Value]) -> Self {
+        if nodes.iter().any(|node| string(node, "id") == provider) {
+            Self::Custom(provider.into())
+        } else {
+            Self::builtin(provider)
+        }
+    }
+
+    fn builtin(provider: &str) -> Self {
+        Self::Builtin(
+            PROVIDER_ALIASES
+                .iter()
+                .find(|(alias, _)| *alias == provider)
+                .map_or(provider, |(_, id)| *id)
+                .into(),
+        )
+    }
+
+    pub(super) fn step(&self, model: &str) -> Value {
+        json!({"kind":"model", "_resolvedProviderId":self.as_str(),
+            "_resolvedProviderKind":if matches!(self, Self::Custom(_)) {"custom"} else {"builtin"}, "model":model})
+    }
+}
+
+impl std::fmt::Display for ProviderIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub(super) fn canonical_provider(provider: &str, nodes: &[Value]) -> ProviderIdentity {
+    nodes
+        .iter()
+        .find(|node| string(node, "id") == provider || string(node, "prefix") == provider)
+        .map(|node| ProviderIdentity::Custom(string(node, "id").into()))
+        .unwrap_or_else(|| ProviderIdentity::builtin(provider))
+}
+
+pub(super) fn model_id<'a>(raw: &'a str, provider: &ProviderIdentity, nodes: &[Value]) -> &'a str {
+    let node = nodes
+        .iter()
+        .find(|node| matches!(provider, ProviderIdentity::Custom(id) if id == string(node, "id")));
     let mut model = raw;
     loop {
         let Some((segment, rest)) = model.split_once('/') else {
             return model;
         };
-        if segment == provider
+        if segment == provider.as_str()
             || PROVIDER_ALIASES
                 .iter()
-                .any(|(alias, id)| *id == provider && *alias == segment)
+                .any(|(alias, id)| provider.is_builtin(id) && *alias == segment)
             || node.is_some_and(|node| segment == string(node, "prefix"))
         {
             model = rest;
@@ -43,7 +91,10 @@ pub(super) fn model_id<'a>(raw: &'a str, provider: &str, nodes: &[Value]) -> &'a
     }
 }
 
-pub(super) fn model_target<'a>(step: &'a Value, nodes: &'a [Value]) -> Option<(&'a str, &'a str)> {
+pub(super) fn model_target<'a>(
+    step: &'a Value,
+    nodes: &[Value],
+) -> Option<(ProviderIdentity, &'a str)> {
     let raw = step
         .as_str()
         .unwrap_or_else(|| string(step, "model"))
@@ -64,12 +115,15 @@ pub(super) fn model_target<'a>(step: &'a Value, nodes: &'a [Value]) -> Option<(&
     let canonical = if resolved.is_empty() {
         canonical_provider(provider, nodes)
     } else {
-        resolved
+        match string(step, "_resolvedProviderKind") {
+            "custom" => ProviderIdentity::Custom(resolved.into()),
+            _ => ProviderIdentity::Builtin(resolved.into()),
+        }
     };
     let model = if resolved.is_empty()
-        && (!provider_id.is_empty() || nodes.iter().any(|node| string(node, "id") == canonical))
+        && (!provider_id.is_empty() || matches!(canonical, ProviderIdentity::Custom(_)))
     {
-        model_id(model, canonical, nodes)
+        model_id(model, &canonical, nodes)
     } else {
         model
     };

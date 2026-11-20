@@ -2,21 +2,23 @@ use crate::{aliases, array, string, unique, upstream, OmniRouteFallback};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-struct CodexRoutes<'a> {
+struct SourceRoutes<'a> {
     root: &'a Value,
     combos: &'a HashMap<String, Value>,
     combo_ids: &'a HashMap<String, String>,
     aliases: BTreeMap<String, String>,
+    restricted: &'static str,
+    label: &'static str,
 }
 
-impl CodexRoutes<'_> {
+impl SourceRoutes<'_> {
     fn provider(&self, provider: &str) -> bool {
         let nodes = array(self.root, "providerNodes");
         let canonical = upstream::canonical_provider(provider, nodes);
-        canonical == "codex"
-            || nodes
-                .iter()
-                .any(|node| string(node, "id") == canonical && string(node, "prefix") == "codex")
+        canonical.as_str() == self.restricted || nodes.iter().any(|node| {
+            matches!(&canonical, upstream::ProviderIdentity::Custom(id) if id == string(node, "id"))
+                && string(node, "prefix") == self.restricted
+        })
     }
 
     fn reaches(
@@ -26,7 +28,10 @@ impl CodexRoutes<'_> {
         budget: &mut usize,
     ) -> Result<bool, String> {
         if *budget == 0 || stack.len() >= 128 {
-            return Err("Codex exclusion discovery exceeded its safety budget".into());
+            return Err(format!(
+                "{} exclusion discovery exceeded its safety budget",
+                self.label
+            ));
         }
         *budget -= 1;
         if !stack.insert(name.to_owned()) {
@@ -43,6 +48,12 @@ impl CodexRoutes<'_> {
         stack: &mut HashSet<String>,
         budget: &mut usize,
     ) -> Result<bool, String> {
+        if name
+            .split_once('/')
+            .is_some_and(|(provider, _)| self.provider(provider))
+        {
+            return Ok(true);
+        }
         if let Some(combo) = self.combos.get(name) {
             for step in array(combo, "models") {
                 let raw = step
@@ -100,12 +111,12 @@ impl CodexRoutes<'_> {
     }
 }
 
-fn insert(exclusions: &mut BTreeSet<String>, pattern: &str) -> Result<(), String> {
+fn insert(exclusions: &mut BTreeSet<String>, pattern: &str, label: &str) -> Result<(), String> {
     if pattern.is_empty()
         || pattern.contains('?')
         || pattern.strip_suffix('*').unwrap_or(pattern).contains('*')
     {
-        return Err(format!("Codex exclusion pattern cannot be represented as an exact ID or a single trailing * prefix: {pattern:?}"));
+        return Err(format!("{label} exclusion pattern cannot be represented as an exact ID or a single trailing * prefix: {pattern:?}"));
     }
     exclusions.insert(pattern.to_owned());
     Ok(())
@@ -115,17 +126,25 @@ pub(super) fn exclusions(
     root: &Value,
     combos: &HashMap<String, Value>,
     combo_ids: &HashMap<String, String>,
+    restricted: &'static str,
 ) -> Result<BTreeSet<String>, String> {
-    let routes = CodexRoutes {
+    let label = if restricted == "codex" {
+        "Codex"
+    } else {
+        "OpenRouter"
+    };
+    let routes = SourceRoutes {
         root,
         combos,
         combo_ids,
         aliases: aliases::alias_map(root, &mut Vec::new()),
+        restricted,
+        label,
     };
-    let mut excluded = BTreeSet::from(["codex/*".to_owned()]);
+    let mut excluded = BTreeSet::from([format!("{restricted}/*")]);
     for (alias, provider) in upstream::PROVIDER_ALIASES {
         if routes.provider(provider) {
-            insert(&mut excluded, &format!("{alias}/*"))?;
+            insert(&mut excluded, &format!("{alias}/*"), label)?;
         }
     }
     for node in array(root, "providerNodes") {
@@ -133,14 +152,14 @@ pub(super) fn exclusions(
             for field in ["id", "prefix"] {
                 let prefix = string(node, field);
                 if !prefix.is_empty() {
-                    insert(&mut excluded, &format!("{prefix}/*"))?;
+                    insert(&mut excluded, &format!("{prefix}/*"), label)?;
                 }
             }
         }
     }
     for name in combos.keys().chain(routes.aliases.keys()) {
         if routes.contains(name)? {
-            insert(&mut excluded, name)?;
+            insert(&mut excluded, name, label)?;
         }
     }
     for mapping in array(root, "modelComboMappings")
@@ -149,7 +168,7 @@ pub(super) fn exclusions(
     {
         if let Some(target) = combo_ids.get(string(mapping, "comboId")) {
             if routes.contains(target)? {
-                insert(&mut excluded, string(mapping, "pattern"))?;
+                insert(&mut excluded, string(mapping, "pattern"), label)?;
             }
         }
     }
@@ -176,9 +195,9 @@ pub(super) fn append(
     for model in models.iter_mut() {
         let name = string(model, "name").to_owned();
         if model.get("allowed_keys").is_some() || is_excluded(&excluded, &name) {
-            insert(&mut excluded, &name)?;
+            insert(&mut excluded, &name, "Fallback")?;
             for alias in array(model, "aliases").iter().filter_map(Value::as_str) {
-                insert(&mut excluded, alias)?;
+                insert(&mut excluded, alias, "Fallback")?;
             }
             continue;
         }
