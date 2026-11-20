@@ -3,6 +3,125 @@ use serde_json::{json, Value};
 use std::{fs, process::Command};
 
 const FIXTURE: &str = include_str!("fixtures/export.json");
+const DB_FIXTURE: &str = include_str!("fixtures/db-dump.json");
+
+#[test]
+fn imports_raw_sqlite_dump_through_shared_mapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("llmux.toml");
+    let report = llmux_import::import(DB_FIXTURE, &output, None).unwrap();
+    assert_eq!(
+        (
+            report.models,
+            report.deployments,
+            report.credentials,
+            report.client_keys
+        ),
+        (2, 4, 3, 1)
+    );
+    let config = RuntimeConfig::load(&output).unwrap();
+    let deployments = config.models[config.model_names["fallback"]]
+        .deployments
+        .iter()
+        .map(|index| {
+            let deployment = &config.deployments[index.0 as usize];
+            (
+                deployment.credential.to_string(),
+                deployment.upstream_model.to_string(),
+                deployment.priority,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        deployments,
+        vec![
+            ("upstream-fast".into(), "test".into(), 0),
+            ("upstream-slow".into(), "test".into(), 1),
+            ("upstream-custom".into(), "model".into(), 2),
+        ]
+    );
+    let pinned = &config.models[config.model_names["pinned"]].deployments;
+    assert_eq!(
+        config.deployments[pinned[0].0 as usize]
+            .credential
+            .to_string(),
+        "upstream-slow"
+    );
+    assert_eq!(
+        config.deployments[2].base_url.to_string(),
+        "https://example.com/v1"
+    );
+    let warnings = report.warnings.join("\n");
+    assert!(warnings.contains("unusable): skipped usable: false"));
+    assert!(warnings.contains("step 2: skipped usable: false"));
+    assert!(warnings.contains("inactive): skipped inactive"));
+    let text = fs::read_to_string(output).unwrap();
+    for secret in [
+        "test-db-slow-secret",
+        "test-db-fast-secret",
+        "test-db-client-secret",
+        "<REDACTED:synthetic:api_key>",
+    ] {
+        assert!(!text.contains(secret));
+        assert!(!warnings.contains(secret));
+    }
+    assert_eq!(
+        fs::read_to_string(dir.path().join("secrets/upstream-custom")).unwrap(),
+        "<REDACTED:synthetic:api_key>"
+    );
+    assert!(!dir.path().join("secrets/upstream-unusable").exists());
+    assert!(!dir.path().join("secrets/upstream-inactive").exists());
+}
+
+#[test]
+fn rejects_malformed_dump_columns_without_logging_values() {
+    for (field, value) in [
+        ("provider_connections", json!({})),
+        ("provider_nodes", json!(false)),
+        ("api_keys", json!("sensitive-invalid-data")),
+    ] {
+        let mut root: Value = serde_json::from_str(DB_FIXTURE).unwrap();
+        root[field] = value;
+        let dir = tempfile::tempdir().unwrap();
+        let error = llmux_import::import(&root.to_string(), &dir.path().join("out.toml"), None)
+            .err()
+            .unwrap();
+        assert!(error.contains("must be an array"));
+        assert!(!error.contains("sensitive-invalid-data"));
+    }
+    for value in [json!(2), json!("0")] {
+        let mut root: Value = serde_json::from_str(DB_FIXTURE).unwrap();
+        root["provider_connections"][0]["is_active"] = value;
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            llmux_import::import(&root.to_string(), &dir.path().join("out.toml"), None).is_err()
+        );
+    }
+}
+
+#[test]
+fn dump_json_columns_fail_closed_and_empty_dump_is_rejected() {
+    for value in [json!("sensitive-invalid-data"), json!([])] {
+        let mut root: Value = serde_json::from_str(DB_FIXTURE).unwrap();
+        root["provider_nodes"][0]["custom_headers_json"] = value;
+        let dir = tempfile::tempdir().unwrap();
+        let error = llmux_import::import(&root.to_string(), &dir.path().join("out.toml"), None)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            "provider_nodes.custom_headers_json must contain a JSON object"
+        );
+        assert!(!dir.path().join("secrets").exists());
+    }
+    let dir = tempfile::tempdir().unwrap();
+    assert!(llmux_import::import(
+        r#"{"provider_connections":[],"combos":[]}"#,
+        &dir.path().join("out.toml"),
+        None
+    )
+    .is_err());
+}
 
 #[test]
 fn imports_and_validates_real_config() {

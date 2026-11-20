@@ -1,0 +1,19 @@
+{
+  "provider_nodes": [
+    {"id":"node-test","type":"openai-compatible","prefix":"custom","api_type":"chat","base_url":"https://example.com/v1","chat_path":"","custom_headers_json":"{}"}
+  ],
+  "provider_connections": [
+    {"id":"slow","provider":"openai","auth_type":"apikey","is_active":1,"api_key":"test-db-slow-secret","priority":9},
+    {"id":"fast","provider":"openai","auth_type":"apikey","is_active":1,"api_key":"test-db-fast-secret","priority":1},
+    {"id":"custom","provider":"node-test","auth_type":"apikey","is_active":1,"api_key":"<REDACTED:synthetic:api_key>","provider_specific_data":"{\"baseUrl\":\"https://example.com/v1\"}"},
+    {"id":"inactive","provider":"openai","auth_type":"apikey","is_active":0,"api_key":"test-db-inactive-secret"},
+    {"id":"unusable","provider":"openai","auth_type":"apikey","is_active":1,"usable":false,"api_key":"test-db-unusable-secret"}
+  ],
+  "combos": [
+    {"id":"combo-1","name":"fallback","data":{"name":"fallback","strategy":"priority","models":["openai/test",{"kind":"model","providerId":"node-test","model":"node-test/model","connectionId":"custom"},{"kind":"model","providerId":"openai","model":"omitted","connectionId":"slow","usable":false},{"kind":"model","providerId":"openai","model":"unusable","connectionId":"unusable"}]}},
+    {"id":"combo-2","name":"pinned","data":"{\"name\":\"pinned\",\"strategy\":\"priority\",\"models\":[{\"kind\":\"model\",\"providerId\":\"openai\",\"model\":\"pin\",\"connectionId\":\"slow\"}]}"}
+  ],
+  "api_keys": [{"id":"client","key":"test-db-client-secret","is_active":1,"allowed_models":[]}],
+  "model_combo_mappings": [],
+  "key_value": {"modelAliases": {"ignored":"openai/test"}}
+}

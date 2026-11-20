@@ -1,4 +1,6 @@
-//! Import OmniRoute legacy JSON exports into a static llmux configuration.
+//! Import OmniRoute JSON exports and SQLite table dumps into a static llmux configuration.
+
+mod db_dump;
 
 use serde_json::{json, Value};
 use std::{
@@ -205,6 +207,11 @@ impl Expander<'_> {
                 break;
             }
             self.remaining_steps -= 1;
+            if step["usable"] == false {
+                self.warnings
+                    .push(format!("combo {name} step {index}: skipped usable: false"));
+                continue;
+            }
             if out.len() >= 10_000 {
                 self.warnings.push(format!(
                     "combo {name}: skipped remaining steps at 10000-deployment safety limit"
@@ -339,6 +346,12 @@ pub fn import(
         return Err("export must be a JSON object".into());
     }
     let mut warnings = Vec::new();
+    let root = if root.get("provider_connections").is_some() {
+        warnings.push("SQLite table dump: normalized rows; unrelated roots are ignored".into());
+        db_dump::normalize(&root)?
+    } else {
+        root
+    };
     match root["_meta"]["version"].as_str() {
         Some("omniroute-v3-legacy-export") => {}
         None => warnings.push("missing export version; interpreting as legacy db.json".into()),
@@ -385,7 +398,9 @@ pub fn import(
     let mut source_ids = HashSet::new();
     for (index, c) in array(&root, "providerConnections").iter().enumerate() {
         let label = format!("connection {index} ({})", string(c, "id"));
-        let reason = if c["isActive"] == false {
+        let reason = if c["usable"] == false {
+            Some("usable: false")
+        } else if c["isActive"] == false {
             Some("inactive")
         } else if !matches!(string(c, "authType"), "apikey" | "api_key" | "api-key") {
             Some("OAuth/token or unsupported auth")
