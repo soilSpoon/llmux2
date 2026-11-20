@@ -34,7 +34,7 @@ fn replacement(provider: &str) -> Option<&'static str> {
         "cloudflare-direct" | "cloudflare-playground" | "cfpd" | "cfp" => Some(
             "replace with a Cloudflare Workers AI account API token at https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1 and a free-eligible model",
         ),
-        "duckduckgo-web" | "deepai" | "deepai-code" => Some("no official replacement; dropped"),
+        "duckduckgo-web" | "ddgw" => Some("Duck.ai has no supported inference API for gateway use"),
         _ => None,
     }
 }

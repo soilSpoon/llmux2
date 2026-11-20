@@ -10,6 +10,140 @@ fn fixture() -> Value {
     })
 }
 
+#[test]
+fn imports_only_recognized_deepai_text_models() {
+    let mut root = fixture();
+    root["providerConnections"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id":"deepai-key", "provider":"deepai", "authType":"apikey", "apiKey":"synthetic-deepai"
+        }));
+    root["combos"].as_array_mut().unwrap().extend([
+        json!({"name":"text", "models":["deepai/text-generator"]}),
+        json!({"name":"summary", "models":["deepai/summarization"]}),
+        json!({"name":"image", "models":["deepai/text2img"]}),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let config = RuntimeConfig::load(&output).unwrap();
+    for (name, upstream) in [("text", "text-generator"), ("summary", "summarization")] {
+        let model = &config.models[config.model_names[name]];
+        let dep = &config.deployments[model.deployments[0].0 as usize];
+        assert_eq!(dep.provider.0.as_ref(), "deepai");
+        assert_eq!(dep.base_url, "https://api.deepai.org/api");
+        assert_eq!(dep.upstream_model.as_ref(), upstream);
+    }
+    assert!(!config.model_names.contains_key("image"));
+    assert!(!config.model_names.contains_key("deepai/text2img"));
+    assert!(!std::fs::read_to_string(output)
+        .unwrap()
+        .contains("synthetic-deepai"));
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("unsupported DeepAI text model")));
+}
+
+#[test]
+fn imports_reviewed_deepai_code_sidecar_as_openai_compatible() {
+    for provider in ["deepai-code", "custom-deepai"] {
+        let mut root = fixture();
+        let endpoint = "http://127.0.0.1:8790/deepai/v1";
+        let prefix = if provider == "deepai-code" {
+            "deepai-code"
+        } else {
+            root["providerNodes"] = json!([{
+                "id":provider, "prefix":"deepai", "type":"openai-compatible", "baseUrl":endpoint
+            }]);
+            "deepai"
+        };
+        root["providerConnections"].as_array_mut().unwrap().push(json!({
+            "id":"sidecar", "provider":provider, "authType":"api-key", "apiKey":"synthetic-sidecar",
+            "providerSpecificData":{"baseUrl":endpoint}
+        }));
+        root["combos"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name":"code", "models":[format!("{prefix}/example-code")]}));
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out.toml");
+        llmux_import::import(&root.to_string(), &output, None).unwrap();
+        let config = RuntimeConfig::load(output).unwrap();
+        let model = &config.models[config.model_names["code"]];
+        let deployment = &config.deployments[model.deployments[0].0 as usize];
+        assert_eq!(deployment.provider.0.as_ref(), "openai_compat");
+        assert_eq!(deployment.base_url, endpoint);
+        assert_eq!(deployment.upstream_model.as_ref(), "example-code");
+    }
+}
+
+#[test]
+fn deepai_code_sidecar_without_key_stays_unavailable() {
+    let mut root = fixture();
+    root["providerNodes"] = json!([{
+        "id":"custom-deepai", "prefix":"deepai", "type":"openai-compatible",
+        "baseUrl":"http://127.0.0.1:8790/deepai/v1"
+    }]);
+    root["providerConnections"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id":"sidecar", "provider":"custom-deepai", "authType":"none",
+        }));
+    root["combos"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name":"code", "models":["deepai/example-code"]}));
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let config = RuntimeConfig::load(output).unwrap();
+    assert!(!config.model_names.contains_key("code"));
+    assert_eq!(report.credentials, 1);
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("DeepAI Code sidecar requires an API key")));
+}
+
+#[test]
+fn reserves_native_deepai_text_ids_when_code_uses_the_deepai_prefix() {
+    let mut root = fixture();
+    root["providerNodes"] = json!([{
+        "id":"custom-deepai", "prefix":"deepai", "type":"openai-compatible",
+        "baseUrl":"http://127.0.0.1:8790/deepai/v1"
+    }]);
+    root["providerConnections"].as_array_mut().unwrap().extend([
+        json!({"id":"native","provider":"deepai","authType":"apikey","apiKey":"synthetic-native"}),
+        json!({"id":"code","provider":"custom-deepai","authType":"apikey","apiKey":"synthetic-code"}),
+    ]);
+    root["combos"].as_array_mut().unwrap().extend([
+        json!({"name":"text","models":["deepai/text-generator"]}),
+        json!({"name":"code","models":["deepai/example-code"]}),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let config = RuntimeConfig::load(output).unwrap();
+    for (name, provider) in [
+        ("text", "deepai"),
+        ("deepai/text-generator", "deepai"),
+        ("code", "openai_compat"),
+        ("deepai/example-code", "openai_compat"),
+    ] {
+        let model = &config.models[config.model_names[name]];
+        assert_eq!(
+            config.deployments[model.deployments[0].0 as usize]
+                .provider
+                .0
+                .as_ref(),
+            provider
+        );
+    }
+}
+
 fn import_with_free_kilo(root: &Value, output: &std::path::Path) -> llmux_import::ImportReport {
     let catalog = output.with_extension("models.json");
     let models = ["vendor/free", "vendor/test:free", "openrouter/free"]
@@ -366,14 +500,21 @@ fn skip_precedence_is_explicit_and_replacement_warnings_are_static() {
             "apikey",
             "",
             "",
-            "no official replacement; dropped",
+            "Duck.ai has no supported inference API for gateway use",
         ),
         (
             "custom-deepai",
             "apikey",
             "test-key",
             "deepai",
-            "no official replacement; dropped",
+            "loopback/localhost upstream",
+        ),
+        (
+            "deepai",
+            "apikey",
+            "test-key",
+            "",
+            "DeepAI requires its official text API base URL",
         ),
         (
             "custom-hms",

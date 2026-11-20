@@ -25,7 +25,7 @@ use llmux_config::{ApiKey, RuntimeConfig};
 use llmux_core::{Executor, GatewayError};
 use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
 use llmux_providers::{
-    truncate_middle_for_format, Anthropic, OpenAiCompat, OpenAiResponses, RequestMetadata,
+    truncate_middle_for_format, Anthropic, DeepAi, OpenAiCompat, OpenAiResponses, RequestMetadata,
     StaticKey,
 };
 use llmux_types::{
@@ -42,6 +42,7 @@ const ATTEMPTS_HEADER: HeaderName = HeaderName::from_static("x-llmux-attempts");
 const CONTEXT_OVERFLOW_HEADER: HeaderName = HeaderName::from_static("x-llmux-context-overflow");
 const DROPPED_MESSAGES_HEADER: HeaderName = HeaderName::from_static("x-llmux-dropped-messages");
 const ANTHROPIC_KEY_HEADER: HeaderName = HeaderName::from_static(provider::ANTHROPIC_KEY_HEADER);
+const DEEPAI_KEY_HEADER: HeaderName = HeaderName::from_static(provider::DEEPAI_KEY_HEADER);
 
 struct Active {
     config: Arc<RuntimeConfig>,
@@ -62,6 +63,7 @@ fn provider_registry() -> ProviderRegistry {
     }
     registry.register(Arc::new(Anthropic::new(provider::ANTHROPIC)));
     registry.register(Arc::new(OpenAiResponses::new()));
+    registry.register(Arc::new(DeepAi::new()));
     registry
 }
 
@@ -72,10 +74,10 @@ fn static_sources(
     std::mem::take(&mut config.api_keys)
         .into_iter()
         .map(|(id, ApiKey { provider, key })| {
-            let source = if &*provider.0 == provider::ANTHROPIC {
-                StaticKey::header(ANTHROPIC_KEY_HEADER, &key)?
-            } else {
-                StaticKey::bearer(&key)?
+            let source = match provider.0.as_ref() {
+                provider::ANTHROPIC => StaticKey::header(ANTHROPIC_KEY_HEADER, &key)?,
+                provider::DEEPAI => StaticKey::header(DEEPAI_KEY_HEADER, &key)?,
+                _ => StaticKey::bearer(&key)?,
             };
             Ok((id, Arc::new(source) as Arc<dyn CredentialSource>))
         })

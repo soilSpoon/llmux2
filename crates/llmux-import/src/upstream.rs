@@ -1,8 +1,14 @@
 use crate::{string, PROVIDERS};
 use http::Uri;
-use llmux_types::provider::{ANTHROPIC as KIND_ANTHROPIC, OPENAI_COMPAT as KIND_OPENAI_COMPAT};
+use llmux_types::provider::{
+    ANTHROPIC as KIND_ANTHROPIC, DEEPAI as KIND_DEEPAI, DEEPAI_TEXT_MODELS,
+    OPENAI_COMPAT as KIND_OPENAI_COMPAT,
+};
 use serde_json::{json, Value};
 use std::net::IpAddr;
+
+pub(super) const DEEPAI_BASE: &str = "https://api.deepai.org/api";
+const DEEPAI_CODE_SIDECAR: &str = "http://127.0.0.1:8790/deepai/v1";
 
 pub(super) const PROVIDER_ALIASES: &[(&str, &str)] = &[
     ("ds", "deepseek"),
@@ -127,6 +133,15 @@ pub(super) fn model_target<'a>(
     } else {
         model
     };
+    let canonical = if resolved.is_empty()
+        && provider == KIND_DEEPAI
+        && DEEPAI_TEXT_MODELS.contains(&model)
+        && matches!(&canonical, ProviderIdentity::Custom(id) if id != provider)
+    {
+        ProviderIdentity::builtin(provider)
+    } else {
+        canonical
+    };
     if provider.is_empty()
         || model.is_empty()
         || model.contains('*')
@@ -201,17 +216,16 @@ fn horde_base_url(url: &str) -> Result<&'static str, &'static str> {
 pub(super) fn resolve(
     connection: &Value,
     nodes: &[Value],
+    keyed: bool,
     warnings: &mut Vec<String>,
 ) -> Result<(String, String), &'static str> {
     let id = string(connection, "provider");
+    let node = nodes.iter().find(|node| string(node, "id") == id);
     let (kind, fallback) = if let Some((_, kind, url)) = PROVIDERS.iter().find(|(p, _, _)| *p == id)
     {
         (*kind, *url)
     } else {
-        let node = nodes
-            .iter()
-            .find(|node| string(node, "id") == id)
-            .ok_or("unknown/non-compatible provider or custom protocol settings")?;
+        let node = node.ok_or("unknown/non-compatible provider or custom protocol settings")?;
         let kind = match string(node, "type") {
             "openai-compatible"
                 if matches!(string(node, "apiType"), "" | "chat" | "chat-completions") =>
@@ -237,9 +251,33 @@ pub(super) fn resolve(
     if url.is_empty() {
         return Err("missing upstream base URL");
     }
-    let url = if ProviderIdentity::connection(id, nodes).is_builtin("morph")
-        && local_host(url, false)
+    let suffix = match kind {
+        KIND_ANTHROPIC => "/messages",
+        KIND_OPENAI_COMPAT | llmux_types::provider::OPENAI => "/chat/completions",
+        _ => "",
+    };
+    let url = url.strip_suffix(suffix).unwrap_or(url);
+    let provider = ProviderIdentity::connection(id, nodes);
+    if kind == KIND_DEEPAI && url != DEEPAI_BASE {
+        return Err("DeepAI requires its official text API base URL");
+    }
+    if kind == KIND_OPENAI_COMPAT
+        && url == DEEPAI_CODE_SIDECAR
+        && (provider.is_builtin("deepai-code")
+            || node.is_some_and(|node| {
+                string(node, "prefix") == "deepai" && string(node, "type") == "openai-compatible"
+            }))
     {
+        if !keyed {
+            return Err("DeepAI Code sidecar requires an API key");
+        }
+        warnings.push(format!(
+            "connection {}: reviewed DeepAI Code sidecar must be reachable on the llmux2 host",
+            string(connection, "id")
+        ));
+        return Ok((kind.into(), url.into()));
+    }
+    let url = if provider.is_builtin("morph") && local_host(url, false) {
         warnings.push(format!("connection {}: reviewed Morph loopback override replaced with official https://api.morphllm.com/v1", string(connection, "id")));
         super::morph::OFFICIAL_URL
     } else if local_host(url, true) {
@@ -247,12 +285,6 @@ pub(super) fn resolve(
     } else {
         url
     };
-    let suffix = if kind == KIND_ANTHROPIC {
-        "/messages"
-    } else {
-        "/chat/completions"
-    };
-    let url = url.strip_suffix(suffix).unwrap_or(url);
     let url = if id == "gemini" {
         gemini_base_url(url)?
     } else if id == "aihorde" {

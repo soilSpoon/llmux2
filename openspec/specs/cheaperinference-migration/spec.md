@@ -103,8 +103,9 @@ THEN the deployment imports successfully without strip_request_fields.
 ### Requirement: Reviewed Morph official migration and logprobs order
 The importer SHALL migrate only built-in Morph loopback connection overrides to
 `https://api.morphllm.com/v1`, warning about the reviewed endpoint substitution.
-Other loopback providers, custom nodes, nonofficial Morph hosts and unspecified
-bind addresses SHALL remain excluded. The existing Morph credential is reused.
+Other loopback providers, custom nodes, nonofficial Morph hosts, and unspecified
+bind addresses SHALL remain excluded except for the reviewed DeepAI Code sidecar
+below. The existing Morph credential is reused.
 
 The reviewed combo names `deepseek-v4.1-flash`, `deepseek-v4.1-flash-fast`,
 `deepseek-v4.1-flash-1017`, `deepseek-v4.1-flash-1017-fast` and
@@ -281,6 +282,25 @@ WHEN the operator supplies a snapshot
 THEN documentation identifies the snapshot as static evidence rather than
 live cost enforcement; paid models and missing pricing do not become keyed
 deployments through names or free-status hints alone.
+
+### Requirement: Direct DeepAI migration
+
+The importer SHALL accept an API key for the built-in DeepAI connection and
+route only `text-generator` and `summarization` to the official text API.
+The importer SHALL retain the explicitly configured
+`http://127.0.0.1:8790/deepai/v1` sidecar as `openai_compat` for a keyed
+`deepai-code` connection or OpenAI-compatible node with prefix `deepai`.
+The regular loopback restrictions apply to other URLs. An explicit
+same-model replacement option still takes precedence for bridge nodes.
+The two native DeepAI text IDs take precedence over the Code node's
+`deepai` prefix. The Code node's explicit ID remains distinct.
+
+#### Scenario: Distinct protocols
+
+WHEN an export contains keyed connections for the official DeepAI API and
+the reviewed local DeepAI Code sidecar
+THEN the importer selects `deepai` for supported text IDs
+and `openai_compat` for the sidecar.
 
 ### Requirement: Reviewed same-model bridge replacements
 

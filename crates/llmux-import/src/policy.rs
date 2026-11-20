@@ -1,4 +1,5 @@
 use crate::{string, ImportOptions};
+use llmux_types::provider::DEEPAI_TEXT_MODELS;
 use serde_json::Value;
 use std::{collections::HashSet, fs, path::Path};
 
@@ -7,6 +8,7 @@ pub(super) enum ModelPolicy {
     Any,
     Workers,
     KiloFree,
+    DeepAiText,
 }
 
 pub(super) struct External {
@@ -139,6 +141,10 @@ impl Policy {
     pub fn model(&self, policy: ModelPolicy, model: &str) -> Result<String, &'static str> {
         match policy {
             ModelPolicy::Any => Ok(model.to_owned()),
+            ModelPolicy::DeepAiText => DEEPAI_TEXT_MODELS
+                .contains(&model)
+                .then(|| model.to_owned())
+                .ok_or("unsupported DeepAI text model"),
             ModelPolicy::Workers => {
                 let mapped = workers_model(model)
                     .ok_or("unknown or deprecated Workers AI model (or requires paid access)")?;

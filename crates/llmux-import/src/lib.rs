@@ -14,7 +14,8 @@ mod upstream;
 mod validation;
 
 use llmux_types::provider::{
-    ANTHROPIC as KIND_ANTHROPIC, OPENAI as KIND_OPENAI, OPENAI_COMPAT as KIND_OPENAI_COMPAT,
+    ANTHROPIC as KIND_ANTHROPIC, DEEPAI as KIND_DEEPAI, OPENAI as KIND_OPENAI,
+    OPENAI_COMPAT as KIND_OPENAI_COMPAT,
 };
 use serde_json::{json, Value};
 use std::{
@@ -90,6 +91,8 @@ pub const PROVIDERS: &[(&str, &str, &str)] = &[
         "https://generativelanguage.googleapis.com/v1beta/openai",
     ),
     ("morph", KIND_OPENAI_COMPAT, "https://api.morphllm.com/v1"),
+    ("deepai", KIND_DEEPAI, upstream::DEEPAI_BASE),
+    ("deepai-code", KIND_OPENAI_COMPAT, ""),
     ("aihorde", KIND_OPENAI_COMPAT, "https://oai.aihorde.net/v1"),
     (
         "kilo",
@@ -596,7 +599,12 @@ pub fn import_with_options(
                 policy.workers.as_ref().unwrap().base_url.clone(),
             ))
         } else {
-            upstream::resolve(c, array(&root, "providerNodes"), &mut warnings)
+            upstream::resolve(
+                c,
+                array(&root, "providerNodes"),
+                matches!(auth, connection::SelectedAuth::Key(_)),
+                &mut warnings,
+            )
         } {
             Ok(provider) => provider,
             Err(reason) => {
@@ -664,16 +672,18 @@ pub fn import_with_options(
                 array(&root, "providerNodes"),
             ),
             credential,
-            kind,
             base_url,
             priority: c["priority"].as_i64().unwrap_or(0),
             policy: if policy::cloudflare(identity) {
                 policy::ModelPolicy::Workers
             } else if policy::kilo(identity) && matches!(auth, connection::SelectedAuth::Key(_)) {
                 policy::ModelPolicy::KiloFree
+            } else if kind == KIND_DEEPAI {
+                policy::ModelPolicy::DeepAiText
             } else {
                 policy::ModelPolicy::Any
             },
+            kind,
         });
         if c.get("globalPriority").is_some()
             || c.get("maxConcurrent").is_some()
