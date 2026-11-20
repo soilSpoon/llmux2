@@ -35,22 +35,37 @@ pub(crate) fn request(body: &[u8], model: &str) -> Result<Bytes, BuildError> {
                         if !matches!(role, "user" | "assistant" | "system" | "developer") {
                             return Err(BuildError::UnsupportedFormat);
                         }
+                        let mut refusal: Option<String> = None;
                         let content = match &item["content"] {
                             Value::String(s) => json!(s),
-                            Value::Array(parts) => Value::Array(parts.iter().map(|part| {
-                                match part["type"].as_str() {
-                                    Some("input_text" | "output_text") => Ok(json!({"type":"text", "text":string(&part["text"])?})),
-                                    Some("input_image") => {
-                                        let mut image = json!({"url":string(&part["image_url"])?});
-                                        if let Some(detail) = part.get("detail") { image["detail"] = detail.clone(); }
-                                        Ok(json!({"type":"image_url", "image_url":image}))
-                                    }
-                                    _ => Err(BuildError::UnsupportedFormat),
+                            Value::Array(parts) => {
+                                let mut content = Vec::new();
+                                for part in parts {
+                                    match part["type"].as_str() {
+                                        Some("input_text" | "output_text") => content.push(json!({"type":"text", "text":string(&part["text"])?})),
+                                        Some("refusal") => {
+                                            let text = string(&part["refusal"])?;
+                                            if role == "assistant" {
+                                                refusal.get_or_insert_with(String::new).push_str(text);
+                                            } else {
+                                                content.push(json!({"type":"text", "text":text}));
+                                            }
+                                        }
+                                        Some("input_image") => {
+                                            let mut image = json!({"url":string(&part["image_url"])?});
+                                            if let Some(detail) = part.get("detail") { image["detail"] = detail.clone(); }
+                                            content.push(json!({"type":"image_url", "image_url":image}));
+                                        }
+                                        _ => return Err(BuildError::UnsupportedFormat),
+                                    };
                                 }
-                            }).collect::<Result<_, _>>()?),
+                                if content.is_empty() && refusal.is_some() { Value::Null } else { Value::Array(content) }
+                            }
                             _ => return Err(BuildError::InvalidBody),
                         };
-                        messages.push(json!({"role":role, "content":content}));
+                        let mut message = json!({"role":role, "content":content});
+                        if let Some(refusal) = refusal { message["refusal"] = json!(refusal); }
+                        messages.push(message);
                     }
                     "function_call" => {
                         let call = json!({"id":string(&item["call_id"])?, "type":"function", "function":{"name":string(&item["name"])?, "arguments":string(&item["arguments"])?}});
@@ -587,6 +602,45 @@ mod tests {
                 json!({"type":"refusal","refusal":"cannot help"})
             );
         }
+    }
+
+    #[test]
+    fn replays_converted_refusal_response() {
+        for content in [Value::Null, json!("preface")] {
+            let (body, _) = complete(&serde_json::to_vec(&json!({"id":"r","choices":[{"message":{"content":content,"refusal":"cannot help"},"finish_reason":"stop"}]})).unwrap()).unwrap();
+            let response: Value = serde_json::from_slice(&body).unwrap();
+            let chat = convert(json!({"input":response["output"]}));
+            assert_eq!(chat["messages"][0]["refusal"], "cannot help");
+            assert_eq!(
+                chat["messages"][0]["content"],
+                if content.is_null() {
+                    Value::Null
+                } else {
+                    json!([{"type":"text","text":"preface"}])
+                }
+            );
+        }
+        for role in ["user", "system", "developer"] {
+            let chat = convert(
+                json!({"input":[{"role":role,"content":[{"type":"refusal","refusal":"cannot help"}]}]}),
+            );
+            assert_eq!(
+                chat["messages"][0]["content"],
+                json!([{"type":"text","text":"cannot help"}])
+            );
+            assert!(chat["messages"][0].get("refusal").is_none());
+        }
+        let chat = convert(
+            json!({"input":[{"role":"assistant","content":[{"type":"refusal","refusal":""},{"type":"refusal","refusal":"no"},{"type":"refusal","refusal":"pe"}]}]}),
+        );
+        assert_eq!(chat["messages"][0]["refusal"], "nope");
+        assert!(matches!(
+            request(
+                br#"{"input":[{"role":"assistant","content":[{"type":"refusal"}]}]}"#,
+                "m"
+            ),
+            Err(BuildError::InvalidBody)
+        ));
     }
 
     #[test]
