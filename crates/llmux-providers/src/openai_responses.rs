@@ -108,7 +108,10 @@ impl ProviderAdapter for OpenAiResponses {
         if req.stream {
             return Ok(GatewayResponse::Stream(
                 if req.format == InboundFormat::OpenAiChat {
-                    chat_stream(stream)
+                    let include_usage = serde_json::from_slice::<Value>(&req.body)
+                        .map_err(|_| bad_gateway())?["stream_options"]["include_usage"]
+                        == true;
+                    chat_stream(stream, include_usage)
                 } else {
                     stream
                 },
@@ -417,6 +420,7 @@ fn chat_event(value: Value) -> SseEvent {
 
 fn chat_stream(
     mut upstream: BoxStream<'static, Result<SseEvent, UpstreamError>>,
+    include_usage: bool,
 ) -> BoxStream<'static, Result<SseEvent, UpstreamError>> {
     Box::pin(async_stream::try_stream! {
         let mut response = json!({});
@@ -438,9 +442,13 @@ fn chat_stream(
                 },
                 "response.completed" => {
                     response = value["response"].clone();
-                    let mut last = chunk(&response, json!({}), json!(if calls.is_empty() {"stop"} else {"tool_calls"}));
-                    last["usage"] = chat_usage(&response);
-                    yield chat_event(last);
+                    yield chat_event(chunk(&response, json!({}), json!(if calls.is_empty() {"stop"} else {"tool_calls"})));
+                    if include_usage {
+                        let mut last = chunk(&response, json!({}), Value::Null);
+                        last["choices"] = json!([]);
+                        last["usage"] = chat_usage(&response);
+                        yield chat_event(last);
+                    }
                     yield SseEvent {event:None,data:"[DONE]".into()};
                     return;
                 },

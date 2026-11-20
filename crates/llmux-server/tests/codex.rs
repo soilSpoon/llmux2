@@ -538,3 +538,39 @@ priority = 1
         assert_eq!(hits.load(Ordering::Relaxed), 1);
     }
 }
+
+#[tokio::test]
+async fn chat_usage_is_opt_in_and_separate_from_finish() {
+    let (_dir, _upstream, gateway, _) = fixture(events()).await;
+    for include in [None, Some(false), Some(true)] {
+        let mut request = json!({"model":"codex","stream":true,"messages":[]});
+        if let Some(include) = include {
+            request["stream_options"] = json!({"include_usage":include});
+        }
+        let (status, body) = send(&gateway.url(), "chat/completions", "owner-key", request).await;
+        assert_eq!(status, StatusCode::OK);
+        let chunks: Vec<Value> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect();
+        let finish = chunks
+            .iter()
+            .position(|chunk| chunk["choices"][0]["finish_reason"] == "stop")
+            .unwrap();
+        assert!(chunks[finish].get("usage").is_none_or(Value::is_null));
+        assert_eq!(
+            chunks.len(),
+            finish + if include == Some(true) { 2 } else { 1 }
+        );
+        if include == Some(true) {
+            assert_eq!(chunks[finish + 1]["choices"], json!([]));
+            assert_eq!(
+                chunks[finish + 1]["usage"],
+                json!({"prompt_tokens":3,"completion_tokens":2,"total_tokens":5})
+            );
+        }
+        assert!(body.trim_end().ends_with("data: [DONE]"));
+    }
+}
