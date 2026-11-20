@@ -36,6 +36,7 @@ enum Reply {
     AbortStream,
     GatedStream(Arc<Semaphore>),
     BadRequest,
+    StructuredBadRequest(Value),
     ContextLength,
     HtmlPayloadTooLarge,
 }
@@ -125,6 +126,7 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
         Reply::BadRequest => (
             StatusCode::BAD_REQUEST, Json(json!({"error": {"message": "bad input"}})),
         ).into_response(),
+        Reply::StructuredBadRequest(payload) => (StatusCode::BAD_REQUEST, Json(payload)).into_response(),
         Reply::HtmlPayloadTooLarge => (
             StatusCode::PAYLOAD_TOO_LARGE, axum::response::Html("<h1>Proxy error</h1>"),
         ).into_response(),
@@ -848,6 +850,36 @@ async fn invalid_client_key_unknown_model_and_upstream_400_do_not_fail_over() {
         json!({"error":{"message":"bad input","type":"invalid_request_error","param":null,"code":"upstream_client_error"}})
     );
     assert_eq!(fixture.counts(), [1, 0]);
+}
+
+#[tokio::test]
+async fn upstream_error_preserves_details_without_a_string_message() {
+    let first = json!({
+        "error": {
+            "type":"invalid_request_error","code":"unsupported_parameter",
+            "param":"reasoning_effort","provider_detail":{"supported":["low"]}
+        },
+        "request_id":"vendor-123"
+    });
+    let mut next = first.clone();
+    next["error"]["message"] = json!(123);
+    let fixture = Fixture::start(
+        [Reply::StructuredBadRequest(first.clone()), Reply::Complete],
+        [Reply::StructuredBadRequest(next), Reply::Complete],
+        "",
+    )
+    .await;
+    let mut expected = first;
+    expected["error"]["message"] = json!("Upstream rejected the request");
+    for _ in 0..2 {
+        let response = fixture.request("test-client", "shared", false).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body(response).await).unwrap(),
+            expected
+        );
+    }
+    assert_eq!(fixture.counts(), [2, 0]);
 }
 
 #[tokio::test]

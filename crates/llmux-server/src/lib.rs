@@ -393,20 +393,15 @@ fn upstream_client_error(status: StatusCode, body: Bytes) -> Response {
             "Upstream rejected the request",
         );
     };
-    if !details.get("message").is_some_and(Value::is_string) {
-        return error(
-            status,
-            "upstream_client_error",
-            "Upstream rejected the request",
-        );
-    }
-    if details.get("type").is_some_and(Value::is_string)
-        && details.contains_key("param")
-        && details.contains_key("code")
-    {
+    let has_message = details.get("message").is_some_and(Value::is_string);
+    let has_type = details.get("type").is_some_and(Value::is_string);
+    if has_message && has_type && details.contains_key("param") && details.contains_key("code") {
         return json_body(status, Body::from(body));
     }
-    if !details.get("type").is_some_and(Value::is_string) {
+    if !has_message {
+        details.insert("message".into(), json!("Upstream rejected the request"));
+    }
+    if !has_type {
         details.insert("type".into(), json!("invalid_request_error"));
     }
     details.entry("param").or_insert(Value::Null);
