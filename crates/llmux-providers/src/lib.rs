@@ -11,7 +11,7 @@ mod truncate;
 pub use anthropic::Anthropic;
 pub use openai_compat::{OpenAiCompat, RequestMetadata, StaticKey};
 pub use openai_responses::OpenAiResponses;
-pub use truncate::{truncate_middle, Truncated};
+pub use truncate::{truncate_middle, truncate_middle_for_format, Truncated};
 
 fn upstream_model<'a>(
     req: &'a llmux_types::GatewayRequest,

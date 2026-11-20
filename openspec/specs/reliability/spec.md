@@ -57,6 +57,13 @@ larger-context model; it SHALL return a clear OpenAI-shaped 400
 `context_length_exceeded` before calling upstream, using a pre-send token
 estimate against the deployment's context size.
 
+#### Scenario: Native Anthropic attachments
+
+WHEN a native Messages request contains a base64 image or document, including in
+tool result content
+THEN the context estimate excludes the encoded attachment data but counts
+surrounding text.
+
 #### Scenario: Opt-in truncation
 
 WHEN the caller opts into middle-out truncation

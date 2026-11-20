@@ -41,6 +41,9 @@ const ANTHROPIC_SSE: &str = concat!(
 enum Reply {
     Ok,
     Limit,
+    Image,
+    BrokenStream,
+    ProtocolHeaders,
 }
 
 struct Upstream {
@@ -70,19 +73,46 @@ impl Upstream {
 async fn messages(State(up): State<Arc<Upstream>>, headers: HeaderMap, body: Bytes) -> Response {
     let request: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(headers["x-api-key"], "test-anthropic");
-    assert_eq!(headers["anthropic-version"], "2023-06-01");
+    if matches!(up.reply, Reply::ProtocolHeaders) {
+        assert_eq!(headers["anthropic-version"], "2024-01-01");
+        assert_eq!(
+            headers.get_all("anthropic-beta").iter().collect::<Vec<_>>(),
+            ["first-beta", "second-beta"]
+        );
+    } else {
+        assert_eq!(headers["anthropic-version"], "2023-06-01");
+        assert!(!headers.contains_key("anthropic-beta"));
+    }
     assert!(!headers.contains_key(header::AUTHORIZATION));
     assert_eq!(request["model"], "claude-upstream");
     assert_eq!(request["max_tokens"], 4096);
     assert_eq!(request["system"], "Be brief");
-    assert_eq!(
-        request["messages"],
-        json!([{"role": "user", "content": [{"type": "text", "text": "Hello"}]}])
-    );
+    if matches!(up.reply, Reply::Image) {
+        let block = &request["messages"].as_array().unwrap().last().unwrap()["content"][0];
+        let source = if block["type"] == "tool_result" {
+            &block["content"][0]["source"]
+        } else {
+            &block["source"]
+        };
+        assert_eq!(source["type"], "base64");
+        assert_eq!(source["data"].as_str().unwrap().len(), 32_000);
+    } else {
+        assert_eq!(
+            request["messages"],
+            json!([{"role": "user", "content": [{"type": "text", "text": "Hello"}]}])
+        );
+    }
     if let Some(limited) = up.limited() {
         return limited;
     }
     if request["stream"] == true {
+        if matches!(up.reply, Reply::BrokenStream) {
+            return (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                ANTHROPIC_SSE.split_once("event: message_stop").unwrap().0,
+            )
+                .into_response();
+        }
         return ([(header::CONTENT_TYPE, "text/event-stream")], ANTHROPIC_SSE).into_response();
     }
     Json(json!({
@@ -101,6 +131,8 @@ async fn chat(State(up): State<Arc<Upstream>>, headers: HeaderMap, body: Bytes) 
     let request: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(headers[header::AUTHORIZATION], "Bearer test-openai");
     assert!(!headers.contains_key("x-api-key"));
+    assert!(!headers.contains_key("anthropic-beta"));
+    assert!(!headers.contains_key("anthropic-version"));
     assert_eq!(request["model"], "gpt-upstream");
     if let Some(limited) = up.limited() {
         return limited;
@@ -123,6 +155,14 @@ struct Fixture {
 
 impl Fixture {
     async fn start(anthropic: (Reply, i32), openai: (Reply, i32)) -> Self {
+        Self::with_context(anthropic, openai, "").await
+    }
+
+    async fn with_context(
+        anthropic: (Reply, i32),
+        openai: (Reply, i32),
+        capabilities: &str,
+    ) -> Self {
         let (anthropic_reply, anthropic_priority) = anthropic;
         let (openai_reply, openai_priority) = openai;
         let anthropic = Upstream::new(anthropic_reply);
@@ -166,6 +206,7 @@ key = "file:{base}/test-openai"
 
 [[models]]
 name = "assistant"
+{capabilities}
 
 [[models.deployments]]
 id = "claude"
@@ -216,8 +257,35 @@ priority = {openai_priority}
     }
 
     async fn send(&self, payload: Value) -> (Response<Body>, String) {
-        let request = Request::post(format!("{}/v1/chat/completions", self.gateway.url()))
-            .header(header::AUTHORIZATION, "Bearer test-client")
+        self.send_to(
+            "/v1/chat/completions",
+            header::AUTHORIZATION,
+            "Bearer test-client",
+            payload,
+        )
+        .await
+    }
+
+    async fn send_to(
+        &self,
+        path: &str,
+        auth_header: header::HeaderName,
+        key: &str,
+        payload: Value,
+    ) -> (Response<Body>, String) {
+        self.send_request(
+            Request::post(format!("{}{path}", self.gateway.url())).header(auth_header, key),
+            payload,
+        )
+        .await
+    }
+
+    async fn send_request(
+        &self,
+        request: http::request::Builder,
+        payload: Value,
+    ) -> (Response<Body>, String) {
+        let request = request
             .header(header::CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from(payload.to_string())))
             .unwrap();
@@ -247,6 +315,182 @@ fn check_route(response: &Response, deployment: &str, attempts: &str) {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["x-llmux-deployment"], deployment);
     assert_eq!(response.headers()["x-llmux-attempts"], attempts);
+}
+
+#[tokio::test]
+async fn native_messages_authentication_and_passthrough() {
+    let fixture = Fixture::start((Reply::Ok, 0), (Reply::Ok, 10)).await;
+    let mut payload = json!({
+        "model":"assistant","max_tokens":4096,"system":"Be brief",
+        "messages":[{"role":"user","content":[{"type":"text","text":"Hello"}]}]
+    });
+    let api_key = header::HeaderName::from_static("x-api-key");
+    let (response, body) = fixture
+        .send_to("/v1/messages", api_key.clone(), "invalid", payload.clone())
+        .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["type"], "authentication_error");
+    assert_eq!(fixture.counts(), [0, 0]);
+
+    let (response, body) = fixture
+        .send_to("/v1/messages", api_key, "test-client", payload.clone())
+        .await;
+    check_route(&response, "claude", "1");
+    let message: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(message["type"], "message");
+    assert_eq!(message["content"][0]["text"], "Hi from Claude");
+    assert_eq!(message["usage"]["output_tokens"], 4);
+
+    payload["stream"] = json!(true);
+    let (response, body) = fixture
+        .send_to(
+            "/v1/messages",
+            header::AUTHORIZATION,
+            "Bearer test-client",
+            payload,
+        )
+        .await;
+    check_route(&response, "claude", "1");
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    for prefix in ["event: ", "data: "] {
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.starts_with(prefix))
+                .collect::<Vec<_>>(),
+            ANTHROPIC_SSE
+                .lines()
+                .filter(|line| line.starts_with(prefix))
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(fixture.counts(), [2, 0]);
+}
+
+#[tokio::test]
+async fn native_messages_forwards_anthropic_protocol_headers() {
+    let fixture = Fixture::start((Reply::ProtocolHeaders, 0), (Reply::Ok, 10)).await;
+    let request = |fixture: &Fixture, path| {
+        Request::post(format!("{}{path}", fixture.gateway.url()))
+            .header(header::AUTHORIZATION, "Bearer test-client")
+            .header("anthropic-version", "2024-01-01")
+            .header("anthropic-beta", "first-beta")
+            .header("anthropic-beta", "second-beta")
+    };
+    let (response, _) = fixture
+        .send_request(
+            request(&fixture, "/v1/messages"),
+            json!({"model":"assistant","max_tokens":4096,"system":"Be brief",
+            "messages":[{"role":"user","content":[{"type":"text","text":"Hello"}]}]}),
+        )
+        .await;
+    check_route(&response, "claude", "1");
+    assert_eq!(fixture.counts(), [1, 0]);
+
+    let fixture = Fixture::start((Reply::Ok, 10), (Reply::Ok, 0)).await;
+    let (response, _) = fixture
+        .send_request(
+            request(&fixture, "/v1/chat/completions"),
+            json!({"model":"assistant","messages":[{"role":"user","content":"Hello"}]}),
+        )
+        .await;
+    check_route(&response, "gpt", "1");
+    assert_eq!(fixture.counts(), [0, 1]);
+}
+
+#[tokio::test]
+async fn native_messages_base64_image_does_not_use_prompt_text_budget() {
+    let fixture = Fixture::with_context(
+        (Reply::Image, 0),
+        (Reply::Ok, 10),
+        "capabilities = { max_context = 4500 }",
+    )
+    .await;
+    let (response, _) = fixture.send_to(
+        "/v1/messages", header::AUTHORIZATION, "Bearer test-client",
+        json!({"model":"assistant","max_tokens":4096,"system":"Be brief",
+            "messages":[{"role":"user","content":[{"type":"image",
+                "source":{"type":"base64","media_type":"image/png","data":"A".repeat(32_000)}}]}]
+        }),
+    ).await;
+    check_route(&response, "claude", "1");
+    assert_eq!(fixture.counts(), [1, 0]);
+}
+
+#[tokio::test]
+async fn native_messages_nested_base64_image_does_not_use_prompt_text_budget() {
+    let fixture = Fixture::with_context(
+        (Reply::Image, 0),
+        (Reply::Ok, 10),
+        "capabilities = { max_context = 4500 }",
+    )
+    .await;
+    let (response, _) = fixture.send_to(
+        "/v1/messages", header::AUTHORIZATION, "Bearer test-client",
+        json!({"model":"assistant","max_tokens":4096,"system":"Be brief",
+            "messages":[
+                {"role":"user","content":"Hello"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1",
+                    "content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"A".repeat(32_000)}}]}]}
+            ]
+        }),
+    ).await;
+    check_route(&response, "claude", "1");
+    assert_eq!(fixture.counts(), [1, 0]);
+}
+
+#[tokio::test]
+async fn native_messages_preserves_anthropic_rate_limit_error() {
+    let fixture = Fixture::start((Reply::Limit, 0), (Reply::Ok, 10)).await;
+    let (response, body) = fixture
+        .send_to(
+            "/v1/messages",
+            header::AUTHORIZATION,
+            "Bearer test-client",
+            json!({"model":"assistant","max_tokens":4096,"system":"Be brief",
+                "messages":[{"role":"user","content":[{"type":"text","text":"Hello"}]}]
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "30");
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["type"], "rate_limit_error");
+    assert_eq!(fixture.counts(), [1, 0]);
+}
+
+#[tokio::test]
+async fn native_messages_emits_anthropic_broken_stream_error() {
+    let fixture = Fixture::start((Reply::BrokenStream, 0), (Reply::Ok, 10)).await;
+    let (response, body) = fixture
+        .send_to(
+            "/v1/messages",
+            header::AUTHORIZATION,
+            "Bearer test-client",
+            json!({"model":"assistant","stream":true,"max_tokens":4096,"system":"Be brief",
+                "messages":[{"role":"user","content":[{"type":"text","text":"Hello"}]}]
+            }),
+        )
+        .await;
+    check_route(&response, "claude", "1");
+    assert!(body.contains("event: message_start"));
+    let last = body.trim_end().split("\n\n").last().unwrap();
+    assert!(last.lines().any(|line| line == "event: error"));
+    let data = last
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .unwrap();
+    let error: Value = serde_json::from_str(data).unwrap();
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["type"], "api_error");
+    assert!(!body.contains("event: message_stop"));
+    assert_eq!(fixture.counts(), [1, 0]);
 }
 
 #[tokio::test]

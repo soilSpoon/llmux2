@@ -16,6 +16,8 @@ pub struct GatewayRequest {
     pub model: Arc<str>,
     pub stream: bool,
     pub body: Bytes,
+    /// Allowlisted Anthropic protocol headers from a native Messages request.
+    pub anthropic_headers: HeaderMap,
     pub est_input_tokens: u32,
     /// Completion tokens the client asked for, reserved against the context window.
     pub max_output_tokens: Option<u32>,

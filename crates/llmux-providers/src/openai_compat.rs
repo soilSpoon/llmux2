@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use std::{
     borrow::Cow,
+    collections::BTreeMap,
     ops::Range,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -61,7 +62,7 @@ pub struct RequestMetadata<'a> {
 }
 
 #[derive(Deserialize)]
-struct RawRequestMetadata<'a> {
+struct RawRequestMetadata<'a, M> {
     #[serde(borrow)]
     model: &'a RawValue,
     #[serde(default)]
@@ -75,7 +76,7 @@ struct RawRequestMetadata<'a> {
     #[serde(default, borrow)]
     max_output_tokens: Option<&'a RawValue>,
     #[serde(default)]
-    messages: TextBytes,
+    messages: M,
     #[serde(default)]
     input: TextBytes,
     #[serde(default)]
@@ -101,7 +102,18 @@ impl<'a> RequestMetadata<'a> {
         if body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
             return Err(BuildError::InvalidBody);
         }
-        let raw: RawRequestMetadata<'_> =
+        if format == InboundFormat::AnthropicMessages {
+            Self::parse_with::<NativeMessagesText>(body, format)
+        } else {
+            Self::parse_with::<TextBytes>(body, format)
+        }
+    }
+
+    fn parse_with<M: Deserialize<'a> + Default + Into<TextBytes>>(
+        body: &'a [u8],
+        format: InboundFormat,
+    ) -> Result<Self, BuildError> {
+        let raw: RawRequestMetadata<'_, M> =
             serde_json::from_slice(body).map_err(|_| BuildError::InvalidBody)?;
         let model = serde_json::from_str::<BorrowedModel<'_>>(raw.model.get())
             .map_err(|_| BuildError::InvalidBody)?
@@ -115,7 +127,7 @@ impl<'a> RequestMetadata<'a> {
             stream: raw.stream.unwrap_or_default(),
             temperature: raw.temperature,
             prompt_bytes: [
-                raw.messages,
+                raw.messages.into(),
                 raw.input,
                 raw.instructions,
                 raw.system,
@@ -134,6 +146,107 @@ impl<'a> RequestMetadata<'a> {
             has_gateway_routing_fields: raw.min_discount_percent || raw.zdr || raw.ranking,
         })
     }
+}
+
+#[derive(Default)]
+struct NativeMessagesText(TextBytes);
+
+impl From<NativeMessagesText> for TextBytes {
+    fn from(value: NativeMessagesText) -> Self {
+        value.0
+    }
+}
+
+impl<'de> Deserialize<'de> for NativeMessagesText {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = <&RawValue>::deserialize(deserializer)?;
+        let bytes = if let Ok(messages) = serde_json::from_str::<Vec<&RawValue>>(raw.get()) {
+            messages.into_iter().try_fold(0, |sum, message| {
+                native_message_bytes(message).map(|n| sum + n)
+            })
+        } else {
+            text_bytes(raw)
+        };
+        bytes
+            .map(|bytes| Self(TextBytes(bytes)))
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+type RawFields<'a> = BTreeMap<String, &'a RawValue>;
+
+fn text_bytes(raw: &RawValue) -> serde_json::Result<u64> {
+    serde_json::from_str::<TextBytes>(raw.get()).map(|value| value.0)
+}
+
+fn field_is(fields: &RawFields<'_>, key: &str, expected: &str) -> bool {
+    fields
+        .get(key)
+        .and_then(|value| serde_json::from_str::<Cow<'_, str>>(value.get()).ok())
+        .is_some_and(|value| value == expected)
+}
+
+pub(crate) fn native_message_bytes(raw: &RawValue) -> serde_json::Result<u64> {
+    let Ok(message) = serde_json::from_str::<RawFields<'_>>(raw.get()) else {
+        return text_bytes(raw);
+    };
+    message.into_iter().try_fold(0, |sum, (key, value)| {
+        let bytes = if key == "content" {
+            native_content_bytes(value, true)?
+        } else {
+            text_bytes(value)?
+        };
+        Ok(sum + key.len() as u64 + bytes)
+    })
+}
+
+fn native_content_bytes(raw: &RawValue, allow_tool_result: bool) -> serde_json::Result<u64> {
+    let Ok(blocks) = serde_json::from_str::<Vec<&RawValue>>(raw.get()) else {
+        return text_bytes(raw);
+    };
+    blocks.into_iter().try_fold(0, |sum, block| {
+        native_block_bytes(block, allow_tool_result).map(|n| sum + n)
+    })
+}
+
+fn native_block_bytes(raw: &RawValue, allow_tool_result: bool) -> serde_json::Result<u64> {
+    let Ok(block) = serde_json::from_str::<RawFields<'_>>(raw.get()) else {
+        return text_bytes(raw);
+    };
+    if allow_tool_result && field_is(&block, "type", "tool_result") {
+        return block.into_iter().try_fold(0, |sum, (key, value)| {
+            let bytes = if key == "content" {
+                native_content_bytes(value, false)?
+            } else {
+                text_bytes(value)?
+            };
+            Ok(sum + key.len() as u64 + bytes)
+        });
+    }
+    if !(field_is(&block, "type", "image") || field_is(&block, "type", "document")) {
+        return text_bytes(raw);
+    }
+    let Some(source) = block
+        .get("source")
+        .and_then(|raw| serde_json::from_str::<RawFields<'_>>(raw.get()).ok())
+        .filter(|source| field_is(source, "type", "base64"))
+    else {
+        return text_bytes(raw);
+    };
+    let source_bytes = source.into_iter().try_fold(0, |sum, (key, value)| {
+        Ok::<_, serde_json::Error>(
+            sum + key.len() as u64 + if key == "data" { 0 } else { text_bytes(value)? },
+        )
+    })?;
+    block.into_iter().try_fold(0, |sum, (key, value)| {
+        Ok(sum
+            + key.len() as u64
+            + if key == "source" {
+                source_bytes
+            } else {
+                text_bytes(value)?
+            })
+    })
 }
 
 fn is_base64_data_url(text: &str) -> bool {

@@ -518,6 +518,7 @@ mod tests {
                 model: "vendor/New-ID".into(),
                 stream: false,
                 body: Bytes::from(body.to_string()),
+                anthropic_headers: HeaderMap::new(),
                 est_input_tokens: 0,
                 max_output_tokens: None,
                 context_overflow: None,

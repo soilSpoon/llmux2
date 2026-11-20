@@ -37,6 +37,17 @@ no credential, for providers that allow anonymous access.
 WHEN a deployment is configured with `auth = "none"` and no credential
 THEN requests are sent upstream without an authorization header.
 
+### Requirement: Native Anthropic protocol headers
+
+The gateway SHALL forward client `anthropic-version` and `anthropic-beta`
+headers only when passing a native Messages request through to Anthropic.
+
+#### Scenario: Native client selects an API version and betas
+
+WHEN a native Messages request supplies Anthropic protocol headers
+THEN the Anthropic upstream receives them, with the gateway's default version
+used only if the client omitted a version.
+
 ### Requirement: Excluded providers and practices
 
 The gateway SHALL NOT integrate OpenRouter, Factory, multi-account pooling, or
