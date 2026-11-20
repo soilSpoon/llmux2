@@ -491,11 +491,7 @@ pub fn import_with_options(
         };
         connections.push(Connection {
             source_id: source_id.into(),
-            provider: upstream::canonical_provider(
-                string(c, "provider"),
-                array(&root, "providerNodes"),
-            )
-            .into(),
+            provider: upstream::canonical_provider(string(c, "provider"), &[]).into(),
             credential,
             kind,
             base_url,
