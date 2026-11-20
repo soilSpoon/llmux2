@@ -2,8 +2,8 @@
 
 use http::Uri;
 use llmux_types::{
-    Billing, CanonicalModel, Capabilities, ContextOverflow, Deployment, DeploymentIdx, ErrorKind,
-    ProviderKind, QuotaSpec, Strategy,
+    CanonicalModel, Capabilities, ContextOverflow, Deployment, DeploymentIdx, ErrorKind,
+    ProviderKind, QuotaSpec,
 };
 use serde::Deserialize;
 use std::{
@@ -136,18 +136,14 @@ impl Default for RawServer {
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RawRouting {
-    default_strategy: Strategy,
     max_attempts: usize,
-    retry_same_deployment: bool,
     fallback_on: Vec<ErrorKind>,
 }
 
 impl Default for RawRouting {
     fn default() -> Self {
         Self {
-            default_strategy: Strategy::Priority,
             max_attempts: 4,
-            retry_same_deployment: false,
             fallback_on: vec![ErrorKind::RateLimited, ErrorKind::QuotaExhausted],
         }
     }
@@ -202,7 +198,6 @@ struct RawModel {
     allowed_keys: Option<Vec<String>>,
     #[serde(default)]
     aliases: Vec<String>,
-    strategy: Option<Strategy>,
     #[serde(default)]
     capabilities: Capabilities,
     #[serde(default)]
@@ -221,9 +216,6 @@ struct RawDeployment {
     upstream_model: String,
     #[serde(default)]
     priority: i32,
-    weight: Option<u32>,
-    #[serde(default)]
-    billing: Billing,
     #[serde(default)]
     quota: QuotaSpec,
     timeout_ms: Option<u64>,
@@ -275,14 +267,14 @@ impl RawConfig {
         if routing.max_attempts == 0 {
             return Err(invalid("routing.max_attempts must be positive"));
         }
-        if routing.default_strategy != Strategy::Priority
-            || routing.retry_same_deployment
-            || routing
-                .fallback_on
-                .iter()
-                .any(|kind| !matches!(kind, ErrorKind::RateLimited | ErrorKind::QuotaExhausted))
+        if routing
+            .fallback_on
+            .iter()
+            .any(|kind| !matches!(kind, ErrorKind::RateLimited | ErrorKind::QuotaExhausted))
         {
-            return Err(invalid("MVP routing supports priority, no same-deployment retries, and rate_limited or quota_exhausted fallback only"));
+            return Err(invalid(
+                "routing.fallback_on supports rate_limited and quota_exhausted only",
+            ));
         }
         if cooldown.default_ms == 0
             || cooldown.max_ms < cooldown.default_ms
@@ -445,11 +437,8 @@ impl RawConfig {
                     ));
                 }
             }
-            let strategy = model.strategy.unwrap_or(routing.default_strategy);
-            if strategy != Strategy::Priority || model.deployments.is_empty() {
-                return Err(invalid(
-                    "each model needs at least one deployment and must use priority routing",
-                ));
+            if model.deployments.is_empty() {
+                return Err(invalid("each model needs at least one deployment"));
             }
 
             if model.capabilities.max_context == Some(0) {
@@ -490,10 +479,8 @@ impl RawConfig {
                             .then_some("https://api.openai.com/v1")
                     })
                     .ok_or_else(|| invalid("deployment requires base_url"))?;
-                if dep.upstream_model.is_empty() || dep.weight == Some(0) {
-                    return Err(invalid(
-                        "upstream_model must not be empty and weight must be positive",
-                    ));
+                if dep.upstream_model.is_empty() {
+                    return Err(invalid("upstream_model must not be empty"));
                 }
                 if dep.max_context == Some(0) {
                     return Err(invalid("max_context must be positive"));
@@ -516,8 +503,6 @@ impl RawConfig {
                     base_url: upstream_uri(base_url)?,
                     upstream_model: dep.upstream_model.into(),
                     priority: dep.priority,
-                    weight: dep.weight.unwrap_or(1),
-                    billing: dep.billing,
                     quota: dep.quota,
                     timeout: timeout(dep.timeout_ms.unwrap_or(server.request_timeout_ms))?,
                     max_context: dep.max_context.or(model.capabilities.max_context),
@@ -527,7 +512,6 @@ impl RawConfig {
             candidates.sort_by_key(|idx| deployments[idx.0 as usize].priority);
             canonical_models.push(CanonicalModel {
                 name,
-                strategy,
                 capabilities: model.capabilities,
                 context_overflow: model.context_overflow,
                 deployments: candidates.into_boxed_slice(),
@@ -674,6 +658,24 @@ mod tests {
         for quota in ["rpd = 0", "tpm = 0", "tpd = 0"] {
             let err = RuntimeConfig::parse(&with_quota(quota)).err().expect(quota);
             assert!(err.to_string().contains("positive"), "{quota}: {err}");
+        }
+    }
+
+    #[test]
+    fn removed_routing_and_deployment_knobs_are_rejected() {
+        let base = config(REQUIRED);
+        for legacy in [
+            "[routing]\ndefault_strategy = \"priority\"\n",
+            "[routing]\nretry_same_deployment = true\n",
+            "[models]\nstrategy = \"priority\"\n[[models]",
+            "weight = 2\n",
+            "billing = \"free\"\n",
+        ] {
+            let input = base.replace("[[models]]", &format!("{legacy}[[models]]"));
+            assert!(
+                RuntimeConfig::parse(&input).is_err(),
+                "legacy key still accepted: {legacy}"
+            );
         }
     }
 

@@ -9,7 +9,7 @@ use http::{header, HeaderMap, HeaderValue, Method, Request, Response, StatusCode
 use hyper::body::Incoming;
 use llmux_types::{
     AuthMaterial, BoxStream, BuildError, Deployment, GatewayRequest, GatewayResponse,
-    InboundFormat, LimitObservation, LimitScope, ProviderAdapter, ProviderKind, SseEvent, Support,
+    InboundFormat, LimitObservation, ProviderAdapter, ProviderKind, SseEvent, Support,
     UpstreamError, Usage,
 };
 use serde::Deserialize;
@@ -476,7 +476,6 @@ impl ProviderAdapter for Anthropic {
             StatusCode::TOO_MANY_REQUESTS => {
                 return Err(UpstreamError::RateLimited {
                     retry_after: retry_after(&parts.headers, SystemTime::now()),
-                    scope: LimitScope::Unknown,
                 })
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
@@ -503,13 +502,8 @@ impl ProviderAdapter for Anthropic {
             }));
         }
         let mut body = collect(body).await?;
-        let parsed = serde_json::from_slice::<Value>(&body);
-        let usage = parsed
-            .as_ref()
-            .ok()
-            .and_then(|v| v.get("usage"))
-            .map(|v| MessageUsage::parse(v).tokens);
         if convert {
+            let parsed = serde_json::from_slice::<Value>(&body);
             body = Bytes::from(convert_response(&parsed.map_err(|_| bad_gateway())?).to_string());
             parts.headers.remove(header::CONTENT_LENGTH);
             parts.headers.insert(
@@ -521,7 +515,6 @@ impl ProviderAdapter for Anthropic {
             status: parts.status,
             headers: parts.headers,
             body,
-            usage,
         })
     }
     fn observe_limits(&self, headers: &HeaderMap) -> Option<LimitObservation> {
@@ -548,7 +541,7 @@ impl ProviderAdapter for Anthropic {
 mod tests {
     use super::*;
     use futures_util::FutureExt;
-    use llmux_types::{Billing, DeploymentIdx, QuotaSpec, RequestId};
+    use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
     use std::time::Duration;
 
     fn converted(v: Value) -> Value {
@@ -918,8 +911,6 @@ mod tests {
             base_url: "https://example.com/v1/".parse().unwrap(),
             upstream_model: "claude".into(),
             priority: 0,
-            weight: 1,
-            billing: Billing::default(),
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(10),
             max_context: None,
@@ -929,7 +920,6 @@ mod tests {
             model: "alias".into(),
             stream: true,
             body: Bytes::from_static(br#"{ "model":"alias", "future":{"model":"untouched"} }"#),
-            parsed: Default::default(),
             est_input_tokens: 0,
             max_output_tokens: None,
             context_overflow: None,

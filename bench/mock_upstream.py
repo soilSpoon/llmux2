@@ -104,7 +104,6 @@ credential = "mock"
 base_url = "http://{upstream}/v1"
 upstream_model = "backend-model"
 priority = 0
-billing = "free"
 """)
             with server(gateway, [str(config)], env) as (gateway_pid, address):
                 yield address, "gateway-model", CLIENT_KEY, [upstream_pid, gateway_pid]

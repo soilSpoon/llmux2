@@ -111,7 +111,6 @@ impl ProviderAdapter for OpenAiResponses {
             let value: Value = serde_json::from_str(&event?.data).map_err(|_| bad_gateway())?;
             if value["type"] == "response.completed" {
                 let response = &value["response"];
-                let usage = usage(response);
                 let response = if req.format == InboundFormat::OpenAiChat {
                     chat_complete(response)?
                 } else {
@@ -121,7 +120,6 @@ impl ProviderAdapter for OpenAiResponses {
                     status: StatusCode::OK,
                     headers: HeaderMap::new(),
                     body: Bytes::from(response.to_string()),
-                    usage,
                 });
             }
         }
