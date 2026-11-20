@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DEFAULT_LISTEN: &str = "127.0.0.1:8090";
+const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 const MAX_BODY: u64 = 1_048_576;
 const PROMPT: &str = "Reply with the single word: ok";
 
@@ -300,6 +300,18 @@ fn probe(
     request(&options.listen, method, path, key, body, options.timeout)
 }
 
+fn usable(format: &str, body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    match format {
+        "chat" => value["choices"].as_array().is_some_and(|c| !c.is_empty()),
+        "responses" => value.get("output").is_some(),
+        "anthropic" => value["content"].as_array().is_some_and(|c| !c.is_empty()),
+        _ => false,
+    }
+}
+
 fn run(options: &Options) -> Result<bool> {
     let mut checks = Vec::new();
     let start = Instant::now();
@@ -307,10 +319,24 @@ fn run(options: &Options) -> Result<bool> {
         let ok = (200..300).contains(&response.status) && response.body == b"ok";
         (ok, response)
     });
+    let healthy = health.as_ref().map(|(ok, _)| *ok).unwrap_or(false);
     checks.push(match health {
         Ok((ok, response)) => record("healthz", start, Ok(response), ok),
         Err(error) => record("healthz", start, Err(error), false),
     });
+    // A listener that fails healthz is not llmux2; never send it the key.
+    if !healthy {
+        let ok = checks.iter().all(|c| c["ok"] == true);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": ok,
+                "listen": options.listen,
+                "checks": checks,
+            }))?
+        );
+        return Ok(ok);
+    }
     let key = fs::read_to_string(&options.key_file)
         .map_err(|e| format!("cannot read client key {}: {e}", options.key_file.display()))?;
     let key = key.trim();
@@ -320,25 +346,37 @@ fn run(options: &Options) -> Result<bool> {
     let start = Instant::now();
     let models = probe(options, "GET", "/v1/models", Some(key), None);
     let mut listed: Vec<String> = Vec::new();
-    let ok = models
-        .as_ref()
-        .map(|r| (200..300).contains(&r.status))
-        .unwrap_or(false);
     if let Ok(response) = &models {
-        if let Ok(value) = serde_json::from_slice::<Value>(&response.body) {
-            listed = value["data"]
-                .as_array()
-                .map(|data| {
+        listed = serde_json::from_slice::<Value>(&response.body)
+            .ok()
+            .and_then(|value| {
+                value["data"].as_array().map(|data| {
                     data.iter()
                         .filter_map(|m| m["id"].as_str().map(str::to_string))
-                        .collect()
+                        .collect::<Vec<String>>()
                 })
-                .unwrap_or_default();
-            listed.sort_unstable();
-            listed.dedup();
-        }
+            })
+            .unwrap_or_default();
+        listed.sort_unstable();
+        listed.dedup();
     }
-    checks.push(record("models", start, models, ok));
+    let ok = models
+        .as_ref()
+        .map(|r| (200..300).contains(&r.status) && !listed.is_empty())
+        .unwrap_or(false);
+    checks.push(match models {
+        Ok(response) if (200..300).contains(&response.status) && listed.is_empty() => record(
+            "models",
+            start,
+            Ok(Response {
+                status: response.status,
+                headers: response.headers,
+                body: b"empty or malformed model catalog".to_vec(),
+            }),
+            false,
+        ),
+        other => record("models", start, other, ok),
+    });
     let selected: Vec<String> = match &options.models {
         Some(models) => models.clone(),
         None => {
@@ -389,9 +427,21 @@ fn run(options: &Options) -> Result<bool> {
         );
         let ok = result
             .as_ref()
-            .map(|r| (200..300).contains(&r.status))
+            .map(|r| (200..300).contains(&r.status) && usable("chat", &r.body))
             .unwrap_or(false);
-        checks.push(record(&name, start, result, ok));
+        let mut entry = record(&name, start, result, ok);
+        if entry["status"] == 403 {
+            entry["ok"] = json!(true);
+            entry["skipped"] = json!("key is not permitted for this model");
+            entry.as_object_mut().unwrap().remove("error");
+        } else if entry["status"]
+            .as_u64()
+            .is_some_and(|s| (200..300).contains(&s))
+            && !ok
+        {
+            entry["error"] = json!("unusable chat completion body");
+        }
+        checks.push(entry);
     }
     if options.all_formats {
         if let Some(model) = options
@@ -419,11 +469,24 @@ fn run(options: &Options) -> Result<bool> {
             ] {
                 let start = Instant::now();
                 let result = probe(options, "POST", path, Some(key), Some(&body.to_string()));
+                let format = name.split(':').next().unwrap_or("");
                 let ok = result
                     .as_ref()
-                    .map(|r| (200..300).contains(&r.status))
+                    .map(|r| (200..300).contains(&r.status) && usable(format, &r.body))
                     .unwrap_or(false);
-                checks.push(record(&name, start, result, ok));
+                let mut entry = record(&name, start, result, ok);
+                if entry["status"] == 403 {
+                    entry["ok"] = json!(true);
+                    entry["skipped"] = json!("key is not permitted for this model");
+                    entry.as_object_mut().unwrap().remove("error");
+                } else if entry["status"]
+                    .as_u64()
+                    .is_some_and(|s| (200..300).contains(&s))
+                    && !ok
+                {
+                    entry["error"] = json!(format!("unusable {format} response body"));
+                }
+                checks.push(entry);
             }
         }
     }

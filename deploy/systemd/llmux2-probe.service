@@ -4,5 +4,6 @@ Description=Synthetic probes for the running llmux2 gateway
 [Service]
 Type=oneshot
 WorkingDirectory=%h/llmux2
-ExecStart=%h/llmux2/bin/llmux2-probe
+# OCI slots listen on 127.0.0.1:8090; the flag overrides the 127.0.0.1:8080 default.
+ExecStart=%h/llmux2/bin/llmux2-probe --listen 127.0.0.1:8090
 UMask=0077

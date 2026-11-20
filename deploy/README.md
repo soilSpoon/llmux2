@@ -97,6 +97,9 @@ model. `--all-formats` additionally probes `/v1/responses` and `/v1/messages`
 once each with the first model, covering the other inbound wire formats.
 `--models a,b` pins an explicit set instead of rotating.
 
+`--listen` defaults to the gateway's default `127.0.0.1:8080`; the shipped
+unit passes `127.0.0.1:8090` for the OCI slots.
+
 The probe reads the gateway client key from `--key-file`
 (`$HOME/llmux2/client.key`), prints a JSON report naming each check's status,
 latency and serving deployment, and exits 0 only when every probe passes;

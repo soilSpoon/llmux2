@@ -153,6 +153,7 @@ fn status_line(status: u16) -> &'static str {
         200 => "200 OK",
         400 => "400 Bad Request",
         401 => "401 Unauthorized",
+        403 => "403 Forbidden",
         429 => "429 Too Many Requests",
         503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
@@ -247,7 +248,7 @@ fn healthy_gateway_probes_each_route_and_reports_json() {
     let (gateway, stop) = Gateway::start(vec![
         Reply::text(200, "ok"),
         models_reply(),
-        Reply::json(200, json!({"id":"chatcmpl-1"})),
+        Reply::json(200, json!({"choices":[{"message":{"content":"ok"}}]})),
     ]);
     let output = listen_flag(&home, &gateway, &[]);
     assert_eq!(output.status.code(), Some(0));
@@ -279,7 +280,7 @@ fn rotation_walks_the_sorted_model_list_across_runs() {
         let (gateway, stop) = Gateway::start(vec![
             Reply::text(200, "ok"),
             models_reply(),
-            Reply::json(200, json!({"id":"ok"})),
+            Reply::json(200, json!({"choices":[{}]})),
         ]);
         let output = listen_flag(&home, &gateway, &[]);
         assert_eq!(output.status.code(), Some(code));
@@ -332,8 +333,8 @@ fn explicit_models_probe_each_listed_model() {
     let (gateway, stop) = Gateway::start(vec![
         Reply::text(200, "ok"),
         models_reply(),
-        Reply::json(200, json!({"id":"a"})),
-        Reply::json(200, json!({"id":"b"})),
+        Reply::json(200, json!({"choices":[{}]})),
+        Reply::json(200, json!({"choices":[{}]})),
     ]);
     let output = listen_flag(&home, &gateway, &["--models", "gamma,alpha"]);
     assert_eq!(output.status.code(), Some(0));
@@ -347,9 +348,9 @@ fn all_formats_adds_responses_and_anthropic_probes() {
     let (gateway, stop) = Gateway::start(vec![
         Reply::text(200, "ok"),
         models_reply(),
-        Reply::json(200, json!({"id":"c"})),
-        Reply::json(200, json!({"id":"r"})),
-        Reply::json(200, json!({"id":"m"})),
+        Reply::json(200, json!({"choices":[{}]})),
+        Reply::json(200, json!({"output":[]})),
+        Reply::json(200, json!({"content":[{"type":"text"}]})),
     ]);
     let output = listen_flag(&home, &gateway, &["--all-formats"]);
     assert_eq!(output.status.code(), Some(0));
@@ -379,6 +380,69 @@ fn all_formats_adds_responses_and_anthropic_probes() {
             "POST /v1/responses",
             "POST /v1/messages"
         ]
+    );
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn healthz_failure_never_sends_the_key() {
+    let home = Home::new();
+    let (gateway, stop) = Gateway::start(vec![Reply::text(503, "no")]);
+    let output = listen_flag(&home, &gateway, &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let report = summary(&output);
+    assert_eq!(report["ok"], false);
+    assert_eq!(gateway.paths(), ["GET /healthz"]);
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn forbidden_model_is_skipped_not_failed() {
+    let home = Home::new();
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        models_reply(),
+        Reply::json(403, json!({"error":{"message":"model_not_allowed"}})),
+    ]);
+    let output = listen_flag(&home, &gateway, &[]);
+    assert_eq!(output.status.code(), Some(0));
+    let report = summary(&output);
+    assert_eq!(report["ok"], true);
+    assert_eq!(
+        report["checks"][2]["skipped"],
+        "key is not permitted for this model"
+    );
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn empty_model_catalog_fails_the_models_check() {
+    let home = Home::new();
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        Reply::json(200, json!({"object":"list","data":[]})),
+    ]);
+    let output = listen_flag(&home, &gateway, &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let report = summary(&output);
+    assert_eq!(report["checks"][1]["ok"], false);
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn unusable_chat_body_fails_the_probe() {
+    let home = Home::new();
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        models_reply(),
+        Reply::json(200, json!({"unexpected": true})),
+    ]);
+    let output = listen_flag(&home, &gateway, &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let report = summary(&output);
+    assert_eq!(
+        report["checks"][2]["error"],
+        "unusable chat completion body"
     );
     stop.send(()).unwrap();
 }
