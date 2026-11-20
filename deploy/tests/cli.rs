@@ -205,3 +205,37 @@ fn cli_deploy_checks_installed_copies_and_sends_show_properties_to_systemctl() {
         fs::read(binary).unwrap()
     );
 }
+
+#[test]
+fn cli_preserves_non_utf8_binary_and_config_paths() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    let home = Home::new();
+    let binary = home.0.join(OsString::from_vec(b"binary-\xff".to_vec()));
+    let config = home
+        .0
+        .join(OsString::from_vec(b"config-\xfe.toml".to_vec()));
+    fs::write(&config, b"non-utf8-path-config").unwrap();
+    executable(&binary,"#!/bin/sh\n[ \"$1\" = --check ] || exit 9\n[ -f \"$2\" ] || exit 8\necho non-utf8-path-checker >&2\nexit 1\n");
+    for inline in [false, true] {
+        let mut args = vec![OsString::from("deploy")];
+        for (flag, path) in [("--binary", &binary), ("--config", &config)] {
+            if inline {
+                let mut arg = OsString::from(format!("{flag}="));
+                arg.push(path);
+                args.push(arg);
+            } else {
+                args.extend([flag.into(), path.as_os_str().into()]);
+            }
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_llmux2-deploy"))
+            .args(args)
+            .env("HOME", &home.0)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "llmux2: configuration validation failed: non-utf8-path-checker\n"
+        );
+    }
+}

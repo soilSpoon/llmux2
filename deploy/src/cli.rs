@@ -1,8 +1,12 @@
 use crate::{Deployment, Host, Result};
 use std::{
     env,
+    ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{DirBuilderExt, OpenOptionsExt},
+    },
     path::PathBuf,
 };
 #[derive(Debug, PartialEq)]
@@ -22,7 +26,13 @@ fn usage(guard: bool) -> &'static str {
         "usage: llmux2-deploy [-h] {deploy,status} ..."
     }
 }
-fn parse(args: &[String], guard: bool) -> std::result::Result<Action, String> {
+fn display_args(args: &[OsString]) -> String {
+    args.iter()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+fn parse(args: &[OsString], guard: bool) -> std::result::Result<Action, String> {
     if args.first().is_some_and(|a| a == "-h" || a == "--help") {
         return Ok(Action::Help(format!(
             "{}\n\nSlot deployment and recovery for llmux2.\n",
@@ -33,20 +43,22 @@ fn parse(args: &[String], guard: bool) -> std::result::Result<Action, String> {
         return if args.is_empty() {
             Ok(Action::Guard)
         } else {
-            Err(format!("unrecognized arguments: {}", args.join(" ")))
+            Err(format!("unrecognized arguments: {}", display_args(args)))
         };
     }
     let Some(command) = args.first() else {
         return Err("the following arguments are required: command".into());
     };
-    if !matches!(command.as_str(), "deploy" | "status") {
+    if command != "deploy" && command != "status" {
         return Err(format!(
-            "argument command: invalid choice: '{command}' (choose from 'deploy', 'status')"
+            "argument command: invalid choice: '{}' (choose from 'deploy', 'status')",
+            command.to_string_lossy()
         ));
     }
     if args.get(1).is_some_and(|a| a == "-h" || a == "--help") {
         return Ok(Action::Help(format!(
-            "usage: llmux2-deploy {command} {}\n",
+            "usage: llmux2-deploy {} {}\n",
+            command.to_string_lossy(),
             if command == "deploy" {
                 "[-h] [--binary BINARY] [--config CONFIG]"
             } else {
@@ -58,30 +70,38 @@ fn parse(args: &[String], guard: bool) -> std::result::Result<Action, String> {
         return if args.len() == 1 {
             Ok(Action::Status)
         } else {
-            Err(format!("unrecognized arguments: {}", args[1..].join(" ")))
+            Err(format!(
+                "unrecognized arguments: {}",
+                display_args(&args[1..])
+            ))
         };
     }
     let mut binary = None;
     let mut config = None;
     let mut index = 1;
     while index < args.len() {
-        if matches!(args[index].as_str(), "-h" | "--help") {
+        if args[index] == "-h" || args[index] == "--help" {
             return Ok(Action::Help(
                 "usage: llmux2-deploy deploy [-h] [--binary BINARY] [--config CONFIG]\n".into(),
             ));
         }
-        let (flag, inline) = args[index]
-            .split_once('=')
-            .map_or((args[index].as_str(), None), |(flag, value)| {
-                (flag, Some(value))
-            });
-        let target = match flag {
-            "--binary" => &mut binary,
-            "--config" => &mut config,
+        let bytes = args[index].as_bytes();
+        let (flag, inline) = bytes.iter().position(|b| *b == b'=').map_or(
+            (args[index].as_os_str(), None),
+            |index| {
+                (
+                    OsStr::from_bytes(&bytes[..index]),
+                    Some(OsStr::from_bytes(&bytes[index + 1..])),
+                )
+            },
+        );
+        let target = match flag.to_str() {
+            Some("--binary") => &mut binary,
+            Some("--config") => &mut config,
             _ => {
                 return Err(format!(
                     "unrecognized arguments: {}",
-                    args[index..].join(" ")
+                    display_args(&args[index..])
                 ))
             }
         };
@@ -90,8 +110,11 @@ fn parse(args: &[String], guard: bool) -> std::result::Result<Action, String> {
         } else {
             index += 1;
             args.get(index)
-                .filter(|s| !s.starts_with('-'))
-                .ok_or_else(|| format!("argument {flag}: expected one argument"))?
+                .filter(|s| !s.as_bytes().starts_with(b"-"))
+                .map(OsString::as_os_str)
+                .ok_or_else(|| {
+                    format!("argument {}: expected one argument", flag.to_string_lossy())
+                })?
         };
         *target = Some(PathBuf::from(value));
         index += 1;
@@ -134,7 +157,7 @@ pub fn main_entry(guard: bool) -> i32 {
     unsafe {
         libc::umask(0o077);
     }
-    let args: Vec<_> = env::args().skip(1).collect();
+    let args: Vec<_> = env::args_os().skip(1).collect();
     let action = match parse(&args, guard) {
         Ok(Action::Help(text)) => {
             print!("{text}");
