@@ -110,3 +110,32 @@ fn wildcard_mapping_priority_and_unavailable_targets_do_not_fall_through() {
         .iter()
         .any(|w| w.contains("public-name: target unavailable")));
 }
+
+#[test]
+fn unavailable_winning_mapping_blocks_lower_mappings_and_legacy_aliases() {
+    for target in ["missing-id", "inactive-id", "malformed-id", "empty-id"] {
+        let mut root = fixture();
+        root["combos"].as_array_mut().unwrap().extend([
+            json!({"id":"inactive-id","data":{"name":"inactive","isActive":false,"models":["openai/inactive"]}}),
+            json!({"id":"malformed-id","data":{"name":"malformed","models":{}}}),
+        ]);
+        root["key_value"]["modelAliases"] = json!({
+            "public-name":"openai/legacy", "chain":"public-name"
+        });
+        root["model_combo_mappings"] = json!([
+            {"pattern":"public-*","combo_id":target,"enabled":1,"priority":10},
+            {"pattern":"public-name","combo_id":"combo-id","enabled":1,"priority":1}
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out.toml");
+        let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+        let config = RuntimeConfig::load(output).unwrap();
+        for name in ["public-name", "chain", "openai/legacy"] {
+            assert!(!config.model_names.contains_key(name), "{target}: {name}");
+        }
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.contains("public-name: target unavailable")));
+    }
+}

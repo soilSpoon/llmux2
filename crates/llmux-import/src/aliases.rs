@@ -79,13 +79,8 @@ pub(super) fn prepare(
     let mut mappings: Vec<_> = array(root, "modelComboMappings")
         .iter()
         .filter(|row| row["enabled"] == true || row["enabled"] == 1)
-        .filter_map(|row| {
-            let name = combo_ids.get(string(row, "comboId"))?;
-            let combo = combos.get(name)?;
-            (combo["isActive"] != false).then_some((row, name))
-        })
         .collect();
-    mappings.sort_by(|(a, _), (b, _)| {
+    mappings.sort_by(|a, b| {
         b["priority"]
             .as_i64()
             .unwrap_or(0)
@@ -93,7 +88,7 @@ pub(super) fn prepare(
             .then_with(|| string(a, "createdAt").cmp(string(b, "createdAt")))
     });
     let mut names: BTreeSet<_> = aliases.keys().cloned().collect();
-    for (row, _) in &mappings {
+    for row in &mappings {
         let pattern = string(row, "pattern");
         if exact(pattern) {
             names.insert(pattern.into());
@@ -103,17 +98,31 @@ pub(super) fn prepare(
             ));
         }
     }
+    let mut unavailable = HashSet::new();
     for name in names {
         if combos.contains_key(&name) {
             warnings.push(format!("alias {name}: collision; existing combo wins"));
             aliases.remove(&name);
             continue;
         }
-        if let Some((_, combo)) = mappings
+        if let Some(mapping) = mappings
             .iter()
-            .find(|(row, _)| matches(string(row, "pattern"), &name))
+            .find(|row| matches(string(row, "pattern"), &name))
         {
-            aliases.insert(name, (*combo).clone());
+            let target = combo_ids.get(string(mapping, "comboId")).filter(|name| {
+                combos
+                    .get(*name)
+                    .is_some_and(|combo| combo["isActive"] != false)
+            });
+            if let Some(target) = target {
+                aliases.insert(name, target.clone());
+            } else {
+                warnings.push(format!(
+                    "alias {name}: target unavailable (winning mapping)"
+                ));
+                aliases.remove(&name);
+                unavailable.insert(name);
+            }
         }
     }
     let mut resolved = BTreeMap::new();
@@ -126,6 +135,12 @@ pub(super) fn prepare(
         let mut seen = HashSet::new();
         let mut current = name.as_str();
         let terminal = loop {
+            if unavailable.contains(current) {
+                warnings.push(format!(
+                    "alias {name}: target unavailable (winning mapping)"
+                ));
+                break None;
+            }
             if combos.contains_key(current) {
                 break Some(current.to_owned());
             }
