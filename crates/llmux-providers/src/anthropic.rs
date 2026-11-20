@@ -246,11 +246,17 @@ fn client_error(status: StatusCode, body: Bytes, convert: bool) -> UpstreamError
 }
 
 #[derive(Default)]
+struct StreamTool {
+    index: usize,
+    has_arguments: bool,
+}
+
+#[derive(Default)]
 struct StreamState {
     id: Value,
     model: Value,
     created: u64,
-    tools: HashMap<u64, usize>,
+    tools: HashMap<u64, StreamTool>,
     usage: Usage,
 }
 impl StreamState {
@@ -267,8 +273,13 @@ impl StreamState {
             }
             Some("content_block_start") if v["content_block"]["type"] == "tool_use" => {
                 let index = self.tools.len();
-                self.tools
-                    .insert(v["index"].as_u64().ok_or_else(bad_gateway)?, index);
+                self.tools.insert(
+                    v["index"].as_u64().ok_or_else(bad_gateway)?,
+                    StreamTool {
+                        index,
+                        has_arguments: false,
+                    },
+                );
                 (
                     json!({"tool_calls":[{"index":index,"id":v["content_block"]["id"],"type":"function","function":{"name":v["content_block"]["name"],"arguments":""}}]}),
                     Value::Null,
@@ -277,10 +288,15 @@ impl StreamState {
             Some("content_block_delta") => match v["delta"]["type"].as_str() {
                 Some("text_delta") => (json!({"content":v["delta"]["text"]}), Value::Null),
                 Some("input_json_delta") => {
-                    let index = v["index"]
+                    let tool = v["index"]
                         .as_u64()
-                        .and_then(|i| self.tools.get(&i))
+                        .and_then(|i| self.tools.get_mut(&i))
                         .ok_or_else(bad_gateway)?;
+                    let arguments = v["delta"]["partial_json"]
+                        .as_str()
+                        .ok_or_else(bad_gateway)?;
+                    tool.has_arguments |= !arguments.is_empty();
+                    let index = tool.index;
                     (
                         json!({"tool_calls":[{"index":index,"function":{"arguments":v["delta"]["partial_json"]}}]}),
                         Value::Null,
@@ -288,6 +304,19 @@ impl StreamState {
                 }
                 _ => return Ok(None),
             },
+            Some("content_block_stop") => {
+                let Some(tool) = v["index"].as_u64().and_then(|i| self.tools.get_mut(&i)) else {
+                    return Ok(None);
+                };
+                if tool.has_arguments {
+                    return Ok(None);
+                }
+                tool.has_arguments = true;
+                (
+                    json!({"tool_calls":[{"index":tool.index,"function":{"arguments":"{}"}}]}),
+                    Value::Null,
+                )
+            }
             Some("message_delta") => {
                 self.usage.output_tokens = usage(&v["usage"]).output_tokens;
                 (json!({}), json!(finish(&v["delta"]["stop_reason"])))
@@ -697,6 +726,60 @@ mod tests {
             .is_err());
         assert!(state
             .map(event(json!({"type":"future"})))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn streaming_empty_tool_arguments_are_valid_json() {
+        let mut state = StreamState::default();
+        for (index, partials) in [(3, vec![]), (5, vec![""]), (8, vec!["", "{\"x\":", "1}"])] {
+            let start = state.map(event(json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":format!("t{index}"),"name":"f","input":{}}}))).unwrap().unwrap();
+            let start: Value = serde_json::from_str(&start.data).unwrap();
+            let tool_index = start["choices"][0]["delta"]["tool_calls"][0]["index"].clone();
+            let mut arguments = String::new();
+            for partial in partials {
+                let delta = state.map(event(json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":partial}}))).unwrap().unwrap();
+                let delta: Value = serde_json::from_str(&delta.data).unwrap();
+                arguments.push_str(
+                    delta["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                        .as_str()
+                        .unwrap(),
+                );
+            }
+            let stop = state
+                .map(event(json!({"type":"content_block_stop","index":index})))
+                .unwrap();
+            if index == 8 {
+                assert!(stop.is_none());
+            } else {
+                let stop: Value = serde_json::from_str(&stop.unwrap().data).unwrap();
+                assert_eq!(
+                    stop["choices"][0]["delta"]["tool_calls"][0]["index"],
+                    tool_index
+                );
+                arguments.push_str(
+                    stop["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                        .as_str()
+                        .unwrap(),
+                );
+            }
+            let parsed: Value = serde_json::from_str(&arguments).unwrap();
+            assert_eq!(
+                parsed,
+                if index == 8 {
+                    json!({"x":1})
+                } else {
+                    json!({})
+                }
+            );
+            assert!(state
+                .map(event(json!({"type":"content_block_stop","index":index})))
+                .unwrap()
+                .is_none());
+        }
+        assert!(state
+            .map(event(json!({"type":"content_block_stop","index":0})))
             .unwrap()
             .is_none());
     }
