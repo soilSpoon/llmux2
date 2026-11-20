@@ -165,36 +165,28 @@ impl Executor {
         };
         let deadline = Instant::now() + self.cfg.server.request_timeout;
         let mut attempts = 0;
-        let mut earliest = None;
-        let mut supported = false;
-        for group in &order.groups {
+        'groups: for group in &order.groups {
             let shift = sequence % group.len();
             let (before, after) = model.deployments[group.clone()].split_at(shift);
             for &idx in after.iter().chain(before) {
+                if attempts == self.cfg.routing.max_attempts {
+                    break 'groups;
+                }
                 let idx = index(idx);
                 let dep = &self.cfg.deployments[idx];
                 let binding = &self.bindings[idx];
                 if binding.adapter.supports(req.format) == Support::No {
                     continue;
                 }
-                supported = true;
                 let now = Instant::now();
-                if let Some(reset) = binding.limits.cooldown_until(now) {
-                    earliest = min_reset(earliest, reset);
-                    continue;
-                }
-                if attempts == self.cfg.routing.max_attempts {
+                if binding.limits.cooldown_until(now).is_some() {
                     continue;
                 }
                 if now >= deadline {
                     return Err(GatewayError::Client(UpstreamError::Timeout));
                 }
-                let permit = match binding.limits.admit(now) {
-                    Ok(permit) => permit,
-                    Err(reset) => {
-                        earliest = min_reset(earliest, reset);
-                        continue;
-                    }
+                let Some(permit) = binding.limits.admit() else {
+                    continue;
                 };
 
                 attempts += 1;
@@ -214,16 +206,17 @@ impl Executor {
                         let wait = retry_after
                             .unwrap_or(self.cfg.cooldown.default)
                             .min(self.cfg.cooldown.max);
-                        let reset = binding.limits.cool_down(wait);
-                        earliest = min_reset(earliest, reset);
+                        binding.limits.cool_down(wait);
+                        drop(permit);
                         if !self
                             .cfg
                             .routing
                             .fallback_on
                             .contains(&ErrorKind::RateLimited)
                         {
+                            let now = Instant::now();
                             return Err(GatewayError::Client(UpstreamError::RateLimited {
-                                retry_after: Some(wait),
+                                retry_after: Some(binding.limits.available_at(now) - now),
                                 scope,
                             }));
                         }
@@ -233,14 +226,19 @@ impl Executor {
                 }
             }
         }
-        if !supported {
-            return Err(GatewayError::Internal);
-        }
+        // Attempts are capped per request, but the next request can use any compatible deployment.
+        let now = Instant::now();
+        let earliest = model
+            .deployments
+            .iter()
+            .map(|idx| &self.bindings[index(*idx)])
+            .filter(|binding| binding.adapter.supports(req.format) != Support::No)
+            .map(|binding| binding.limits.available_at(now))
+            .min()
+            .ok_or(GatewayError::Internal)?;
         Err(GatewayError::AllCandidatesExhausted {
             attempts,
-            retry_after: earliest.map_or(Duration::ZERO, |t: Instant| {
-                t.saturating_duration_since(Instant::now())
-            }),
+            retry_after: earliest.saturating_duration_since(Instant::now()),
         })
     }
 
@@ -311,10 +309,6 @@ fn hold_permit(response: GatewayResponse, permit: Permit) -> GatewayResponse {
         }
         complete => complete,
     }
-}
-
-fn min_reset(previous: Option<Instant>, reset: Instant) -> Option<Instant> {
-    Some(previous.map_or(reset, |earliest| earliest.min(reset)))
 }
 
 fn index(idx: DeploymentIdx) -> usize {

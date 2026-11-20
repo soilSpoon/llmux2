@@ -99,6 +99,15 @@ struct Fixture {
 
 impl Fixture {
     async fn start(first: [Reply; 2], next: [Reply; 2], primary_quota: &str) -> Self {
+        Self::start_with_max_attempts(first, next, primary_quota, 4).await
+    }
+
+    async fn start_with_max_attempts(
+        first: [Reply; 2],
+        next: [Reply; 2],
+        primary_quota: &str,
+        max_attempts: usize,
+    ) -> Self {
         let [primary_first, secondary_first] = first;
         let [primary_next, secondary_next] = next;
         let primary = Arc::new(Mock {
@@ -139,6 +148,9 @@ impl Fixture {
 [server]
 client_keys = ["file:{base}/test-client"]
 request_timeout_ms = 4000
+
+[routing]
+max_attempts = {max_attempts}
 
 [[credentials]]
 id = "primary"
@@ -295,6 +307,40 @@ async fn both_rate_limited_returns_earliest_retry_after() {
         assert_eq!(fixture.counts(), [1, 1]);
     }
     println!("both deployments returned 429: gateway returned 429 with earliest Retry-After: 5");
+}
+
+#[tokio::test]
+async fn retry_after_checks_cooldown_and_rpm_together() {
+    let fixture = Fixture::start(
+        [Reply::Limit(5), Reply::Limit(90)],
+        [Reply::Complete, Reply::Complete],
+        "quota = { rpm = 1 }",
+    )
+    .await;
+    for _ in 0..2 {
+        let response = fixture.request("test-client", "shared", false).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "60");
+        assert_eq!(fixture.counts(), [1, 1]);
+    }
+}
+
+#[tokio::test]
+async fn retry_after_is_zero_if_attempt_budget_left_a_ready_deployment() {
+    let fixture = Fixture::start_with_max_attempts(
+        [Reply::Limit(5), Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+        1,
+    )
+    .await;
+    let response = fixture.request("test-client", "shared", false).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "0");
+    assert_eq!(fixture.counts(), [1, 0]);
+    let retry = fixture.request("test-client", "shared", false).await;
+    check_route(&retry, "d2", "1");
+    assert_eq!(fixture.counts(), [1, 1]);
 }
 
 #[tokio::test]

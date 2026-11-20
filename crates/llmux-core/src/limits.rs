@@ -46,12 +46,29 @@ impl DeploymentLimits {
         self.baseline + Duration::from_nanos(offset_ns.max(previous))
     }
 
-    pub fn admit(self: &Arc<Self>, now: Instant) -> Result<Permit, Instant> {
+    pub fn available_at(&self, now: Instant) -> Instant {
+        let mut ready = self.cooldown_until(now).unwrap_or(now);
+        if let Some((max, queue)) = &self.rpm {
+            let starts = queue.lock().unwrap_or_else(|err| err.into_inner());
+            if starts.len() >= *max as usize {
+                ready = ready.max(starts[0] + RPM_WINDOW);
+            }
+        }
+        if self
+            .concurrent
+            .is_some_and(|max| self.inflight.load(Ordering::Relaxed) >= max)
+        {
+            ready = ready.max(now + CONCURRENCY_RETRY);
+        }
+        ready
+    }
+
+    pub fn admit(self: &Arc<Self>) -> Option<Permit> {
         let permit = if let Some(max) = self.concurrent {
             let mut inflight = self.inflight.load(Ordering::Relaxed);
             loop {
                 if inflight >= max {
-                    return Err(now + CONCURRENCY_RETRY);
+                    return None;
                 }
                 match self.inflight.compare_exchange_weak(
                     inflight,
@@ -77,11 +94,11 @@ impl DeploymentLimits {
                 starts.pop_front();
             }
             if starts.len() >= *max as usize {
-                return Err(starts[0] + RPM_WINDOW);
+                return None;
             }
             starts.push_back(now);
         }
-        Ok(permit)
+        Some(permit)
     }
 }
 
@@ -106,10 +123,11 @@ mod tests {
             ..QuotaSpec::default()
         }));
         let now = Instant::now();
-        let permit = limits.admit(now).ok().unwrap();
-        assert_eq!(limits.admit(now).err(), Some(now + CONCURRENCY_RETRY));
+        let permit = limits.admit().unwrap();
+        assert!(limits.admit().is_none());
+        assert_eq!(limits.available_at(now), now + CONCURRENCY_RETRY);
         drop(permit);
-        assert!(limits.admit(now).is_ok());
+        assert!(limits.admit().is_some());
     }
 
     #[test]
