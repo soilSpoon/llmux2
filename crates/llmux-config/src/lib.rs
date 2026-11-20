@@ -211,6 +211,8 @@ struct RawModel {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDeployment {
+    #[serde(default)]
+    fallback: bool,
     id: String,
     credential: Option<String>,
     auth: Option<DeploymentAuth>,
@@ -531,6 +533,7 @@ impl RawConfig {
                 );
                 candidates.push(idx);
                 deployments.push(Deployment {
+                    fallback: dep.fallback || is_catch_all,
                     idx,
                     id,
                     provider,
@@ -767,6 +770,16 @@ refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
             .replace("name = \"model\"", "name = \"*\"")
             .replace("upstream_model = \"upstream\"", "upstream_model = \"*\"");
         assert!(RuntimeConfig::parse(&wildcard).is_ok());
+        assert!(!RuntimeConfig::parse(&base).unwrap().deployments[0].fallback);
+        assert!(
+            RuntimeConfig::parse(
+                &base.replace("upstream_model =", "fallback = true\nupstream_model =")
+            )
+            .unwrap()
+            .deployments[0]
+                .fallback
+        );
+        assert!(RuntimeConfig::parse(&wildcard).unwrap().deployments[0].fallback);
         let excluded = wildcard.replace(
             "name = \"*\"",
             "name = \"*\"\nexclude = [\"codex/*\", \"exact\"]",

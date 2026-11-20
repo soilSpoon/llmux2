@@ -172,6 +172,7 @@ async fn fixture_full(
     });
     let deployments = (0..3)
         .map(|i| Deployment {
+            fallback: false,
             idx: DeploymentIdx(i),
             id: format!("dep{i}").into(),
             provider: adapter.kind.clone(),

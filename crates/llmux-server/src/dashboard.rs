@@ -99,7 +99,10 @@ async fn stats(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
         return StatusCode::NOT_FOUND.into_response();
     };
     let mut response = if authorized(&headers, std::slice::from_ref(&dashboard.key)) {
+        let deployments = state.executor.deployment_stats();
         Json(json!({
+            "fallback": llmux_core::FallbackStats::from_deployments(&deployments),
+            "catch_all": state.executor.catch_all_stats(),
             "uptime_ms": dashboard.started.elapsed().as_millis() as u64,
             "responses": {
                 "ok": dashboard.ok.load(Relaxed),
@@ -108,7 +111,7 @@ async fn stats(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
                 "failed": dashboard.failed.load(Relaxed),
                 "ready_us": dashboard.ready_us.load(Relaxed),
             },
-            "deployments": state.executor.deployment_stats(),
+            "deployments": deployments,
         }))
         .into_response()
     } else {

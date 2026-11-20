@@ -23,7 +23,7 @@ use llmux_types::{
     UpstreamError,
 };
 use stats::AttemptStats;
-pub use stats::DeploymentStats;
+pub use stats::{CatchAllStats, DeploymentStats, FallbackStats};
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
@@ -95,6 +95,7 @@ struct ModelOrder {
 }
 
 pub struct Executor {
+    catch_all_stats: Option<stats::CatchAllCounter>,
     cfg: Arc<RuntimeConfig>,
     bindings: Box<[Binding]>,
     orders: Box<[ModelOrder]>,
@@ -230,6 +231,7 @@ impl Executor {
             .pool_idle_timeout(Duration::from_secs(30))
             .retry_canceled_requests(false);
         Ok(Self {
+            catch_all_stats: cfg.server.dashboard_key.is_some().then(Default::default),
             cfg,
             bindings,
             orders,
@@ -261,6 +263,13 @@ impl Executor {
                 })
             })
             .collect()
+    }
+
+    pub fn catch_all_stats(&self) -> CatchAllStats {
+        self.catch_all_stats
+            .as_ref()
+            .map(|stats| stats.lock().unwrap().clone())
+            .unwrap_or_default()
     }
 
     pub async fn execute(&self, req: GatewayRequest) -> Result<RoutedResponse, GatewayError> {
@@ -376,6 +385,11 @@ impl Executor {
                     last_transient = None;
                     match result {
                         Ok(response) => {
+                            if self.cfg.catch_all == Some(model_idx) {
+                                if let Some(stats) = &self.catch_all_stats {
+                                    stats.lock().unwrap().record(&req.model);
+                                }
+                            }
                             if matches!(response, GatewayResponse::Complete { .. }) {
                                 binding.limits.succeeded();
                             }
