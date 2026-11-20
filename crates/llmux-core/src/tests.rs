@@ -137,6 +137,7 @@ async fn fixture(
             max: Duration::from_secs(5),
         },
         api_keys: HashMap::new(),
+        oauth: HashMap::new(),
         model_names: HashMap::from([("model".into(), 0)]),
         models: Box::new([CanonicalModel {
             name: "model".into(),
