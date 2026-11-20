@@ -48,3 +48,9 @@ provider fees unless the owner explicitly asks.
 WHEN a Codex deployment uses ChatGPT OAuth
 THEN it is reachable only with the owner's own gateway key and never joins a
 shared fallback pool.
+
+#### Scenario: xAI OAuth deployment
+
+WHEN a deployment uses an OAuth credential minted by `llmux-login xai`
+(the public Grok CLI client on auth.x.ai)
+THEN requests go to api.x.ai with the OAuth bearer via `openai_compat`.

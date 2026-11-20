@@ -207,6 +207,42 @@ rejected with 400. An incomplete, failed, or interrupted stream is not successfu
 after SSE commitment errors terminate the stream without replaying the request.
 Anthropic inbound is not supported by this adapter.
 
+## xAI OAuth (api.x.ai)
+
+Sign in with xAI uses the public Grok CLI OAuth client (authorization-code
+PKCE on `auth.x.ai`) and serves `api.x.ai` through `provider = "openai_compat"`,
+the same pattern OmniRoute uses for its `xai-oauth` provider.
+
+Run `cargo run -p llmux-login -- xai --dir ~/.config/llmux/xai` (the directory
+is optional). It opens the browser with a private sign-in URL, listens for the
+callback on `127.0.0.1:56121/callback` (falling back to a free port), validates
+the ES256 ID token against xAI's JWKS, requires the `api:access` scope, and
+writes `credentials.json` and `refresh_token` with owner-only permissions. Paste
+the printed credential block into `llmux.toml`, then point a deployment at it:
+
+```toml
+[[credentials]]
+id = "xai"
+kind = "oauth"
+provider = "openai_compat"
+token_url = "https://auth.x.ai/oauth2/token"
+client_id = "b1a00492-073a-47ea-816f-4c329264a828" # public Grok CLI client
+refresh_token = "file:/absolute/path/to/.config/llmux/xai/refresh_token"
+
+[[models]]
+name = "grok-4.7"
+
+[[models.deployments]]
+id = "xai-grok-4.7"
+credential = "xai"
+base_url = "https://api.x.ai/v1"
+upstream_model = "grok-4.7"
+```
+
+Do not run login concurrently with a gateway using the same rotating token file.
+Unlike Codex, an xAI credential needs no `allowed_keys` restriction unless
+your own policy wants one.
+
 ## Development
 
 ### Sign in with ChatGPT

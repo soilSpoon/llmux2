@@ -9,7 +9,7 @@ use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use llmux_login::{Endpoints, PendingLogin};
+use llmux_login::{Endpoints, Flow, PendingLogin};
 use llmux_testkit::TestServer;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -147,7 +147,7 @@ async fn callback(params: &HashMap<String, String>, values: &[(&str, &str)]) -> 
 async fn first_login_files_snippet_and_returning_login() {
     let (_server, fake, endpoints) = fixture().await;
     let dir = tempfile::tempdir().unwrap();
-    let pending = PendingLogin::start(dir.path(), endpoints.clone())
+    let pending = PendingLogin::start(dir.path(), Flow::codex(endpoints.clone()))
         .await
         .unwrap();
     let first = params(&pending);
@@ -231,7 +231,9 @@ async fn first_login_files_snippet_and_returning_login() {
         credential["refresh_token"].as_str().unwrap(),
         format!("file:{}", dir.path().join("refresh_token").display())
     );
-    let pending = PendingLogin::start(dir.path(), endpoints).await.unwrap();
+    let pending = PendingLogin::start(dir.path(), Flow::codex(endpoints))
+        .await
+        .unwrap();
     let second = params(&pending);
     assert_eq!(second["ext_agent_host_id"], first["ext_agent_host_id"]);
     assert_eq!(second["client_id"], "oaiapp_issued");
@@ -254,7 +256,9 @@ async fn first_login_files_snippet_and_returning_login() {
 async fn invalid_callback_state_keeps_waiting_for_valid_callback() {
     let (_server, fake, endpoints) = fixture().await;
     let dir = tempfile::tempdir().unwrap();
-    let pending = PendingLogin::start(dir.path(), endpoints).await.unwrap();
+    let pending = PendingLogin::start(dir.path(), Flow::codex(endpoints))
+        .await
+        .unwrap();
     let params = params(&pending);
     prepare(&fake, &params).await;
     let complete = tokio::spawn(pending.finish());
@@ -296,7 +300,9 @@ async fn callback_failures_do_not_exchange_or_write_credentials() {
     for mode in ["denied", "missing", "dynamic", "duplicate"] {
         let (_server, fake, endpoints) = fixture().await;
         let dir = tempfile::tempdir().unwrap();
-        let pending = PendingLogin::start(dir.path(), endpoints).await.unwrap();
+        let pending = PendingLogin::start(dir.path(), Flow::codex(endpoints))
+            .await
+            .unwrap();
         let params = params(&pending);
         let state = params["state"].as_str();
         let mut fields = vec![("state", state), ("code", "code +&")];
@@ -338,7 +344,9 @@ async fn invalid_tokens_and_missing_plan_permission_are_rejected() {
         let (_server, fake, endpoints) = fixture().await;
         let dir = tempfile::tempdir().unwrap();
         fake.lock().await.mode = mode;
-        let pending = PendingLogin::start(dir.path(), endpoints).await.unwrap();
+        let pending = PendingLogin::start(dir.path(), Flow::codex(endpoints))
+            .await
+            .unwrap();
         let params = params(&pending);
         prepare(&fake, &params).await;
         let complete = tokio::spawn(pending.finish());
@@ -364,7 +372,7 @@ async fn invalid_tokens_and_missing_plan_permission_are_rejected() {
 async fn returning_login_rejects_client_or_identity_change_without_overwriting() {
     let (_server, fake, endpoints) = fixture().await;
     let dir = tempfile::tempdir().unwrap();
-    let pending = PendingLogin::start(dir.path(), endpoints.clone())
+    let pending = PendingLogin::start(dir.path(), Flow::codex(endpoints.clone()))
         .await
         .unwrap();
     let p = params(&pending);
@@ -382,7 +390,7 @@ async fn returning_login_rejects_client_or_identity_change_without_overwriting()
     task.await.unwrap().unwrap();
     let before = fs::read(dir.path().join("credentials.json")).unwrap();
     for mode in ["client", "subject"] {
-        let pending = PendingLogin::start(dir.path(), endpoints.clone())
+        let pending = PendingLogin::start(dir.path(), Flow::codex(endpoints.clone()))
             .await
             .unwrap();
         let p = params(&pending);
@@ -416,7 +424,7 @@ async fn invalid_grant_restarts_with_the_issued_client_and_fresh_pkce() {
     let (_server, fake, endpoints) = fixture().await;
     let dir = tempfile::tempdir().unwrap();
     fake.lock().await.mode = "invalid_grant";
-    let pending = PendingLogin::start(dir.path(), endpoints.clone())
+    let pending = PendingLogin::start(dir.path(), Flow::codex(endpoints.clone()))
         .await
         .unwrap();
     let first = params(&pending);
@@ -435,7 +443,7 @@ async fn invalid_grant_restarts_with_the_issued_client_and_fresh_pkce() {
     let client = error.retry_client_id().unwrap();
     assert_eq!(client, "oaiapp_issued");
     assert!(!dir.path().join("credentials.json").exists());
-    let pending = PendingLogin::retry(dir.path(), endpoints, client)
+    let pending = PendingLogin::retry(dir.path(), Flow::codex(endpoints), client)
         .await
         .unwrap();
     let next = params(&pending);
@@ -491,7 +499,9 @@ async fn occupied_preferred_port_uses_another_loopback_port() {
     .unwrap();
     let (_server, _fake, endpoints) = fixture().await;
     let dir = tempfile::tempdir().unwrap();
-    let pending = PendingLogin::start(dir.path(), endpoints).await.unwrap();
+    let pending = PendingLogin::start(dir.path(), Flow::codex(endpoints))
+        .await
+        .unwrap();
     let p = params(&pending);
     let redirect = Url::parse(&p["redirect_uri"]).unwrap();
     assert_eq!(redirect.host_str(), Some("127.0.0.1"));
