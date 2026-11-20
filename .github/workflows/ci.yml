@@ -21,6 +21,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
+      - name: Test dashboard browser logic
+        run: node --test crates/llmux-server/tests/dashboard.cjs
       - name: Test benchmark harness
         run: python3 -B -m unittest discover -s bench -v
       - name: Test repository tooling
