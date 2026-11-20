@@ -10,7 +10,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use jsonwebtoken::{decode, decode_header, jwk::JwkSet, Algorithm, DecodingKey, Validation};
-use rand::{rngs::OsRng, RngCore};
+use rand::{rngs::SysRng, TryRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -425,7 +425,7 @@ fn random() -> Result<String> {
 
 fn random_n(n: usize) -> Result<String> {
     let mut bytes = vec![0; n];
-    OsRng
+    SysRng
         .try_fill_bytes(&mut bytes)
         .map_err(|_| Error::Authorization)?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
