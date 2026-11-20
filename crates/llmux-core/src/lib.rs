@@ -102,12 +102,33 @@ pub struct Executor {
 }
 
 impl Executor {
+    fn shared_limits<'a>(
+        shared: &mut Vec<(&'a Deployment, Arc<DeploymentLimits>)>,
+        dep: &'a Deployment,
+    ) -> Arc<DeploymentLimits> {
+        let same_route = |other: &&Deployment| {
+            other.provider == dep.provider
+                && other.credential == dep.credential
+                && other.base_url == dep.base_url
+                && other.upstream_model == dep.upstream_model
+                && other.quota == dep.quota
+        };
+        if let Some((_, limits)) = shared.iter().find(|(other, _)| same_route(other)) {
+            return limits.clone();
+        }
+        let limits = Arc::new(DeploymentLimits::new(dep.quota));
+        shared.push((dep, limits.clone()));
+        limits
+    }
+
     pub fn new(
         cfg: Arc<RuntimeConfig>,
         registry: &ProviderRegistry,
         credentials: &HashMap<Arc<str>, Arc<dyn CredentialSource>>,
     ) -> Result<Self, InitError> {
         let mut disabled = HashMap::<Arc<str>, Arc<AtomicBool>>::new();
+        // Deployments that reach the same upstream route draw on one provider limit.
+        let mut shared_limits = Vec::<(&Deployment, Arc<DeploymentLimits>)>::new();
         let bindings = cfg
             .deployments
             .iter()
@@ -133,7 +154,7 @@ impl Executor {
                     adapter,
                     auth,
                     disabled,
-                    limits: Arc::new(DeploymentLimits::new(dep.quota)),
+                    limits: Self::shared_limits(&mut shared_limits, dep),
                     stats: cfg.server.dashboard_key.is_some().then(Arc::default),
                 })
             })
