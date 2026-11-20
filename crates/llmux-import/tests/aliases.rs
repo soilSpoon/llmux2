@@ -168,3 +168,86 @@ fn mapping_to_skipped_duplicate_combo_never_binds_to_first_combo() {
         assert!(warnings.contains("duplicate-alias: target unavailable"));
     }
 }
+
+#[test]
+fn equal_priority_mappings_use_earliest_created_at() {
+    let mut root = fixture();
+    root["combos"].as_array_mut().unwrap().push(json!({
+        "id":"newer-id","data":{"name":"newer","models":["openai/newer"]}
+    }));
+    root["key_value"]["modelAliases"] = json!({});
+    root["model_combo_mappings"] = json!([
+        {"pattern":"dated","combo_id":"newer-id","enabled":1,"priority":10,"created_at":"2026-01-02T00:00:00Z"},
+        {"pattern":"dated","combo_id":"combo-id","enabled":1,"priority":10,"created_at":"2026-01-01T00:00:00Z"},
+        {"pattern":"dated","combo_id":"missing","enabled":0,"priority":20,"created_at":"2025-01-01T00:00:00Z"}
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let config = RuntimeConfig::load(output).unwrap();
+    assert_eq!(
+        config.model_names.get("dated"),
+        config.model_names.get("canonical")
+    );
+}
+
+#[test]
+fn combo_prefixed_alias_targets_preserve_unavailable_targets() {
+    let mut root = fixture();
+    root["key_value"]["modelAliases"] = json!({
+        "prefixed":"combo/canonical", "empty-prefixed":"combo/empty", "missing-prefixed":"combo/missing"
+    });
+    root["model_combo_mappings"] = json!([]);
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let config = RuntimeConfig::load(output).unwrap();
+    assert_eq!(
+        config.model_names.get("prefixed"),
+        config.model_names.get("canonical")
+    );
+    for name in ["empty-prefixed", "missing-prefixed"] {
+        assert!(!config.model_names.contains_key(name));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.contains(&format!("alias {name}: target unavailable"))));
+    }
+}
+
+#[test]
+fn alias_chain_boundary_counts_alias_hops_not_terminal_targets() {
+    for target in ["canonical", "combo/canonical", "openai/direct-test"] {
+        for hops in [127, 128, 129] {
+            let mut root = fixture();
+            let mut aliases = serde_json::Map::new();
+            for i in 0..hops {
+                let next = if i + 1 == hops {
+                    target.into()
+                } else {
+                    format!("chain-{}", i + 1)
+                };
+                aliases.insert(format!("chain-{i}"), Value::String(next));
+            }
+            root["key_value"]["modelAliases"] = aliases.into();
+            root["model_combo_mappings"] = json!([]);
+            let dir = tempfile::tempdir().unwrap();
+            let output = dir.path().join("out.toml");
+            let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+            let config = RuntimeConfig::load(output).unwrap();
+            assert_eq!(
+                config.model_names.contains_key("chain-0"),
+                hops <= 128,
+                "{target}: {hops}"
+            );
+            assert!(config.model_names.contains_key("chain-1"));
+            assert_eq!(
+                report
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("alias chain-0: skipped cycle or chain safety limit")),
+                hops > 128
+            );
+        }
+    }
+}

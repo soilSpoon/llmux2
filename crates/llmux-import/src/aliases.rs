@@ -137,12 +137,14 @@ pub(super) fn prepare(
             {
                 break Some(combo.to_owned());
             }
-            if !seen.insert(current) || seen.len() > 128 {
-                warnings.push(format!("alias {name}: skipped cycle or chain safety limit"));
-                break None;
-            }
             match aliases.get(current) {
-                Some(next) => current = next,
+                Some(next) => {
+                    if !seen.insert(current) || seen.len() > 128 {
+                        warnings.push(format!("alias {name}: skipped cycle or chain safety limit"));
+                        break None;
+                    }
+                    current = next;
+                }
                 None => break Some(current.to_owned()),
             }
         };
