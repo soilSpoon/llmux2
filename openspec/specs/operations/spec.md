@@ -26,8 +26,6 @@ fallback share, top retained IDs and fallback deployment labels.
 - THEN new IDs count in the other bucket while retained IDs continue accumulating.
 - WHEN an upstream attempt fails before a response is ready
 - THEN it does not increment served counts or the catch-all breakdown.
-
-
 ### Requirement: Korean dashboard
 
 The gateway SHALL offer an at-a-glance dashboard in Korean, light theme by

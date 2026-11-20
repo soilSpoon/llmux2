@@ -124,6 +124,8 @@ thead th { color: var(--secondary); font-weight: 600; white-space: nowrap; }
 tbody:last-child tr:last-child td { border-bottom: 0; }
 .deployment { width: 23%; min-width: 128px; font-weight: 600; overflow-wrap: anywhere; }
 .deployment small { display: block; font-weight: 400; color: var(--muted); }
+.deployment .route-state { display: block; }
+#catch-all-models { overflow-wrap: anywhere; }
 .numeric { text-align: end; }
 td.numeric, .priority { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .limits { color: var(--muted); font-size: .875rem; white-space: nowrap; font-variant-numeric: tabular-nums; }

@@ -154,7 +154,7 @@ test("live metrics, routing state, and disconnect recovery are displayed in Kore
   assert.equal(ui.element("latency").textContent, "10 ms");
   assert.equal(ui.element("fallback-share").textContent, "40%");
   assert.equal(ui.element("catch-all-models").textContent, "vendor/new · 2");
-  assert.equal(ui.element("catch-all-other").textContent, "Other · 3");
+  assert.equal(ui.element("catch-all-other").textContent, "기타 · 3");
   assert.equal(ui.rows[1][0].children[0].textContent, "Fallback");
   assert.equal(ui.rows[0][0].textContent, "gateway-model");
   assert.equal(ui.rows[1][2].children[0].textContent, "재시도 대기 · 2초");
