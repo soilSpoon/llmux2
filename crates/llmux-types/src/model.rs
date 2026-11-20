@@ -71,6 +71,8 @@ pub struct Deployment {
     pub billing: Billing,
     pub quota: QuotaSpec,
     pub timeout: Duration,
+    /// Context window in tokens (prompt plus completion); `None` is unchecked.
+    pub max_context: Option<u32>,
 }
 
 #[derive(Debug)]

@@ -863,6 +863,7 @@ mod tests {
             billing: Billing::default(),
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(10),
+            max_context: None,
         };
         let mut req = GatewayRequest {
             format: InboundFormat::AnthropicMessages,
