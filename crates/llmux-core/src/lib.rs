@@ -33,7 +33,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use thiserror::Error;
-use tokio::time::{timeout, timeout_at, Instant};
+use tokio::time::{timeout_at, Instant};
 
 #[derive(Debug, Error)]
 pub enum InitError {
@@ -569,19 +569,32 @@ impl Executor {
                 let idle_timeout = self.cfg.server.request_timeout.min(dep.timeout);
                 let cooldown = (self.cfg.cooldown.default, self.cfg.cooldown.max);
                 let events = stream::unfold(
-                    Some((events, binding.stats.clone(), binding.limits.clone())),
+                    Some((
+                        events,
+                        binding.stats.clone(),
+                        binding.limits.clone(),
+                        Box::pin(tokio::time::sleep(idle_timeout)),
+                    )),
                     move |state| async move {
-                        let (mut events, stats, limits) = state?;
-                        let error = match timeout(idle_timeout, events.next()).await {
-                            Ok(Some(Ok(event))) => {
-                                return Some((Ok(event), Some((events, stats, limits))))
-                            }
-                            Ok(Some(Err(err))) => err,
-                            Ok(None) => {
-                                limits.succeeded();
-                                return None;
-                            }
-                            Err(_) => UpstreamError::Timeout,
+                        let (mut events, stats, limits, mut idle) = state?;
+                        // Measure idle from each poll, not from the last event: a
+                        // downstream pause must not eat into the upstream idle window.
+                        idle.as_mut().reset(Instant::now() + idle_timeout);
+                        let error = tokio::select! {
+                            next = events.next() => match next {
+                                Some(Ok(event)) => {
+                                    return Some((
+                                        Ok(event),
+                                        Some((events, stats, limits, idle)),
+                                    ));
+                                }
+                                Some(Err(err)) => err,
+                                None => {
+                                    limits.succeeded();
+                                    return None;
+                                }
+                            },
+                            () = &mut idle => UpstreamError::Timeout,
                         };
                         if let Some(stats) = &stats {
                             stats.record_stream_error();
