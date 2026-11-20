@@ -1,0 +1,17 @@
+[package]
+name = "llmux-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper-rustls.workspace = true
+hyper-util.workspace = true
+llmux-config.workspace = true
+llmux-types.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

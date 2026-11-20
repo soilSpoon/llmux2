@@ -1,0 +1,242 @@
+//! Axum boundary for the OpenAI-compatible chat gateway.
+
+use axum::{
+    body::{self, Body},
+    extract::{Request, State},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
+    routing::post,
+    Json, Router,
+};
+use futures_util::StreamExt;
+use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use http_body_util::LengthLimitError;
+use llmux_config::RuntimeConfig;
+use llmux_core::{Executor, GatewayError};
+use llmux_providers::{OpenAiChatMetadata, OpenAiCompat, StaticKey};
+use llmux_types::{
+    CredentialSource, GatewayRequest, GatewayResponse, InboundFormat, ProviderRegistry, RequestId,
+    UpstreamError,
+};
+use serde_json::json;
+use std::{convert::Infallible, error::Error, sync::Arc, time::Duration};
+use subtle::ConstantTimeEq;
+
+const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+const DEPLOYMENT_HEADER: HeaderName = HeaderName::from_static("x-llmux-deployment");
+const ATTEMPTS_HEADER: HeaderName = HeaderName::from_static("x-llmux-attempts");
+
+struct AppState {
+    config: Arc<RuntimeConfig>,
+    executor: Executor,
+}
+
+pub fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Send + Sync>> {
+    let mut registry = ProviderRegistry::default();
+    for kind in ["openai", "openai_compat"] {
+        registry.register(Arc::new(OpenAiCompat::new(kind)));
+    }
+    let sources = std::mem::take(&mut config.api_keys)
+        .into_iter()
+        .map(|(id, key)| {
+            Ok((
+                id,
+                Arc::new(StaticKey::bearer(&key)?) as Arc<dyn CredentialSource>,
+            ))
+        })
+        .collect::<Result<_, llmux_types::BuildError>>()?;
+
+    let config = Arc::new(config);
+    let executor = Executor::new(config.clone(), &registry, &sources)?;
+    Ok(Router::new()
+        .route("/v1/chat/completions", post(chat))
+        .with_state(Arc::new(AppState { config, executor })))
+}
+
+async fn chat(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if !authorized(request.headers(), &state.config.server.client_keys) {
+        let mut response = error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "Invalid gateway API key",
+        );
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        return response;
+    }
+    let body = match body::to_bytes(request.into_body(), MAX_REQUEST_BYTES).await {
+        Ok(body) => body,
+        Err(err)
+            if err
+                .source()
+                .is_some_and(|cause| cause.is::<LengthLimitError>()) =>
+        {
+            return error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "invalid_request_error",
+                "Request body too large",
+            );
+        }
+        Err(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Could not read request body",
+            )
+        }
+    };
+    let Ok(metadata) = OpenAiChatMetadata::parse(&body) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Expected a JSON object with a nonempty string model and optional boolean stream",
+        );
+    };
+
+    let req = GatewayRequest {
+        format: InboundFormat::OpenAiChat,
+        model: Arc::from(metadata.model.as_ref()),
+        stream: metadata.stream,
+        est_input_tokens: body.len().div_ceil(4) as u32,
+        body,
+        parsed: Default::default(),
+        request_id: RequestId(Arc::from(uuid::Uuid::new_v4().to_string())),
+    };
+
+    let routed = match state.executor.execute(req).await {
+        Ok(routed) => routed,
+        Err(err) => return gateway_error(err),
+    };
+    let mut response = match routed.response {
+        GatewayResponse::Complete { status, body, .. } => json_body(status, Body::from(body)),
+        GatewayResponse::Stream(events) => {
+            let stream = events.map(|event| {
+                let event = match event {
+                    Ok(event) => {
+                        let out = Event::default().data(event.data);
+                        if let Some(name) = event.event {
+                            out.event(name)
+                        } else {
+                            out
+                        }
+                    }
+                    Err(_) => Event::default().data(
+                        r#"{"error":{"message":"Upstream stream ended unexpectedly","type":"upstream_error","code":"stream_broken"}}"#,
+                    ),
+                };
+                Ok::<_, Infallible>(event)
+            });
+            Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response()
+        }
+    };
+    if state.config.server.expose_routing_headers {
+        if let Ok(value) = HeaderValue::from_str(&routed.deployment) {
+            response.headers_mut().insert(DEPLOYMENT_HEADER, value);
+        }
+        response
+            .headers_mut()
+            .insert(ATTEMPTS_HEADER, HeaderValue::from(routed.attempts));
+    }
+    response
+}
+
+fn authorized(headers: &HeaderMap, keys: &[Arc<str>]) -> bool {
+    let mut auth = headers.get_all(header::AUTHORIZATION).iter();
+    let Some((scheme, value)) = auth
+        .next()
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.split_once(' '))
+    else {
+        return false;
+    };
+    if auth.next().is_some() || !scheme.eq_ignore_ascii_case("bearer") {
+        return false;
+    }
+    let value = value.trim_start_matches(' ');
+    keys.iter()
+        .fold(subtle::Choice::from(0), |matched, key| {
+            matched | key.as_bytes().ct_eq(value.as_bytes())
+        })
+        .into()
+}
+
+fn gateway_error(err: GatewayError) -> Response {
+    match err {
+        GatewayError::UnknownModel => {
+            error(StatusCode::NOT_FOUND, "model_not_found", "Unknown model")
+        }
+        GatewayError::UnsupportedStream => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Model does not support streaming",
+        ),
+        GatewayError::AllCandidatesExhausted { retry_after, .. } => rate_limited(retry_after),
+        GatewayError::Client(UpstreamError::RateLimited { retry_after, .. }) => {
+            rate_limited(retry_after.unwrap_or_default())
+        }
+        GatewayError::Client(UpstreamError::BadRequest { status, body }) => {
+            json_body(status, Body::from(body))
+        }
+        GatewayError::Client(UpstreamError::Timeout) => error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "upstream_timeout",
+            "Upstream timed out",
+        ),
+        GatewayError::Client(_) => error(
+            StatusCode::BAD_GATEWAY,
+            "upstream_error",
+            "Upstream request failed",
+        ),
+        GatewayError::Internal => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Gateway could not prepare the request",
+        ),
+    }
+}
+
+fn rate_limited(wait: Duration) -> Response {
+    let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+    let mut response = error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limit_exceeded",
+        "No upstream currently available",
+    );
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+    response
+}
+
+fn error(status: StatusCode, code: &str, message: &str) -> Response {
+    let kind = match status {
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        StatusCode::UNAUTHORIZED => "authentication_error",
+        status if status.is_server_error() => "server_error",
+        _ => "invalid_request_error",
+    };
+    (
+        status,
+        Json(json!({
+            "error": {"message": message, "type": kind, "param": null, "code": code}
+        })),
+    )
+        .into_response()
+}
+
+fn json_body(status: StatusCode, body: Body) -> Response {
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        body,
+    )
+        .into_response()
+}
