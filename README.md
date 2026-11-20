@@ -1,6 +1,6 @@
 # llmux2
 
-Rust gateway exposing multiple API-key upstreams under one OpenAI-compatible model name. The MVP supports JSON and SSE at `POST /v1/chat/completions`.
+Rust gateway exposing multiple API-key upstreams under one OpenAI-compatible model name. Both `POST /v1/chat/completions` and `POST /v1/responses` support JSON and SSE.
 
 ## Run
 
@@ -15,7 +15,16 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"llama-70b","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-For SSE, add `"stream":true` to the request and use `curl -N`. The gateway rewrites just the top-level request model to the upstream ID; other request fields and successful response payloads pass through.
+For Chat Completions on OpenAI-compatible upstreams, the gateway rewrites only the top-level request model. Other request fields and successful response payloads pass through.
+
+```sh
+curl -sS http://127.0.0.1:8080/v1/responses \
+  -H "Authorization: Bearer $LLMUX_CLIENT_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"llama-70b","input":"Hello"}'
+```
+
+The Responses route translates requests to Chat Completions on OpenAI-compatible upstreams and converts replies back. Stateful Responses conversations and built-in non-function tools are unsupported. For SSE on either route, add `"stream":true` and use `curl -N`.
 
 ## Routing
 
@@ -30,7 +39,7 @@ The MVP does not wire OAuth into server configuration, or implement multi-format
 - `llmux-types` defines the shared model, IR, and provider contracts.
 - `llmux-config` parses and validates TOML and secret references.
 - `llmux-core` selects deployments, enforces limits, and executes attempts.
-- `llmux-providers` implements the OpenAI-compatible and Anthropic Messages adapters with static API-key and OAuth refresh-token credential sources (OAuth configuration wiring is not yet available), including Responses-to-Chat-Completions conversion (JSON and SSE); server routing for `/v1/responses` is not yet wired. Stateful Responses conversations and built-in non-function tools are unsupported.
+- `llmux-providers` implements the OpenAI-compatible and Anthropic Messages adapters with static API-key and OAuth refresh-token credential sources (OAuth configuration wiring is not yet available), including Responses-to-Chat-Completions conversion.
 - `llmux-server` assembles those crates and serves the HTTP API.
 - `llmux-testkit` provides loopback HTTP fixtures.
 
