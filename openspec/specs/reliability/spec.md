@@ -21,7 +21,9 @@ the error to the client.
 #### Scenario: An explicitly missing upstream model or an Anthropic HTTP 408 triggers failover
 
 WHEN a deployment returns HTTP 400 or 404 with the explicit upstream error
-code `model_not_found`, or the Anthropic adapter receives HTTP 408
+code `model_not_found`, an OpenAI-compatible non-streaming success status
+contains that explicit error instead of a completion, or the Anthropic adapter
+receives HTTP 408
 THEN the gateway SHALL try the next eligible deployment within the existing
 attempt and time budgets, before committing a response. An ordinary upstream
 400 or generic 404 SHALL remain terminal.
