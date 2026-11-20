@@ -504,6 +504,10 @@ mod tests {
             timeout: Duration::from_secs(10),
             max_context: None,
         };
+        dep.headers.insert(
+            "x-deployment",
+            http::HeaderValue::from_static("static-value"),
+        );
         for (format, body) in [
             (
                 InboundFormat::OpenAiResponses,
@@ -533,6 +537,7 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 let sent: Value = serde_json::from_slice(request.body()).unwrap();
+                assert_eq!(request.headers()["x-deployment"], "static-value");
                 assert_eq!(sent["model"], expected, "{format:?} {upstream}");
             }
         }

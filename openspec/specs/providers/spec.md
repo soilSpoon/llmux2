@@ -35,7 +35,7 @@ no credential, for providers that allow anonymous access.
 #### Scenario: Anonymous provider
 
 WHEN a deployment is configured with `auth = "none"` and no credential
-THEN requests are sent upstream without an authorization header.
+THEN requests are sent upstream without an adapter-generated authorization header.
 
 ### Requirement: Deployment-specific Chat Completions field filtering
 

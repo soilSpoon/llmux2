@@ -43,7 +43,7 @@ time (terminal CR/LF from reference files is trimmed). Use references for secret
 Headers apply on every upstream attempt, are marked sensitive, and are not logged.
 Invalid names/values, duplicate case-insensitive names, hop-by-hop/framing headers
 (`Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`, `TE`,
-`Trailer`, `Upgrade`), and proxy authentication headers are rejected.
+`Trailer`, `Upgrade`, `Proxy-Connection`, `HTTP2-Settings`), and proxy authentication headers are rejected.
 `Authorization` and the adapter credential header (`x-api-key` for Anthropic)
 cannot be overridden on credentialed deployments. Explicit `auth = "none"`
 deployments may supply their own Authorization instead. Existing configs are

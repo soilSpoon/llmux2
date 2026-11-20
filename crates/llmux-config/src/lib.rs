@@ -702,6 +702,8 @@ pub fn validate_deployment_header(
             | "upgrade"
             | "proxy-authorization"
             | "proxy-authenticate"
+            | "proxy-connection"
+            | "http2-settings"
     ) || (!anonymous
         && (name == http::header::AUTHORIZATION
             || (provider == provider::ANTHROPIC && name == "x-api-key")))
@@ -783,6 +785,8 @@ mod tests {
             "Trailer",
             "Upgrade",
             "Proxy-Authorization",
+            "Proxy-Connection",
+            "HTTP2-Settings",
             "Authorization",
             "bad name",
         ] {
@@ -796,6 +800,17 @@ mod tests {
             "{base}\nheaders = {{ x-test = \"bad\\r\\nvalue\" }}\n"
         ))
         .is_err());
+        for reference in [
+            "env:LLMUX_MISSING_CUSTOM_HEADER_TEST",
+            "file:/nonexistent/llmux-header",
+        ] {
+            let error = RuntimeConfig::parse(&format!(
+                "{base}\nheaders = {{ x-test = \"{reference}\" }}\n"
+            ))
+            .err()
+            .unwrap();
+            assert!(!error.to_string().contains(reference));
+        }
     }
 
     #[test]
