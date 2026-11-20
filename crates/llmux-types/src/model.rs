@@ -75,11 +75,33 @@ pub struct Deployment {
     pub max_context: Option<u32>,
 }
 
+/// What to do with a request that fits no deployment's context window.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub enum ContextOverflow {
+    #[default]
+    #[serde(rename = "reject")]
+    Reject,
+    /// Drop messages from the middle, keeping system prompts and the latest message.
+    #[serde(rename = "middle-out")]
+    MiddleOut,
+}
+
+impl ContextOverflow {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "reject" => Some(Self::Reject),
+            "middle-out" => Some(Self::MiddleOut),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CanonicalModel {
     pub name: Arc<str>,
     pub strategy: Strategy,
     pub capabilities: Capabilities,
+    pub context_overflow: ContextOverflow,
     /// Sorted by ascending priority.
     pub deployments: Box<[DeploymentIdx]>,
 }

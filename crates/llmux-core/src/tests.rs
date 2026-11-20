@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use http::{HeaderMap, Request, Response};
 use hyper::body::Incoming;
 use llmux_types::{
-    AuthError, AuthMaterial, BuildError, CanonicalModel, Capabilities, InboundFormat, ProviderKind,
-    RequestId, Strategy,
+    AuthError, AuthMaterial, BuildError, CanonicalModel, Capabilities, ContextOverflow,
+    InboundFormat, ProviderKind, RequestId, Strategy,
 };
 use std::{collections::VecDeque, sync::Mutex};
 
@@ -151,6 +151,7 @@ async fn fixture_with_context(
             name: "model".into(),
             strategy: Strategy::Priority,
             capabilities: Capabilities::default(),
+            context_overflow: ContextOverflow::default(),
             deployments: Box::new([DeploymentIdx(0), DeploymentIdx(1), DeploymentIdx(2)]),
         }]),
         deployments,
@@ -187,6 +188,7 @@ fn request() -> GatewayRequest {
         parsed: Default::default(),
         est_input_tokens: 0,
         max_output_tokens: None,
+        context_overflow: None,
         request_id: RequestId("test".into()),
     }
 }
@@ -381,6 +383,7 @@ async fn rejects_requests_that_fit_no_deployment_without_calling_upstream() {
             limit: 4000,
             prompt_tokens: 3990,
             max_output_tokens: Some(20),
+            middle_out: false,
         })
     ));
     assert!(matches!(
@@ -388,6 +391,17 @@ async fn rejects_requests_that_fit_no_deployment_without_calling_upstream() {
             .execute(sized_request(u32::MAX, Some(u32::MAX)))
             .await,
         Err(GatewayError::ContextLengthExceeded { limit: 4000, .. })
+    ));
+    let middle_out = GatewayRequest {
+        context_overflow: Some(ContextOverflow::MiddleOut),
+        ..sized_request(4001, None)
+    };
+    assert!(matches!(
+        executor.execute(middle_out).await,
+        Err(GatewayError::ContextLengthExceeded {
+            middle_out: true,
+            ..
+        })
     ));
     assert!(adapter.calls.lock().unwrap().is_empty());
     let response = executor.execute(sized_request(3990, None)).await.unwrap();

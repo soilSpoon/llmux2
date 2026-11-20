@@ -120,7 +120,7 @@ fn is_base64_data_url(text: &str) -> bool {
 
 /// Sums string and key lengths of any JSON value without allocating.
 #[derive(Default)]
-struct TextBytes(u64);
+pub(crate) struct TextBytes(pub(crate) u64);
 
 impl<'de> Deserialize<'de> for TextBytes {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
