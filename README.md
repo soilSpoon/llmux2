@@ -38,7 +38,7 @@ Rejecting is the default. To trim instead, set `context_overflow = "middle-out"`
 
 `x-llmux-deployment` and `x-llmux-attempts` identify the winning deployment and number of HTTP attempts (not skipped deployments). Set `server.expose_routing_headers = false` to hide them. A stream commits on its first complete SSE event; after that, failures end the stream with an error payload rather than replaying the request.
 
-The MVP does not implement multi-format routing, hot reload, circuit breakers, or failover on errors other than 429. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local RPM uses a bounded per-deployment sliding window only when configured.
+Before a response is committed, the gateway can fail over on upstream server, connection, and timeout errors within its attempt and time limits. Rate-limit and quota-exhaustion failover are controlled by `routing.fallback_on` and enabled by default. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local RPM uses a bounded per-deployment sliding window only when configured.
 
 ## Credentials
 
@@ -73,9 +73,11 @@ require reauthorization after restart. `env:` references are memory-only. Option
 `resource` must be an absolute HTTPS URL without credentials or fragment. For Sign in
 with ChatGPT, use `https://auth.openai.com/api/accounts/oauth/token` as `token_url`,
 the issued client ID, `resource = "https://api.openai.com/v1"`, and omit `scopes`.
-Authentication-error fallback / on-demand refresh retries are not implemented.
+A refreshable authentication error can trigger one on-demand refresh and retry for the attempted deployment, still subject to request and admission limits. If refresh fails or authentication is rejected again, the gateway disables that credential for routing and can try another eligible deployment.
 
 ## Development
+
+See the [engineering standards](AGENTS.md) for test-first development, reliability checks, and PR evidence.
 
 - `llmux-types` defines the shared model, IR, and provider contracts.
 - `llmux-config` parses and validates TOML and secret references.
