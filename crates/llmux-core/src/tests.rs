@@ -975,7 +975,7 @@ async fn request_log_records_each_request() {
             retry_after: Some(Duration::from_secs(1)),
         }],
         false,
-        [None; 3],
+        [Some(1024); 3],
         &[("model", &[0])],
         Default::default(),
         Default::default(),
@@ -996,6 +996,20 @@ async fn request_log_records_each_request() {
     ));
     tokio::time::sleep(Duration::from_millis(1100)).await;
     executor.execute(request()).await.unwrap();
+    // A middle-out context rejection is a preliminary probe the server retries;
+    // it must not produce a record.
+    let probe = GatewayRequest {
+        est_input_tokens: 10_000,
+        context_overflow: Some(ContextOverflow::MiddleOut),
+        ..request()
+    };
+    assert!(matches!(
+        executor.execute(probe).await,
+        Err(GatewayError::ContextLengthExceeded {
+            middle_out: true,
+            ..
+        })
+    ));
     drop(executor);
 
     let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)

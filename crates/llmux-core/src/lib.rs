@@ -341,7 +341,17 @@ impl Executor {
         let model = req.model.clone();
         let mut meta = RouteMeta::default();
         let result = self.route(req, &mut meta).await;
-        if let Some(log) = &self.request_log {
+        // A middle-out context rejection is a probe: the server truncates and
+        // retries under the same request ID, so logging it would double-count
+        // one client request.
+        let preliminary = matches!(
+            result,
+            Err(GatewayError::ContextLengthExceeded {
+                middle_out: true,
+                ..
+            })
+        );
+        if let Some(log) = self.request_log.as_ref().filter(|_| !preliminary) {
             let latency_ms = started.elapsed().as_millis() as u64;
             let dep = meta.last_dep.map(|idx| &self.cfg.deployments[idx]);
             log.record(&RequestRecord {
