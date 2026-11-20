@@ -124,11 +124,10 @@ impl ProviderAdapter for OpenAiResponses {
             let value: Value = serde_json::from_str(&event?.data).map_err(|_| bad_gateway())?;
             if value["type"] == "response.completed" {
                 let response = &value["response"];
-                let usage = usage(response);
                 let response = match req.format {
                     InboundFormat::OpenAiChat => chat_complete(response)?,
                     InboundFormat::AnthropicMessages => {
-                        messages::complete_chat(&chat_complete(response)?)?.0
+                        messages::complete_chat(&chat_complete(response)?)?
                     }
                     InboundFormat::OpenAiResponses => response.clone(),
                 };
@@ -136,7 +135,6 @@ impl ProviderAdapter for OpenAiResponses {
                     status: StatusCode::OK,
                     headers: HeaderMap::new(),
                     body: Bytes::from(response.to_string()),
-                    usage,
                 });
             }
         }
@@ -511,7 +509,7 @@ mod tests {
         let response = json!({"id":"r1","model":"model","status":"completed","output":[
             {"type":"message","content":[{"type":"refusal","refusal":"Cannot help."}]}
         ]});
-        let (message, _) = messages::complete_chat(&chat_complete(&response).unwrap()).unwrap();
+        let message = messages::complete_chat(&chat_complete(&response).unwrap()).unwrap();
         assert_eq!(
             message["content"],
             json!([{"type":"text","text":"Cannot help."}])

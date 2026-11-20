@@ -156,13 +156,12 @@ fn envelope(chat: &Value, content: Vec<Value>, reason: Value, usage: Usage) -> V
     })
 }
 
-pub(crate) fn complete(body: &[u8]) -> Result<(Bytes, Option<Usage>), UpstreamError> {
+pub(crate) fn complete(body: &[u8]) -> Result<Bytes, UpstreamError> {
     let chat: Value = serde_json::from_slice(body).map_err(|_| bad_gateway())?;
-    let (message, usage) = complete_chat(&chat)?;
-    Ok((Bytes::from(message.to_string()), usage))
+    Ok(Bytes::from(complete_chat(&chat)?.to_string()))
 }
 
-pub(crate) fn complete_chat(chat: &Value) -> Result<(Value, Option<Usage>), UpstreamError> {
+pub(crate) fn complete_chat(chat: &Value) -> Result<Value, UpstreamError> {
     let choice = chat["choices"].get(0).ok_or_else(bad_gateway)?;
     let finish = stop(&choice["finish_reason"]);
     let message = choice["message"].as_object().ok_or_else(bad_gateway)?;
@@ -196,8 +195,7 @@ pub(crate) fn complete_chat(chat: &Value) -> Result<(Value, Option<Usage>), Upst
             }));
         }
     }
-    let usage = usage(&chat["usage"]);
-    let body = envelope(
+    Ok(envelope(
         chat,
         content,
         json!(if refusal.is_some() && finish != "max_tokens" {
@@ -205,9 +203,8 @@ pub(crate) fn complete_chat(chat: &Value) -> Result<(Value, Option<Usage>), Upst
         } else {
             finish
         }),
-        usage.unwrap_or_default(),
-    );
-    Ok((body, usage))
+        usage(&chat["usage"]).unwrap_or_default(),
+    ))
 }
 
 fn event(kind: &str, mut value: Value) -> SseEvent {
@@ -318,7 +315,7 @@ mod tests {
         let chat = json!({
             "id":"chat","model":"model","choices":[{"message":{"content":null,"refusal":"Cannot help."},"finish_reason":"stop"}]
         });
-        let (complete, _) = complete_chat(&chat).unwrap();
+        let complete = complete_chat(&chat).unwrap();
         let input = [
             json!({"id":"chat","model":"model","choices":[{"delta":{"refusal":"Cannot "}}]})
                 .to_string(),
@@ -351,7 +348,7 @@ mod tests {
         let chat = json!({"id":"chat","model":"model","choices":[{
             "message":{"content":"Sorry. ","refusal":"Cannot help."},"finish_reason":"stop"
         }]});
-        let (complete, _) = complete_chat(&chat).unwrap();
+        let complete = complete_chat(&chat).unwrap();
         let input = [
             json!({"id":"chat","model":"model","choices":[{"delta":{"content":"Sorry. ","refusal":"Cannot "}}]}).to_string(),
             json!({"choices":[{"delta":{"refusal":"help."},"finish_reason":"stop"}]}).to_string(),
@@ -414,7 +411,7 @@ mod tests {
                 {"id":"call","function":{"name":"lookup","arguments":"{\"incomplete\":"}}
             ]},"finish_reason":"length"}]
         });
-        let (complete, _) = complete_chat(&chat).unwrap();
+        let complete = complete_chat(&chat).unwrap();
         assert_eq!(complete["stop_reason"], "max_tokens");
         assert_eq!(
             complete["content"][0],

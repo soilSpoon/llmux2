@@ -9,8 +9,8 @@ use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use llmux_types::{
     AuthError, AuthMaterial, BuildError, CredentialSource, Deployment, GatewayRequest,
-    GatewayResponse, InboundFormat, LimitObservation, LimitScope, ProviderAdapter, ProviderKind,
-    Support, UpstreamError,
+    GatewayResponse, InboundFormat, LimitObservation, ProviderAdapter, ProviderKind, Support,
+    UpstreamError,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -27,6 +27,13 @@ const MAX_ERROR_BYTES: usize = 64 * 1024;
 const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_RETRY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// Which rate-limit family a 429 belongs to, to pick the matching reset header.
+enum Scope {
+    Requests,
+    Tokens,
+    Unknown,
+}
+
 #[derive(Deserialize)]
 struct RawChatMetadata<'a> {
     #[serde(borrow)]
@@ -35,9 +42,10 @@ struct RawChatMetadata<'a> {
     stream: Option<bool>,
 }
 
-pub struct OpenAiChatMetadata<'a> {
-    pub model: Cow<'a, str>,
-    pub stream: bool,
+struct OpenAiChatMetadata<'a> {
+    model: Cow<'a, str>,
+    #[allow(dead_code)] // read by tests; production code only needs the model
+    stream: bool,
 }
 
 /// Request fields the gateway reads before routing, parsed in one pass.
@@ -305,7 +313,8 @@ impl<'de> Deserialize<'de> for TextBytes {
 }
 
 impl<'a> OpenAiChatMetadata<'a> {
-    pub fn parse(body: &'a [u8]) -> Result<Self, BuildError> {
+    #[cfg(test)]
+    fn parse(body: &'a [u8]) -> Result<Self, BuildError> {
         Self::parse_with_range(body).map(|(metadata, _)| metadata)
     }
 
@@ -502,12 +511,12 @@ impl ProviderAdapter for OpenAiCompat {
             if let Some(error) = embedded_error(&body, &parts.headers, SystemTime::now()) {
                 return Err(error);
             }
-            let (body, usage) = match req.format {
+            let body = match req.format {
                 InboundFormat::OpenAiResponses => {
                     responses::complete(&body).map_err(|()| bad_gateway())?
                 }
                 InboundFormat::AnthropicMessages => messages::complete(&body)?,
-                InboundFormat::OpenAiChat => (body, None),
+                InboundFormat::OpenAiChat => body,
             };
             let mut headers = parts.headers;
             if req.format != InboundFormat::OpenAiChat {
@@ -517,7 +526,6 @@ impl ProviderAdapter for OpenAiCompat {
                 status,
                 headers,
                 body,
-                usage,
             })
         }
     }
@@ -656,20 +664,20 @@ fn classify_error_details(
         .unwrap_or("")
         .to_ascii_lowercase();
     let scope = if header_text(headers, "x-ratelimit-remaining-requests") == Some("0") {
-        LimitScope::Requests
+        Scope::Requests
     } else if header_text(headers, "x-ratelimit-remaining-tokens") == Some("0")
         || message.contains("tokens per")
         || kind.contains("tokens")
         || code.contains("tokens")
     {
-        LimitScope::Tokens
+        Scope::Tokens
     } else if message.contains("requests per")
         || kind.contains("requests")
         || code.contains("requests")
     {
-        LimitScope::Requests
+        Scope::Requests
     } else {
-        LimitScope::Unknown
+        Scope::Unknown
     };
     let wait = retry_after(headers, now)
         .or_else(|| {
@@ -680,13 +688,13 @@ fn classify_error_details(
                 .map(|n| Duration::from_secs_f64((n / 1000.0).min(MAX_RETRY.as_secs_f64())))
         })
         .or_else(|| match scope {
-            LimitScope::Requests => {
+            Scope::Requests => {
                 header_text(headers, "x-ratelimit-reset-requests").and_then(parse_duration)
             }
-            LimitScope::Tokens => {
+            Scope::Tokens => {
                 header_text(headers, "x-ratelimit-reset-tokens").and_then(parse_duration)
             }
-            LimitScope::Unknown => None,
+            Scope::Unknown => None,
         });
     let quota = [code, kind].iter().any(|marker| {
         matches!(
@@ -708,10 +716,7 @@ fn classify_error_details(
         429 if quota => UpstreamError::QuotaExhausted {
             reset_at: wait.and_then(|wait| now.checked_add(wait)),
         },
-        429 => UpstreamError::RateLimited {
-            retry_after: wait,
-            scope,
-        },
+        429 => UpstreamError::RateLimited { retry_after: wait },
         401 => UpstreamError::Auth { refreshable: true },
         403 => UpstreamError::Auth { refreshable: false },
         408 => UpstreamError::Timeout,
@@ -818,7 +823,7 @@ mod tests {
         use http_body_util::Full;
         use hyper_util::{client::legacy::Client, rt::TokioExecutor};
         use llmux_testkit::TestServer;
-        use llmux_types::{Billing, DeploymentIdx, QuotaSpec, RequestId};
+        use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
         use serde_json::{json, Value};
 
         let server = TestServer::start(axum::Router::new().route(
@@ -867,8 +872,6 @@ mod tests {
             base_url: format!("{}/v1", server.url()).parse().unwrap(),
             upstream_model: "chat-model".into(),
             priority: 0,
-            weight: 1,
-            billing: Billing::default(),
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(5),
             max_context: None,
@@ -888,7 +891,6 @@ mod tests {
                     })
                     .to_string(),
                 ),
-                parsed: Default::default(),
                 est_input_tokens: 0,
                 max_output_tokens: Some(64),
                 context_overflow: None,
@@ -1006,10 +1008,7 @@ mod tests {
             assert!(matches!(classify(408, body), UpstreamError::Timeout));
             assert!(matches!(
                 classify(429, body),
-                UpstreamError::RateLimited {
-                    scope: LimitScope::Unknown,
-                    retry_after: None
-                }
+                UpstreamError::RateLimited { retry_after: None }
             ));
             for status in [500, 503, 529, 599] {
                 assert!(
@@ -1095,18 +1094,14 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH;
         let body =
             Bytes::from_static(br#"{"error":{"message":"Rate limit on tokens per minute"}}"#);
-        let check = |headers: &HeaderMap, scope, wait| {
+        let check = |headers: &HeaderMap, wait| {
             assert!(
-                matches!(classify_error(StatusCode::TOO_MANY_REQUESTS, headers, body.clone(), now), UpstreamError::RateLimited { scope: s, retry_after: w } if s == scope && w == wait)
+                matches!(classify_error(StatusCode::TOO_MANY_REQUESTS, headers, body.clone(), now), UpstreamError::RateLimited { retry_after: w, .. } if w == wait)
             );
         };
-        check(&headers, LimitScope::Tokens, None);
+        check(&headers, None);
         headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("20ms"));
-        check(
-            &headers,
-            LimitScope::Tokens,
-            Some(Duration::from_millis(20)),
-        );
+        check(&headers, Some(Duration::from_millis(20)));
         headers.insert(
             "x-ratelimit-remaining-requests",
             HeaderValue::from_static("0"),
@@ -1115,34 +1110,22 @@ mod tests {
             "x-ratelimit-reset-requests",
             HeaderValue::from_static("6m0s"),
         );
-        check(
-            &headers,
-            LimitScope::Requests,
-            Some(Duration::from_secs(360)),
-        );
+        check(&headers, Some(Duration::from_secs(360)));
         headers.insert("retry-after-ms", HeaderValue::from_static("1250"));
-        check(
-            &headers,
-            LimitScope::Requests,
-            Some(Duration::from_millis(1250)),
-        );
+        check(&headers, Some(Duration::from_millis(1250)));
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
-        check(&headers, LimitScope::Requests, Some(Duration::from_secs(2)));
+        check(&headers, Some(Duration::from_secs(2)));
         assert!(
             matches!(classify_error(StatusCode::TOO_MANY_REQUESTS, &headers, Bytes::from_static(br#"{"error":{"code":"insufficient_quota"}}"#), now), UpstreamError::QuotaExhausted { reset_at: Some(reset) } if reset == now + Duration::from_secs(2))
         );
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("bad"));
         headers.insert("retry-after-ms", HeaderValue::from_static("NaN"));
-        check(
-            &headers,
-            LimitScope::Requests,
-            Some(Duration::from_secs(360)),
-        );
+        check(&headers, Some(Duration::from_secs(360)));
         headers.insert(
             header::RETRY_AFTER,
             HeaderValue::from_static("999999999999999999999999"),
         );
-        check(&headers, LimitScope::Requests, Some(MAX_RETRY));
+        check(&headers, Some(MAX_RETRY));
     }
 
     #[test]

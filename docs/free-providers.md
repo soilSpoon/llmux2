@@ -246,8 +246,8 @@ page only exposes account-specific limits, no number is invented.
 
 Each block is a **separate complete `llmux.toml`**, not a fragment to concatenate.
 Export `LLMUX_CLIENT_KEY` and the named upstream key first; llmux2 accepts only
-`env:`/`file:` secret references, not inline secrets. `billing = "free"` is routing
-metadata, **not** a promise to the provider to disable charges.
+`env:`/`file:` secret references, not inline secrets. Free tier eligibility is
+your responsibility, not the config’s.
 
 Use only non-sensitive test prompts initially. Syntactic/runtime-config validation
 does not verify a live key, current free eligibility, model access, or generation.
@@ -278,7 +278,6 @@ id = "cloudflare"
 credential = "cloudflare-key"
 base_url = "https://api.cloudflare.com/client/v4/accounts/ACCOUNT_ID/ai/v1"
 upstream_model = "@cf/meta/llama-3.1-8b-instruct"
-billing = "free"
 ```
 
 ### Kilo Gateway (official API key)
@@ -300,7 +299,6 @@ id = "kilo"
 credential = "kilo-key"
 base_url = "https://ai-gateway.kilo.ai/api/v1"
 upstream_model = "kilo-auto/free"
-billing = "free"
 ```
 
 ### OpenRouter (free router only)
@@ -322,7 +320,6 @@ id = "openrouter"
 credential = "openrouter-key"
 base_url = "https://openrouter.ai/api/v1"
 upstream_model = "openrouter/free"
-billing = "free"
 quota = { rpm = 20 }
 ```
 
@@ -349,7 +346,6 @@ id = "gemini"
 credential = "gemini-key"
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
 upstream_model = "FREE_MODEL_FROM_YOUR_PROJECT"
-billing = "free"
 ```
 
 ### Kilo Gateway (mixed anonymous and keyed)
@@ -358,7 +354,7 @@ One public model uses anonymous access first, then its official API key after a
 429 or another eligible failure. Only the keyed deployment needs an upstream
 secret. No fake Bearer token is sent for anonymous requests. Hourly IP limits and
 keyed account quotas remain upstream policies; this is not permission to evade
-them. `billing = "free"` cannot prevent charges if you choose a paid model.
+them; llmux2 does not gate paid models, so choose carefully.
 
 ```toml
 [server]
@@ -379,7 +375,6 @@ provider = "openai_compat"
 base_url = "https://ai-gateway.kilo.ai/api/v1"
 upstream_model = "kilo-auto/free"
 priority = 0
-billing = "free"
 
 [[models.deployments]]
 id = "kilo-keyed"
@@ -387,7 +382,6 @@ credential = "kilo-key"
 base_url = "https://ai-gateway.kilo.ai/api/v1"
 upstream_model = "kilo-auto/free"
 priority = 10
-billing = "free"
 ```
 
 ### AI Horde (official anonymous access)
@@ -410,7 +404,6 @@ auth = "none"
 provider = "openai_compat"
 base_url = "https://oai.aihorde.net/v1"
 upstream_model = "koboldcpp/Artemis-31B-v1.2"
-billing = "free"
 quota = { concurrent = 1 }
 ```
 
@@ -437,7 +430,6 @@ id = "samba"
 credential = "samba-key"
 base_url = "https://YOUR_CONSOLE_HOST/v1"
 upstream_model = "gpt-oss-120b"
-billing = "free"
 quota = { rpm = 20 }
 ```
 
@@ -460,7 +452,6 @@ id = "cohere"
 credential = "cohere-key"
 base_url = "https://api.cohere.ai/compatibility/v1"
 upstream_model = "command-a-plus-05-2026"
-billing = "free"
 quota = { rpm = 20 }
 ```
 
