@@ -23,6 +23,7 @@ use std::{
 
 const MAX_COMPLETE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
+const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_RETRY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Deserialize)]
@@ -263,9 +264,10 @@ async fn collect(body: Incoming) -> Result<Bytes, UpstreamError> {
 
 async fn collect_error<B: hyper::body::Body<Data = Bytes> + Unpin>(mut body: B) -> Bytes {
     let mut bytes = BytesMut::new();
+    let deadline = tokio::time::Instant::now() + ERROR_BODY_TIMEOUT;
     while bytes.len() < MAX_ERROR_BYTES {
-        match body.frame().await {
-            Some(Ok(frame)) => {
+        match tokio::time::timeout_at(deadline, body.frame()).await {
+            Ok(Some(Ok(frame))) => {
                 if let Ok(data) = frame.into_data() {
                     let len = data.len().min(MAX_ERROR_BYTES - bytes.len());
                     bytes.extend_from_slice(&data[..len]);
@@ -745,26 +747,60 @@ mod tests {
         }
     }
 
-    #[test]
-    fn error_collection_is_bounded_and_retains_partial_bytes_on_failure() {
-        use futures_util::FutureExt;
+    #[tokio::test]
+    async fn error_collection_is_bounded_and_retains_partial_bytes_on_failure() {
         use http_body_util::{Full, StreamBody};
         use hyper::body::Frame;
         let body = Full::new(Bytes::from(vec![b'x'; MAX_ERROR_BYTES + 1]));
-        assert_eq!(
-            collect_error(body).now_or_never().unwrap().len(),
-            MAX_ERROR_BYTES
-        );
+        assert_eq!(collect_error(body).await.len(), MAX_ERROR_BYTES);
         let frames = futures_util::stream::iter([
             Ok(Frame::data(Bytes::from_static(b"partial"))),
             Err(std::io::Error::other("read failed")),
         ]);
-        assert_eq!(
-            collect_error(StreamBody::new(frames))
-                .now_or_never()
-                .unwrap(),
-            "partial"
-        );
+        assert_eq!(collect_error(StreamBody::new(frames)).await, "partial");
+    }
+
+    #[tokio::test]
+    async fn stalled_error_body_preserves_status_headers_and_partial_details() {
+        use futures_util::{stream, StreamExt};
+        use http_body_util::StreamBody;
+        use hyper::body::Frame;
+        for partial in [
+            Bytes::new(),
+            Bytes::from_static(br#"{"error":{"code":"insufficient_quota"}}"#),
+        ] {
+            let frames = stream::once(std::future::ready(Ok::<_, std::io::Error>(Frame::data(
+                partial.clone(),
+            ))))
+            .chain(stream::pending());
+            let start = tokio::time::Instant::now();
+            let body = tokio::time::timeout(
+                ERROR_BODY_TIMEOUT * 3,
+                collect_error(StreamBody::new(frames)),
+            )
+            .await
+            .unwrap();
+            assert!(start.elapsed() >= ERROR_BODY_TIMEOUT);
+            assert_eq!(body, partial);
+            let mut headers = HeaderMap::new();
+            headers.insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            let error = classify_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                &headers,
+                body,
+                SystemTime::UNIX_EPOCH,
+            );
+            if partial.is_empty() {
+                assert!(
+                    matches!(error, UpstreamError::RateLimited { retry_after: Some(wait), .. } if wait == Duration::from_secs(5))
+                );
+            } else {
+                assert!(matches!(
+                    error,
+                    UpstreamError::QuotaExhausted { reset_at: Some(_) }
+                ));
+            }
+        }
     }
 
     #[test]
