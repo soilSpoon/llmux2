@@ -414,6 +414,33 @@ async fn expired_deployments_are_skipped() {
 }
 
 #[tokio::test]
+async fn exhaustion_retry_hint_ignores_expired_deployments() {
+    let (executor, _, _, _server) = fixture_full(
+        vec![UpstreamError::RateLimited {
+            retry_after: Some(Duration::from_secs(30)),
+        }],
+        false,
+        [None; 3],
+        &[("model", &[0, 1])],
+        Default::default(),
+        Default::default(),
+        false,
+        [
+            None,
+            Some(SystemTime::now() - Duration::from_secs(60)),
+            None,
+        ],
+    )
+    .await;
+    let Err(GatewayError::AllCandidatesExhausted { retry_after, .. }) =
+        executor.execute(request()).await
+    else {
+        panic!("expected exhaustion")
+    };
+    assert!(retry_after > Duration::from_secs(2));
+}
+
+#[tokio::test]
 async fn transient_errors_fall_back() {
     for error in [
         UpstreamError::Server {

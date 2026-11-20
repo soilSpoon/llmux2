@@ -818,12 +818,12 @@ fn expiry(deployment: &str, stamp: toml::value::Datetime) -> Result<SystemTime, 
                 "deployment {deployment} expires_at must be an RFC 3339 timestamp"
             ))
         })?;
-    Ok(SystemTime::UNIX_EPOCH
-        + Duration::from_secs(parsed.unix_timestamp().try_into().map_err(|_| {
-            invalid(&format!(
-                "deployment {deployment} expires_at is out of range"
-            ))
-        })?))
+    let seconds: u64 = parsed.unix_timestamp().try_into().map_err(|_| {
+        invalid(&format!(
+            "deployment {deployment} expires_at is out of range"
+        ))
+    })?;
+    Ok(SystemTime::UNIX_EPOCH + Duration::new(seconds, parsed.nanosecond()))
 }
 
 fn required_oauth(value: Option<String>, field: &str) -> Result<String, ConfigError> {
@@ -1048,6 +1048,20 @@ mod tests {
         ))
         .expect("RFC 3339 expiry");
         assert!(parsed.deployments[0].expires_at.is_some());
+        let fractional = RuntimeConfig::parse(&base.replace(
+            "upstream_model = \"upstream\"",
+            "expires_at = 2030-01-01T00:00:00.900Z\nupstream_model = \"upstream\"",
+        ))
+        .expect("fractional RFC 3339 expiry");
+        assert_eq!(
+            fractional.deployments[0]
+                .expires_at
+                .unwrap()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .subsec_millis(),
+            900
+        );
         assert!(RuntimeConfig::parse(&base).unwrap().deployments[0]
             .expires_at
             .is_none());
