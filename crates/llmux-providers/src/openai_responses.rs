@@ -1,12 +1,12 @@
 use crate::{
     messages,
-    openai_compat::{bad_gateway, classify_error, collect_error},
+    openai_compat::{apply_auth, bad_gateway, classify_error, collect_error, endpoint_uri},
     sse, OpenAiCompat,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode};
+use http::{header, HeaderMap, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use llmux_types::{
     provider, AuthMaterial, BoxStream, BuildError, Deployment, GatewayRequest, GatewayResponse,
@@ -51,28 +51,17 @@ impl ProviderAdapter for OpenAiResponses {
             return Err(BuildError::UnsupportedFormat);
         }
         let body = normalize(&req.body, crate::upstream_model(req, dep), req.format)?;
-        let mut parts = dep.base_url.clone().into_parts();
-        parts.path_and_query =
-            Some(format!("{}/responses", dep.base_url.path().trim_end_matches('/')).parse()?);
-        let uri = http::Uri::from_parts(parts).map_err(|e| BuildError::InvalidRequest(e.into()))?;
+        let uri = endpoint_uri(&dep.base_url, "/responses")?;
         let mut request = Request::post(uri)
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT, "text/event-stream")
             .body(Bytes::from(body.to_string()))?;
-        match auth {
-            AuthMaterial::Bearer(token) => {
-                let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
-                    .map_err(|_| BuildError::InvalidAuth)?;
-                value.set_sensitive(true);
-                request.headers_mut().insert(header::AUTHORIZATION, value);
-            }
-            AuthMaterial::Header { name, value } => {
-                let mut value = value.clone();
-                value.set_sensitive(true);
-                request.headers_mut().insert(name, value);
-            }
-            AuthMaterial::None => {}
-        }
+        apply_auth(
+            request.headers_mut(),
+            auth,
+            header::AUTHORIZATION,
+            "Bearer ",
+        )?;
         Ok(request)
     }
     async fn parse_response(
