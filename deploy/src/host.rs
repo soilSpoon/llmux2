@@ -44,6 +44,8 @@ pub fn health(listen: &str) -> Result<bool> {
         if !status.next().is_some_and(|s| s.starts_with("HTTP/")) || status.next() != Some("200") {
             return Ok(false);
         }
+        let mut content_length = None;
+        let mut chunked = false;
         for _ in 0..100 {
             line.clear();
             Read::by_ref(&mut reader).take(65537).read_line(&mut line)?;
@@ -51,14 +53,62 @@ pub fn health(listen: &str) -> Result<bool> {
                 return Ok(false);
             }
             if line == "\r\n" || line == "\n" {
-                let mut prefix = [0; 2];
-                reader.read_exact(&mut prefix)?;
-                return Ok(prefix == *b"ok");
+                return Ok(health_body(&mut reader, chunked, content_length)? == b"ok");
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = Some(
+                        value
+                            .trim()
+                            .parse::<u64>()
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                    );
+                }
+                if name.eq_ignore_ascii_case("transfer-encoding") {
+                    chunked = value.trim().eq_ignore_ascii_case("chunked");
+                }
             }
         }
         Ok(false)
     };
     Ok(operation().unwrap_or(false))
+}
+fn health_body(
+    reader: &mut impl BufRead,
+    chunked: bool,
+    length: Option<u64>,
+) -> io::Result<Vec<u8>> {
+    let mut prefix = Vec::with_capacity(3);
+    if !chunked {
+        Read::by_ref(reader)
+            .take(length.unwrap_or(3).min(3))
+            .read_to_end(&mut prefix)?;
+        return Ok(prefix);
+    }
+    loop {
+        let mut line = String::new();
+        Read::by_ref(reader).take(65537).read_line(&mut line)?;
+        let size = u64::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if size == 0 {
+            return Ok(prefix);
+        }
+        let count = size.min((3 - prefix.len()) as u64) as usize;
+        let start = prefix.len();
+        prefix.resize(start + count, 0);
+        reader.read_exact(&mut prefix[start..])?;
+        if prefix.len() == 3 {
+            return Ok(prefix);
+        }
+        let mut crlf = [0; 2];
+        reader.read_exact(&mut crlf)?;
+        if crlf != *b"\r\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid chunk terminator",
+            ));
+        }
+    }
 }
 fn socket_address(host: IpAddr, port: u16, scope: Option<&str>) -> io::Result<SocketAddr> {
     let Some(scope) = scope else {

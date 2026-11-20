@@ -15,8 +15,9 @@ The tools SHALL serialize through the same deployment lock, use private atomic
 file replacement, preserve the source and installed configuration checks,
 observe seven stable unit samples at half-second intervals, and try health up
 to sixty times before stopping the old slot. The health probe SHALL use a
-two-second TCP connect/read timeout and accept only HTTP 200 with an `ok` body
-prefix. systemctl and configuration checks SHALL have 130- and 120-second
+two-second TCP connect/read timeout and accept only HTTP 200 whose first up-to-three
+decoded body bytes equal exactly `ok`, respecting Content-Length and chunked
+framing. systemctl and configuration checks SHALL have 130- and 120-second
 deadlines respectively.
 
 #### Scenario: Failed handoff before old-slot stop
