@@ -347,8 +347,23 @@ node --test crates/llmux-server/tests/dashboard.cjs
 
 In CI, `coverage` runs the Rust unit and integration tests once with coverage
 instrumentation, while `check` runs Rust doctests, lint, and the dashboard and
-repository tooling tests. Use `cargo test --locked --workspace` to run all Rust
+deployment tooling tests. The `xtask` workspace member contains CI policy tools
+and repository-file checks; its tests run in `coverage`, not again in `check`.
+Use `cargo test --locked --workspace` to run all Rust
 tests locally without instrumentation.
+
+Run `cargo xtask pr-policy` with `PR_BODY`, `BASE_SHA`, and `HEAD_SHA` to check a
+PR description and its test evidence. Run `cargo xtask coverage-ratchet coverage.json`
+on an LLVM coverage JSON report to enforce `.github/coverage-floor`; optional
+`BASE_SHA` also prevents lowering the committed floor. Both commands exit 0 on
+success and 1 on failure. `xtask` is not a default workspace member and depends
+only on `serde_json`, not the gateway crates. New tools belong in separate modules
+behind subcommands of this one binary.
+
+The policy and coverage jobs share the `policy-tools` Rust cache. Only coverage
+pushes on `main` save it, avoiding competing saves from PR jobs; the normal xtask
+build from the coverage-floor step is reusable by PR policy checks, alongside the
+separate instrumented coverage artifacts.
 
 ## Live gateway comparison
 

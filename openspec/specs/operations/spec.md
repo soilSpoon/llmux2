@@ -51,6 +51,15 @@ the merge policy. Fetch failures SHALL block merging.
 WHEN a PR head changes after review or independent verification
 THEN the gate rejects stale evidence and merging requires fresh evidence.
 
+#### Scenario: Repository policy tools
+
+WHEN CI checks PR policy or the coverage ratchet
+THEN it SHALL run `cargo xtask pr-policy` or
+`cargo xtask coverage-ratchet <coverage.json>` respectively, preserving the
+existing environment inputs and success/failure exit codes.
+AND the non-default `xtask` workspace member SHALL expose one binary with a
+module per tool, independent of gateway crates.
+
 ### Requirement: Fast feedback loops
 
 CI/CD and tests SHALL stay fast: only needed steps, no unnecessary work, since
@@ -61,6 +70,13 @@ a long loop slows management, improvement, and implementation.
 WHEN a workflow step is proposed
 THEN it is kept only if it gates a real failure mode; anything else is
 dropped.
+
+#### Scenario: Policy cache and test ownership
+
+WHEN PR policy and coverage build xtask
+THEN PR policy SHALL use its own small xtask-only Rust cache rather than restoring
+the workspace cache, and xtask tests SHALL run in the coverage job rather than
+again in check.
 
 ### Requirement: Simple and extensible
 
