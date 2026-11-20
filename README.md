@@ -123,6 +123,23 @@ Rejecting is the default. To trim instead, set `context_overflow = "middle-out"`
 
 Before a response is committed, the gateway can fail over on upstream server, connection, and timeout errors within its attempt and time limits. Rate-limit and quota-exhaustion failover are controlled by `routing.fallback_on` and enabled by default. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local request and token quotas use per-deployment sliding windows (one minute for `rpm`/`tpm`, one day for `rpd`/`tpd`) only when configured. Token quotas count the same prompt-plus-output estimate used for context fitting, and a single request larger than a token quota is still admitted when that window is empty. A credential may also set `quota` (`rpm`, `rpd`, `tpm`, `tpd`) for providers that limit per key or project across models; those windows are shared by every deployment that uses the credential.
 
+### Strict OpenAI-compatible upstreams
+
+Some deployments reject optional Chat Completions fields. Set
+`strip_request_fields` on the affected `openai` or `openai_compat` deployment,
+listing only the fields that upstream rejects. For example, on the strict
+DeepSeek route:
+
+```toml
+strip_request_fields = ["seed", "user", "safety_identifier", "reasoning.effort", "logprobs", "top_logprobs"]
+```
+
+The gateway omits these fields from the upstream request in both JSON and SSE
+mode; it does not emulate their behavior. `reasoning.effort` removes only that
+member and drops the enclosing `reasoning` object if it becomes empty. It does
+not remove the separate top-level `reasoning_effort`. Other deployments are
+unchanged. Remove the setting to restore passthrough.
+
 ### Catch-all route for cutover
 
 Add one `[[models]]` entry named `"*"` to forward otherwise unknown IDs, for

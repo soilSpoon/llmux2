@@ -2,8 +2,8 @@
 
 use http::Uri;
 use llmux_types::{
-    provider, CanonicalModel, Capabilities, ContextOverflow, Deployment, DeploymentIdx, ErrorKind,
-    ProviderKind, QuotaSpec,
+    provider, CanonicalModel, Capabilities, ChatRequestField, ContextOverflow, Deployment,
+    DeploymentIdx, ErrorKind, ProviderKind, QuotaSpec,
 };
 use serde::Deserialize;
 use std::{
@@ -219,6 +219,8 @@ struct RawDeployment {
     provider: Option<String>,
     base_url: Option<String>,
     upstream_model: String,
+    #[serde(default)]
+    strip_request_fields: Box<[ChatRequestField]>,
     #[serde(default)]
     priority: i32,
     #[serde(default)]
@@ -503,6 +505,16 @@ impl RawConfig {
                 {
                     return Err(invalid("OAuth openai_responses models require allowed_keys for the owner's gateway keys"));
                 }
+                if !dep.strip_request_fields.is_empty()
+                    && !matches!(
+                        provider.0.as_ref(),
+                        provider::OPENAI | provider::OPENAI_COMPAT
+                    )
+                {
+                    return Err(invalid(
+                        "strip_request_fields requires openai or openai_compat",
+                    ));
+                }
                 let base_url = dep
                     .base_url
                     .as_deref()
@@ -540,6 +552,7 @@ impl RawConfig {
                     credential: dep.credential.unwrap_or_default().into(),
                     base_url: upstream_uri(base_url)?,
                     upstream_model: dep.upstream_model.into(),
+                    strip_request_fields: dep.strip_request_fields,
                     priority: dep.priority,
                     quota: dep.quota,
                     timeout: timeout(dep.timeout_ms.unwrap_or(server.request_timeout_ms))?,

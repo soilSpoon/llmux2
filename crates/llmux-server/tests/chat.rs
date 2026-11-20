@@ -31,6 +31,7 @@ enum Reply {
     Limit(u64),
     Quota(Option<u64>),
     Complete,
+    ExpectedChatRequest(Value),
     NegotiatedStream(Value),
     WithoutGatewayControls,
     InlineUsageStream,
@@ -73,6 +74,10 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
         mock.next.clone()
     };
     match reply {
+        Reply::ExpectedChatRequest(expected) if request != expected => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":{"message":"unexpected upstream request fields"}})),
+        ).into_response(),
         Reply::Quota(seconds) => {
             let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": {"code": "insufficient_quota"}}))).into_response();
             if let Some(seconds) = seconds {
@@ -81,11 +86,11 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
             response
         }
         Reply::Limit(seconds) => (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, seconds.to_string())]).into_response(),
-        Reply::Complete if request["stream"] == true => (
+        Reply::Complete | Reply::ExpectedChatRequest(_) if request["stream"] == true => (
             [(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")],
             "data: {\"id\":\"chunk-1\"}\r\n\r\ndata: [DONE]\n\n",
         ).into_response(),
-        Reply::Complete => Json(json!({
+        Reply::Complete | Reply::ExpectedChatRequest(_) => Json(json!({
             "id": mock.model,
             "object": "chat.completion",
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello!"}, "finish_reason": "stop"}],
@@ -507,6 +512,57 @@ async fn cheaperinference_controls_are_not_sent_to_upstream() {
             check_route(&response, "d1", "1");
             assert!(body(response).await.contains("Hi"));
         }
+    }
+}
+
+#[tokio::test]
+async fn chat_strips_rejected_fields_only_for_the_configured_deployment() {
+    for (strip, stream) in [(true, false), (true, true), (false, false), (false, true)] {
+        let mut request = json!({
+            "model":"alias", "stream":stream, "messages":[{"role":"user","content":"Hello"}],
+            "seed":42, "user":"caller", "safety_identifier":"hashed-id",
+            "logprobs":true, "top_logprobs":2, "reasoning":{"effort":"low"},
+            "reasoning_effort":"high",
+            "vendor_option":{"model":"leave-me-alone","seed":9,"reasoning":{"effort":"keep"}}
+        });
+        if stream {
+            request["reasoning"]["vendor_option"] = json!("keep");
+        }
+        let mut expected = request.clone();
+        expected["model"] = json!("vendor-primary");
+        if strip {
+            for field in [
+                "seed",
+                "user",
+                "safety_identifier",
+                "logprobs",
+                "top_logprobs",
+            ] {
+                expected.as_object_mut().unwrap().remove(field);
+            }
+            if stream {
+                expected["reasoning"] = json!({"vendor_option":"keep"});
+            } else {
+                expected.as_object_mut().unwrap().remove("reasoning");
+            }
+        }
+        let fixture = Fixture::start(
+            [Reply::ExpectedChatRequest(expected), Reply::Complete],
+            [Reply::Complete, Reply::Complete],
+            if strip {
+                r#"strip_request_fields = ["seed", "user", "safety_identifier", "reasoning.effort", "logprobs", "top_logprobs"]"#
+            } else {
+                ""
+            },
+        )
+        .await;
+        let response = fixture
+            .post("/v1/chat/completions", "test-client", request.to_string())
+            .await;
+        check_route(&response, "d1", "1");
+        let output = body(response).await;
+        assert!(output.contains(if stream { "data: [DONE]" } else { "Hello!" }));
+        assert_eq!(fixture.counts(), [1, 0]);
     }
 }
 

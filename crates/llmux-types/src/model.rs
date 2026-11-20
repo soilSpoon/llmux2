@@ -36,6 +36,18 @@ impl Default for Capabilities {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatRequestField {
+    Seed,
+    User,
+    SafetyIdentifier,
+    #[serde(rename = "reasoning.effort")]
+    ReasoningEffort,
+    Logprobs,
+    TopLogprobs,
+}
+
 #[derive(Debug)]
 pub struct Deployment {
     pub fallback: bool,
@@ -46,6 +58,7 @@ pub struct Deployment {
     pub credential: Arc<str>,
     pub base_url: http::Uri,
     pub upstream_model: Arc<str>,
+    pub strip_request_fields: Box<[ChatRequestField]>,
     pub priority: i32,
     pub quota: QuotaSpec,
     pub timeout: Duration,

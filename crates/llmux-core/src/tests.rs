@@ -191,6 +191,7 @@ async fn fixture_full(
             },
             base_url: server.url().parse().unwrap(),
             upstream_model: "upstream".into(),
+            strip_request_fields: Box::default(),
             priority: i as i32,
             quota: if i < 2 {
                 shared_quota
