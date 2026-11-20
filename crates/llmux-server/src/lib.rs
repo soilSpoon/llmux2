@@ -13,10 +13,10 @@ use axum::{
 use futures_util::StreamExt;
 use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use http_body_util::LengthLimitError;
-use llmux_config::RuntimeConfig;
+use llmux_config::{ApiKey, RuntimeConfig};
 use llmux_core::{Executor, GatewayError};
 use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
-use llmux_providers::{OpenAiChatMetadata, OpenAiCompat, StaticKey};
+use llmux_providers::{Anthropic, OpenAiChatMetadata, OpenAiCompat, StaticKey};
 use llmux_types::{
     CredentialSource, GatewayRequest, GatewayResponse, InboundFormat, ProviderRegistry, RequestId,
     UpstreamError,
@@ -28,6 +28,8 @@ use subtle::ConstantTimeEq;
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const DEPLOYMENT_HEADER: HeaderName = HeaderName::from_static("x-llmux-deployment");
 const ATTEMPTS_HEADER: HeaderName = HeaderName::from_static("x-llmux-attempts");
+const ANTHROPIC: &str = "anthropic";
+const ANTHROPIC_KEY_HEADER: HeaderName = HeaderName::from_static("x-api-key");
 
 struct AppState {
     config: Arc<RuntimeConfig>,
@@ -39,13 +41,16 @@ pub async fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Se
     for kind in ["openai", "openai_compat"] {
         registry.register(Arc::new(OpenAiCompat::new(kind)));
     }
+    registry.register(Arc::new(Anthropic::new(ANTHROPIC)));
     let mut sources = std::mem::take(&mut config.api_keys)
         .into_iter()
-        .map(|(id, key)| {
-            Ok((
-                id,
-                Arc::new(StaticKey::bearer(&key)?) as Arc<dyn CredentialSource>,
-            ))
+        .map(|(id, ApiKey { provider, key })| {
+            let source = if &*provider.0 == ANTHROPIC {
+                StaticKey::header(ANTHROPIC_KEY_HEADER, &key)?
+            } else {
+                StaticKey::bearer(&key)?
+            };
+            Ok((id, Arc::new(source) as Arc<dyn CredentialSource>))
         })
         .collect::<Result<std::collections::HashMap<_, _>, llmux_types::BuildError>>()?;
     for (id, credential) in std::mem::take(&mut config.oauth) {
