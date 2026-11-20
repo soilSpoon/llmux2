@@ -38,3 +38,34 @@ The MVP does not implement OAuth, multi-format translation, hot reload, circuit 
 cargo test --locked --workspace
 cargo test --locked -p llmux-server --test chat -- --nocapture
 ```
+
+## Mock-upstream load benchmark
+
+On Linux with Python 3.10+, Cargo, and readable `/proc/<pid>/smaps_rollup`, run:
+
+```sh
+python3 benchmarks/mock_upstream.py
+```
+
+The command builds the release gateway and an Axum mock, starts and stops them
+on ephemeral loopback ports with dummy API keys, and prints a Markdown table
+with direct, via-gateway, and via-minus-direct results. Use `--requests`,
+`--concurrency`, and `--workers` to tune the run. Defaults: 4,096 timed
+requests per route and mode, 64 concurrent clients/held streams, and two Tokio
+workers per server process.
+
+- **Latency and throughput:** Each client warms its HTTP/1.1 connection with
+  four requests, then runs a share of the timed requests. p99 is the nearest-rank
+  end-to-end completion time, reported separately for JSON and SSE. Throughput
+  divides completed requests by elapsed wall time. SSE p99 time to first token
+  measures from request start to the first complete content-bearing event, not
+  the role-only event. The mock sends eight content chunks and `[DONE]` without
+  artificial delay; these are short-response, single-host measurements and the
+  load generator can limit throughput.
+- **Memory:** In fresh processes primed with one JSON request, capture idle
+  proportional set size (PSS), open the configured number of streams, and hold
+  them after their first content event. Report the median of five PSS samples
+  minus idle PSS, divided by the number of held streams. Direct measures the
+  mock process; via-gateway sums the mock and gateway PSS. The difference is
+  added userspace memory per stream at that concurrency, including connection
+  and allocator overhead, but excluding the client and kernel socket buffers.
