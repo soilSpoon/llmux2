@@ -125,6 +125,32 @@ logprobs, reorder unrelated combos, or replace the optional final fallback.
 - **WHEN** the Morph model or combo name is not reviewed, or either leg is absent
 - **THEN** no reviewed logprobs-order policy is applied
 
+### Requirement: Reviewed Respan secondary routes
+For the existing source combo `gpt-6-luna`, the importer SHALL append the
+ordered upstream IDs `gpt-6-luna`, `openai/gpt-6-luna`, and
+`perplexity/gpt-6-luna` after surviving source legs, using one active, usable
+API-key custom openai_compat connection whose node prefix is `respan` and whose
+normalized endpoint is exactly `https://api.respan.ai/api/v1`. This reviewed
+tuple follows OCI verification of Responses JSON and SSE. Azure OpenAI, Azure
+Foundry and Bedrock variants SHALL NOT be added by this policy.
+The importer SHALL use the first eligible connection in existing priority
+order, skip each upstream ID already deployed on that endpoint, preserve source
+leg order and assign consecutive priorities before optional OmniRoute fallback.
+It SHALL NOT use Codex, OAuth or anonymous connections, synthesize a primary for
+an empty/missing combo, or augment unrelated combos. Round-robin combos SHALL
+remain unchanged with a warning. Normal upstream endpoint normalization SHALL
+apply, including connection overrides; generated config and warnings SHALL NOT
+contain credential values. Removing an ID or the reviewed row and regenerating
+config SHALL roll back that part or all of this policy.
+
+#### Scenario: Reviewed secondary follows Experlabs
+- **WHEN** a non-round-robin Luna combo has surviving legs and an eligible Respan connection
+- **THEN** the missing reviewed IDs are appended in declared order on one connection, before fallback
+
+#### Scenario: Unavailable or already declared route
+- **WHEN** the reviewed connection is unavailable or an ID already exists on the reviewed endpoint
+- **THEN** no unavailable or duplicate deployment is added
+
 ### Requirement: Gemini OpenAI endpoint parameter compatibility
 
 The importer SHALL add seed and user stripping to openai and openai_compat

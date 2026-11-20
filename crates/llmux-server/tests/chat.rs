@@ -789,6 +789,76 @@ async fn responses_json_uses_alias_and_fails_over() {
 }
 
 #[tokio::test]
+async fn responses_sse_429_fails_over() {
+    let fixture = Fixture::start(
+        [Reply::Limit(60), Reply::ResponseStream { complete: true }],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture.responses("test-client", "alias", true).await;
+    check_route(&response, "d2", "2");
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    let text = body(response).await;
+    assert!(!text.contains("[DONE]"));
+    let events: Vec<_> = text.trim_end().split("\n\n").collect();
+    assert!(events[0]
+        .lines()
+        .any(|line| line == "event: response.created"));
+    assert!(events.iter().any(|event| {
+        event
+            .lines()
+            .any(|line| line == "event: response.output_text.delta")
+            && event.contains(r#""delta":"Hello!""#)
+    }));
+    let terminal = events.last().unwrap();
+    assert!(terminal
+        .lines()
+        .any(|line| line == "event: response.completed"));
+    let payload: Value = serde_json::from_str(
+        terminal
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["type"], "response.completed");
+    assert_eq!(payload["sequence_number"], events.len() - 1);
+    assert_eq!(payload["response"]["status"], "completed");
+    assert_eq!(
+        payload["response"]["output"][0]["content"][0]["text"],
+        "Hello!"
+    );
+    assert_eq!(fixture.counts(), [1, 1]);
+}
+
+#[tokio::test]
+async fn responses_json_skips_primary_during_429_cooldown() {
+    let fixture = Fixture::start(
+        [Reply::Limit(60), Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let first = fixture.responses("test-client", "alias", false).await;
+    check_route(&first, "d2", "2");
+    drop(body(first).await);
+    assert_eq!(fixture.counts(), [1, 1]);
+
+    let response = fixture.responses("test-client", "shared", false).await;
+    check_route(&response, "d2", "1");
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+    let output: Value = serde_json::from_str(&body(response).await).unwrap();
+    assert_eq!(output["object"], "response");
+    assert_eq!(output["status"], "completed");
+    assert_eq!(output["output"][0]["content"][0]["text"], "Hello!");
+    assert_eq!(fixture.counts(), [1, 2]);
+}
+
+#[tokio::test]
 async fn responses_sse_preserves_event_names_and_reports_interrupted_streams() {
     for complete in [true, false] {
         let fixture = Fixture::start(
