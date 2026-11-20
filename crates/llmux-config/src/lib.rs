@@ -471,11 +471,10 @@ impl RawConfig {
                 if dep.max_context == Some(0) {
                     return Err(invalid("max_context must be positive"));
                 }
-                if dep.quota.rpm == Some(0) || dep.quota.concurrent == Some(0) {
+                let quota = dep.quota;
+                if [quota.rpm, quota.rpd, quota.tpm, quota.tpd, quota.concurrent].contains(&Some(0))
+                {
                     return Err(invalid("configured limits must be positive"));
-                }
-                if dep.quota.rpd.is_some() || dep.quota.tpm.is_some() || dep.quota.tpd.is_some() {
-                    return Err(invalid("MVP quotas support rpm and concurrent only"));
                 }
                 let idx = DeploymentIdx(
                     u32::try_from(deployments.len())
@@ -636,6 +635,17 @@ mod tests {
                 super::RuntimeConfig::parse(&config(auth)).is_err(),
                 "{auth}"
             );
+        }
+    }
+
+    #[test]
+    fn token_and_daily_quotas_are_accepted_and_must_be_positive() {
+        let with_quota = |quota: &str| format!("{}quota = {{ {quota} }}\n", config(REQUIRED));
+        RuntimeConfig::parse(&with_quota("rpm = 20, rpd = 50, tpm = 30000, tpd = 200000"))
+            .expect("token and daily quotas");
+        for quota in ["rpd = 0", "tpm = 0", "tpd = 0"] {
+            let err = RuntimeConfig::parse(&with_quota(quota)).err().expect(quota);
+            assert!(err.to_string().contains("positive"), "{quota}: {err}");
         }
     }
 

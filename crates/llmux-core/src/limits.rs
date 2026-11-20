@@ -9,7 +9,8 @@ use std::{
 };
 use tokio::time::Instant;
 
-const RPM_WINDOW: Duration = Duration::from_secs(60);
+const MINUTE: Duration = Duration::from_secs(60);
+const DAY: Duration = Duration::from_secs(86_400);
 const CONCURRENCY_RETRY: Duration = Duration::from_secs(1);
 
 pub(super) struct DeploymentLimits {
@@ -17,7 +18,7 @@ pub(super) struct DeploymentLimits {
     cooldown_until_ns: AtomicU64,
     concurrent: Option<u32>,
     inflight: AtomicU32,
-    rpm: Option<(u32, Mutex<VecDeque<Instant>>)>,
+    windows: Box<[Window]>,
     limit_strikes: AtomicU32,
 }
 
@@ -33,7 +34,22 @@ impl DeploymentLimits {
             cooldown_until_ns: AtomicU64::new(0),
             concurrent: spec.concurrent,
             inflight: AtomicU32::new(0),
-            rpm: spec.rpm.map(|rpm| (rpm, Mutex::default())),
+            windows: [
+                (spec.rpm, MINUTE, Unit::Requests),
+                (spec.rpd, DAY, Unit::Requests),
+                (spec.tpm, MINUTE, Unit::Tokens),
+                (spec.tpd, DAY, Unit::Tokens),
+            ]
+            .into_iter()
+            .filter_map(|(max, span, unit)| {
+                max.map(|max| Window {
+                    max: u64::from(max),
+                    span,
+                    unit,
+                    used: Mutex::default(),
+                })
+            })
+            .collect(),
             limit_strikes: AtomicU32::new(0),
         }
     }
@@ -85,12 +101,13 @@ impl DeploymentLimits {
         self.baseline + Duration::from_nanos(offset_ns.max(previous))
     }
 
-    pub fn available_at(&self, now: Instant) -> Instant {
+    pub fn available_at(&self, now: Instant, tokens: u64) -> Instant {
         let mut ready = self.cooldown_until(now).unwrap_or(now);
-        if let Some((max, queue)) = &self.rpm {
-            let starts = queue.lock().unwrap_or_else(|err| err.into_inner());
-            if starts.len() >= *max as usize {
-                ready = ready.max(starts[0] + RPM_WINDOW);
+        for window in self.windows.iter() {
+            let used = window.lock(now);
+            let cost = window.unit.cost(tokens);
+            if used.total > 0 && used.total + cost > window.max {
+                ready = ready.max(used.free_at(window.max.saturating_sub(cost), window.span));
             }
         }
         if self
@@ -102,7 +119,7 @@ impl DeploymentLimits {
         ready
     }
 
-    pub fn admit(self: &Arc<Self>) -> Option<Permit> {
+    pub fn admit(self: &Arc<Self>, tokens: u64) -> Option<Permit> {
         let permit = if let Some(max) = self.concurrent {
             let mut inflight = self.inflight.load(Ordering::Relaxed);
             loop {
@@ -123,21 +140,85 @@ impl DeploymentLimits {
         } else {
             Permit(None)
         };
-        if let Some((max, queue)) = &self.rpm {
-            let mut starts = queue.lock().unwrap_or_else(|err| err.into_inner());
-            let now = Instant::now();
-            while starts
-                .front()
-                .is_some_and(|at| now.duration_since(*at) >= RPM_WINDOW)
-            {
-                starts.pop_front();
-            }
-            if starts.len() >= *max as usize {
+        let now = Instant::now();
+        let mut windows: Vec<_> = self
+            .windows
+            .iter()
+            .map(|window| (window, window.lock(now)))
+            .collect();
+        for (window, used) in &windows {
+            let cost = window.unit.cost(tokens);
+            if used.total > 0 && used.total + cost > window.max {
                 return None;
             }
-            starts.push_back(now);
+        }
+        for (window, used) in &mut windows {
+            let cost = window.unit.cost(tokens);
+            if cost > 0 {
+                used.entries.push_back((now, cost));
+                used.total += cost;
+            }
         }
         Some(permit)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Unit {
+    Requests,
+    Tokens,
+}
+
+impl Unit {
+    fn cost(self, tokens: u64) -> u64 {
+        match self {
+            Self::Requests => 1,
+            Self::Tokens => tokens,
+        }
+    }
+}
+
+/// Sliding window of admitted requests or estimated tokens.
+struct Window {
+    max: u64,
+    span: Duration,
+    unit: Unit,
+    used: Mutex<Usage>,
+}
+
+#[derive(Default)]
+struct Usage {
+    entries: VecDeque<(Instant, u64)>,
+    total: u64,
+}
+
+impl Window {
+    fn lock(&self, now: Instant) -> std::sync::MutexGuard<'_, Usage> {
+        let mut used = self.used.lock().unwrap_or_else(|err| err.into_inner());
+        while let Some(&(at, cost)) = used.entries.front() {
+            if now.duration_since(at) < self.span {
+                break;
+            }
+            used.entries.pop_front();
+            used.total -= cost;
+        }
+        used
+    }
+}
+
+impl Usage {
+    /// When enough entries expire for the total to fall to `target`.
+    fn free_at(&self, target: u64, span: Duration) -> Instant {
+        let mut total = self.total;
+        for &(at, cost) in &self.entries {
+            total -= cost;
+            if total <= target {
+                return at + span;
+            }
+        }
+        self.entries
+            .back()
+            .map_or_else(Instant::now, |&(at, _)| at + span)
     }
 }
 
@@ -162,11 +243,11 @@ mod tests {
             ..QuotaSpec::default()
         }));
         let now = Instant::now();
-        let permit = limits.admit().unwrap();
-        assert!(limits.admit().is_none());
-        assert_eq!(limits.available_at(now), now + CONCURRENCY_RETRY);
+        let permit = limits.admit(0).unwrap();
+        assert!(limits.admit(0).is_none());
+        assert_eq!(limits.available_at(now, 1), now + CONCURRENCY_RETRY);
         drop(permit);
-        assert!(limits.admit().is_some());
+        assert!(limits.admit(0).is_some());
     }
 
     #[test]
@@ -226,5 +307,67 @@ mod tests {
             ),
             Duration::from_secs(3_600),
         );
+    }
+
+    #[test]
+    fn token_and_daily_quotas_skip_the_deployment_until_the_window_frees() {
+        let tpm = Arc::new(DeploymentLimits::new(QuotaSpec {
+            tpm: Some(100),
+            ..QuotaSpec::default()
+        }));
+        assert!(tpm.admit(60).is_some());
+        assert!(tpm.admit(60).is_none(), "tpm counts estimated tokens");
+        assert!(tpm.admit(40).is_some());
+
+        for spec in [
+            QuotaSpec {
+                rpd: Some(1),
+                ..QuotaSpec::default()
+            },
+            QuotaSpec {
+                tpd: Some(10),
+                ..QuotaSpec::default()
+            },
+        ] {
+            let limits = Arc::new(DeploymentLimits::new(spec));
+            let now = Instant::now();
+            assert!(limits.admit(10).is_some());
+            assert!(limits.admit(1).is_none(), "{spec:?} is a daily quota");
+            assert!(limits.available_at(now, 1) >= now + Duration::from_secs(86_399));
+        }
+    }
+
+    #[test]
+    fn a_request_larger_than_the_token_quota_still_reaches_an_idle_deployment() {
+        let limits = Arc::new(DeploymentLimits::new(QuotaSpec {
+            tpm: Some(100),
+            ..QuotaSpec::default()
+        }));
+        assert!(limits.admit(500).is_some());
+        assert!(limits.admit(1).is_none());
+    }
+
+    #[test]
+    fn token_quota_retry_time_accounts_for_the_request_size() {
+        let limits = Arc::new(DeploymentLimits::new(QuotaSpec {
+            tpm: Some(100),
+            ..QuotaSpec::default()
+        }));
+        let now = Instant::now();
+        assert!(limits.admit(60).is_some());
+        assert!(limits.available_at(now, 60) >= now + Duration::from_secs(59));
+        assert_eq!(limits.available_at(now, 40), now);
+    }
+
+    #[test]
+    fn zero_token_requests_leave_no_token_window_entries() {
+        let limits = Arc::new(DeploymentLimits::new(QuotaSpec {
+            tpd: Some(10),
+            ..QuotaSpec::default()
+        }));
+        for _ in 0..3 {
+            assert!(limits.admit(0).is_some());
+        }
+        assert!(limits.windows[0].lock(Instant::now()).entries.is_empty());
     }
 }

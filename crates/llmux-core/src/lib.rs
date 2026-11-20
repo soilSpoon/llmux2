@@ -336,7 +336,7 @@ impl Executor {
                     if attempts == self.cfg.routing.max_attempts {
                         break 'groups;
                     }
-                    let Some(permit) = binding.limits.admit() else {
+                    let Some(permit) = binding.limits.admit(needed) else {
                         last_transient = None;
                         break;
                     };
@@ -436,7 +436,7 @@ impl Executor {
                 !binding.disabled.load(Ordering::Relaxed)
                     && binding.adapter.supports(req.format) != Support::No
             })
-            .map(|binding| binding.limits.available_at(now))
+            .map(|binding| binding.limits.available_at(now, needed))
             .min()
             .unwrap_or(now);
         Err(GatewayError::AllCandidatesExhausted {
