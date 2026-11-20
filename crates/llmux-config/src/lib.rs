@@ -2,8 +2,8 @@
 
 use http::Uri;
 use llmux_types::{
-    Billing, CanonicalModel, Capabilities, Deployment, DeploymentIdx, ErrorKind, ProviderKind,
-    QuotaSpec, Strategy,
+    Billing, CanonicalModel, Capabilities, ContextOverflow, Deployment, DeploymentIdx, ErrorKind,
+    ProviderKind, QuotaSpec, Strategy,
 };
 use serde::Deserialize;
 use std::{
@@ -184,6 +184,8 @@ struct RawModel {
     strategy: Option<Strategy>,
     #[serde(default)]
     capabilities: Capabilities,
+    #[serde(default)]
+    context_overflow: ContextOverflow,
     deployments: Vec<RawDeployment>,
 }
 
@@ -401,6 +403,7 @@ impl RawConfig {
                 name,
                 strategy,
                 capabilities: model.capabilities,
+                context_overflow: model.context_overflow,
                 deployments: candidates.into_boxed_slice(),
             });
         }
@@ -609,6 +612,22 @@ refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
         ) + &format!(
             "{deployment}\n[[models.deployments]]\nid = \"other\"\ncredential = \"oauth\"\nbase_url = \"https://example.com/v1\"\nupstream_model = \"upstream\"\n"
         )
+    }
+
+    #[test]
+    fn context_overflow_defaults_to_reject() {
+        let parsed = RuntimeConfig::parse(&context_config("", "")).unwrap();
+        assert_eq!(parsed.models[0].context_overflow, ContextOverflow::Reject);
+        let parsed =
+            RuntimeConfig::parse(&context_config(r#"context_overflow = "middle-out""#, ""))
+                .unwrap();
+        assert_eq!(
+            parsed.models[0].context_overflow,
+            ContextOverflow::MiddleOut
+        );
+        assert!(
+            RuntimeConfig::parse(&context_config(r#"context_overflow = "truncate""#, "")).is_err()
+        );
     }
 
     #[test]

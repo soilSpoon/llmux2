@@ -17,8 +17,8 @@ use hyper_util::{
 use limits::{DeploymentLimits, Permit};
 use llmux_config::RuntimeConfig;
 use llmux_types::{
-    BuildError, CredentialSource, Deployment, DeploymentIdx, ErrorKind, GatewayRequest,
-    GatewayResponse, ProviderAdapter, ProviderRegistry, Support, UpstreamError,
+    BuildError, ContextOverflow, CredentialSource, Deployment, DeploymentIdx, ErrorKind,
+    GatewayRequest, GatewayResponse, ProviderAdapter, ProviderRegistry, Support, UpstreamError,
 };
 use std::{
     collections::HashMap,
@@ -53,6 +53,8 @@ pub enum GatewayError {
         limit: u32,
         prompt_tokens: u32,
         max_output_tokens: Option<u32>,
+        /// Whether the request or model opted into middle-out truncation.
+        middle_out: bool,
     },
     #[error("all candidates are rate limited")]
     AllCandidatesExhausted {
@@ -213,6 +215,8 @@ impl Executor {
                     limit,
                     prompt_tokens: req.est_input_tokens,
                     max_output_tokens: req.max_output_tokens,
+                    middle_out: req.context_overflow.unwrap_or(model.context_overflow)
+                        == ContextOverflow::MiddleOut,
                 });
             }
         }

@@ -712,3 +712,60 @@ async fn context_precheck_skips_small_deployments_and_rejects_without_upstream()
     assert!(message.contains("200000 requested"), "{message}");
     assert_eq!(fixture.counts(), calls);
 }
+
+#[tokio::test]
+async fn middle_out_truncation_is_opt_in_and_reported() {
+    let fixture = Fixture::start(
+        [Reply::Complete, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "max_context = 30",
+    )
+    .await;
+    let payload = json!({
+        "model": "shared",
+        "max_tokens": 99_970,
+        "messages": [
+            {"role": "system", "content": "Hello"},
+            {"role": "user", "content": "x".repeat(200)},
+            {"role": "assistant", "content": "y".repeat(200)},
+            {"role": "user", "content": "latest"},
+        ],
+        "vendor_option": {"model": "leave-me-alone"},
+    })
+    .to_string();
+    let post = |overflow: Option<&'static str>| {
+        let mut request = Request::post(format!("{}/v1/chat/completions", fixture.gateway.url()))
+            .header(header::AUTHORIZATION, "Bearer test-client")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(overflow) = overflow {
+            request = request.header("x-llmux-context-overflow", overflow);
+        }
+        let request = request
+            .body(Full::new(Bytes::from(payload.clone())))
+            .unwrap();
+        async move {
+            timeout(
+                Duration::from_secs(5),
+                Client::builder(TokioExecutor::new())
+                    .build_http()
+                    .request(request),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+    };
+    for overflow in [None, Some("reject")] {
+        let response = post(overflow).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().get("x-llmux-dropped-messages").is_none());
+    }
+    assert_eq!(post(Some("drop")).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(fixture.counts(), [0, 0]);
+
+    let response = post(Some("middle-out")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-llmux-dropped-messages"], "2");
+    assert_eq!(response.headers()["x-llmux-deployment"], "d2");
+    assert_eq!(fixture.counts(), [0, 1]);
+}

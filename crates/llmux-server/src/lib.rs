@@ -1,5 +1,6 @@
 //! Axum boundary for the OpenAI-compatible gateway.
 
+use axum::body::Bytes;
 use axum::{
     body::{self, Body},
     extract::{Request, State},
@@ -16,10 +17,10 @@ use http_body_util::LengthLimitError;
 use llmux_config::{ApiKey, RuntimeConfig};
 use llmux_core::{Executor, GatewayError};
 use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
-use llmux_providers::{Anthropic, OpenAiCompat, RequestMetadata, StaticKey};
+use llmux_providers::{truncate_middle, Anthropic, OpenAiCompat, RequestMetadata, StaticKey};
 use llmux_types::{
-    CredentialSource, GatewayRequest, GatewayResponse, InboundFormat, ProviderRegistry, RequestId,
-    UpstreamError,
+    ContextOverflow, CredentialSource, GatewayRequest, GatewayResponse, InboundFormat,
+    ProviderRegistry, RequestId, UpstreamError,
 };
 use serde_json::{json, value::RawValue};
 use std::{convert::Infallible, error::Error, sync::Arc, time::Duration};
@@ -28,6 +29,8 @@ use subtle::ConstantTimeEq;
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const DEPLOYMENT_HEADER: HeaderName = HeaderName::from_static("x-llmux-deployment");
 const ATTEMPTS_HEADER: HeaderName = HeaderName::from_static("x-llmux-attempts");
+const CONTEXT_OVERFLOW_HEADER: HeaderName = HeaderName::from_static("x-llmux-context-overflow");
+const DROPPED_MESSAGES_HEADER: HeaderName = HeaderName::from_static("x-llmux-dropped-messages");
 const ANTHROPIC: &str = "anthropic";
 const ANTHROPIC_KEY_HEADER: HeaderName = HeaderName::from_static("x-api-key");
 
@@ -94,6 +97,19 @@ async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) 
             .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
         return response;
     }
+    let context_overflow = match request.headers().get(CONTEXT_OVERFLOW_HEADER) {
+        None => None,
+        Some(value) => match value.to_str().ok().and_then(ContextOverflow::from_name) {
+            Some(policy) => Some(policy),
+            None => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "x-llmux-context-overflow must be `reject` or `middle-out`",
+                )
+            }
+        },
+    };
     let body = match body::to_bytes(request.into_body(), MAX_REQUEST_BYTES).await {
         Ok(body) => body,
         Err(err)
@@ -123,18 +139,45 @@ async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) 
         );
     };
 
-    let req = GatewayRequest {
+    let model: Arc<str> = Arc::from(metadata.model.as_ref());
+    let request_id = RequestId(Arc::from(uuid::Uuid::new_v4().to_string()));
+    let request = |body: Bytes, prompt_bytes: u64| GatewayRequest {
         format,
-        model: Arc::from(metadata.model.as_ref()),
+        model: model.clone(),
         stream: metadata.stream,
-        est_input_tokens: u32::try_from(metadata.prompt_bytes.div_ceil(4)).unwrap_or(u32::MAX),
+        est_input_tokens: u32::try_from(prompt_bytes.div_ceil(4)).unwrap_or(u32::MAX),
         max_output_tokens: metadata.max_output_tokens,
+        context_overflow,
         body,
         parsed: Default::default(),
-        request_id: RequestId(Arc::from(uuid::Uuid::new_v4().to_string())),
+        request_id: request_id.clone(),
     };
 
-    let routed = match state.executor.execute(req).await {
+    let mut dropped = 0;
+    let mut result = state
+        .executor
+        .execute(request(body.clone(), metadata.prompt_bytes))
+        .await;
+    if let Err(GatewayError::ContextLengthExceeded {
+        limit,
+        middle_out: true,
+        ..
+    }) = result
+    {
+        if let Some(truncated) = truncate_middle(
+            &body,
+            metadata.prompt_bytes,
+            metadata.max_output_tokens,
+            limit,
+        ) {
+            dropped = truncated.dropped;
+            result = state
+                .executor
+                .execute(request(truncated.body, truncated.prompt_bytes))
+                .await;
+        }
+    }
+    let routed = match result {
         Ok(routed) => routed,
         Err(err) => return gateway_error(err),
     };
@@ -178,6 +221,11 @@ async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) 
                 .into_response()
         }
     };
+    if dropped > 0 {
+        response
+            .headers_mut()
+            .insert(DROPPED_MESSAGES_HEADER, HeaderValue::from(dropped));
+    }
     if state.config.server.expose_routing_headers {
         if let Ok(value) = HeaderValue::from_str(&routed.deployment) {
             response.headers_mut().insert(DEPLOYMENT_HEADER, value);
@@ -228,6 +276,7 @@ fn gateway_error(err: GatewayError) -> Response {
             limit,
             prompt_tokens,
             max_output_tokens,
+            ..
         } => {
             let output = max_output_tokens.unwrap_or(0);
             let needed = u64::from(prompt_tokens) + u64::from(output);
