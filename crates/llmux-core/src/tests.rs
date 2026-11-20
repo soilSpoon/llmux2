@@ -150,11 +150,13 @@ async fn fixture_with_models(
         shared_quota,
         Default::default(),
         false,
+        [None; 3],
     )
     .await
 }
 
 /// `second_quota` is the quota of credential "second", used only by dep2.
+#[allow(clippy::too_many_arguments)]
 async fn fixture_full(
     errors: Vec<UpstreamError>,
     refresh_fails: bool,
@@ -163,6 +165,7 @@ async fn fixture_full(
     shared_quota: llmux_types::QuotaSpec,
     second_quota: llmux_types::QuotaSpec,
     split_routes: bool,
+    expiry: [Option<SystemTime>; 3],
 ) -> Fixture {
     let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
     let served_status = status.clone();
@@ -213,6 +216,7 @@ async fn fixture_full(
             },
             timeout: Duration::from_secs(1),
             max_context: max_context[i as usize],
+            expires_at: expiry[i as usize],
         })
         .collect();
     let cfg = RuntimeConfig {
@@ -381,6 +385,32 @@ async fn failed_refresh_disables_credential() {
     assert_eq!(response.deployment.as_ref(), "dep2");
     assert_eq!(response.attempts, 2);
     assert_eq!(credential.refreshes.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn expired_deployments_are_skipped() {
+    let (executor, adapter, _, _server) = fixture_full(
+        vec![],
+        false,
+        [None; 3],
+        &[("model", &[0, 1])],
+        Default::default(),
+        Default::default(),
+        false,
+        [
+            Some(SystemTime::now() - Duration::from_secs(60)),
+            Some(SystemTime::now() + Duration::from_secs(3600)),
+            None,
+        ],
+    )
+    .await;
+    let response = executor.execute(request()).await.unwrap();
+    assert_eq!(response.deployment.as_ref(), "dep1");
+    assert_eq!(response.attempts, 1);
+    assert_eq!(
+        *adapter.calls.lock().unwrap(),
+        vec![("dep1".into(), "0".into())]
+    );
 }
 
 #[tokio::test]
@@ -924,6 +954,7 @@ async fn credential_quota_limits_the_credentials_deployments() {
             ..Default::default()
         },
         false,
+        [None; 3],
     )
     .await;
     executor.execute(request()).await.unwrap();
@@ -944,6 +975,7 @@ async fn exhausted_quota_cools_every_deployment_on_the_credential() {
         Default::default(),
         Default::default(),
         true,
+        [None; 3],
     )
     .await;
     let to = |model: &str| GatewayRequest {
@@ -978,6 +1010,7 @@ async fn credential_peers_cool_only_until_the_quota_resets() {
         Default::default(),
         Default::default(),
         true,
+        [None; 3],
     )
     .await;
     *adapter.observed.lock().unwrap() = Some(LimitObservation {

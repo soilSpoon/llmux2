@@ -398,6 +398,7 @@ impl Executor {
                 let binding = &self.bindings[index(idx)];
                 if binding.disabled.load(Ordering::Relaxed)
                     || binding.adapter.supports(req.format) == Support::No
+                    || dep.expires_at.is_some_and(|end| SystemTime::now() >= end)
                 {
                     continue;
                 }
@@ -435,11 +436,19 @@ impl Executor {
                 let dep = &self.cfg.deployments[idx];
                 let binding = &self.bindings[idx];
                 let support = binding.adapter.supports(req.format);
+                if binding.disabled.load(Ordering::Relaxed)
+                    || support == Support::No
+                    || !fits(dep)
+                    || dep.expires_at.is_some_and(|end| SystemTime::now() >= end)
+                {
+                    continue;
+                }
                 let now = Instant::now();
                 machine.select();
                 let mut event = if binding.disabled.load(Ordering::Relaxed)
                     || support == Support::No
                     || !fits(dep)
+                    || dep.expires_at.is_some_and(|end| SystemTime::now() >= end)
                 {
                     Event::Ineligible
                 } else if support != Support::Convert

@@ -9,4 +9,5 @@ http.workspace = true
 llmux-types.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+time.workspace = true
 toml.workspace = true
