@@ -1,4 +1,5 @@
-use llmux_types::Deployment;
+use crate::GatewayError;
+use llmux_types::{Deployment, ErrorKind};
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::{collections::BTreeMap, sync::Mutex};
@@ -50,11 +51,74 @@ impl FallbackStats {
 
 pub(crate) type CatchAllCounter = Mutex<CatchAllStats>;
 
+const FAILURE_CLASSES: [&str; 11] = [
+    "rate_limited",
+    "quota_exhausted",
+    "auth",
+    "bad_request",
+    "context_length",
+    "server_error",
+    "timeout",
+    "connect_error",
+    "stream_broken",
+    "invalid_request",
+    "internal",
+];
+
+fn failure_index(kind: ErrorKind) -> usize {
+    match kind {
+        ErrorKind::RateLimited => 0,
+        ErrorKind::QuotaExhausted => 1,
+        ErrorKind::Auth => 2,
+        ErrorKind::BadRequest => 3,
+        ErrorKind::ContextLength => 4,
+        ErrorKind::ServerError => 5,
+        ErrorKind::Timeout => 6,
+        ErrorKind::ConnectError => 7,
+        ErrorKind::StreamBroken => 8,
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SkipReason {
+    Disabled,
+    UnsupportedFormat,
+    ContextLength,
+    Cooldown,
+    AdmissionLimited,
+    UnsupportedConversion,
+}
+
+const SKIP_REASONS: [&str; 6] = [
+    "disabled",
+    "unsupported_format",
+    "context_length",
+    "cooldown",
+    "admission_limited",
+    "unsupported_conversion",
+];
+
+fn snapshot_counts<const N: usize>(
+    labels: [&'static str; N],
+    counts: &[AtomicU64; N],
+) -> BTreeMap<&'static str, u64> {
+    labels
+        .into_iter()
+        .zip(counts)
+        .filter_map(|(label, count)| {
+            let count = count.load(Relaxed);
+            (count != 0).then_some((label, count))
+        })
+        .collect()
+}
+
 #[derive(Default)]
 pub(crate) struct AttemptStats {
     routed: AtomicU64,
     failed_attempts: AtomicU64,
     stream_errors: AtomicU64,
+    failure_classes: [AtomicU64; FAILURE_CLASSES.len()],
+    skip_reasons: [AtomicU64; SKIP_REASONS.len()],
 }
 
 #[derive(Serialize)]
@@ -72,20 +136,32 @@ pub struct DeploymentStats<'a> {
     routed: u64,
     failed_attempts: u64,
     stream_errors: u64,
+    failure_classes: BTreeMap<&'static str, u64>,
+    skip_reasons: BTreeMap<&'static str, u64>,
 }
 
 impl AttemptStats {
-    pub(crate) fn record_attempt(&self, routed: bool) {
-        let counter = if routed {
-            &self.routed
+    pub(crate) fn record_attempt(&self, error: Option<&GatewayError>) {
+        if let Some(error) = error {
+            self.failed_attempts.fetch_add(1, Relaxed);
+            let index = match error {
+                GatewayError::Client(error) => failure_index(error.kind()),
+                GatewayError::InvalidRequest => 9,
+                _ => 10,
+            };
+            self.failure_classes[index].fetch_add(1, Relaxed);
         } else {
-            &self.failed_attempts
-        };
-        counter.fetch_add(1, Relaxed);
+            self.routed.fetch_add(1, Relaxed);
+        }
     }
 
-    pub(crate) fn record_stream_error(&self) {
+    pub(crate) fn record_stream_error(&self, kind: ErrorKind) {
         self.stream_errors.fetch_add(1, Relaxed);
+        self.failure_classes[failure_index(kind)].fetch_add(1, Relaxed);
+    }
+
+    pub(crate) fn record_skip(&self, reason: SkipReason) {
+        self.skip_reasons[reason as usize].fetch_add(1, Relaxed);
     }
 
     pub(crate) fn snapshot<'a>(
@@ -110,6 +186,8 @@ impl AttemptStats {
             routed: self.routed.load(Relaxed),
             failed_attempts: self.failed_attempts.load(Relaxed),
             stream_errors: self.stream_errors.load(Relaxed),
+            failure_classes: snapshot_counts(FAILURE_CLASSES, &self.failure_classes),
+            skip_reasons: snapshot_counts(SKIP_REASONS, &self.skip_reasons),
         }
     }
 }

@@ -21,7 +21,7 @@ use llmux_types::{
     ErrorKind, GatewayRequest, GatewayResponse, ProviderAdapter, ProviderRegistry, Support,
     UpstreamError,
 };
-use stats::AttemptStats;
+use stats::{AttemptStats, SkipReason};
 pub use stats::{CatchAllStats, DeploymentStats, FallbackStats};
 use std::{
     collections::{HashMap, HashSet},
@@ -76,6 +76,19 @@ pub struct RoutedResponse {
     pub response: GatewayResponse,
 }
 
+#[derive(Debug)]
+pub struct RoutedError {
+    pub deployment: Option<Arc<str>>,
+    pub attempts: usize,
+    pub error: GatewayError,
+}
+
+#[derive(Default)]
+struct RouteTrace {
+    last_attempted: Option<usize>,
+    attempts: usize,
+}
+
 type HttpClient = llmux_types::HttpClient;
 
 struct Binding {
@@ -86,6 +99,26 @@ struct Binding {
     /// Other routes on the same credential, cooled together when its quota runs out.
     key_peers: Box<[Arc<DeploymentLimits>]>,
     stats: Option<Arc<AttemptStats>>,
+}
+
+impl Binding {
+    fn record_skip(&self, reason: SkipReason) {
+        if let Some(stats) = &self.stats {
+            stats.record_skip(reason);
+        }
+    }
+
+    fn skip_reason(&self, support: Support, fits: bool) -> Option<SkipReason> {
+        if self.disabled.load(Ordering::Relaxed) {
+            Some(SkipReason::Disabled)
+        } else if support == Support::No {
+            Some(SkipReason::UnsupportedFormat)
+        } else if !fits {
+            Some(SkipReason::ContextLength)
+        } else {
+            None
+        }
+    }
 }
 
 struct ModelOrder {
@@ -314,6 +347,32 @@ impl Executor {
     }
 
     pub async fn execute(&self, req: GatewayRequest) -> Result<RoutedResponse, GatewayError> {
+        self.execute_attributed(req)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    pub async fn execute_attributed(
+        &self,
+        req: GatewayRequest,
+    ) -> Result<RoutedResponse, RoutedError> {
+        let mut trace = RouteTrace::default();
+        self.route(req, &mut trace)
+            .await
+            .map_err(|error| RoutedError {
+                deployment: trace
+                    .last_attempted
+                    .map(|idx| self.cfg.deployments[idx].id.clone()),
+                attempts: trace.attempts,
+                error,
+            })
+    }
+
+    async fn route(
+        &self,
+        req: GatewayRequest,
+        trace: &mut RouteTrace,
+    ) -> Result<RoutedResponse, GatewayError> {
         let model_idx = self
             .cfg
             .model_names
@@ -365,6 +424,17 @@ impl Executor {
                 limit = limit.max(dep.max_context);
             }
             if let Some(limit) = limit {
+                if self.cfg.server.dashboard_key.is_some() {
+                    for &idx in &model.deployments {
+                        let binding = &self.bindings[index(idx)];
+                        let support = binding.adapter.supports(req.format);
+                        if let Some(reason) =
+                            binding.skip_reason(support, fits(&self.cfg.deployments[index(idx)]))
+                        {
+                            binding.record_skip(reason);
+                        }
+                    }
+                }
                 return Err(GatewayError::ContextLengthExceeded {
                     limit,
                     prompt_tokens: req.est_input_tokens,
@@ -380,7 +450,6 @@ impl Executor {
             0
         };
         let deadline = Instant::now() + self.cfg.server.request_timeout;
-        let mut attempts = 0;
         let mut last_transient = None;
         let mut incompatible = Vec::new();
         let mut unavailable = false;
@@ -388,19 +457,20 @@ impl Executor {
             let shift = sequence % group.len();
             let (before, after) = model.deployments[group.clone()].split_at(shift);
             for &idx in after.iter().chain(before) {
-                if attempts == self.cfg.routing.max_attempts {
+                if trace.attempts == self.cfg.routing.max_attempts {
                     break 'groups;
                 }
                 let idx = index(idx);
                 let dep = &self.cfg.deployments[idx];
                 let binding = &self.bindings[idx];
                 let support = binding.adapter.supports(req.format);
-                if binding.disabled.load(Ordering::Relaxed) || support == Support::No || !fits(dep)
-                {
+                if let Some(reason) = binding.skip_reason(support, fits(dep)) {
+                    binding.record_skip(reason);
                     continue;
                 }
                 let now = Instant::now();
                 if support != Support::Convert && binding.limits.cooldown_until(now).is_some() {
+                    binding.record_skip(SkipReason::Cooldown);
                     unavailable = true;
                     last_transient = None;
                     continue;
@@ -410,7 +480,7 @@ impl Executor {
                 }
                 let mut refreshed = false;
                 loop {
-                    if attempts == self.cfg.routing.max_attempts {
+                    if trace.attempts == self.cfg.routing.max_attempts {
                         break 'groups;
                     }
                     let permit = if support == Support::Convert {
@@ -418,6 +488,7 @@ impl Executor {
                     } else if let Some(permit) = binding.limits.admit(needed) {
                         Some(permit)
                     } else {
+                        binding.record_skip(SkipReason::AdmissionLimited);
                         unavailable = true;
                         last_transient = None;
                         break;
@@ -426,21 +497,28 @@ impl Executor {
                     let upstream =
                         timeout_at(attempt_deadline, Self::build_request(&req, dep, binding)).await;
                     if matches!(upstream, Ok(Err(BuildError::UnsupportedConversion))) {
+                        binding.record_skip(SkipReason::UnsupportedConversion);
                         incompatible.push(idx);
                         break;
                     }
                     let Some(permit) = permit.or_else(|| {
                         if binding.limits.cooldown_until(Instant::now()).is_some() {
+                            binding.record_skip(SkipReason::Cooldown);
                             None
                         } else {
-                            binding.limits.admit(needed)
+                            let permit = binding.limits.admit(needed);
+                            if permit.is_none() {
+                                binding.record_skip(SkipReason::AdmissionLimited);
+                            }
+                            permit
                         }
                     }) else {
                         unavailable = true;
                         last_transient = None;
                         break;
                     };
-                    attempts += 1;
+                    trace.attempts += 1;
+                    trace.last_attempted = Some(idx);
                     let timed_out = Err(GatewayError::Client(UpstreamError::Timeout));
                     let result = match upstream {
                         Ok(Ok(upstream)) => {
@@ -455,7 +533,7 @@ impl Executor {
                         Err(_) => timed_out,
                     };
                     if let Some(stats) = &binding.stats {
-                        stats.record_attempt(result.is_ok());
+                        stats.record_attempt(result.as_ref().err());
                     }
                     last_transient = None;
                     match result {
@@ -470,7 +548,7 @@ impl Executor {
                             }
                             return Ok(RoutedResponse {
                                 deployment: dep.id.clone(),
-                                attempts,
+                                attempts: trace.attempts,
                                 response: hold_permit(response, permit),
                             });
                         }
@@ -549,7 +627,7 @@ impl Executor {
         if let Some(err) = last_transient {
             return Err(GatewayError::Client(err));
         }
-        if attempts == 0 && !unavailable && !incompatible.is_empty() {
+        if trace.attempts == 0 && !unavailable && !incompatible.is_empty() {
             return Err(GatewayError::InvalidRequest);
         }
         // The next request can use any compatible deployment, even if retries stopped early.
@@ -568,7 +646,7 @@ impl Executor {
             .min()
             .unwrap_or(now);
         Err(GatewayError::AllCandidatesExhausted {
-            attempts,
+            attempts: trace.attempts,
             retry_after: earliest.saturating_duration_since(Instant::now()),
         })
     }
@@ -654,7 +732,7 @@ impl Executor {
                             () = &mut idle => UpstreamError::Timeout,
                         };
                         if let Some(stats) = &stats {
-                            stats.record_stream_error();
+                            stats.record_stream_error(error.kind());
                         }
                         let hint = match &error {
                             UpstreamError::RateLimited { retry_after, .. } => Some(*retry_after),

@@ -22,7 +22,7 @@ use futures_util::StreamExt;
 use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use http_body_util::LengthLimitError;
 use llmux_config::{ApiKey, RuntimeConfig};
-use llmux_core::{Executor, GatewayError};
+use llmux_core::{Executor, GatewayError, RoutedError};
 use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
 use llmux_providers::{
     truncate_middle_for_format, Anthropic, OpenAiCompat, OpenAiResponses, RequestMetadata,
@@ -346,11 +346,15 @@ async fn execute_authorized(active: &Active, request: Request, format: InboundFo
     let mut dropped = 0;
     let mut result = active
         .executor
-        .execute(request(upstream_body.clone(), metadata.prompt_bytes))
+        .execute_attributed(request(upstream_body.clone(), metadata.prompt_bytes))
         .await;
-    if let Err(GatewayError::ContextLengthExceeded {
-        limit,
-        middle_out: true,
+    if let Err(RoutedError {
+        error:
+            GatewayError::ContextLengthExceeded {
+                limit,
+                middle_out: true,
+                ..
+            },
         ..
     }) = result
     {
@@ -364,16 +368,29 @@ async fn execute_authorized(active: &Active, request: Request, format: InboundFo
             dropped = truncated.dropped;
             result = active
                 .executor
-                .execute(request(truncated.body, truncated.prompt_bytes))
+                .execute_attributed(request(truncated.body, truncated.prompt_bytes))
                 .await;
         }
     }
     let routed = match result {
         Ok(routed) => routed,
-        Err(GatewayError::UnknownModel) if format == InboundFormat::OpenAiChat => {
+        Err(RoutedError {
+            error: GatewayError::UnknownModel,
+            ..
+        }) if format == InboundFormat::OpenAiChat => {
             return chat_bad_request("Invalid model format");
         }
-        Err(err) => return gateway_error(err),
+        Err(failure) => {
+            let mut response = gateway_error(failure.error);
+            if active.config.server.expose_routing_headers && failure.attempts > 0 {
+                add_routing_headers(
+                    &mut response,
+                    failure.deployment.as_deref(),
+                    failure.attempts,
+                );
+            }
+            return response;
+        }
     };
     let mut response = match routed.response {
         GatewayResponse::Complete { status, body, .. } => json_body(status, Body::from(body)),
@@ -424,14 +441,18 @@ async fn execute_authorized(active: &Active, request: Request, format: InboundFo
             .insert(DROPPED_MESSAGES_HEADER, HeaderValue::from(dropped));
     }
     if active.config.server.expose_routing_headers {
-        if let Ok(value) = HeaderValue::from_str(&routed.deployment) {
-            response.headers_mut().insert(DEPLOYMENT_HEADER, value);
-        }
-        response
-            .headers_mut()
-            .insert(ATTEMPTS_HEADER, HeaderValue::from(routed.attempts));
+        add_routing_headers(&mut response, Some(&routed.deployment), routed.attempts);
     }
     response
+}
+
+fn add_routing_headers(response: &mut Response, deployment: Option<&str>, attempts: usize) {
+    if let Some(value) = deployment.and_then(|id| HeaderValue::from_str(id).ok()) {
+        response.headers_mut().insert(DEPLOYMENT_HEADER, value);
+    }
+    response
+        .headers_mut()
+        .insert(ATTEMPTS_HEADER, HeaderValue::from(attempts));
 }
 
 fn authorized_for_format(headers: &HeaderMap, keys: &[Arc<str>], format: InboundFormat) -> bool {

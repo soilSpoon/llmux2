@@ -207,6 +207,27 @@ impl Fixture {
         fallback_on_429: bool,
         dashboard: bool,
     ) -> Self {
+        Self::start_with_exposure(
+            first,
+            next,
+            primary_quota,
+            max_attempts,
+            fallback_on_429,
+            dashboard,
+            true,
+        )
+        .await
+    }
+
+    async fn start_with_exposure(
+        first: [Reply; 2],
+        next: [Reply; 2],
+        primary_quota: &str,
+        max_attempts: usize,
+        fallback_on_429: bool,
+        dashboard: bool,
+        expose_routing_headers: bool,
+    ) -> Self {
         let [primary_first, secondary_first] = first;
         let [primary_next, secondary_next] = next;
         let primary = Arc::new(Mock {
@@ -258,6 +279,7 @@ impl Fixture {
 [server]
 client_keys = ["file:{base}/test-client"]
 request_timeout_ms = 4000
+expose_routing_headers = {expose_routing_headers}
 {dashboard}
 
 [routing]
@@ -760,6 +782,8 @@ async fn dashboard_reports_fallback_and_committed_stream_errors_without_exposing
     assert_eq!(rows[0]["id"], "d1");
     assert_eq!(rows[0]["routed"], 0);
     assert_eq!(rows[0]["failed_attempts"], 1);
+    assert_eq!(rows[0]["failure_classes"], json!({"rate_limited":1}));
+    assert_eq!(rows[0]["skip_reasons"], json!({"cooldown":1}));
     assert_eq!(rows[0]["rpm_limit"], 20);
     assert_eq!(rows[0]["in_flight"], 0);
     assert!(rows[0]["cooldown_ms"].as_u64().unwrap() > 0);
@@ -767,7 +791,44 @@ async fn dashboard_reports_fallback_and_committed_stream_errors_without_exposing
     assert_eq!(rows[1]["routed"], 2);
     assert_eq!(rows[1]["failed_attempts"], 0);
     assert_eq!(rows[1]["stream_errors"], 1);
+    assert_eq!(rows[1]["failure_classes"], json!({"stream_broken":1}));
     assert!(rows[1]["cooldown_ms"].is_null());
+}
+
+#[tokio::test]
+async fn gateway_error_headers_attribute_attempts_only_when_exposed() {
+    for expose in [true, false] {
+        let fixture = Fixture::start_with_exposure(
+            [Reply::Limit(5), Reply::BadRequest],
+            [Reply::Complete, Reply::Complete],
+            "",
+            4,
+            true,
+            false,
+            expose,
+        )
+        .await;
+        let response = fixture.request("test-client", "shared", false).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(fixture.counts(), [1, 1]);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-llmux-deployment")
+                .map(|v| v.to_str().unwrap()),
+            expose.then_some("d2")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-llmux-attempts")
+                .map(|v| v.to_str().unwrap()),
+            expose.then_some("2")
+        );
+        let unknown = fixture.request("test-client", "unknown", false).await;
+        assert!(!unknown.headers().contains_key("x-llmux-deployment"));
+        assert!(!unknown.headers().contains_key("x-llmux-attempts"));
+    }
 }
 
 #[tokio::test]
