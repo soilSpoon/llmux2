@@ -197,7 +197,7 @@ fn usage_json(u: Usage) -> Value {
 }
 fn finish(v: &Value) -> &'static str {
     match v.as_str() {
-        Some("max_tokens") => "length",
+        Some("max_tokens" | "model_context_window_exceeded") => "length",
         Some("tool_use") => "tool_calls",
         _ => "stop",
     }
@@ -638,6 +638,7 @@ mod tests {
             ("end_turn", "stop"),
             ("stop_sequence", "stop"),
             ("max_tokens", "length"),
+            ("model_context_window_exceeded", "length"),
             ("tool_use", "tool_calls"),
             ("future", "stop"),
         ] {
@@ -652,6 +653,20 @@ mod tests {
             convert_response(&v)["choices"][0]["message"]["content"],
             Value::Null
         );
+    }
+
+    #[test]
+    fn streaming_context_window_exceeded_finishes_with_length() {
+        let chunk = StreamState::default()
+            .map(event(json!({
+                "type":"message_delta",
+                "delta":{"stop_reason":"model_context_window_exceeded"},
+                "usage":{"output_tokens":5}
+            })))
+            .unwrap()
+            .unwrap();
+        let chunk: Value = serde_json::from_str(&chunk.data).unwrap();
+        assert_eq!(chunk["choices"][0]["finish_reason"], "length");
     }
 
     fn event(v: Value) -> SseEvent {
