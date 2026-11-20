@@ -111,7 +111,7 @@ fn convert_request(body: &[u8], model: &str) -> Result<Bytes, BuildError> {
             _ => return Err(BuildError::InvalidBody),
         };
         if role == "assistant" {
-            if let Some(calls) = message.get("tool_calls") {
+            if let Some(calls) = message.get("tool_calls").filter(|calls| !calls.is_null()) {
                 for call in calls.as_array().ok_or(BuildError::InvalidBody)? {
                     let arguments: Value =
                         serde_json::from_str(string(&call["function"]["arguments"])?)
@@ -524,6 +524,24 @@ mod tests {
                 json!([{"type":"tool_use","id":"t1","name":"f","input":{}}])
             );
         }
+    }
+
+    #[test]
+    fn null_and_empty_tool_calls_are_absent() {
+        for calls in [Value::Null, json!([])] {
+            let out = converted(
+                json!({"messages":[{"role":"assistant","content":"hello","tool_calls":calls}]}),
+            );
+            assert_eq!(
+                out["messages"],
+                json!([{"role":"assistant","content":[{"type":"text","text":"hello"}]}])
+            );
+        }
+        assert!(convert_request(
+            br#"{"messages":[{"role":"assistant","content":"hello","tool_calls":{}}]}"#,
+            "m"
+        )
+        .is_err());
     }
 
     #[test]
