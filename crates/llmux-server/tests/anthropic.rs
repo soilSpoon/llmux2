@@ -40,6 +40,7 @@ const ANTHROPIC_SSE: &str = concat!(
 #[derive(Clone, Copy)]
 enum Reply {
     Ok,
+    Exhausted,
     Limit,
     Image,
     Document,
@@ -118,7 +119,7 @@ async fn messages(State(up): State<Arc<Upstream>>, headers: HeaderMap, body: Byt
         }
         return ([(header::CONTENT_TYPE, "text/event-stream")], ANTHROPIC_SSE).into_response();
     }
-    Json(json!({
+    let mut response = Json(json!({
         "id": "msg_1",
         "type": "message",
         "role": "assistant",
@@ -127,7 +128,18 @@ async fn messages(State(up): State<Arc<Upstream>>, headers: HeaderMap, body: Byt
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 3, "output_tokens": 4},
     }))
-    .into_response()
+    .into_response();
+    if matches!(up.reply, Reply::Exhausted) {
+        response.headers_mut().insert(
+            "anthropic-ratelimit-requests-remaining",
+            "0".parse().unwrap(),
+        );
+        response.headers_mut().insert(
+            "anthropic-ratelimit-requests-reset",
+            "2099-01-01T00:00:00Z".parse().unwrap(),
+        );
+    }
+    response
 }
 
 async fn chat(State(up): State<Arc<Upstream>>, headers: HeaderMap, body: Bytes) -> Response {
@@ -331,6 +343,27 @@ fn check_route(response: &Response, deployment: &str, attempts: &str) {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["x-llmux-deployment"], deployment);
     assert_eq!(response.headers()["x-llmux-attempts"], attempts);
+}
+
+#[tokio::test]
+async fn anthropic_reset_header_skips_an_exhausted_deployment() {
+    let fixture = Fixture::start((Reply::Exhausted, 0), (Reply::Ok, 10)).await;
+    let payload = json!({
+        "model":"assistant","max_tokens":4096,"system":"Be brief",
+        "messages":[{"role":"user","content":[{"type":"text","text":"Hello"}]}]
+    });
+    for expected in ["claude", "gpt"] {
+        let (response, _) = fixture
+            .send_to(
+                "/v1/messages",
+                header::AUTHORIZATION,
+                "Bearer test-client",
+                payload.clone(),
+            )
+            .await;
+        check_route(&response, expected, "1");
+    }
+    assert_eq!(fixture.counts(), [1, 1]);
 }
 
 #[tokio::test]

@@ -718,6 +718,62 @@ pub(crate) fn classify_error(
     classify_error_details(status, headers, body, now, &details)
 }
 
+fn gemini_quota(details: &serde_json::Value) -> (bool, Option<Duration>) {
+    let mut daily = false;
+    let mut wait = None;
+    for detail in details["details"].as_array().into_iter().flatten() {
+        match detail["@type"].as_str() {
+            Some("type.googleapis.com/google.rpc.QuotaFailure") => {
+                daily |= detail["violations"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|violation| {
+                        ["quotaId", "quotaMetric"].iter().any(|field| {
+                            violation[field].as_str().is_some_and(|name| {
+                                let name: String = name
+                                    .chars()
+                                    .filter(char::is_ascii_alphanumeric)
+                                    .map(|c| c.to_ascii_lowercase())
+                                    .collect();
+                                name.contains("perday")
+                            })
+                        })
+                    });
+            }
+            Some("type.googleapis.com/google.rpc.RetryInfo") => {
+                wait = wait.max(detail["retryDelay"].as_str().and_then(gemini_retry_delay));
+            }
+            _ => {}
+        }
+    }
+    (daily, wait)
+}
+
+fn gemini_retry_delay(value: &str) -> Option<Duration> {
+    let value = value.strip_suffix('s')?;
+    let (seconds, nanos) = match value.split_once('.') {
+        Some((seconds, fraction)) => {
+            if fraction.is_empty()
+                || fraction.len() > 9
+                || !fraction.bytes().all(|c| c.is_ascii_digit())
+            {
+                return None;
+            }
+            (
+                seconds,
+                fraction.parse::<u32>().ok()? * 10u32.pow(9 - fraction.len() as u32),
+            )
+        }
+        None => (value, 0),
+    };
+    if seconds.is_empty() || !seconds.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let duration = Duration::new(seconds.parse().ok()?, nanos);
+    (!duration.is_zero()).then_some(duration.min(MAX_RETRY))
+}
+
 fn classify_error_details(
     status: StatusCode,
     headers: &HeaderMap,
@@ -754,7 +810,13 @@ fn classify_error_details(
     } else {
         Scope::Unknown
     };
-    let wait = retry_after(headers, now)
+    let (daily, gemini_wait) = if status == StatusCode::TOO_MANY_REQUESTS {
+        gemini_quota(details)
+    } else {
+        (false, None)
+    };
+    let wait = gemini_wait
+        .or_else(|| retry_after(headers, now))
         .or_else(|| {
             header_text(headers, "retry-after-ms")?
                 .parse::<f64>()
@@ -784,7 +846,7 @@ fn classify_error_details(
         402 => UpstreamError::QuotaExhausted {
             reset_at: wait.and_then(|wait| now.checked_add(wait)),
         },
-        429 if quota => UpstreamError::QuotaExhausted {
+        429 if quota || daily => UpstreamError::QuotaExhausted {
             reset_at: wait.and_then(|wait| now.checked_add(wait)),
         },
         429 => UpstreamError::RateLimited { retry_after: wait },
@@ -1051,6 +1113,60 @@ mod tests {
             Bytes::copy_from_slice(body.as_bytes()),
             SystemTime::UNIX_EPOCH,
         )
+    }
+
+    #[test]
+    fn gemini_quota_details_distinguish_daily_limits_and_prefer_retry_info() {
+        let now = SystemTime::UNIX_EPOCH;
+        for (quota_id, delay, daily, wait) in [
+            (
+                "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+                "3.125s",
+                false,
+                3125,
+            ),
+            (
+                "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                "3600s",
+                true,
+                3_600_000,
+            ),
+            (
+                "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+                "bad",
+                false,
+                8000,
+            ),
+            (
+                "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+                "0s",
+                false,
+                8000,
+            ),
+        ] {
+            let payload = serde_json::json!([{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[
+                {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":quota_id}]},
+                {"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":delay}
+            ]}}]);
+            let mut headers = HeaderMap::new();
+            headers.insert(header::RETRY_AFTER, HeaderValue::from_static("8"));
+            let error = classify_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                &headers,
+                Bytes::from(payload.to_string()),
+                now,
+            );
+            let wait = Duration::from_millis(wait);
+            match error {
+                UpstreamError::QuotaExhausted { reset_at } if daily => {
+                    assert_eq!(reset_at, Some(now + wait))
+                }
+                UpstreamError::RateLimited { retry_after } if !daily => {
+                    assert_eq!(retry_after, Some(wait))
+                }
+                other => panic!("unexpected error for {quota_id}: {other:?}"),
+            }
+        }
     }
 
     #[test]

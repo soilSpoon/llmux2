@@ -39,6 +39,24 @@ cools down.
 WHEN a stream ends with a rate-limit error
 THEN the deployment is skipped for new requests until its cooldown ends.
 
+#### Scenario: Gemini reports an explicit quota violation
+
+WHEN a Gemini 429 contains a daily `google.rpc.QuotaFailure` violation
+THEN the gateway treats it as credential quota exhaustion rather than
+deployment throttling. A positive `google.rpc.RetryInfo.retryDelay` takes
+precedence over generic retry headers. Invalid or zero delays fall back to
+other hints or local backoff.
+
+#### Scenario: Anthropic exposes an exhausted rate-limit window
+
+WHEN Anthropic reports zero remaining requests, total tokens, input tokens,
+or output tokens with a future RFC3339 reset
+THEN the gateway proactively skips that deployment until the applicable
+reset. On a 429, a positive `Retry-After` takes precedence; otherwise the
+latest future reset for an exhausted or unreported window is used. Invalid
+or stale resets are ignored, and resets are subject to the configured
+cooldown cap.
+
 ### Requirement: Rate-limit avoidance
 
 The gateway SHALL reduce 429s proactively: secure additional paths, pace
