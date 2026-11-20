@@ -5,6 +5,7 @@ const fmt = new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 1 });
 const clock = new Intl.DateTimeFormat("ko-KR", { hour: "numeric", minute: "2-digit", second: "2-digit" });
 const WINDOW_MS = 120_000;
 const POLL_MS = 2_000;
+const THEME_KEY = "llmux2.dashboard.theme";
 const total = ({ ok, rejected, unavailable, failed }) => ok + rejected + unavailable + failed;
 const table = document.querySelector("table");
 let session;
@@ -12,6 +13,22 @@ let session;
 function text(id, value) {
   if (byId(id).textContent !== value) byId(id).textContent = value;
 }
+
+function setTheme(dark) {
+  const theme = dark ? "dark" : "light";
+  document.documentElement.dataset.theme = theme;
+  text("theme", dark ? "밝게" : "어둡게");
+  byId("theme").setAttribute("aria-label", dark ? "밝은 테마로 전환" : "어두운 테마로 전환");
+  return theme;
+}
+
+let savedTheme;
+try { savedTheme = localStorage.getItem(THEME_KEY); } catch {}
+setTheme(savedTheme === "dark");
+byId("theme").addEventListener("click", () => {
+  const theme = setTheme(document.documentElement.dataset.theme !== "dark");
+  try { localStorage.setItem(THEME_KEY, theme); } catch {}
+});
 
 function status(label, tone) {
   text("connection", label);

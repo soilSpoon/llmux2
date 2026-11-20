@@ -7,7 +7,9 @@ const { createContext, runInContext } = require("node:vm");
 
 const script = readFileSync(join(__dirname, "../src/dashboard/app.js"), "utf8");
 
-function dashboard(fetch) {
+const themeKey = "llmux2.dashboard.theme";
+
+function dashboard(fetch, localStorage) {
   const nodes = new Map();
   const timers = new Map();
   let timer = 0;
@@ -50,17 +52,19 @@ function dashboard(fetch) {
     if (!nodes.has(id)) nodes.set(id, { ...makeNode(), hidden: id === "dashboard" });
     return nodes.get(id);
   };
+  const root = makeNode();
   const context = createContext({
     AbortController,
     AbortSignal: {},
     clearTimeout: (id) => timers.delete(id),
     setTimeout(callback) { timers.set(++timer, callback); return timer; },
-    document: { getElementById: element, querySelector: () => table, createElement: makeNode },
+    document: { documentElement: root, getElementById: element, querySelector: () => table, createElement: makeNode },
+    localStorage,
     fetch,
   });
   runInContext(script, context);
   return {
-    element, timers,
+    element, timers, root,
     get rows() { return table.tBodies.flatMap((group) => group.rows); },
     submit() {
       element("key").value = "fake-key";
@@ -73,6 +77,33 @@ function dashboard(fetch) {
     },
   };
 }
+
+test("the locked dashboard defaults to light and preserves the chosen theme across reloads", () => {
+  const saved = new Map([[themeKey, "invalid"]]);
+  const storage = { getItem: (key) => saved.get(key), setItem: (key, value) => saved.set(key, value) };
+  const noNetwork = () => assert.fail("Changing the theme must not contact the gateway");
+  const first = dashboard(noNetwork, storage);
+  assert.equal(first.root.dataset.theme, "light");
+  assert.equal(first.element("theme").textContent, "어둡게");
+  first.element("theme").click();
+  assert.equal(first.root.dataset.theme, "dark");
+  assert.equal(first.element("dashboard").hidden, true);
+  assert.deepEqual([...saved], [[themeKey, "dark"]]);
+  const reopened = dashboard(noNetwork, storage);
+  assert.equal(reopened.root.dataset.theme, "dark");
+  assert.equal(reopened.element("theme").textContent, "밝게");
+  reopened.element("theme").click();
+  assert.equal(reopened.root.dataset.theme, "light");
+  assert.deepEqual([...saved], [[themeKey, "light"]]);
+});
+
+test("the theme can be changed even when browser storage is unavailable", () => {
+  const blocked = () => { throw new Error("storage denied"); };
+  const ui = dashboard(undefined, { getItem: blocked, setItem: blocked });
+  assert.equal(ui.root.dataset.theme, "light");
+  ui.element("theme").click();
+  assert.equal(ui.root.dataset.theme, "dark");
+});
 
 test("rejected sign-in is localized and stops polling without newer AbortSignal helpers", async () => {
   let request;
