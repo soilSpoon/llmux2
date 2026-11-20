@@ -369,6 +369,8 @@ impl ProviderAdapter for OpenAiCompat {
             Ok(GatewayResponse::Stream(
                 if req.format == InboundFormat::OpenAiResponses {
                     responses::stream(stream)
+                } else if let Some(include_usage) = sse::requested_usage(&req.body) {
+                    sse::with_chat_usage(stream, include_usage)
                 } else {
                     stream
                 },

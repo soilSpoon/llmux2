@@ -32,6 +32,7 @@ enum Reply {
     Quota(Option<u64>),
     Complete,
     NegotiatedStream(Value),
+    InlineUsageStream,
     ResponseStream { complete: bool },
     AbortStream,
     EmptyStream,
@@ -99,6 +100,15 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
                 ),
             ).into_response()
         }
+        Reply::InlineUsageStream => (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            concat!(
+                "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+                "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}\n\n",
+                "data: {\"id\":\"c\",\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}\n\n",
+                "data: [DONE]\n\n",
+            ),
+        ).into_response(),
         Reply::ResponseStream { complete } => {
             assert_eq!(request["stream"], true);
             assert_eq!(request["stream_options"]["include_usage"], true);
@@ -407,6 +417,52 @@ async fn openai_chat_preserves_documented_and_extension_parameters_and_usage() {
     assert!(output.ends_with(
         "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}\n\ndata: [DONE]\n\n"
     ));
+}
+
+#[tokio::test]
+async fn openai_chat_enforces_explicit_stream_usage_options() {
+    let fixture = Fixture::start(
+        [Reply::InlineUsageStream, Reply::Complete],
+        [Reply::InlineUsageStream, Reply::Complete],
+        "",
+    )
+    .await;
+    for include_usage in [false, true] {
+        let response = fixture
+            .post(
+                "/v1/chat/completions",
+                "test-client",
+                json!({
+                    "model":"alias","messages":[{"role":"user","content":"Hello"}],
+                    "stream":true,"stream_options":{"include_usage":include_usage},
+                    "vendor_option":{"model":"leave-me-alone"}
+                })
+                .to_string(),
+            )
+            .await;
+        check_route(&response, "d1", "1");
+        let output = body(response).await;
+        let mut data: Vec<_> = output
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .collect();
+        assert_eq!(data.pop(), Some("[DONE]"));
+        let chunks: Vec<Value> = data
+            .into_iter()
+            .map(|chunk| serde_json::from_str(chunk).unwrap())
+            .collect();
+        assert_eq!(chunks.len(), if include_usage { 3 } else { 2 });
+        assert_eq!(chunks[0]["choices"][0]["delta"]["content"], "Hi");
+        assert_eq!(chunks[1]["choices"][0]["finish_reason"], "stop");
+        for chunk in &chunks[..2] {
+            assert_eq!(chunk.get("usage"), include_usage.then_some(&Value::Null));
+        }
+        if include_usage {
+            assert_eq!(chunks[2]["choices"], json!([]));
+            assert_eq!(chunks[2]["usage"]["total_tokens"], 10);
+            assert_eq!(chunks[2]["id"], "c");
+        }
+    }
 }
 
 #[tokio::test]
