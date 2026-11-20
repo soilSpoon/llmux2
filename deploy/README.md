@@ -111,8 +111,11 @@ max_cooldowns = 2                  # more than this many cooling deployments
 max_disabled = 0                   # any disabled deployment alerts
 ```
 
-`failure_ratio` compares `failed_attempts + stream_errors` against the previous
-run's counters, persisted atomically in `$HOME/llmux2/alert-state.json`. The
+`failure_ratio` compares new `failed_attempts + stream_errors` against new
+attempts (`routed + failed_attempts` — `routed` already counts requests that
+later error mid-stream) since the previous run's counters, persisted atomically
+in `$HOME/llmux2/alert-state.json`. Values outside `0..=1` (including `nan`)
+are rejected as config errors. The
 first run (or any run after counters reset, e.g. a reload or restart) records
 a baseline and cannot breach the ratio. Wire notifications with
 `OnFailure=` on `llmux2-alert.service` or a journal watcher; the tool itself

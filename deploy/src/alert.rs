@@ -35,7 +35,17 @@ pub struct Thresholds {
 impl Thresholds {
     pub fn load(path: &Path) -> std::result::Result<Self, String> {
         match fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).map_err(|e| e.to_string()),
+            Ok(text) => {
+                let thresholds: Self = toml::from_str(&text).map_err(|e| e.to_string())?;
+                if let Some(ratio) = thresholds.failure_ratio {
+                    if !(0.0..=1.0).contains(&ratio) {
+                        return Err(format!(
+                            "failure_ratio must be between 0 and 1, got {ratio}"
+                        ));
+                    }
+                }
+                Ok(thresholds)
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(error.to_string()),
         }
@@ -124,15 +134,20 @@ pub fn evaluate(
                 continue;
             };
             let routed = counter(entry, "routed");
-            let failed = counter(entry, "failed_attempts") + counter(entry, "stream_errors");
+            let failed = counter(entry, "failed_attempts");
+            let stream = counter(entry, "stream_errors");
             let base_routed = counter(before, "routed");
-            let base_failed = counter(before, "failed_attempts") + counter(before, "stream_errors");
-            // A reload or restart resets counters; the new snapshot re-bases.
-            if routed < base_routed || failed < base_failed {
+            let base_failed = counter(before, "failed_attempts");
+            let base_stream = counter(before, "stream_errors");
+            // A reload or restart resets counters; any single counter dropping
+            // means the snapshot re-bases rather than mixing generations.
+            if routed < base_routed || failed < base_failed || stream < base_stream {
                 continue;
             }
-            let new_failed = failed - base_failed;
-            let attempts = routed - base_routed + new_failed;
+            // `routed` already counts requests that later errored mid-stream,
+            // so only failed_attempts adds attempts on top of it.
+            let new_failed = (failed - base_failed) + (stream - base_stream);
+            let attempts = (routed - base_routed) + (failed - base_failed);
             if attempts < thresholds.min_attempts() {
                 continue;
             }
@@ -271,18 +286,45 @@ mod tests {
         // a: 6/14 = 43%; still below.
         assert!(evaluate(&now, Some(&before), &thresholds).is_empty());
         let now = [dep("a", 105, 6, 2, false, false)];
-        // a: 8/13 = 62% > 50%.
+        // a: 8/11 = 72% > 50%; stream errors already count in routed.
         let alerts = evaluate(&now, Some(&before), &thresholds);
         assert_eq!(alerts.len(), 1);
-        assert!(alerts[0].contains("a") && alerts[0].contains("8/13"));
+        assert!(alerts[0].contains("a") && alerts[0].contains("8/11"));
+        // Ten routed streams all failing is 100%, not 50%.
+        let all_streams_failed = [dep("a", 110, 0, 10, false, false)];
+        let alerts = evaluate(&all_streams_failed, Some(&before), &thresholds);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].contains("10/10"));
         // Below the attempt window nothing fires.
         thresholds.min_attempts = 20;
         assert!(evaluate(&now, Some(&before), &thresholds).is_empty());
         // A counter reset skips the ratio and re-bases.
         let reset = [dep("a", 4, 1, 0, false, false)];
         assert!(evaluate(&reset, Some(&before), &thresholds).is_empty());
+        // A drop in one failure counter is a reset even when the sum grows.
+        let mixed = [dep("a", 105, 20, 0, false, false)];
+        let before_mixed = prev(&[("a", 100, 5, 10)]);
+        assert!(evaluate(&mixed, Some(&before_mixed), &thresholds).is_empty());
         // No snapshot: no ratio at all.
         assert!(evaluate(&now, None, &thresholds).is_empty());
+    }
+
+    #[test]
+    fn load_rejects_invalid_failure_ratio() {
+        let dir = std::env::temp_dir().join(format!("alert-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("alerts.toml");
+        for text in [
+            "failure_ratio = nan",
+            "failure_ratio = -0.1",
+            "failure_ratio = 1.5",
+        ] {
+            fs::write(&path, text).unwrap();
+            assert!(Thresholds::load(&path).is_err(), "{text}");
+        }
+        fs::write(&path, "failure_ratio = 0.5").unwrap();
+        assert_eq!(Thresholds::load(&path).unwrap().failure_ratio, Some(0.5));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
