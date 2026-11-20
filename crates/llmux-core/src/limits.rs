@@ -1,4 +1,4 @@
-use llmux_types::QuotaSpec;
+use llmux_types::{LimitObservation, QuotaSpec};
 use std::{
     collections::VecDeque,
     sync::{
@@ -50,6 +50,18 @@ impl DeploymentLimits {
         };
         let backoff = default.saturating_mul(1u32.checked_shl(strikes - 1).unwrap_or(u32::MAX));
         self.cool_down(hint.unwrap_or(backoff).min(max))
+    }
+
+    /// Skips the deployment until reset when the provider reports no requests or tokens left.
+    pub fn observe(&self, observed: LimitObservation, max: Duration) {
+        for (remaining, reset) in [
+            (observed.remaining_requests, observed.reset_requests),
+            (observed.remaining_tokens, observed.reset_tokens),
+        ] {
+            if let (Some(0), Some(reset)) = (remaining, reset) {
+                self.cool_down(reset.min(max));
+            }
+        }
     }
 
     pub fn succeeded(&self) {

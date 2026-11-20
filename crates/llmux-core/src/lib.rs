@@ -452,6 +452,9 @@ impl Executor {
             .request(upstream.map(Full::new))
             .await
             .map_err(|_| GatewayError::Client(UpstreamError::Connect))?;
+        if let Some(observed) = binding.adapter.observe_limits(response.headers()) {
+            binding.limits.observe(observed, self.cfg.cooldown.max);
+        }
         let response = binding
             .adapter
             .parse_response(req, dep, response)
