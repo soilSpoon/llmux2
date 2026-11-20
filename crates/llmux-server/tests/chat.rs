@@ -34,6 +34,7 @@ enum Reply {
     AbortStream,
     GatedStream(Arc<Semaphore>),
     BadRequest,
+    ContextLength,
     HtmlPayloadTooLarge,
 }
 
@@ -89,6 +90,9 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
                 }));
             ([(header::CONTENT_TYPE, "text/event-stream")], Body::from_stream(events)).into_response()
         }
+        Reply::ContextLength => (
+            StatusCode::BAD_REQUEST, Json(json!({"error": {"code": "context_length_exceeded"}})),
+        ).into_response(),
         Reply::BadRequest => (
             StatusCode::BAD_REQUEST, Json(json!({"error": {"message": "bad input"}})),
         ).into_response(),
@@ -321,6 +325,26 @@ async fn quota_exhaustion_cools_down_and_obeys_fallback_policy() {
             assert_eq!(fixture.counts(), [1, 1 + usize::from(fallback)]);
         }
     }
+}
+
+#[tokio::test]
+async fn context_length_error_returns_an_openai_client_error() {
+    let fixture = Fixture::start(
+        [Reply::ContextLength, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture.request("test-client", "shared", false).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: Value = serde_json::from_str(&body(response).await).unwrap();
+    assert_eq!(error["error"]["code"], "context_length_exceeded");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("maximum context length"));
+    assert_eq!(fixture.counts(), [1, 0]);
 }
 
 #[tokio::test]
