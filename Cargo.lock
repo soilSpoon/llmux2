@@ -452,6 +452,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "llmux-import"
+version = "0.1.0"
+dependencies = [
+ "llmux-config",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "llmux-providers"
 version = "0.1.0"
 dependencies = [

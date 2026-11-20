@@ -1,0 +1,35 @@
+{
+  "_meta": {"version": "omniroute-v3-legacy-export"},
+  "providerNodes": [
+    {"id": "openai-compatible-chat-local", "prefix": "local", "type": "openai-compatible", "apiType": "chat", "baseUrl": "https://custom.example/v1"},
+    {"id": "anthropic-compatible-local", "type": "anthropic-compatible", "baseUrl": "https://claude.example/v1"}
+  ],
+  "providerConnections": [
+    {"id": "slow/key", "provider": "openai", "authType": "apikey", "apiKey": "test-openai-slow-secret", "priority": 10},
+    {"id": "fast key", "provider": "openai", "authType": "apikey", "apiKey": "test-openai-fast-secret", "priority": 1, "isActive": true},
+    {"id": "custom", "provider": "openai-compatible-chat-local", "authType": "apikey", "apiKey": "test-custom-secret", "priority": 0},
+    {"id": "claude", "provider": "anthropic-compatible-local", "authType": "apikey", "apiKey": "test-claude-secret"},
+    {"id": "groq", "provider": "groq", "authType": "apikey", "apiKey": "test-groq-secret"},
+    {"id": "oauth", "provider": "openai", "authType": "oauth", "accessToken": "test-oauth-secret", "refreshToken": "test-refresh-secret"},
+    {"id": "inactive", "provider": "openai", "authType": "apikey", "apiKey": "test-inactive-secret", "isActive": false},
+    {"id": "encrypted", "provider": "openai", "authType": "apikey", "apiKey": "enc:v1:encrypted-secret"},
+    {"id": "unknown", "provider": "gemini", "authType": "apikey", "apiKey": "test-unknown-secret"}
+  ],
+  "combos": [
+    {"name": "priority", "strategy": "priority", "models": ["openai/gpt-test", {"model": "org/model", "providerId": "groq"}, "local/vendor/model", "unknown/missing"]},
+    {"name": "rotate", "strategy": "round-robin", "models": ["openai/gpt-test", "groq/other"]},
+    {"name": "pinned", "strategy": "fallback", "models": [{"model": "openai/pin", "connectionId": "slow/key"}]},
+    {"name": "allowed", "strategy": "priority", "models": [{"model": "gpt-test", "providerId": "openai", "allowedConnectionIds": ["slow/key", "fast key"]}]},
+    {"name": "nested", "strategy": "priority", "models": [{"kind": "combo-ref", "comboName": "pinned"}, "rotate"]},
+    {"name": "cycle", "strategy": "priority", "models": [{"kind": "combo-ref", "comboName": "cycle"}, "groq/valid"]},
+    {"name": "empty", "models": ["unknown/only"]},
+    {"data": "{\"name\":\"stored\",\"strategy\":\"weighted\",\"models\":[{\"providerId\":\"anthropic-compatible-local\",\"model\":\"claude-test\"}]}"}
+  ],
+  "apiKeys": [
+    {"id": "client", "key": "test-client-secret", "isActive": true},
+    {"id": "disabled", "key": "test-disabled-client-secret", "isActive": false},
+    {"id": "restricted", "key": "test-restricted-client-secret", "isActive": true, "allowedModels": ["priority"]}
+  ],
+  "modelAliases": {"legacy-alias": "openai/gpt-test"},
+  "settings": {"ignored": true}
+}
