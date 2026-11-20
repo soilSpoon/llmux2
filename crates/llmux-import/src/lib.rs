@@ -36,7 +36,7 @@ pub struct ImportOptions<'a> {
 
 struct Connection {
     source_id: String,
-    provider: String,
+    provider: upstream::ProviderIdentity,
     credential: Option<String>,
     kind: String,
     base_url: String,
@@ -258,7 +258,7 @@ impl Expander<'_> {
                 ));
                 continue;
             }
-            let replacement = if p == "openrouter" && self.policy.openrouter_replacements {
+            let replacement = if p.is_builtin("openrouter") && self.policy.openrouter_replacements {
                 let replacement = replacements::find(model);
                 if replacement.is_none() || !pinned.is_empty() || !allowed.is_empty() {
                     self.warnings.push(format!("combo {name} step {index}: no verified connected OpenRouter replacement (or source connection restriction)"));
@@ -417,7 +417,7 @@ pub fn import_with_options(
         let id = unique("workers-ai", &mut ids);
         credentials.push(json!({"id":id,"kind":"api_key","provider":"openai_compat","key":workers.reference}));
         warnings.push("Workers AI uses rpm=1 per deployment, NOT an account-wide neuron/daily spending cap; enforce free-only billing at Cloudflare".into());
-        connections.push(Connection {source_id:"workers-ai-opt-in".into(),provider:"workers-ai".into(),credential:Some(id.clone()),kind:"openai_compat".into(),base_url:workers.base_url.clone(),priority:i64::MAX,policy:policy::ModelPolicy::Workers});
+        connections.push(Connection {source_id:"workers-ai-opt-in".into(),provider:upstream::ProviderIdentity::Builtin("workers-ai".into()),credential:Some(id.clone()),kind:"openai_compat".into(),base_url:workers.base_url.clone(),priority:i64::MAX,policy:policy::ModelPolicy::Workers});
         id
     });
     for (index, c) in array(&root, "providerConnections").iter().enumerate() {
@@ -491,7 +491,10 @@ pub fn import_with_options(
         };
         connections.push(Connection {
             source_id: source_id.into(),
-            provider: upstream::canonical_provider(string(c, "provider"), &[]).into(),
+            provider: upstream::ProviderIdentity::connection(
+                string(c, "provider"),
+                array(&root, "providerNodes"),
+            ),
             credential,
             kind,
             base_url,
@@ -527,7 +530,9 @@ pub fn import_with_options(
                 .filter(|c| c.base_url == "https://ai-gateway.kilo.ai/api/v1")
                 .map(|c| c.provider.clone())
                 .collect();
-            providers.extend(["kilo".into(), "kilocode".into()]);
+            providers.extend(
+                ["kilo", "kilocode"].map(|id| upstream::ProviderIdentity::Builtin(id.into())),
+            );
             providers.sort();
             providers.dedup();
             let mut external_ids: HashSet<_> = array(&root, "providerConnections")
@@ -589,7 +594,7 @@ pub fn import_with_options(
         if policy.openrouter_replacements {
             if let Some(model) = name.strip_prefix("openrouter/") {
                 combo["models"] =
-                    json!([{"kind":"model","_resolvedProviderId":"openrouter","model":model}]);
+                    json!([upstream::ProviderIdentity::Builtin("openrouter".into()).step(model)]);
                 warnings.push(format!(
                     "combo {name}: source combo replaced by reviewed official-only policy"
                 ));

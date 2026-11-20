@@ -21,7 +21,8 @@ pub(super) fn matches(route: &Route, connection: &Connection) -> bool {
         }
         "mistral" => connection.base_url == "https://api.mistral.ai/v1",
         "workers" => {
-            connection.provider == "workers-ai" && connection.policy == ModelPolicy::Workers
+            connection.provider.is_builtin("workers-ai")
+                && connection.policy == ModelPolicy::Workers
         }
         "kilo" => {
             connection.base_url == "https://ai-gateway.kilo.ai/api/v1"
@@ -38,7 +39,7 @@ pub(super) fn seed(direct: &mut BTreeMap<String, Value>, connections: &[Connecti
             .any(|connection| matches(route, connection))
         {
             let name = format!("openrouter/{}", route.0);
-            direct.entry(name.clone()).or_insert_with(|| json!({"name":name,"models":[{"kind":"model","_resolvedProviderId":"openrouter","model":route.0}]}));
+            direct.entry(name.clone()).or_insert_with(|| json!({"name":name,"models":[crate::upstream::ProviderIdentity::Builtin("openrouter".into()).step(route.0)]}));
         }
     }
 }

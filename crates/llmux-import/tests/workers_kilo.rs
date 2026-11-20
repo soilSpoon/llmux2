@@ -36,6 +36,27 @@ fn success(output: &std::process::Output) -> String {
 }
 
 #[test]
+fn custom_node_id_ds_keeps_its_identity_without_opt_ins() {
+    let mut root = fixture();
+    root["providerNodes"] = json!([{"id":"ds","prefix":"gateway","type":"openai-compatible","baseUrl":"https://custom.example/v1"}]);
+    root["providerConnections"] = json!([{"id":"custom","provider":"ds","authType":"apikey","apiKey":"synthetic-custom-key"}]);
+    root["combos"] =
+        json!([{"name":"custom","models":["gateway/vendor/model", "ds/vendor/model"]}]);
+    let dir = tempfile::tempdir().unwrap();
+    success(&run(&root, dir.path(), &[]));
+    let config = RuntimeConfig::load(dir.path().join("out.toml")).unwrap();
+    for name in ["custom", "gateway/vendor/model", "ds/vendor/model"] {
+        let model = &config.models[config.model_names[name]];
+        for dep in &model.deployments {
+            let dep = &config.deployments[dep.0 as usize];
+            assert_eq!(dep.base_url.to_string(), "https://custom.example/v1");
+            assert_eq!(dep.upstream_model.as_ref(), "vendor/model");
+        }
+    }
+    assert!(!config.model_names.contains_key("deepseek/vendor/model"));
+}
+
+#[test]
 fn unavailable_mapping_blocks_retained_openrouter_combo_and_dependents() {
     for target in ["missing", "empty"] {
         let mut root = fixture();

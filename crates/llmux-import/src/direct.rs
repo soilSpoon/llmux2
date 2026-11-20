@@ -27,8 +27,8 @@ pub(super) fn collect(
             let Some((provider, model)) = upstream::model_target(step, nodes) else {
                 continue;
             };
-            let node = nodes.iter().find(|node| string(node, "id") == provider);
-            if provider == "codex"
+            let node = nodes.iter().find(|node| matches!(&provider, upstream::ProviderIdentity::Custom(id) if id == string(node, "id")));
+            if provider.is_builtin("codex")
                 || node.is_some_and(|node| string(node, "prefix") == "codex")
                 || model.contains(['*', '?'])
                 || model.chars().any(char::is_whitespace)
@@ -38,18 +38,18 @@ pub(super) fn collect(
             {
                 continue;
             }
-            let mut prefixes = vec![provider];
+            let mut prefixes = vec![provider.as_str()];
             if let Some(node) = node {
                 let prefix = string(node, "prefix");
                 if !prefix.is_empty() && upstream::canonical_provider(prefix, nodes) == provider {
                     prefixes.push(prefix);
                 }
             } else {
-                prefixes.extend(
-                    upstream::PROVIDER_ALIASES
-                        .iter()
-                        .filter_map(|(alias, id)| (*id == provider).then_some(*alias)),
-                );
+                prefixes.extend(upstream::PROVIDER_ALIASES.iter().filter_map(|(alias, id)| {
+                    (provider.is_builtin(id)
+                        && upstream::canonical_provider(alias, nodes) == provider)
+                        .then_some(*alias)
+                }));
             }
             let mut names: Vec<_> = prefixes
                 .into_iter()
@@ -62,7 +62,10 @@ pub(super) fn collect(
                 names.push(raw.to_owned());
             }
             for name in names {
-                direct.insert(name.clone(), json!({"name":name,"models":[{"kind":"model","_resolvedProviderId":provider,"model":model}]}));
+                direct.insert(
+                    name.clone(),
+                    json!({"name":name,"models":[provider.step(model)]}),
+                );
             }
         }
     }
