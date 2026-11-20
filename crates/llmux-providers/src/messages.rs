@@ -164,6 +164,7 @@ pub(crate) fn complete(body: &[u8]) -> Result<(Bytes, Option<Usage>), UpstreamEr
 
 pub(crate) fn complete_chat(chat: &Value) -> Result<(Value, Option<Usage>), UpstreamError> {
     let choice = chat["choices"].get(0).ok_or_else(bad_gateway)?;
+    let finish = stop(&choice["finish_reason"]);
     let message = choice["message"].as_object().ok_or_else(bad_gateway)?;
     let mut content = Vec::new();
     if let Some(text) = message.get("content").and_then(Value::as_str) {
@@ -178,15 +179,16 @@ pub(crate) fn complete_chat(chat: &Value) -> Result<(Value, Option<Usage>), Upst
     }
     if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
         for call in calls {
-            let parameters: Value = serde_json::from_str(
+            let parameters = serde_json::from_str::<Value>(
                 call["function"]["arguments"]
                     .as_str()
                     .ok_or_else(bad_gateway)?,
-            )
-            .map_err(|_| bad_gateway())?;
-            if !parameters.is_object() {
-                return Err(bad_gateway());
-            }
+            );
+            let parameters = match parameters {
+                Ok(input) if input.is_object() => input,
+                Err(error) if finish == "max_tokens" && error.is_eof() => json!({}),
+                _ => return Err(bad_gateway()),
+            };
             content.push(json!({"type":"tool_use",
                 "id":call["id"].as_str().ok_or_else(bad_gateway)?,
                 "name":call["function"]["name"].as_str().ok_or_else(bad_gateway)?,
@@ -198,10 +200,10 @@ pub(crate) fn complete_chat(chat: &Value) -> Result<(Value, Option<Usage>), Upst
     let body = envelope(
         chat,
         content,
-        json!(if refusal.is_some() {
+        json!(if refusal.is_some() && finish != "max_tokens" {
             "refusal"
         } else {
-            stop(&choice["finish_reason"])
+            finish
         }),
         usage.unwrap_or_default(),
     );
@@ -235,7 +237,7 @@ pub(crate) fn stream(
             let chunk = chunk?;
             if chunk.data == "[DONE]" {
                 let finish = reason.ok_or_else(bad_gateway)?;
-                let finish = if refusal { "refusal" } else { finish };
+                let finish = if refusal && finish != "max_tokens" { "refusal" } else { finish };
                 if let Some(index) = text {
                     yield block_stop(index);
                 }
@@ -339,5 +341,22 @@ mod tests {
         assert_eq!(complete["stop_reason"], "refusal");
         assert_eq!(text, "Cannot help.");
         assert_eq!(events[events.len() - 2]["delta"]["stop_reason"], "refusal");
+    }
+
+    #[test]
+    fn messages_conversion_keeps_max_tokens_for_partial_tool_json() {
+        let mut chat = json!({
+            "id":"chat","model":"model","choices":[{"message":{"tool_calls":[
+                {"id":"call","function":{"name":"lookup","arguments":"{\"incomplete\":"}}
+            ]},"finish_reason":"length"}]
+        });
+        let (complete, _) = complete_chat(&chat).unwrap();
+        assert_eq!(complete["stop_reason"], "max_tokens");
+        assert_eq!(
+            complete["content"][0],
+            json!({"type":"tool_use","id":"call","name":"lookup","input":{}})
+        );
+        chat["choices"][0]["finish_reason"] = json!("tool_calls");
+        assert!(complete_chat(&chat).is_err());
     }
 }
