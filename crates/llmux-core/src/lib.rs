@@ -470,18 +470,33 @@ impl Executor {
                     }))?
                     .map_err(GatewayError::Client)?;
                 let idle_timeout = self.cfg.server.request_timeout.min(dep.timeout);
+                let cooldown = (self.cfg.cooldown.default, self.cfg.cooldown.max);
                 let events = stream::unfold(
-                    Some((events, binding.stats.clone())),
+                    Some((events, binding.stats.clone(), binding.limits.clone())),
                     move |state| async move {
-                        let (mut events, stats) = state?;
+                        let (mut events, stats, limits) = state?;
                         let error = match timeout(idle_timeout, events.next()).await {
-                            Ok(Some(Ok(event))) => return Some((Ok(event), Some((events, stats)))),
+                            Ok(Some(Ok(event))) => {
+                                return Some((Ok(event), Some((events, stats, limits))))
+                            }
                             Ok(Some(Err(err))) => err,
                             Ok(None) => return None,
                             Err(_) => UpstreamError::Timeout,
                         };
                         if let Some(stats) = &stats {
                             stats.record_stream_error();
+                        }
+                        let hint = match &error {
+                            UpstreamError::RateLimited { retry_after, .. } => Some(*retry_after),
+                            UpstreamError::QuotaExhausted { reset_at } => {
+                                Some(reset_at.map(|reset| {
+                                    reset.duration_since(SystemTime::now()).unwrap_or_default()
+                                }))
+                            }
+                            _ => None,
+                        };
+                        if let Some(hint) = hint {
+                            limits.limited(hint, cooldown.0, cooldown.1);
                         }
                         Some((Err(error), None))
                     },
