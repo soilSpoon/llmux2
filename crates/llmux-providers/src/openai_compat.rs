@@ -880,6 +880,7 @@ mod tests {
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(5),
             max_context: None,
+            fallback: false,
         };
         let client = Client::builder(TokioExecutor::new()).build_http();
         for stream in [false, true] {

@@ -282,3 +282,96 @@ async fn reload_without_config_path_is_rejected() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"]["message"].is_string());
 }
+
+#[tokio::test]
+async fn reload_rotates_admin_key_and_warns_on_restart_only_fields() {
+    env();
+    let upstream = upstream().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("llmux.toml");
+    let old_key = dir.path().join("old.key");
+    let new_key = dir.path().join("new.key");
+    std::fs::write(&old_key, "old-key").unwrap();
+    std::fs::write(&new_key, "new-key").unwrap();
+    std::fs::write(
+        &path,
+        config(&upstream.url()).replace(
+            "env:LLMUX_ADMIN_TEST_ADMIN",
+            &format!("file:{}", old_key.display()),
+        ),
+    )
+    .unwrap();
+    let router =
+        llmux_server::app_with_path(RuntimeConfig::load(&path).unwrap(), Some(path.clone()))
+            .await
+            .unwrap();
+    let gateway = TestServer::start(router).await.unwrap();
+    let client = Client::builder(TokioExecutor::new()).build_http();
+    let status_url = format!("{}/admin/status", gateway.url());
+
+    std::fs::write(
+        &path,
+        config(&upstream.url())
+            .replace(
+                "env:LLMUX_ADMIN_TEST_ADMIN",
+                &format!("file:{}", new_key.display()),
+            )
+            .replace("[server]", "[server]\nlisten = \"127.0.0.1:9\""),
+    )
+    .unwrap();
+    let (status, body) = call(
+        &client,
+        "POST",
+        &format!("{}/admin/reload", gateway.url()),
+        Some("old-key"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning.as_str().unwrap().contains("listen")));
+
+    let (status, _) = call(&client, "GET", &status_url, Some("old-key"), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "rotated-out key denied");
+    let (status, _) = call(&client, "GET", &status_url, Some("new-key"), None).await;
+    assert_eq!(status, StatusCode::OK, "new key accepted");
+}
+
+#[tokio::test]
+async fn disable_credential_without_deployments() {
+    env();
+    let upstream = upstream().await;
+    let mut content = config(&upstream.url());
+    content.push_str(
+        r#"
+[[credentials]]
+id = "spare"
+kind = "api_key"
+provider = "openai_compat"
+key = "env:LLMUX_ADMIN_TEST_PROVIDER"
+"#,
+    );
+    let gateway = TestServer::start(
+        llmux_server::app(RuntimeConfig::parse(&content).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let client = Client::builder(TokioExecutor::new()).build_http();
+
+    let url = format!("{}/admin/credentials/spare/disabled", gateway.url());
+    let (status, body) = call(
+        &client,
+        "POST",
+        &url,
+        Some("admin-key"),
+        Some(json!({"disabled": true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["disabled"], true);
+}
