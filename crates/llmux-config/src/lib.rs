@@ -275,6 +275,7 @@ impl RawConfig {
                     let refresh_token =
                         resolve_secret(&required_oauth(refresh_token, "refresh_token")?)?;
                     let client_secret = client_secret.as_deref().map(resolve_secret).transpose()?;
+                    let scopes = scopes.filter(|scopes| !scopes.is_empty());
                     if scopes.as_ref().is_some_and(|scopes| {
                         scopes.iter().any(|scope| {
                             scope.is_empty()
@@ -536,6 +537,12 @@ refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
         assert_eq!(credential.scopes.as_deref().unwrap(), ["read", "write"]);
         assert_eq!(credential.refresh_skew, Duration::ZERO);
         assert_eq!(credential.request_timeout, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn oauth_empty_scopes_are_absent() {
+        let parsed = RuntimeConfig::parse(&config(&format!("{REQUIRED}\nscopes = []"))).unwrap();
+        assert!(parsed.oauth["oauth"].scopes.is_none());
     }
 
     #[test]
