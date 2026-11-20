@@ -16,6 +16,7 @@ pub(super) struct External {
 
 pub(super) struct Policy {
     pub workers: Option<External>,
+    workers_models: Option<HashSet<String>>,
     pub kilo_key: Option<String>,
     pub kilo_free: Option<HashSet<String>>,
     pub openrouter_replacements: bool,
@@ -66,6 +67,30 @@ impl Policy {
             }
             _ => return Err("Cloudflare opt-in requires both --cloudflare-account-id-file and --cloudflare-token-file".into()),
         };
+        let workers_models = options
+            .workers_ai_models
+            .map(|path| {
+                let content = fs::read_to_string(path)
+                    .map_err(|_| "could not read Workers AI model snapshot")?;
+                let catalog: Value = serde_json::from_str(&content)
+                    .map_err(|_| "invalid Workers AI model snapshot JSON")?;
+                if catalog["success"] != true {
+                    return Err("Workers AI model snapshot must be a successful API response");
+                }
+                let rows = catalog["result"]
+                    .as_array()
+                    .ok_or("Workers AI model snapshot requires a result array")?;
+                rows.iter()
+                    .map(|row| {
+                        row["name"]
+                            .as_str()
+                            .filter(|name| !name.is_empty())
+                            .map(str::to_owned)
+                            .ok_or("Workers AI model snapshot requires a name on every model")
+                    })
+                    .collect::<Result<HashSet<_>, _>>()
+            })
+            .transpose()?;
         let kilo_free = options
             .kilo_free_models
             .map(|path| {
@@ -96,6 +121,7 @@ impl Policy {
             .transpose()?;
         Ok(Self {
             workers,
+            workers_models,
             kilo_free,
             kilo_key: options.kilo_key_file.map(reference).transpose()?,
             openrouter_replacements: options.openrouter_replacements,
@@ -113,9 +139,18 @@ impl Policy {
     pub fn model(&self, policy: ModelPolicy, model: &str) -> Result<String, &'static str> {
         match policy {
             ModelPolicy::Any => Ok(model.to_owned()),
-            ModelPolicy::Workers => workers_model(model)
-                .map(str::to_owned)
-                .ok_or("unknown or deprecated Workers AI model (or requires paid access)"),
+            ModelPolicy::Workers => {
+                let mapped = workers_model(model)
+                    .ok_or("unknown or deprecated Workers AI model (or requires paid access)")?;
+                if self
+                    .workers_models
+                    .as_ref()
+                    .is_some_and(|models| !models.contains(mapped))
+                {
+                    return Err("mapped model not present in Workers AI model snapshot");
+                }
+                Ok(mapped.to_owned())
+            }
             ModelPolicy::KiloFree => match &self.kilo_free {
                 None => Err("keyed Kilo requires --kilo-free-models; skipped to avoid cost"),
                 Some(free) if free.contains(model) => Ok(model.to_owned()),
@@ -146,6 +181,11 @@ pub(super) fn workers_model(raw: &str) -> Option<&'static str> {
         }
     }
     if model == "meta-llama/llama-3.3-70b-instruct-fp8-fast" {
+        model = "meta/llama-3.3-70b-instruct-fp8-fast";
+    }
+    // https://developers.cloudflare.com/workers-ai/changelog/#2026-05-08
+    // https://developers.cloudflare.com/workers-ai/models/llama-3.3-70b-instruct-fp8-fast/
+    if model == "meta/llama-3.1-8b-instruct" {
         model = "meta/llama-3.3-70b-instruct-fp8-fast";
     }
     WORKERS

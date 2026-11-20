@@ -36,6 +36,118 @@ fn success(output: &std::process::Output) -> String {
 }
 
 #[test]
+fn retired_workers_bridge_models_use_current_llama_for_free_cloudflare() {
+    let mut root = fixture();
+    root["providerConnections"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"cf","provider":"cloudflare-direct","authType":"none"}));
+    root["combos"].as_array_mut().unwrap().extend([
+        json!({"name":"free-cloudflare","models":["cloudflare-direct/meta/llama-3.1-8b-instruct"]}),
+        json!({"name":"retired-small","models":["cfpd/meta/llama-3.2-1b-instruct"]}),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let account = dir.path().join("account");
+    let token = dir.path().join("token");
+    fs::write(&account, "0123456789abcdef0123456789abcdef").unwrap();
+    fs::write(&token, "synthetic-token").unwrap();
+    success(&run(
+        &root,
+        dir.path(),
+        &[
+            ("--cloudflare-account-id-file", &account),
+            ("--cloudflare-token-file", &token),
+        ],
+    ));
+    let config = RuntimeConfig::load(dir.path().join("out.toml")).unwrap();
+    let model = &config.models[config.model_names["free-cloudflare"]];
+    assert_eq!(model.deployments.len(), 1);
+    assert_eq!(
+        config.deployments[model.deployments[0].0 as usize]
+            .upstream_model
+            .as_ref(),
+        "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    );
+    assert!(!config.model_names.contains_key("retired-small"));
+    for deployment in &config.deployments {
+        assert!(!deployment.upstream_model.contains("llama-3.1-8b-instruct"));
+        assert!(!deployment.upstream_model.contains("llama-3.2-1b-instruct"));
+    }
+}
+
+#[test]
+fn workers_snapshot_filters_mapped_targets_and_never_expands_the_allowlist() {
+    for rows in [
+        json!([]),
+        json!([
+            {"name":"@cf/meta/llama-3.3-70b-instruct-fp8-fast"},
+            {"name":"@cf/meta/llama-3.1-8b-instruct"},
+            {"name":"@cf/meta/llama-3.2-1b-instruct"}
+        ]),
+    ] {
+        let mut root = fixture();
+        root["providerConnections"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":"cf","provider":"cfpd","authType":"none"}));
+        root["combos"].as_array_mut().unwrap().extend([
+            json!({"name":"free-cloudflare","models":["cfpd/meta/llama-3.1-8b-instruct"]}),
+            json!({"name":"missing","models":["cfpd/openai/gpt-oss-20b"]}),
+            json!({"name":"retired","models":["cfpd/meta/llama-3.2-1b-instruct"]}),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let account = dir.path().join("account");
+        let token = dir.path().join("token");
+        let snapshot = dir.path().join("models.json");
+        fs::write(&account, "0123456789abcdef0123456789abcdef").unwrap();
+        fs::write(&token, "synthetic-token").unwrap();
+        fs::write(&snapshot, json!({"success":true,"result":rows}).to_string()).unwrap();
+        let warnings = success(&run(
+            &root,
+            dir.path(),
+            &[
+                ("--cloudflare-account-id-file", &account),
+                ("--cloudflare-token-file", &token),
+                ("--workers-ai-models", &snapshot),
+            ],
+        ));
+        let config = RuntimeConfig::load(dir.path().join("out.toml")).unwrap();
+        assert_eq!(
+            config.model_names.contains_key("free-cloudflare"),
+            !rows.as_array().unwrap().is_empty()
+        );
+        assert!(!config.model_names.contains_key("missing"));
+        assert!(!config.model_names.contains_key("retired"));
+        assert!(warnings.contains("not present in Workers AI model snapshot"));
+    }
+}
+
+#[test]
+fn workers_snapshot_rejects_unreadable_malformed_and_failed_api_responses() {
+    for content in [
+        None,
+        Some("not-json"),
+        Some("{}"),
+        Some(r#"{"success":false,"result":[]}"#),
+        Some(r#"{"success":true,"result":[{}]}"#),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("models.json");
+        if let Some(content) = content {
+            fs::write(&snapshot, content).unwrap();
+        }
+        let output = run(
+            &fixture(),
+            dir.path(),
+            &[("--workers-ai-models", &snapshot)],
+        );
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Workers AI model snapshot"));
+        assert!(!dir.path().join("out.toml").exists());
+    }
+}
+
+#[test]
 fn official_replacements_and_rejected_openrouter_routes_never_get_fallback() {
     let mut root = fixture();
     let official = "openrouter/anthropic/claude-fable-5.2";
