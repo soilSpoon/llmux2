@@ -71,6 +71,22 @@ Authentication-error fallback / on-demand refresh retries are not implemented.
 
 ## Development
 
+### Sign in with ChatGPT
+
+Run `cargo run -p llmux-login -- --dir ~/.config/llmux/codex` (the directory is
+optional). The command opens the system browser and also prints a private sign-in
+URL. Do not share that URL: returning sign-ins include a retained ID-token hint.
+The loopback callback uses `127.0.0.1:1455/auth/callback`, falling back to a free port.
+
+After validating the ID token and ChatGPT plan permission, the command atomically
+writes owner-only `credentials.json` and `refresh_token` files and prints a TOML
+credential snippet. A stable `host_id` survives restarts. Re-running with the same
+directory reauthorizes its saved client/account; use a separate directory to add a
+different account or workspace. Treat the entire directory as sensitive, never
+commit it, and do not run concurrent login/gateway processes for the same session.
+The snippet targets `provider = "openai_responses"` and the OAuth `resource` field;
+the Responses upstream adapter and resource configuration support are separate work.
+
 - `llmux-types` defines the shared model, IR, and provider contracts.
 - `llmux-config` parses and validates TOML and secret references.
 - `llmux-core` selects deployments, enforces limits, and executes attempts.

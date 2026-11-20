@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/llmux-login",
     "crates/llmux-import",
     "crates/llmux-types",
     "crates/llmux-config",
@@ -17,6 +18,14 @@ edition = "2021"
 publish = false
 
 [workspace.dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+jsonwebtoken = "9.3"
+rand = "0.8"
+sha2 = "0.10"
+tempfile = "3"
+url = { version = "2", features = ["serde"] }
+webbrowser = "1"
 arc-swap = "1"
 llmux-types = { path = "crates/llmux-types" }
 llmux-config = { path = "crates/llmux-config" }
