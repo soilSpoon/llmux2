@@ -450,6 +450,9 @@ impl ProviderAdapter for Anthropic {
                 },
             )
             .body(body)?;
+        if req.format == InboundFormat::AnthropicMessages {
+            request.headers_mut().extend(req.anthropic_headers.clone());
+        }
         let auth = match auth {
             AuthMaterial::Bearer(key) => Some((
                 http::HeaderName::from_static("x-api-key"),
@@ -931,6 +934,7 @@ mod tests {
             model: "alias".into(),
             stream: true,
             body: Bytes::from_static(br#"{ "model":"alias", "future":{"model":"untouched"} }"#),
+            anthropic_headers: HeaderMap::new(),
             est_input_tokens: 0,
             max_output_tokens: None,
             context_overflow: None,

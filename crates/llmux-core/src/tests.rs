@@ -260,6 +260,7 @@ fn request() -> GatewayRequest {
         stream: false,
         body: Bytes::new(),
         est_input_tokens: 0,
+        anthropic_headers: HeaderMap::new(),
         max_output_tokens: None,
         context_overflow: None,
         request_id: RequestId("test".into()),
