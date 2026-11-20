@@ -120,6 +120,10 @@ fn convert_request(body: &[u8], model: &str) -> Result<Bytes, BuildError> {
                 }
             }
         }
+        content.retain(|block| block["type"] != "text" || block["text"] != "");
+        if content.is_empty() {
+            continue;
+        }
         if let Some(last) = messages.last_mut().filter(|last| last["role"] == role) {
             last["content"].as_array_mut().unwrap().extend(content);
         } else {
@@ -499,6 +503,27 @@ mod tests {
         assert_eq!(out["stop_sequences"], json!(["end"]));
         assert_eq!(out["metadata"]["user_id"], "u");
         assert!(out.get("response_format").is_none());
+    }
+
+    #[test]
+    fn drops_empty_text_blocks_without_dropping_tool_calls() {
+        for content in [json!(""), json!([{"type":"text","text":""}])] {
+            let out = converted(json!({"messages":[
+                {"role":"user","content":""},
+                {"role":"user","content":[{"type":"text","text":""},{"type":"text","text":"hello"}]},
+                {"role":"assistant","content":content,"tool_calls":[{"id":"t1","function":{"name":"f","arguments":"{}"}}]}
+            ]}));
+            let messages = out["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(
+                messages[0]["content"],
+                json!([{"type":"text","text":"hello"}])
+            );
+            assert_eq!(
+                messages[1]["content"],
+                json!([{"type":"tool_use","id":"t1","name":"f","input":{}}])
+            );
+        }
     }
 
     #[test]
