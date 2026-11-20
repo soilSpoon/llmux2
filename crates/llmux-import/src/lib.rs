@@ -2,6 +2,7 @@
 
 mod aliases;
 mod connection;
+mod context;
 mod db_dump;
 mod direct;
 mod fallback;
@@ -235,6 +236,7 @@ fn write_secret(dir: &Path, id: &str, secret: &str) -> Result<String, String> {
 }
 
 struct Expander<'a> {
+    context: &'a mut context::Overrides,
     combos: &'a HashMap<String, Value>,
     connections: &'a [Connection],
     nodes: &'a [Value],
@@ -403,6 +405,9 @@ impl Expander<'_> {
                     }
                 };
                 let mut deployment = json!({"base_url":c.base_url,"upstream_model":model});
+                if let Some(limit) = self.context.limit(&c.provider, &model) {
+                    deployment["max_context"] = limit.into();
+                }
                 if c.headers
                     .as_object()
                     .is_some_and(|headers| !headers.is_empty())
@@ -759,6 +764,7 @@ pub fn import_with_options(
         }
     }
     let nodes = array(&root, "providerNodes");
+    let mut context = context::Overrides::load(&root, &mut warnings);
     let mut direct = direct::collect(&combos, nodes, &connections);
     replacements::seed_antigravity(&mut direct, &connections);
     if policy.openrouter_replacements {
@@ -776,6 +782,7 @@ pub fn import_with_options(
             for target in &targets {
                 let mut deployments = Vec::new();
                 Expander {
+                    context: &mut context,
                     combos: &combos,
                     connections: &connections,
                     nodes,
@@ -850,6 +857,7 @@ pub fn import_with_options(
         }
     }
     let mut models = Vec::new();
+    context.reset_usage();
     let mut deployment_ids = HashSet::new();
     let mut deployment_count = 0;
     for name in order {
@@ -870,6 +878,7 @@ pub fn import_with_options(
         }
         let mut deployments = Vec::new();
         Expander {
+            context: &mut context,
             combos: lookup,
             connections: &connections,
             nodes: array(&root, "providerNodes"),
@@ -891,6 +900,7 @@ pub fn import_with_options(
         models.push(json!({"name":name,"aliases":[],"deployments":deployments}));
     }
     aliases::attach(&mut models, aliases, &mut warnings);
+    context.report(&mut warnings);
     if let (Some(options), Some(exclusions)) = (fallback, fallback_exclusions) {
         let credential = unique("omniroute-fallback", &mut ids);
         credentials.push(
