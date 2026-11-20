@@ -11,6 +11,7 @@ members = [
     "crates/llmux-server",
     "crates/llmux-testkit",
     "crates/llmux-cli",
+    "crates/llmux-mcp",
 ]
 default-members = ["crates/llmux-server"]
 
