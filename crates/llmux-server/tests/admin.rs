@@ -338,6 +338,16 @@ async fn reload_rotates_admin_key_and_warns_on_restart_only_fields() {
     assert_eq!(status, StatusCode::UNAUTHORIZED, "rotated-out key denied");
     let (status, _) = call(&client, "GET", &status_url, Some("new-key"), None).await;
     assert_eq!(status, StatusCode::OK, "new key accepted");
+
+    let stats_url = format!("{}/dashboard/stats", gateway.url());
+    let (status, _) = call(&client, "GET", &stats_url, Some("old-key"), None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "dashboard revokes rotated-out key"
+    );
+    let (status, _) = call(&client, "GET", &stats_url, Some("new-key"), None).await;
+    assert_eq!(status, StatusCode::OK, "dashboard accepts new key");
 }
 
 #[tokio::test]
