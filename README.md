@@ -29,7 +29,7 @@ curl -sS http://127.0.0.1:8080/v1/responses \
   -d '{"model":"llama-70b","input":"Hello"}'
 ```
 
-The Responses route translates requests to Chat Completions on OpenAI-compatible upstreams and converts replies back. It accepts reasoning effort as either `reasoning.effort` or `reasoning_effort`; conflicting values are rejected. Stateful Responses conversations and built-in non-function tools are unsupported. For SSE on either route, add `"stream":true` and use `curl -N`.
+The Responses route translates requests to Chat Completions on OpenAI-compatible upstreams and converts replies back. It accepts reasoning effort as either `reasoning.effort` or `reasoning_effort`; when both are non-null, `reasoning_effort` takes precedence. Stateful Responses conversations and built-in non-function tools are unsupported. For SSE on either route, add `"stream":true` and use `curl -N`.
 
 llmux2 accepts and discards the CheaperInference routing fields `min_discount_percent`, `zdr`, and `ranking`. These fields do not impose a price ceiling, guarantee zero data retention, or change how llmux2 ranks deployments. Enforce any retention requirements in your provider configuration.
 
