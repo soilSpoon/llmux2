@@ -71,7 +71,7 @@ impl<'a> OpenAiChatMetadata<'a> {
 #[derive(Deserialize)]
 struct BorrowedModel<'a>(#[serde(borrow)] Cow<'a, str>);
 
-fn rewrite_model(body: &Bytes, model: &str) -> Result<Bytes, BuildError> {
+pub(crate) fn rewrite_model(body: &Bytes, model: &str) -> Result<Bytes, BuildError> {
     let (metadata, range) = OpenAiChatMetadata::parse_with_range(body)?;
     if metadata.model == model {
         return Ok(body.clone());
@@ -254,7 +254,7 @@ impl ProviderAdapter for OpenAiCompat {
     }
 }
 
-async fn collect(body: Incoming) -> Result<Bytes, UpstreamError> {
+pub(crate) async fn collect(body: Incoming) -> Result<Bytes, UpstreamError> {
     Limited::new(body, MAX_COMPLETE_BYTES)
         .collect()
         .await
@@ -483,13 +483,13 @@ fn embedded_error(body: &Bytes, headers: &HeaderMap, now: SystemTime) -> Option<
     ))
 }
 
-fn bad_gateway() -> UpstreamError {
+pub(crate) fn bad_gateway() -> UpstreamError {
     UpstreamError::Server {
         status: StatusCode::BAD_GATEWAY,
     }
 }
 
-fn retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+pub(crate) fn retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
     let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
     if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)).min(MAX_RETRY));
