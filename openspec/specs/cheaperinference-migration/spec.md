@@ -6,6 +6,24 @@ Moving CheaperInference traffic from OmniRoute onto llmux2.
 
 ## Requirements
 
+### Requirement: Custom provider headers
+
+The importer SHALL preserve compatible node custom_headers_json/customHeaders
+as static deployment headers, replacing the node map with a connection override
+when present. It SHALL write every value to a private 0600 file and emit only
+file references. Invalid or forbidden headers SHALL skip the connection with
+a warning that does not expose values.
+
+#### Scenario: HMS node
+
+WHEN an eligible custom node has valid custom headers
+THEN its combos and direct routes load with those headers on each deployment.
+
+#### Scenario: Empty override
+
+WHEN a connection has an explicitly empty customHeaders map
+THEN no node headers are inherited.
+
 ### Requirement: DeepSeek parameter compatibility
 
 The importer SHALL configure built-in DeepSeek deployments to strip seed, user,
