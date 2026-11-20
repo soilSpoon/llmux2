@@ -36,6 +36,43 @@ fn success(output: &std::process::Output) -> String {
 }
 
 #[test]
+fn empty_winning_mapping_blocks_seeded_replacement_and_dependents() {
+    for models in [
+        json!([]),
+        json!(["openrouter/vendor/unknown"]),
+        json!([{"providerId":"anthropic","model":"claude-fable-5-2","usable":false}]),
+    ] {
+        let mut root = fixture();
+        root["providerConnections"].as_array_mut().unwrap().push(json!({"id":"anthropic","provider":"anthropic","authType":"apikey","apiKey":"synthetic-anthropic-key"}));
+        root["combos"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":"empty","name":"empty","isActive":true,"models":models}));
+        root["modelAliases"] =
+            json!({"dependent":"openrouter/anthropic/claude-fable-5.2", "chain":"dependent"});
+        root["modelComboMappings"] = json!([
+            {"pattern":"openrouter/anthropic/claude-fable-5.2","comboId":"empty","priority":100,"enabled":true},
+            {"pattern":"openrouter/anthropic/claude-fable-5.2","comboId":"missing","priority":0,"enabled":true}
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let warnings = success(&run(
+            &root,
+            dir.path(),
+            &[("--openrouter-replacements", dir.path())],
+        ));
+        let config = RuntimeConfig::load(dir.path().join("out.toml")).unwrap();
+        for name in [
+            "openrouter/anthropic/claude-fable-5.2",
+            "dependent",
+            "chain",
+        ] {
+            assert!(!config.model_names.contains_key(name), "unexpected {name}");
+        }
+        assert!(warnings.contains("target unavailable (winning mapping)"));
+    }
+}
+
+#[test]
 fn replaced_openrouter_combos_preserve_nested_and_alias_references() {
     let mut root = fixture();
     let name = "openrouter/anthropic/claude-fable-5.2";

@@ -62,12 +62,13 @@ pub(super) fn prepare(
     direct: &BTreeMap<String, Value>,
     order: &mut Vec<String>,
     warnings: &mut Vec<String>,
-    official_replacements: bool,
+    unavailable_combos: Option<&HashSet<String>>,
 ) -> (
     BTreeMap<String, String>,
     HashMap<String, Value>,
     HashSet<String>,
 ) {
+    let official_replacements = unavailable_combos.is_some();
     let mut aliases = alias_map(root, warnings);
     let mut mappings: Vec<_> = array(root, "modelComboMappings")
         .iter()
@@ -107,6 +108,7 @@ pub(super) fn prepare(
                 combos
                     .get(*name)
                     .is_some_and(|combo| combo["isActive"] != false)
+                    && !unavailable_combos.is_some_and(|unavailable| unavailable.contains(*name))
             });
             if let Some(target) = target {
                 if official_replacements && name.starts_with("openrouter/") {

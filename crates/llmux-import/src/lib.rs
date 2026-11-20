@@ -602,6 +602,29 @@ pub fn import_with_options(
     if policy.openrouter_replacements {
         replacements::seed(&mut direct, &connections);
     }
+    let mut unavailable_combos = HashSet::new();
+    if policy.openrouter_replacements {
+        let targets: HashSet<_> = array(&root, "modelComboMappings")
+            .iter()
+            .filter_map(|row| combo_ids.get(string(row, "comboId")))
+            .collect();
+        for target in targets {
+            let mut deployments = Vec::new();
+            Expander {
+                combos: &combos,
+                connections: &connections,
+                nodes,
+                warnings: &mut Vec::new(),
+                remaining_steps: 1024,
+                exhausted: false,
+                policy: &policy,
+            }
+            .expand(target, &mut Vec::new(), &mut deployments);
+            if deployments.is_empty() {
+                unavailable_combos.insert(target.clone());
+            }
+        }
+    }
     let (aliases, mut synthetic, unavailable_aliases) = aliases::prepare(
         &root,
         &combos,
@@ -609,7 +632,9 @@ pub fn import_with_options(
         &direct,
         &mut order,
         &mut warnings,
-        policy.openrouter_replacements,
+        policy
+            .openrouter_replacements
+            .then_some(&unavailable_combos),
     );
     direct.extend(direct::collect(&synthetic, nodes, &connections));
     for (name, model) in direct {
