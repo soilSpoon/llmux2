@@ -44,13 +44,14 @@ cargo test --locked -p llmux-server --test chat -- --nocapture
 On Linux with Python 3.10+, Cargo, and readable `/proc/<pid>/smaps_rollup`, run:
 
 ```sh
-python3 benchmarks/mock_upstream.py
+python3 bench/mock_upstream.py
 ```
 
-The command builds the release gateway and an Axum mock, starts and stops them
+The command builds the release gateway and the `llmux-testkit` Axum mock, starts and stops them
 on ephemeral loopback ports with dummy API keys, and prints a Markdown table
 with direct, via-gateway, and via-minus-direct results. Use `--requests`,
-`--concurrency`, and `--workers` to tune the run. Defaults: 4,096 timed
+`--concurrency`, and `--workers` to tune the run, or `--upstream-delay-ms` to
+inject a fixed delay before every mock response. Defaults: no artificial delay, 4,096 timed
 requests per route and mode, 64 concurrent clients/held streams, and two Tokio
 workers per server process.
 
@@ -59,9 +60,14 @@ workers per server process.
   end-to-end completion time, reported separately for JSON and SSE. Throughput
   divides completed requests by elapsed wall time. SSE p99 time to first token
   measures from request start to the first complete content-bearing event, not
-  the role-only event. The mock sends eight content chunks and `[DONE]` without
-  artificial delay; these are short-response, single-host measurements and the
-  load generator can limit throughput.
+  the role-only event. The mock sends eight content chunks and `[DONE]`.
+  These are short-response, single-host measurements and the load generator
+  can limit throughput.
+- **1,000 RPS JSON target:** An independent arrival schedule offers one request
+  per millisecond, without waiting for previous responses. Latency is measured
+  from each scheduled arrival through completion, so client queueing is
+  included when workers lag. Via-gateway p99 minus direct p99 is compared to
+  the design's **< 1 ms** target; the result is advisory, not a CI gate.
 - **Memory:** In fresh processes primed with one JSON request, capture idle
   proportional set size (PSS), open the configured number of streams, and hold
   them after their first content event. Report the median of five PSS samples

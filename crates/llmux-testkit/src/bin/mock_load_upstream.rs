@@ -8,7 +8,7 @@ use axum::{
 };
 use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
-use std::{convert::Infallible, io};
+use std::{convert::Infallible, io, time::Duration};
 use tokio::net::TcpListener;
 
 const ROLE: &str = "data: {\"id\":\"mock\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n";
@@ -16,8 +16,14 @@ const TOKEN: &str = "data: {\"id\":\"mock\",\"object\":\"chat.completion.chunk\"
 const STOP: &str = "data: {\"id\":\"mock\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
 const DONE: &str = "data: [DONE]\n\n";
 
+#[derive(Clone, Copy)]
+struct Mock {
+    hold: bool,
+    delay: Duration,
+}
+
 async fn chat(
-    State(hold): State<bool>,
+    State(Mock { hold, delay }): State<Mock>,
     headers: HeaderMap,
     Json(request): Json<Value>,
 ) -> Response {
@@ -30,6 +36,9 @@ async fn chat(
     }
     if request["model"] != "backend-model" {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
     }
     if request["stream"] != true {
         return Json(json!({
@@ -56,15 +65,26 @@ async fn chat(
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let hold = match std::env::args().nth(1).as_deref() {
-        None => false,
-        Some("--hold") => true,
-        _ => return Err(io::Error::other("usage: mock_load_upstream [--hold]")),
+    let usage = || io::Error::other("usage: mock_load_upstream [--hold] [--delay-ms N]");
+    let mut mock = Mock {
+        hold: false,
+        delay: Duration::ZERO,
     };
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--hold" => mock.hold = true,
+            "--delay-ms" => {
+                let ms = args.next().and_then(|s| s.parse().ok()).ok_or_else(usage)?;
+                mock.delay = Duration::from_millis(ms);
+            }
+            _ => return Err(usage()),
+        }
+    }
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     eprintln!("mock_load_upstream listening on {}", listener.local_addr()?);
     let app = Router::new()
         .route("/v1/chat/completions", post(chat))
-        .with_state(hold);
+        .with_state(mock);
     axum::serve(listener, app).await
 }

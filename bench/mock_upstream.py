@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import queue
 import select
 import statistics
 import subprocess
@@ -21,12 +22,14 @@ ROOT = Path(__file__).resolve().parents[1]
 TOKENS = 8
 CLIENT_KEY = "mock-gateway"
 UPSTREAM_KEY = "mock-backend"
+TARGET_RPS = 1000
+OVERHEAD_LIMIT_MS = 1.0
 
 
 def build():
     output = subprocess.check_output(
-        ["cargo", "build", "--locked", "--release", "-p", "llmux-server",
-         "--bin", "llmux-server", "--example", "mock_load_upstream",
+        ["cargo", "build", "--locked", "--release", "-p", "llmux-server", "-p", "llmux-testkit",
+         "--bin", "llmux-server", "--bin", "mock_load_upstream",
          "--message-format=json-render-diagnostics"],
         cwd=ROOT,
         text=True,
@@ -62,11 +65,14 @@ def server(binary, args, env):
 
 
 @contextmanager
-def target(binaries, via_gateway, hold, workers):
+def target(binaries, via_gateway, hold, workers, delay_ms):
     mock, gateway = binaries
     env = dict(os.environ, TOKIO_WORKER_THREADS=str(workers),
                LLMUX_BENCH_CLIENT_KEY=CLIENT_KEY, LLMUX_BENCH_UPSTREAM_KEY=UPSTREAM_KEY)
-    with server(mock, ["--hold"] if hold else [], env) as (upstream_pid, upstream):
+    mock_args = ["--delay-ms", str(delay_ms)]
+    if hold:
+        mock_args.append("--hold")
+    with server(mock, mock_args, env) as (upstream_pid, upstream):
         if not via_gateway:
             yield upstream, "backend-model", UPSTREAM_KEY, [upstream_pid]
             return
@@ -175,7 +181,34 @@ def p99(samples):
     return sorted(samples)[math.ceil(len(samples) * 0.99) - 1]
 
 
-def load(address, model, key, streaming, concurrency, requests):
+def arrivals(requests, rate):
+    start = time.perf_counter()
+    for i in range(requests):
+        scheduled = start + i / rate
+        remaining = scheduled - time.perf_counter()
+        if remaining > 0:
+            time.sleep(remaining)
+        yield scheduled
+
+
+def fixed_rate(pool, chat, connections, requests, rate):
+    available = queue.SimpleQueue()
+    for connection in connections:
+        available.put(connection)
+
+    def request(scheduled):
+        connection = available.get()
+        try:
+            chat.request(connection)
+            return time.perf_counter() - scheduled
+        finally:
+            available.put(connection)
+
+    pending = [pool.submit(request, scheduled) for scheduled in arrivals(requests, rate)]
+    return p99([future.result() for future in pending]) * 1000
+
+
+def load(address, model, key, streaming, concurrency, requests, rate=None):
     chat = Chat(model, key, streaming)
     with ExitStack() as stack:
         with concurrent.futures.ThreadPoolExecutor(concurrency) as pool:
@@ -189,6 +222,8 @@ def load(address, model, key, streaming, concurrency, requests):
                     chat.request(connection)
 
             list(pool.map(warm, connections))
+            if rate is not None:
+                return fixed_rate(pool, chat, connections, requests, rate)
             start = None
 
             def start_timer():
@@ -243,29 +278,45 @@ def compare(args):
     rows = []
     for via_gateway in (False, True):
         label = "via gateway" if via_gateway else "direct"
-        print(f"Benchmarking {label} (JSON, SSE, held streams)…", file=sys.stderr)
+        print(f"Benchmarking {label} (JSON, SSE, held streams, {TARGET_RPS} RPS JSON)…",
+              file=sys.stderr)
         measurements = []
         for streaming in (False, True):
-            with target(binaries, via_gateway, False, args.workers) as (address, model, key, _):
+            with target(binaries, via_gateway, False, args.workers, args.upstream_delay_ms) as (
+                address, model, key, _
+            ):
                 latency, first, throughput = load(address, model, key, streaming,
                                                   args.concurrency, args.requests)
                 measurements.extend((latency, throughput))
                 if streaming:
                     measurements.append(first)
-        with target(binaries, via_gateway, True, args.workers) as (address, model, key, pids):
+        with target(binaries, via_gateway, True, args.workers, args.upstream_delay_ms) as (
+            address, model, key, pids
+        ):
             measurements.append(memory_per_stream(address, model, key, pids, args.concurrency))
+        with target(binaries, via_gateway, False, args.workers, args.upstream_delay_ms) as (
+            address, model, key, _
+        ):
+            measurements.append(load(address, model, key, False, args.concurrency,
+                                     args.requests, rate=TARGET_RPS))
         rows.append(measurements)
     print(f"{args.requests} requests per route and mode, {args.concurrency} workers/held "
-          f"streams, {args.workers} Tokio workers per server process.\n")
+          f"streams, {args.workers} Tokio workers per server process, "
+          f"{args.upstream_delay_ms} ms configured upstream delay.\n")
     print("| Metric | Direct | Via gateway | Gateway − direct |")
     print("| --- | ---: | ---: | ---: |")
     labels = (
         "JSON p99 latency (ms)", "JSON throughput (req/s)",
         "SSE p99 completion latency (ms)", "SSE throughput (streams/s)",
         "SSE p99 time to first token (ms)", "Incremental PSS per held stream (KiB)",
+        f"JSON p99 latency at {TARGET_RPS:,} RPS (ms)",
     )
     for label, direct, gateway in zip(labels, *rows):
         print(f"| {label} | {direct:.3f} | {gateway:.3f} | {gateway - direct:+.3f} |")
+    overhead = rows[1][-1] - rows[0][-1]
+    result = "PASS" if overhead < OVERHEAD_LIMIT_MS else "FAIL"
+    print(f"\nJSON gateway p99 overhead target at {TARGET_RPS:,} RPS: "
+          f"**{result}** ({overhead:+.3f} ms; target < {OVERHEAD_LIMIT_MS:g} ms, advisory).")
 
 
 def main():
@@ -273,11 +324,15 @@ def main():
     parser.add_argument("--requests", type=int, default=4096, help="timed requests per route and mode")
     parser.add_argument("--concurrency", type=int, default=64, help="load workers and held streams")
     parser.add_argument("--workers", type=int, default=2, help="Tokio workers per server process")
+    parser.add_argument("--upstream-delay-ms", type=int, default=0,
+                        help="inject a fixed delay before each mock response")
     args = parser.parse_args()
     if not sys.platform.startswith("linux") or not Path("/proc/self/smaps_rollup").is_file():
         parser.error("Linux with /proc/<pid>/smaps_rollup is required for PSS measurement")
     if not 1 <= args.concurrency <= args.requests or args.workers < 1:
         parser.error("require 1 <= concurrency <= requests and workers >= 1")
+    if not 0 <= args.upstream_delay_ms < 15000:
+        parser.error("upstream delay must be nonnegative and below the 15-second client timeout")
     compare(args)
 
 

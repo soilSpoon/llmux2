@@ -8,6 +8,13 @@ class BenchmarkTest(unittest.TestCase):
     def test_p99_is_nearest_rank(self):
         self.assertEqual(bench.p99(list(reversed(range(100)))), 98)
 
+    def test_arrivals_keep_fixed_schedule_when_dispatch_falls_behind(self):
+        with patch.object(
+            bench.time, "perf_counter", side_effect=[0, 0, 1.5, 2.5, 2.75]
+        ), patch.object(bench.time, "sleep") as sleep:
+            self.assertEqual(list(bench.arrivals(4, 1)), [0, 1, 2, 3])
+            sleep.assert_called_once_with(0.25)
+
     def test_ttft_uses_complete_content_event_not_role_event(self):
         response = MagicMock()
         response.__enter__.return_value = response
