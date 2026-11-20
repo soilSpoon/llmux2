@@ -192,6 +192,9 @@ pub(crate) fn complete(body: &[u8]) -> Result<(Bytes, Option<Usage>), ()> {
     } else {
         "completed"
     };
+    for item in &mut output {
+        item["status"] = json!(status);
+    }
     let response = envelope(&chat, output, status);
     Ok((
         Bytes::from(serde_json::to_vec(&response).map_err(|_| ())?),
@@ -229,8 +232,13 @@ impl Translator {
             if !self.started {
                 return Err(());
             }
+            let status = if self.incomplete {
+                "incomplete"
+            } else {
+                "completed"
+            };
             for index in 0..self.output.len() {
-                self.output[index]["status"] = json!("completed");
+                self.output[index]["status"] = json!(status);
                 let item = self.output[index].clone();
                 if item["type"] == "message" {
                     for (content_index, part) in
@@ -267,7 +275,14 @@ impl Translator {
                     "completed"
                 },
             );
-            events.push(self.event("response.completed", json!({"response":response})));
+            events.push(self.event(
+                if self.incomplete {
+                    "response.incomplete"
+                } else {
+                    "response.completed"
+                },
+                json!({"response":response}),
+            ));
             return Ok(events);
         }
         let chunk: Value = serde_json::from_str(data).map_err(|_| ())?;
@@ -494,6 +509,8 @@ mod tests {
         );
         assert_eq!(response["output"][0]["content"][0], text_part("hello"));
         assert_eq!(response["output"][1]["call_id"], "a");
+        assert_eq!(response["output"][0]["status"], "incomplete");
+        assert_eq!(response["output"][1]["status"], "incomplete");
         assert_eq!(response["usage"]["total_tokens"], 5);
         let (body, tokens) = complete(
             br#"{"id":"x","choices":[{"message":{"content":null},"finish_reason":"stop"}]}"#,
@@ -600,6 +617,44 @@ mod tests {
         let last: Value = serde_json::from_str(&events.last().unwrap().data).unwrap();
         assert_eq!(last["response"]["output"][0]["content"][0]["text"], "hello");
         assert_eq!(last["response"]["usage"]["input_tokens"], 2);
+    }
+
+    #[test]
+    fn streaming_length_is_incomplete() {
+        let mut translator = Translator::default();
+        translator.push(&chunk(json!({"content":"partial","tool_calls":[{"index":0,"id":"a","function":{"name":"lookup","arguments":"{"}}]}))).unwrap();
+        translator
+            .push(r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#)
+            .unwrap();
+        translator
+            .push(r#"{"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":3}}"#)
+            .unwrap();
+        let events = translator.push("[DONE]").unwrap();
+        assert_eq!(
+            events.last().unwrap().event.as_deref(),
+            Some("response.incomplete")
+        );
+        let data: Vec<Value> = events
+            .iter()
+            .map(|event| serde_json::from_str(&event.data).unwrap())
+            .collect();
+        for event in data
+            .iter()
+            .filter(|event| event["type"] == "response.output_item.done")
+        {
+            assert_eq!(event["item"]["status"], "incomplete");
+        }
+        let response = &data.last().unwrap()["response"];
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+        assert_eq!(response["usage"]["input_tokens"], 2);
+        assert_eq!(response["output"].as_array().unwrap().len(), 2);
+        for item in response["output"].as_array().unwrap() {
+            assert_eq!(item["status"], "incomplete");
+        }
     }
 
     #[test]
