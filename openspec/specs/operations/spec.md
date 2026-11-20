@@ -37,7 +37,7 @@ THEN it SHALL leave the new slot running and report that handoff stage.
 
 WHEN CI runs deployment tests
 THEN it SHALL run the Rust tests once in the coverage job, using fake waits,
-while the check job SHALL retain the remaining Python merge-gate tests.
+and merge-gate Rust tests SHALL also run there rather than in the check job.
 
 ### Requirement: Bounded fallback traffic visibility
 The gateway SHALL expose reporting-only deployment `fallback` flags, defaulting
@@ -98,6 +98,15 @@ Only the latest run of each head check name SHALL determine its outcome.
 Every latest head check SHALL be completed before merging.
 Required checks SHALL come from the checked-in ruleset and review markers from
 the merge policy. Fetch failures SHALL block merging.
+
+#### Scenario: Rust merge preflight
+
+WHEN a bot evaluates whether PR N can merge
+THEN it SHALL run `cargo xtask merge-gate N` from a trusted, up-to-date main
+checkout, using authenticated `gh api` with REST and review-thread pagination.
+AND it SHALL exit 0 only on pass, report the evaluated SHA, reject a head change
+during fetching, and perform no mutations. Bootstrap gate changes SHALL require
+independent review before using the changed gate.
 
 #### Scenario: New commit invalidates verification
 
