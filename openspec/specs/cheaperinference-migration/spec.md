@@ -110,7 +110,9 @@ The reviewed combo names `deepseek-v4.1-flash`, `deepseek-v4.1-flash-fast`,
 `deepseek-v4.1-flash-1017`, `deepseek-v4.1-flash-1017-fast` and
 `deepseek-v4.1-flash-1017-ultrafast` SHALL place official Morph
 `morph-dsv41flash-1017` deployments before Vibe/Mistral
-`deepseek-v4-1-flash-1017` deployments, preserving other legs' relative order.
+`deepseek-v4-1-flash-1017` deployments and bridge replacements. The three fast
+combos SHALL start with Morph; the two base combos SHALL retain declared Numes
+ahead of Morph. Remaining legs SHALL preserve their relative order.
 This explicit policy follows OCI verification of Morph models.list and chat
 logprobs, and Mistral's rejection of logprobs for this model; it SHALL NOT strip
 logprobs, reorder unrelated combos, or replace the optional final fallback.
@@ -292,7 +294,9 @@ model, use Codex/Factory/OpenRouter targets, or relax Workers AI eligibility.
 
 WHEN a reviewed bridge leg appears in a combo, nested combo or direct alias
 THEN its official deployments expand in place in the original leg order,
-subject to existing reviewed Morph ordering; source combo/alias/mapping
+except that the five reviewed DeepSeek-flash combos place verified Morph ahead
+of bridge replacements, the three fast combos start with Morph, and the two
+base combos keep declared Numes ahead of Morph; source combo/alias/mapping
 precedence is retained, including unavailable winning mappings.
 
 #### Scenario: Source restrictions and missing targets

@@ -434,6 +434,9 @@ impl Expander<'_> {
                     }
                 };
                 let mut deployment = json!({"base_url":c.base_url,"upstream_model":model});
+                if bridge.is_some() {
+                    deployment["_bridge_replacement"] = true.into();
+                }
                 if let Some(limit) = self.context.limit(&c.provider, &model) {
                     deployment["max_context"] = limit.into();
                 }
@@ -915,6 +918,11 @@ pub fn import_with_options(
         }
         .expand(&name, &mut Vec::new(), &mut deployments);
         morph::order(&name, &mut deployments, &connections, nodes, &mut warnings);
+        for deployment in &mut deployments {
+            if let Some(fields) = deployment.as_object_mut() {
+                fields.remove("_bridge_replacement");
+            }
+        }
         if deployments.is_empty() {
             warnings.push(format!("combo {name}: skipped: no deployments"));
             continue;
