@@ -216,6 +216,8 @@ def send(gateway, case, timeout, secrets):
             remaining()
             chunk = response.read1(4096)
             if not chunk:
+                if response.length is not None and response.length > 0:
+                    raise ValueError("truncated HTTP response")
                 break
             if is_sse:
                 for byte in chunk:
@@ -239,7 +241,7 @@ def send(gateway, case, timeout, secrets):
                         raise ValueError("SSE event exceeds limit")
                 if len(pending) > MAX_EVENT:
                     raise ValueError("SSE line exceeds limit")
-                if record["done"]:
+                if record["done"] and response.length is None:
                     break
             else:
                 raw.extend(chunk)

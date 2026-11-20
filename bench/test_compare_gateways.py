@@ -245,6 +245,13 @@ class TransportTest(unittest.TestCase):
                 received.append(body)
                 req = json.loads(body)
                 self.send_response(200)
+                if req['model'] in ('short-body', 'sized-body'):
+                    payload = (b'data: {"choices":[{"delta":{}}]}\n\ndata: [DONE]\n\n' if req.get('stream')
+                               else b'{"choices":[{"message":{}}]}')
+                    self.send_header('Content-Length', str(len(payload) + (10 if req['model'] == 'short-body' else 0)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 self.send_header("x-llmux-deployment", "deployment-1")
                 self.send_header("x-llmux-attempts", "2")
                 self.send_header("x-omniroute-route-class", "inference")
@@ -352,6 +359,14 @@ class TransportTest(unittest.TestCase):
                     self.assertEqual(row['error_class'], 'connection')
         row = compare.send(self.gateway, compare.generate_cases(['invalid-delta'])[1], 2, [])
         self.assertEqual(row['error_class'], 'connection')
+
+    def test_content_length_requires_complete_body_even_after_stream_done(self):
+        for model, expected in (('short-body', 'connection'), ('sized-body', 'ok')):
+            for case in compare.generate_cases([model]):
+                with self.subTest(model=model, kind=case['kind']):
+                    row = compare.send(self.gateway, case, 2, [])
+                    self.assertEqual(row['status'], 200)
+                    self.assertEqual(row['error_class'], expected)
 
 
 if __name__ == "__main__":
