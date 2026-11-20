@@ -24,7 +24,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use thiserror::Error;
 use tokio::time::{timeout, timeout_at, Instant};
@@ -216,6 +216,24 @@ impl Executor {
                             .routing
                             .fallback_on
                             .contains(&ErrorKind::RateLimited)
+                        {
+                            break 'groups;
+                        }
+                    }
+                    Ok(Err(GatewayError::Client(UpstreamError::QuotaExhausted { reset_at }))) => {
+                        let wait = reset_at
+                            .map(|reset| {
+                                reset.duration_since(SystemTime::now()).unwrap_or_default()
+                            })
+                            .unwrap_or(self.cfg.cooldown.default)
+                            .min(self.cfg.cooldown.max);
+                        binding.limits.cool_down(wait);
+                        drop(permit);
+                        if !self
+                            .cfg
+                            .routing
+                            .fallback_on
+                            .contains(&ErrorKind::QuotaExhausted)
                         {
                             break 'groups;
                         }
