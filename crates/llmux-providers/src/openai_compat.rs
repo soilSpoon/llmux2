@@ -727,7 +727,7 @@ mod tests {
                 r#""code":"context_length_exceeded""#,
                 llmux_types::ErrorKind::ContextLength,
             ),
-            (r#""status":400""#, llmux_types::ErrorKind::BadRequest),
+            (r#""status":400"#, llmux_types::ErrorKind::BadRequest),
         ] {
             let body = Bytes::from(format!(
                 r#"{{"error":{{"padding":"{}",{details}}}}}"#,
