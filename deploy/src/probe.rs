@@ -312,6 +312,29 @@ fn usable(format: &str, body: &[u8]) -> bool {
     }
 }
 
+fn entry(
+    name: &str,
+    start: Instant,
+    result: Result<Response>,
+    ok: bool,
+    format: &str,
+    skip_403: bool,
+) -> Value {
+    let mut entry = record(name, start, result, ok);
+    if entry["status"] == 403 && skip_403 {
+        entry["ok"] = json!(true);
+        entry["skipped"] = json!("key is not permitted for this model");
+        entry.as_object_mut().unwrap().remove("error");
+    } else if entry["status"]
+        .as_u64()
+        .is_some_and(|s| (200..300).contains(&s))
+        && !ok
+    {
+        entry["error"] = json!(format!("unusable {format} response body"));
+    }
+    entry
+}
+
 fn run(options: &Options) -> Result<bool> {
     let mut checks = Vec::new();
     let start = Instant::now();
@@ -346,37 +369,49 @@ fn run(options: &Options) -> Result<bool> {
     let start = Instant::now();
     let models = probe(options, "GET", "/v1/models", Some(key), None);
     let mut listed: Vec<String> = Vec::new();
+    let mut catalog_valid = false;
     if let Ok(response) = &models {
-        listed = serde_json::from_slice::<Value>(&response.body)
-            .ok()
-            .and_then(|value| {
-                value["data"].as_array().map(|data| {
-                    data.iter()
-                        .filter_map(|m| m["id"].as_str().map(str::to_string))
-                        .collect::<Vec<String>>()
-                })
-            })
-            .unwrap_or_default();
-        listed.sort_unstable();
-        listed.dedup();
+        if let Ok(value) = serde_json::from_slice::<Value>(&response.body) {
+            if let Some(data) = value["data"].as_array() {
+                catalog_valid = true;
+                listed = data
+                    .iter()
+                    .filter_map(|m| m["id"].as_str().map(str::to_string))
+                    .collect();
+                listed.sort_unstable();
+                listed.dedup();
+            }
+        }
     }
+    // A malformed catalog fails outright; a legitimately empty one only fails
+    // when there is no pinned --models list left to probe.
     let ok = models
         .as_ref()
-        .map(|r| (200..300).contains(&r.status) && !listed.is_empty())
+        .map(|r| {
+            (200..300).contains(&r.status)
+                && catalog_valid
+                && (!listed.is_empty() || options.models.is_some())
+        })
         .unwrap_or(false);
     checks.push(match models {
-        Ok(response) if (200..300).contains(&response.status) && listed.is_empty() => record(
-            "models",
-            start,
-            Ok(Response {
-                status: response.status,
-                headers: response.headers,
-                body: b"empty or malformed model catalog".to_vec(),
-            }),
-            false,
-        ),
+        Ok(response)
+            if (200..300).contains(&response.status)
+                && (!catalog_valid || (listed.is_empty() && options.models.is_none())) =>
+        {
+            record(
+                "models",
+                start,
+                Ok(Response {
+                    status: response.status,
+                    headers: response.headers,
+                    body: b"empty or malformed model catalog".to_vec(),
+                }),
+                false,
+            )
+        }
         other => record("models", start, other, ok),
     });
+    let explicit = options.models.is_some();
     let selected: Vec<String> = match &options.models {
         Some(models) => models.clone(),
         None => {
@@ -429,64 +464,54 @@ fn run(options: &Options) -> Result<bool> {
             .as_ref()
             .map(|r| (200..300).contains(&r.status) && usable("chat", &r.body))
             .unwrap_or(false);
-        let mut entry = record(&name, start, result, ok);
-        if entry["status"] == 403 {
-            entry["ok"] = json!(true);
-            entry["skipped"] = json!("key is not permitted for this model");
-            entry.as_object_mut().unwrap().remove("error");
-        } else if entry["status"]
-            .as_u64()
-            .is_some_and(|s| (200..300).contains(&s))
-            && !ok
-        {
-            entry["error"] = json!("unusable chat completion body");
-        }
-        checks.push(entry);
+        checks.push(entry(&name, start, result, ok, "chat", !explicit));
     }
     if options.all_formats {
-        if let Some(model) = options
+        let candidates: Vec<String> = options
             .models
-            .as_ref()
-            .and_then(|m| m.first())
-            .or_else(|| listed.first())
-            .cloned()
-        {
-            for (name, path, body) in [
-                (
-                    format!("responses:{model}"),
-                    "/v1/responses",
-                    json!({"model": model, "input": PROMPT, "max_output_tokens": 16}),
-                ),
-                (
-                    format!("anthropic:{model}"),
-                    "/v1/messages",
-                    json!({
-                        "model": model,
-                        "max_tokens": 1,
-                        "messages": [{"role": "user", "content": PROMPT}],
-                    }),
-                ),
-            ] {
+            .clone()
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| listed.clone());
+        for (format, path, body) in [
+            (
+                "responses",
+                "/v1/responses",
+                json!({"input": PROMPT, "max_output_tokens": 16}),
+            ),
+            (
+                "anthropic",
+                "/v1/messages",
+                json!({
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": PROMPT}],
+                }),
+            ),
+        ] {
+            // Walk candidates so a key-restricted model cannot leave a
+            // permanent blind spot: skipped models yield to the next one.
+            for model in &candidates {
+                let name = format!("{format}:{model}");
                 let start = Instant::now();
-                let result = probe(options, "POST", path, Some(key), Some(&body.to_string()));
-                let format = name.split(':').next().unwrap_or("");
+                let mut request_body = body.clone();
+                request_body["model"] = json!(model);
+                let result = probe(
+                    options,
+                    "POST",
+                    path,
+                    Some(key),
+                    Some(&request_body.to_string()),
+                );
                 let ok = result
                     .as_ref()
                     .map(|r| (200..300).contains(&r.status) && usable(format, &r.body))
                     .unwrap_or(false);
-                let mut entry = record(&name, start, result, ok);
-                if entry["status"] == 403 {
-                    entry["ok"] = json!(true);
-                    entry["skipped"] = json!("key is not permitted for this model");
-                    entry.as_object_mut().unwrap().remove("error");
-                } else if entry["status"]
-                    .as_u64()
-                    .is_some_and(|s| (200..300).contains(&s))
-                    && !ok
-                {
-                    entry["error"] = json!(format!("unusable {format} response body"));
-                }
+                let skipped =
+                    result.as_ref().map(|r| r.status == 403).unwrap_or(false) && !explicit;
+                let entry = entry(&name, start, result, ok, format, !explicit);
                 checks.push(entry);
+                if !skipped {
+                    break;
+                }
             }
         }
     }

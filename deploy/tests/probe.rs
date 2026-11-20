@@ -440,9 +440,81 @@ fn unusable_chat_body_fails_the_probe() {
     let output = listen_flag(&home, &gateway, &[]);
     assert_eq!(output.status.code(), Some(1));
     let report = summary(&output);
+    assert_eq!(report["checks"][2]["error"], "unusable chat response body");
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn pinned_forbidden_model_fails() {
+    let home = Home::new();
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        models_reply(),
+        Reply::json(403, json!({"error":{"message":"model_not_allowed"}})),
+    ]);
+    let output = listen_flag(&home, &gateway, &["--models", "alpha"]);
+    assert_eq!(output.status.code(), Some(1));
+    let report = summary(&output);
+    assert_eq!(report["checks"][2]["ok"], false);
+    assert!(report["checks"][2]["skipped"].is_null());
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn format_probes_walk_past_key_restricted_models() {
+    let home = Home::new();
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        models_reply(),
+        Reply::json(403, json!({"error":{"message":"model_not_allowed"}})),
+        Reply::json(403, json!({"error":{"message":"model_not_allowed"}})),
+        Reply::json(200, json!({"output":[]})),
+        Reply::json(403, json!({"error":{"message":"model_not_allowed"}})),
+        Reply::json(200, json!({"content":[{"type":"text"}]})),
+    ]);
+    let output = listen_flag(&home, &gateway, &["--all-formats"]);
+    assert_eq!(output.status.code(), Some(0));
+    let report = summary(&output);
+    assert_eq!(report["ok"], true);
+    let names: Vec<&str> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
     assert_eq!(
-        report["checks"][2]["error"],
-        "unusable chat completion body"
+        names,
+        [
+            "healthz",
+            "models",
+            "chat:alpha",
+            "responses:alpha",
+            "responses:beta",
+            "anthropic:alpha",
+            "anthropic:beta"
+        ]
     );
+    assert_eq!(
+        report["checks"][3]["skipped"],
+        "key is not permitted for this model"
+    );
+    assert_eq!(report["checks"][4]["ok"], true);
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn empty_catalog_with_pinned_models_still_verifies() {
+    let home = Home::new();
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        Reply::json(200, json!({"object":"list","data":[]})),
+        Reply::json(200, json!({"choices":[{}]})),
+    ]);
+    let output = listen_flag(&home, &gateway, &["--models", "pinned"]);
+    assert_eq!(output.status.code(), Some(0));
+    let report = summary(&output);
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["checks"][1]["ok"], true);
+    assert_eq!(report["checks"][2]["name"], "chat:pinned");
     stop.send(()).unwrap();
 }
