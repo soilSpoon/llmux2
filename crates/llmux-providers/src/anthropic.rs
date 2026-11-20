@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use http::{header, HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use llmux_types::{
-    AuthMaterial, BoxStream, BuildError, Deployment, GatewayRequest, GatewayResponse,
+    provider, AuthMaterial, BoxStream, BuildError, Deployment, GatewayRequest, GatewayResponse,
     InboundFormat, LimitObservation, ProviderAdapter, ProviderKind, SseEvent, Support,
     UpstreamError, Usage,
 };
@@ -452,7 +452,7 @@ impl ProviderAdapter for Anthropic {
             .body(body)?;
         let auth = match auth {
             AuthMaterial::Bearer(key) => Some((
-                http::HeaderName::from_static("x-api-key"),
+                http::HeaderName::from_static(provider::ANTHROPIC_KEY_HEADER),
                 HeaderValue::from_str(key).map_err(|_| BuildError::InvalidAuth)?,
             )),
             AuthMaterial::Header { name, value } => Some((name.clone(), value.clone())),
@@ -884,7 +884,7 @@ mod tests {
             panic!()
         };
         assert_eq!(raw, body);
-        let a = Anthropic::new("anthropic");
+        let a = Anthropic::new(provider::ANTHROPIC);
         assert!(a.observe_limits(&HeaderMap::new()).is_none());
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -902,7 +902,7 @@ mod tests {
 
     #[test]
     fn auth_passthrough_and_support() {
-        let a = Anthropic::new("anthropic");
+        let a = Anthropic::new(provider::ANTHROPIC);
         let mut dep = Deployment {
             idx: DeploymentIdx(0),
             id: "a".into(),

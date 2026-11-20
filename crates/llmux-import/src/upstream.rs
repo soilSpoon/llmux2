@@ -1,5 +1,6 @@
 use crate::{string, PROVIDERS};
 use http::Uri;
+use llmux_types::provider::{ANTHROPIC as KIND_ANTHROPIC, OPENAI_COMPAT as KIND_OPENAI_COMPAT};
 use serde_json::{json, Value};
 use std::net::IpAddr;
 
@@ -160,9 +161,9 @@ pub(super) fn resolve(
             "openai-compatible"
                 if matches!(string(node, "apiType"), "" | "chat" | "chat-completions") =>
             {
-                "openai_compat"
+                KIND_OPENAI_COMPAT
             }
-            "anthropic-compatible" => "anthropic",
+            "anthropic-compatible" => KIND_ANTHROPIC,
             _ => return Err("unknown/non-compatible provider or custom protocol settings"),
         };
         if !string(node, "chatPath").is_empty()
@@ -188,7 +189,7 @@ pub(super) fn resolve(
     if local_host(url) {
         return Err("loopback/localhost upstream; configure a reachable connection base URL");
     }
-    let suffix = if kind == "anthropic" {
+    let suffix = if kind == KIND_ANTHROPIC {
         "/messages"
     } else {
         "/chat/completions"

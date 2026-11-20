@@ -4,6 +4,7 @@ mod adapter;
 mod error;
 mod model;
 mod persist;
+pub mod provider;
 mod request;
 mod upstream;
 

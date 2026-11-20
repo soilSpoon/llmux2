@@ -8,6 +8,9 @@ mod fallback;
 mod upstream;
 mod validation;
 
+use llmux_types::provider::{
+    ANTHROPIC as KIND_ANTHROPIC, OPENAI as KIND_OPENAI, OPENAI_COMPAT as KIND_OPENAI_COMPAT,
+};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -40,35 +43,43 @@ struct Connection {
 
 // OmniRoute registry/<id>/index.ts; Gemini uses Google's documented OpenAI compatibility API.
 pub const PROVIDERS: &[(&str, &str, &str)] = &[
-    ("openai", "openai", "https://api.openai.com/v1"),
-    ("anthropic", "anthropic", "https://api.anthropic.com/v1"),
+    ("openai", KIND_OPENAI, "https://api.openai.com/v1"),
+    ("anthropic", KIND_ANTHROPIC, "https://api.anthropic.com/v1"),
     (
         "openrouter",
-        "openai_compat",
+        KIND_OPENAI_COMPAT,
         "https://openrouter.ai/api/v1",
     ),
-    ("groq", "openai_compat", "https://api.groq.com/openai/v1"),
-    ("deepseek", "openai_compat", "https://api.deepseek.com"),
-    ("mistral", "openai_compat", "https://api.mistral.ai/v1"),
-    ("xai", "openai_compat", "https://api.x.ai/v1"),
-    ("together", "openai_compat", "https://api.together.xyz/v1"),
+    ("groq", KIND_OPENAI_COMPAT, "https://api.groq.com/openai/v1"),
+    ("deepseek", KIND_OPENAI_COMPAT, "https://api.deepseek.com"),
+    ("mistral", KIND_OPENAI_COMPAT, "https://api.mistral.ai/v1"),
+    ("xai", KIND_OPENAI_COMPAT, "https://api.x.ai/v1"),
+    (
+        "together",
+        KIND_OPENAI_COMPAT,
+        "https://api.together.xyz/v1",
+    ),
     (
         "fireworks",
-        "openai_compat",
+        KIND_OPENAI_COMPAT,
         "https://api.fireworks.ai/inference/v1",
     ),
-    ("cerebras", "openai_compat", "https://api.cerebras.ai/v1"),
+    ("cerebras", KIND_OPENAI_COMPAT, "https://api.cerebras.ai/v1"),
     (
         "gemini",
-        "openai_compat",
+        KIND_OPENAI_COMPAT,
         "https://generativelanguage.googleapis.com/v1beta/openai",
     ),
-    ("morph", "openai_compat", "https://api.morphllm.com/v1"),
-    ("aihorde", "openai_compat", "https://oai.aihorde.net/v1"),
-    ("kilo", "openai_compat", "https://ai-gateway.kilo.ai/api/v1"),
+    ("morph", KIND_OPENAI_COMPAT, "https://api.morphllm.com/v1"),
+    ("aihorde", KIND_OPENAI_COMPAT, "https://oai.aihorde.net/v1"),
+    (
+        "kilo",
+        KIND_OPENAI_COMPAT,
+        "https://ai-gateway.kilo.ai/api/v1",
+    ),
     (
         "kilocode",
-        "openai_compat",
+        KIND_OPENAI_COMPAT,
         "https://ai-gateway.kilo.ai/api/v1",
     ),
 ];
@@ -415,7 +426,7 @@ pub fn import_with_fallback(
                 Some(id)
             }
             connection::SelectedAuth::None => {
-                if kind != "openai_compat" {
+                if kind != KIND_OPENAI_COMPAT {
                     warnings.push(format!(
                         "{label}: skipped anonymous auth requires an OpenAI-compatible provider"
                     ));

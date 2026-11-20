@@ -781,6 +781,7 @@ version = "0.1.0"
 dependencies = [
  "http",
  "llmux-config",
+ "llmux-types",
  "serde_json",
  "tempfile",
  "toml",
