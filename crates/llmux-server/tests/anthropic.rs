@@ -42,6 +42,7 @@ enum Reply {
     Ok,
     Limit,
     Image,
+    BrokenStream,
 }
 
 struct Upstream {
@@ -90,6 +91,13 @@ async fn messages(State(up): State<Arc<Upstream>>, headers: HeaderMap, body: Byt
         return limited;
     }
     if request["stream"] == true {
+        if matches!(up.reply, Reply::BrokenStream) {
+            return (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                ANTHROPIC_SSE.split_once("event: message_stop").unwrap().0,
+            )
+                .into_response();
+        }
         return ([(header::CONTENT_TYPE, "text/event-stream")], ANTHROPIC_SSE).into_response();
     }
     Json(json!({
@@ -351,6 +359,55 @@ async fn native_messages_base64_image_does_not_use_prompt_text_budget() {
         }),
     ).await;
     check_route(&response, "claude", "1");
+    assert_eq!(fixture.counts(), [1, 0]);
+}
+
+#[tokio::test]
+async fn native_messages_preserves_anthropic_rate_limit_error() {
+    let fixture = Fixture::start((Reply::Limit, 0), (Reply::Ok, 10)).await;
+    let (response, body) = fixture
+        .send_to(
+            "/v1/messages",
+            header::AUTHORIZATION,
+            "Bearer test-client",
+            json!({"model":"assistant","max_tokens":4096,"system":"Be brief",
+                "messages":[{"role":"user","content":[{"type":"text","text":"Hello"}]}]
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "30");
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["type"], "rate_limit_error");
+    assert_eq!(fixture.counts(), [1, 0]);
+}
+
+#[tokio::test]
+async fn native_messages_emits_anthropic_broken_stream_error() {
+    let fixture = Fixture::start((Reply::BrokenStream, 0), (Reply::Ok, 10)).await;
+    let (response, body) = fixture
+        .send_to(
+            "/v1/messages",
+            header::AUTHORIZATION,
+            "Bearer test-client",
+            json!({"model":"assistant","stream":true,"max_tokens":4096,"system":"Be brief",
+                "messages":[{"role":"user","content":[{"type":"text","text":"Hello"}]}]
+            }),
+        )
+        .await;
+    check_route(&response, "claude", "1");
+    assert!(body.contains("event: message_start"));
+    let last = body.trim_end().split("\n\n").last().unwrap();
+    assert!(last.lines().any(|line| line == "event: error"));
+    let data = last
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .unwrap();
+    let error: Value = serde_json::from_str(data).unwrap();
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["type"], "api_error");
+    assert!(!body.contains("event: message_stop"));
     assert_eq!(fixture.counts(), [1, 0]);
 }
 
