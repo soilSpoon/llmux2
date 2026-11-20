@@ -70,6 +70,48 @@ fn connection_url_wins_and_public_builtins_are_mapped() {
 }
 
 #[test]
+fn gemini_overrides_use_only_supported_google_compatibility_roots() {
+    let expected = "https://generativelanguage.googleapis.com/v1beta/openai";
+    for base_url in [
+        "https://generativelanguage.googleapis.com/v1beta",
+        "https://generativelanguage.googleapis.com/v1beta/",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        "https://generativelanguage.googleapis.com/v1beta/openai/",
+    ] {
+        let mut root = fixture();
+        root["providerConnections"][0]["provider"] = json!("gemini");
+        root["providerConnections"][0]["providerSpecificData"] = json!({"baseUrl":base_url});
+        root["combos"][0]["models"] = json!(["gemini/test"]);
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out.toml");
+        llmux_import::import(&root.to_string(), &output, None).unwrap();
+        let config = RuntimeConfig::load(&output).unwrap();
+        assert_eq!(config.deployments[0].base_url.to_string(), expected);
+    }
+    for base_url in [
+        "https://generativelanguage.googleapis.com/v1beta/models",
+        "https://unsupported.example/private-root",
+    ] {
+        let mut root = fixture();
+        root["providerConnections"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id":"gemini", "provider":"gemini", "authType":"apikey", "apiKey":"hidden-secret",
+                "providerSpecificData":{"baseUrl":base_url}
+            }));
+        let dir = tempfile::tempdir().unwrap();
+        let report =
+            llmux_import::import(&root.to_string(), &dir.path().join("out.toml"), None).unwrap();
+        assert_eq!(report.credentials, 1);
+        let warnings = report.warnings.join("\n");
+        assert!(warnings.contains("unsupported Gemini base URL"));
+        assert!(!warnings.contains(base_url));
+        assert!(!dir.path().join("secrets/upstream-gemini").exists());
+    }
+}
+
+#[test]
 fn invalid_metadata_is_skipped_without_printing_its_contents() {
     let mut root = fixture();
     root["providerConnections"]

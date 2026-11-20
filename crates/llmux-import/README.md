@@ -68,6 +68,8 @@ only at its official `https://api.morphllm.com/v1` endpoint.
 Gemini uses Google's documented OpenAI-compatible endpoint
 `https://generativelanguage.googleapis.com/v1beta/openai`, not OmniRoute's native
 Gemini protocol endpoint. See https://ai.google.dev/gemini-api/docs/openai.
+Gemini connection overrides at Google's native `/v1beta` root are normalized
+to `/v1beta/openai`; overrides at other roots are skipped with a warning.
 
 Not imported: OAuth/token/cookie auth, encrypted credentials, unsupported
 providers/protocols (including custom Responses/custom-JSON nodes), custom chat

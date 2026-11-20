@@ -77,6 +77,16 @@ fn metadata(connection: &Value) -> Result<Value, &'static str> {
     }
 }
 
+fn gemini_base_url(url: &str) -> Result<&'static str, &'static str> {
+    match url {
+        "https://generativelanguage.googleapis.com/v1beta"
+        | "https://generativelanguage.googleapis.com/v1beta/openai" => {
+            Ok("https://generativelanguage.googleapis.com/v1beta/openai")
+        }
+        _ => Err("unsupported Gemini base URL; use Google's OpenAI-compatible endpoint"),
+    }
+}
+
 pub(super) fn resolve(
     connection: &Value,
     nodes: &[Value],
@@ -128,6 +138,11 @@ pub(super) fn resolve(
         "/chat/completions"
     };
     let url = url.strip_suffix(suffix).unwrap_or(url);
+    let url = if id == "gemini" {
+        gemini_base_url(url)?
+    } else {
+        url
+    };
     if id == "morph" && url != "https://api.morphllm.com/v1" {
         return Err("Morph requires its public official Morph endpoint");
     }
