@@ -146,11 +146,19 @@ fn usage(value: &Value) -> Option<Usage> {
     })
 }
 
-fn envelope(chat: &Value, output: Vec<Value>, status: &str) -> Value {
+fn incomplete_reason(finish_reason: &Value) -> Option<&'static str> {
+    match finish_reason.as_str() {
+        Some("length") => Some("max_output_tokens"),
+        Some("content_filter") => Some("content_filter"),
+        _ => None,
+    }
+}
+
+fn envelope(chat: &Value, output: Vec<Value>, status: &str, reason: Option<&str>) -> Value {
     let tokens = usage(&chat["usage"]);
     json!({"id":chat["id"], "object":"response", "created_at":chat["created"], "model":chat["model"],
         "status":status, "output":output, "error":null,
-        "incomplete_details":if status == "incomplete" { json!({"reason":"max_output_tokens"}) } else { Value::Null },
+        "incomplete_details":reason.map(|reason| json!({"reason":reason})),
         "usage":tokens.map(|u| json!({"input_tokens":u.input_tokens,"output_tokens":u.output_tokens,"total_tokens":u64::from(u.input_tokens)+u64::from(u.output_tokens)}))})
 }
 
@@ -187,7 +195,8 @@ pub(crate) fn complete(body: &[u8]) -> Result<(Bytes, Option<Usage>), ()> {
             output.push(json!({"id":format!("fc_{}", call["id"].as_str().ok_or(())?), "type":"function_call", "status":"completed", "call_id":call["id"], "name":call["function"]["name"], "arguments":call["function"]["arguments"]}));
         }
     }
-    let status = if choice["finish_reason"] == "length" {
+    let reason = incomplete_reason(&choice["finish_reason"]);
+    let status = if reason.is_some() {
         "incomplete"
     } else {
         "completed"
@@ -195,7 +204,7 @@ pub(crate) fn complete(body: &[u8]) -> Result<(Bytes, Option<Usage>), ()> {
     for item in &mut output {
         item["status"] = json!(status);
     }
-    let response = envelope(&chat, output, status);
+    let response = envelope(&chat, output, status, reason);
     Ok((
         Bytes::from(serde_json::to_vec(&response).map_err(|_| ())?),
         usage(&chat["usage"]),
@@ -211,7 +220,7 @@ struct Translator {
     text: Option<usize>,
     refusal: Option<usize>,
     calls: BTreeMap<u64, usize>,
-    incomplete: bool,
+    incomplete: Option<&'static str>,
     started: bool,
 }
 
@@ -232,7 +241,7 @@ impl Translator {
             if !self.started {
                 return Err(());
             }
-            let status = if self.incomplete {
+            let status = if self.incomplete.is_some() {
                 "incomplete"
             } else {
                 "completed"
@@ -269,14 +278,15 @@ impl Translator {
             let response = envelope(
                 &self.chat,
                 self.output.clone(),
-                if self.incomplete {
+                if self.incomplete.is_some() {
                     "incomplete"
                 } else {
                     "completed"
                 },
+                self.incomplete,
             );
             events.push(self.event(
-                if self.incomplete {
+                if self.incomplete.is_some() {
                     "response.incomplete"
                 } else {
                     "response.completed"
@@ -290,7 +300,7 @@ impl Translator {
             chunk["id"].as_str().ok_or(())?;
             self.chat = chunk.clone();
             self.started = true;
-            let response = envelope(&self.chat, vec![], "in_progress");
+            let response = envelope(&self.chat, vec![], "in_progress", None);
             events.push(self.event("response.created", json!({"response":response})));
             events.push(self.event("response.in_progress", json!({"response":response})));
         }
@@ -301,7 +311,7 @@ impl Translator {
         let Some(choice) = choices.first() else {
             return Ok(events);
         };
-        self.incomplete |= choice["finish_reason"] == "length";
+        self.incomplete = incomplete_reason(&choice["finish_reason"]).or(self.incomplete);
         let delta = &choice["delta"];
         for (field, is_refusal) in [("content", false), ("refusal", true)] {
             let Some(text) = delta[field].as_str() else {
@@ -654,6 +664,69 @@ mod tests {
         assert_eq!(response["output"].as_array().unwrap().len(), 2);
         for item in response["output"].as_array().unwrap() {
             assert_eq!(item["status"], "incomplete");
+        }
+    }
+
+    #[test]
+    fn content_filter_is_incomplete() {
+        for msg in [
+            json!({"content":null}),
+            json!({"content":"partial","refusal":"blocked","tool_calls":[{"id":"a","function":{"name":"lookup","arguments":"{"}}]}),
+        ] {
+            let (body, _) = complete(
+                &serde_json::to_vec(
+                    &json!({"id":"r","choices":[{"message":msg,"finish_reason":"content_filter"}]}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let response: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(response["status"], "incomplete");
+            assert_eq!(
+                response["incomplete_details"],
+                json!({"reason":"content_filter"})
+            );
+            for item in response["output"].as_array().unwrap() {
+                assert_eq!(item["status"], "incomplete");
+            }
+        }
+        for delta in [
+            json!({}),
+            json!({"content":"partial","refusal":"blocked","tool_calls":[{"index":0,"id":"a","function":{"name":"lookup","arguments":"{"}}]}),
+        ] {
+            let mut translator = Translator::default();
+            translator.push(&chunk(delta)).unwrap();
+            translator
+                .push(r#"{"choices":[{"delta":{},"finish_reason":"content_filter"}]}"#)
+                .unwrap();
+            translator
+                .push(r#"{"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":3}}"#)
+                .unwrap();
+            let events = translator.push("[DONE]").unwrap();
+            assert_eq!(
+                events.last().unwrap().event.as_deref(),
+                Some("response.incomplete")
+            );
+            let data: Vec<Value> = events
+                .iter()
+                .map(|event| serde_json::from_str(&event.data).unwrap())
+                .collect();
+            for event in data
+                .iter()
+                .filter(|event| event["type"] == "response.output_item.done")
+            {
+                assert_eq!(event["item"]["status"], "incomplete");
+            }
+            let response = &data.last().unwrap()["response"];
+            assert_eq!(response["status"], "incomplete");
+            assert_eq!(
+                response["incomplete_details"],
+                json!({"reason":"content_filter"})
+            );
+            assert_eq!(response["usage"]["output_tokens"], 3);
+            for item in response["output"].as_array().unwrap() {
+                assert_eq!(item["status"], "incomplete");
+            }
         }
     }
 
