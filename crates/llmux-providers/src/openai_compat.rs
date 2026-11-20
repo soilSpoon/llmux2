@@ -28,7 +28,7 @@ struct RawChatMetadata<'a> {
     #[serde(borrow)]
     model: &'a RawValue,
     #[serde(default)]
-    stream: bool,
+    stream: Option<bool>,
 }
 
 pub struct OpenAiChatMetadata<'a> {
@@ -58,7 +58,7 @@ impl<'a> OpenAiChatMetadata<'a> {
         Ok((
             Self {
                 model,
-                stream: raw.stream,
+                stream: raw.stream.unwrap_or_default(),
             },
             start..start + value.len(),
         ))
@@ -292,6 +292,12 @@ mod tests {
             rewrite_model(&body, "alias").unwrap().as_ptr(),
             body.as_ptr()
         );
+    }
+
+    #[test]
+    fn null_stream_setting_defaults_to_non_streaming() {
+        let raw = br#"{"model":"model","stream":null}"#;
+        assert!(!OpenAiChatMetadata::parse(raw).unwrap().stream);
     }
 
     #[test]
