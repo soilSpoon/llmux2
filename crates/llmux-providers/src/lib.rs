@@ -1,6 +1,7 @@
-//! OpenAI-compatible and Anthropic Messages adapters and static-key credentials.
+//! OpenAI-compatible and Anthropic Messages adapters and static-key / OAuth credential sources.
 
 mod anthropic;
+pub mod oauth;
 mod openai_compat;
 mod sse;
 
