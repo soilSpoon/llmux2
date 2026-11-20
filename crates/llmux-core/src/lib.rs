@@ -507,15 +507,22 @@ impl Executor {
                             }
                         }
                         Err(GatewayError::Client(UpstreamError::QuotaExhausted { reset_at })) => {
+                            let hint = reset_at.map(|reset| {
+                                reset.duration_since(SystemTime::now()).unwrap_or_default()
+                            });
                             let until = binding.limits.limited(
-                                reset_at.map(|reset| {
-                                    reset.duration_since(SystemTime::now()).unwrap_or_default()
-                                }),
+                                hint,
                                 self.cfg.cooldown.default,
                                 self.cfg.cooldown.max,
                             );
+                            // Peers wait for the key's reset, not this route's own limits.
                             for peer in &binding.key_peers {
-                                peer.cool_down_until(until);
+                                match hint {
+                                    Some(wait) => {
+                                        peer.cool_down(wait.min(self.cfg.cooldown.max));
+                                    }
+                                    None => peer.cool_down_until(until),
+                                }
                             }
                             if !self
                                 .cfg

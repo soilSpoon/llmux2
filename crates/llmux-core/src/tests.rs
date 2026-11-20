@@ -917,3 +917,43 @@ async fn exhausted_quota_cools_every_deployment_on_the_credential() {
         "dep1 shares dep0's exhausted credential"
     );
 }
+
+#[tokio::test]
+async fn credential_peers_cool_only_until_the_quota_resets() {
+    let (executor, adapter, _, _server) = fixture_full(
+        vec![UpstreamError::QuotaExhausted {
+            reset_at: Some(SystemTime::now() + Duration::from_millis(50)),
+        }],
+        false,
+        [None; 3],
+        &[("a", &[0]), ("b", &[1, 2])],
+        Default::default(),
+        Default::default(),
+        true,
+    )
+    .await;
+    *adapter.observed.lock().unwrap() = Some(LimitObservation {
+        remaining_requests: Some(0),
+        reset_requests: Some(Duration::from_secs(10)),
+        ..LimitObservation::default()
+    });
+    let to = |model: &str| GatewayRequest {
+        model: model.into(),
+        ..request()
+    };
+    assert!(executor.execute(to("a")).await.is_err());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    executor.execute(to("b")).await.unwrap();
+    let served: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(
+        served,
+        ["dep0", "dep1"],
+        "dep0's own route limit is not the key's"
+    );
+}
