@@ -859,8 +859,9 @@ async fn chat_reports_omniroute_errors_for_invalid_temperature_and_unknown_model
     .await;
     for stream in [false, true] {
         for (model, temperature, message) in [
-            ("shared", 3, "temperature: must be between 0 and 2"),
-            ("unknown", 1, "Invalid model format"),
+            ("shared", json!(3), "temperature: must be between 0 and 2"),
+            ("shared", json!("hot"), "temperature: must be a number"),
+            ("unknown", json!(1), "Invalid model format"),
         ] {
             let request = json!({"model":model,"stream":stream,"temperature":temperature,
                 "messages":[{"role":"user","content":"Hello"}],"vendor_option":{"model":"leave-me-alone"}});
