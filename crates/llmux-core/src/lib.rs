@@ -204,7 +204,7 @@ impl Executor {
                     }
                     Ok(Err(GatewayError::Client(UpstreamError::RateLimited {
                         retry_after,
-                        scope,
+                        ..
                     }))) => {
                         let wait = retry_after
                             .unwrap_or(self.cfg.cooldown.default)
@@ -217,11 +217,7 @@ impl Executor {
                             .fallback_on
                             .contains(&ErrorKind::RateLimited)
                         {
-                            let now = Instant::now();
-                            return Err(GatewayError::Client(UpstreamError::RateLimited {
-                                retry_after: Some(binding.limits.available_at(now) - now),
-                                scope,
-                            }));
+                            break 'groups;
                         }
                     }
                     Ok(Err(err)) => return Err(err),
@@ -229,7 +225,7 @@ impl Executor {
                 }
             }
         }
-        // Attempts are capped per request, but the next request can use any compatible deployment.
+        // The next request can use any compatible deployment, even if retries stopped early.
         let now = Instant::now();
         let earliest = model
             .deployments

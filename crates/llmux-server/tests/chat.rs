@@ -99,14 +99,15 @@ struct Fixture {
 
 impl Fixture {
     async fn start(first: [Reply; 2], next: [Reply; 2], primary_quota: &str) -> Self {
-        Self::start_with_max_attempts(first, next, primary_quota, 4).await
+        Self::start_with_routing(first, next, primary_quota, 4, true).await
     }
 
-    async fn start_with_max_attempts(
+    async fn start_with_routing(
         first: [Reply; 2],
         next: [Reply; 2],
         primary_quota: &str,
         max_attempts: usize,
+        fallback_on_429: bool,
     ) -> Self {
         let [primary_first, secondary_first] = first;
         let [primary_next, secondary_next] = next;
@@ -143,6 +144,11 @@ impl Fixture {
             fs::write(secrets.path().join(key), format!("{key}\n")).unwrap();
         }
         let base = secrets.path().display();
+        let fallback_on = if fallback_on_429 {
+            r#"["rate_limited"]"#
+        } else {
+            "[]"
+        };
         let config = format!(
             r#"
 [server]
@@ -151,6 +157,7 @@ request_timeout_ms = 4000
 
 [routing]
 max_attempts = {max_attempts}
+fallback_on = {fallback_on}
 
 [[credentials]]
 id = "primary"
@@ -327,11 +334,21 @@ async fn retry_after_checks_cooldown_and_rpm_together() {
 
 #[tokio::test]
 async fn retry_after_is_zero_if_attempt_budget_left_a_ready_deployment() {
-    let fixture = Fixture::start_with_max_attempts(
+    verify_fresh_request_routing(1, true).await;
+}
+
+#[tokio::test]
+async fn retry_after_is_zero_if_failover_is_disabled_but_backup_is_ready() {
+    verify_fresh_request_routing(4, false).await;
+}
+
+async fn verify_fresh_request_routing(max_attempts: usize, fallback_on_429: bool) {
+    let fixture = Fixture::start_with_routing(
         [Reply::Limit(5), Reply::Complete],
         [Reply::Complete, Reply::Complete],
-        "",
-        1,
+        "quota = { rpm = 1 }",
+        max_attempts,
+        fallback_on_429,
     )
     .await;
     let response = fixture.request("test-client", "shared", false).await;
