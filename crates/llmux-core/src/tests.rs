@@ -97,6 +97,15 @@ async fn fixture_with_context(
     refresh_fails: bool,
     max_context: [Option<u32>; 3],
 ) -> Fixture {
+    fixture_with_models(errors, refresh_fails, max_context, &[("model", &[0, 1, 2])]).await
+}
+
+async fn fixture_with_models(
+    errors: Vec<UpstreamError>,
+    refresh_fails: bool,
+    max_context: [Option<u32>; 3],
+    models: &[(&str, &[u32])],
+) -> Fixture {
     let server = llmux_testkit::TestServer::start(axum::Router::new().fallback(|| async { "ok" }))
         .await
         .unwrap();
@@ -147,14 +156,21 @@ async fn fixture_with_context(
         },
         api_keys: HashMap::new(),
         oauth: HashMap::new(),
-        model_names: HashMap::from([("model".into(), 0)]),
-        models: Box::new([CanonicalModel {
-            name: "model".into(),
-            strategy: Strategy::Priority,
-            capabilities: Capabilities::default(),
-            context_overflow: ContextOverflow::default(),
-            deployments: Box::new([DeploymentIdx(0), DeploymentIdx(1), DeploymentIdx(2)]),
-        }]),
+        model_names: models
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| (Arc::from(*name), i))
+            .collect(),
+        models: models
+            .iter()
+            .map(|(name, deployments)| CanonicalModel {
+                name: Arc::from(*name),
+                strategy: Strategy::Priority,
+                capabilities: Capabilities::default(),
+                context_overflow: ContextOverflow::default(),
+                deployments: deployments.iter().copied().map(DeploymentIdx).collect(),
+            })
+            .collect(),
         deployments,
     };
     let mut registry = ProviderRegistry::default();
@@ -428,4 +444,43 @@ async fn exhaustion_retry_hint_ignores_deployments_that_do_not_fit() {
         panic!("expected exhaustion")
     };
     assert!(retry_after > Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn rate_limit_cools_down_every_model_sharing_the_upstream_route() {
+    // dep0 and dep1 share provider, credential, base_url and upstream model.
+    let (executor, adapter, _, _server) = fixture_with_models(
+        vec![UpstreamError::RateLimited {
+            retry_after: Some(Duration::from_secs(3)),
+            scope: llmux_types::LimitScope::Requests,
+        }],
+        false,
+        [None; 3],
+        &[("a", &[0, 2]), ("b", &[1, 2])],
+    )
+    .await;
+    let first = executor
+        .execute(GatewayRequest {
+            model: "a".into(),
+            ..request()
+        })
+        .await
+        .unwrap();
+    assert_eq!(first.deployment.as_ref(), "dep2");
+    let second = executor
+        .execute(GatewayRequest {
+            model: "b".into(),
+            ..request()
+        })
+        .await
+        .unwrap();
+    assert_eq!(second.deployment.as_ref(), "dep2");
+    let calls: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(calls, ["dep0", "dep2", "dep2"]);
 }
