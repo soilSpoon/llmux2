@@ -1,6 +1,7 @@
 //! Import OmniRoute JSON exports and SQLite table dumps into a static llmux configuration.
 
 mod db_dump;
+mod upstream;
 
 use serde_json::{json, Value};
 use std::{
@@ -26,7 +27,7 @@ struct Connection {
     priority: i64,
 }
 
-// OmniRoute open-sse/config/providers/registry/<id>/index.ts (chat endpoint minus suffix).
+// OmniRoute registry/<id>/index.ts; Gemini uses Google's documented OpenAI compatibility API.
 pub const PROVIDERS: &[(&str, &str, &str)] = &[
     ("openai", "openai", "https://api.openai.com/v1"),
     ("anthropic", "anthropic", "https://api.anthropic.com/v1"),
@@ -46,6 +47,12 @@ pub const PROVIDERS: &[(&str, &str, &str)] = &[
         "https://api.fireworks.ai/inference/v1",
     ),
     ("cerebras", "openai_compat", "https://api.cerebras.ai/v1"),
+    (
+        "gemini",
+        "openai_compat",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+    ),
+    ("morph", "openai_compat", "https://api.morphllm.com/v1"),
 ];
 
 fn string<'a>(value: &'a Value, field: &str) -> &'a str {
@@ -142,35 +149,6 @@ fn write_secret(dir: &Path, id: &str, secret: &str) -> Result<String, String> {
     Ok(format!("file:{}", path.display()))
 }
 
-fn provider(connection: &Value, nodes: &[Value]) -> Option<(String, String)> {
-    let id = string(connection, "provider");
-    if let Some((_, kind, url)) = PROVIDERS.iter().find(|(p, _, _)| *p == id) {
-        return Some(((*kind).into(), (*url).into()));
-    }
-    let node = nodes.iter().find(|n| string(n, "id") == id)?;
-    let kind = match string(node, "type") {
-        "openai-compatible"
-            if matches!(string(node, "apiType"), "" | "chat" | "chat-completions") =>
-        {
-            "openai_compat"
-        }
-        "anthropic-compatible" => "anthropic",
-        _ => return None,
-    };
-    if !string(node, "chatPath").is_empty()
-        || node["customHeaders"]
-            .as_object()
-            .is_some_and(|h| !h.is_empty())
-    {
-        return None;
-    }
-    let url = string(node, "baseUrl").trim_end_matches('/');
-    if url.is_empty() {
-        return None;
-    }
-    Some((kind.into(), url.into()))
-}
-
 struct Expander<'a> {
     combos: &'a HashMap<String, Value>,
     connections: &'a [Connection],
@@ -244,10 +222,22 @@ impl Expander<'_> {
             let (p, model) = if provider_id.is_empty() {
                 raw.split_once('/').unwrap_or(("", raw))
             } else {
-                (
-                    provider_id,
-                    raw.strip_prefix(&format!("{provider_id}/")).unwrap_or(raw),
-                )
+                (provider_id, raw)
+            };
+            let canonical = upstream::canonical_provider(p, self.nodes);
+            let model = if provider_id.is_empty() {
+                // The routing segment was already consumed by split_once.
+                if self
+                    .nodes
+                    .iter()
+                    .any(|node| string(node, "id") == canonical)
+                {
+                    upstream::model_id(model, canonical, self.nodes)
+                } else {
+                    model
+                }
+            } else {
+                upstream::model_id(model, canonical, self.nodes)
             };
             if p.is_empty()
                 || model.is_empty()
@@ -259,15 +249,7 @@ impl Expander<'_> {
                 ));
                 continue;
             }
-            let p = if p == "ds" {
-                "deepseek"
-            } else {
-                self.nodes
-                    .iter()
-                    .find(|n| string(n, "prefix") == p)
-                    .map(|n| string(n, "id"))
-                    .unwrap_or(p)
-            };
+            let p = canonical;
             let pinned = string(step, "connectionId");
             let allowed = array(step, "allowedConnectionIds");
             if step
@@ -413,11 +395,12 @@ pub fn import(
             warnings.push(format!("{label}: skipped {reason}"));
             continue;
         }
-        let Some((kind, base_url)) = provider(c, array(&root, "providerNodes")) else {
-            warnings.push(format!(
-                "{label}: skipped unknown/non-compatible provider or custom protocol settings"
-            ));
-            continue;
+        let (kind, base_url) = match upstream::resolve(c, array(&root, "providerNodes")) {
+            Ok(provider) => provider,
+            Err(reason) => {
+                warnings.push(format!("{label}: skipped {reason}"));
+                continue;
+            }
         };
         let source_id = string(c, "id");
         if source_id.is_empty() || !source_ids.insert(source_id.to_owned()) {
