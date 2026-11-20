@@ -54,8 +54,9 @@ impl DeploymentLimits {
     /// Cools down after a 429. Without a provider hint, each consecutive limit doubles the wait;
     /// a limit that lands while the deployment is already cooling does not count as another one.
     pub fn limited(&self, hint: Option<Duration>, default: Duration, max: Duration) -> Instant {
-        let strikes = if self.cooldown_until(Instant::now()).is_some() {
-            self.limit_strikes.load(Ordering::Relaxed).max(1)
+        let counted = self.limit_strikes.load(Ordering::Relaxed);
+        let strikes = if counted > 0 && self.cooldown_until(Instant::now()).is_some() {
+            counted
         } else {
             self.limit_strikes
                 .fetch_add(1, Ordering::Relaxed)
@@ -446,5 +447,27 @@ mod tests {
             "the key's rpm is shared across its deployments"
         );
         assert!(b.available_at(now, 1) >= now + Duration::from_secs(59));
+    }
+
+    #[test]
+    fn a_limit_after_a_header_cooldown_still_starts_probing() {
+        let limits = Arc::new(DeploymentLimits::new(QuotaSpec::default()));
+        limits.observe(
+            LimitObservation {
+                remaining_requests: Some(0),
+                reset_requests: Some(Duration::from_millis(1)),
+                ..LimitObservation::default()
+            },
+            Duration::from_secs(1),
+        );
+        limits.limited(None, Duration::from_millis(1), Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(5));
+        let now = Instant::now();
+        let _probe = limits.admit(0).expect("one probe");
+        assert!(
+            limits.admit(0).is_none(),
+            "a header cooldown must not hide the limit"
+        );
+        assert_eq!(limits.available_at(now, 0), now + CONCURRENCY_RETRY);
     }
 }
