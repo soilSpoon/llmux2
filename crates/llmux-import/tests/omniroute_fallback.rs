@@ -71,6 +71,18 @@ fn fallback_is_last_and_codex_routes_are_excluded() {
         .map(|idx| &cfg.deployments[idx.0 as usize])
         .collect();
     let fallback = deps.last().unwrap();
+    assert!(fallback.fallback);
+    assert!(deps[..deps.len() - 1].iter().all(|dep| !dep.fallback));
+    let raw: toml::Value = toml::from_str(&text).unwrap();
+    assert_eq!(
+        raw["models"][0]["deployments"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["fallback"]
+            .as_bool(),
+        Some(true)
+    );
     assert!(deps[..deps.len() - 1]
         .iter()
         .all(|dep| dep.priority < fallback.priority));
@@ -91,6 +103,7 @@ fn fallback_is_last_and_codex_routes_are_excluded() {
     assert!(!cfg.model_names.contains_key("*"));
     let catch_all = &cfg.models[cfg.catch_all.unwrap()];
     assert_eq!(catch_all.deployments.len(), 1);
+    assert!(cfg.deployments[catch_all.deployments[0].0 as usize].fallback);
     assert_eq!(
         cfg.deployments[catch_all.deployments[0].0 as usize]
             .upstream_model

@@ -38,6 +38,7 @@ impl Default for Capabilities {
 
 #[derive(Debug)]
 pub struct Deployment {
+    pub fallback: bool,
     pub idx: DeploymentIdx,
     pub id: Arc<str>,
     pub provider: ProviderKind,

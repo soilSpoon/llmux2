@@ -191,10 +191,10 @@ pub(super) fn append(
             .filter(|priority| i32::try_from(*priority).is_ok())
             .ok_or("no priority available for OmniRoute fallback")?;
         let id = unique(&format!("omniroute-fallback-{name}"), ids);
-        model["deployments"].as_array_mut().ok_or("imported model has no deployments")?.push(json!({"id":id,"credential":credential,"base_url":options.base_url,"upstream_model":name,"priority":priority}));
+        model["deployments"].as_array_mut().ok_or("imported model has no deployments")?.push(json!({"id":id,"credential":credential,"base_url":options.base_url,"upstream_model":name,"priority":priority,"fallback":true}));
     }
     let id = unique("omniroute-catch-all", ids);
-    models.push(json!({"name":"*","exclude":excluded,"deployments":[{"id":id,"credential":credential,"base_url":options.base_url,"upstream_model":"*","priority":0}]}));
+    models.push(json!({"name":"*","exclude":excluded,"deployments":[{"id":id,"credential":credential,"base_url":options.base_url,"upstream_model":"*","priority":0,"fallback":true}]}));
     Ok(())
 }
 

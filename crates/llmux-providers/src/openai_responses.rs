@@ -492,6 +492,7 @@ mod tests {
     fn wildcard_deployment_forwards_requested_model() {
         let adapter = OpenAiResponses::new();
         let mut dep = Deployment {
+            fallback: false,
             idx: DeploymentIdx(0),
             id: "r".into(),
             provider: adapter.kind().clone(),

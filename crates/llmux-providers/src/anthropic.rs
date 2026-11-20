@@ -907,6 +907,7 @@ mod tests {
     fn auth_passthrough_and_support() {
         let a = Anthropic::new(provider::ANTHROPIC);
         let mut dep = Deployment {
+            fallback: false,
             idx: DeploymentIdx(0),
             id: "a".into(),
             provider: a.kind().clone(),
