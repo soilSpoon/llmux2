@@ -48,7 +48,7 @@ impl DeploymentLimits {
                 .fetch_add(1, Ordering::Relaxed)
                 .saturating_add(1)
         };
-        let backoff = default.saturating_mul(1 << (strikes - 1).min(16));
+        let backoff = default.saturating_mul(1u32.checked_shl(strikes - 1).unwrap_or(u32::MAX));
         self.cool_down(hint.unwrap_or(backoff).min(max))
     }
 
@@ -170,6 +170,10 @@ mod tests {
     fn repeated_unhinted_limits_back_off_exponentially_until_success() {
         let limits = DeploymentLimits::new(QuotaSpec::default());
         let (default, max) = (Duration::from_secs(1), Duration::from_secs(5));
+        let wait_with = |limits: &DeploymentLimits, default, max| {
+            let start = Instant::now();
+            limits.limited(None, default, max).duration_since(start)
+        };
         let wait = |limits: &DeploymentLimits, hint| {
             let start = Instant::now();
             limits.limited(hint, default, max).duration_since(start)
@@ -197,5 +201,18 @@ mod tests {
         limits.cooldown_until_ns.store(0, Ordering::Relaxed);
         limits.succeeded();
         near(wait(&limits, None), default);
+        for _ in 0..40 {
+            limits.cooldown_until_ns.store(0, Ordering::Relaxed);
+            limits.limited(None, Duration::from_millis(1), Duration::from_secs(3_600));
+        }
+        limits.cooldown_until_ns.store(0, Ordering::Relaxed);
+        near(
+            wait_with(
+                &limits,
+                Duration::from_millis(1),
+                Duration::from_secs(3_600),
+            ),
+            Duration::from_secs(3_600),
+        );
     }
 }
