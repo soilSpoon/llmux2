@@ -40,9 +40,11 @@ For converted Anthropic Chat streams, set `stream_options.include_usage` to `tru
 `GET /healthz` is unauthenticated and returns `200 ok`; it is excluded from
 dashboard statistics. On SIGTERM or SIGINT, the server marks itself draining
 and returns 503 only for health probes. For `server.drain_grace_ms` (default
-2000, valid range 0–86400000 ms), it keeps accepting connections and serving
+2000, valid range 0–10000 ms), it keeps accepting connections and serving
 real requests, adding `Connection: close` to HTTP/1 responses so keep-alive
 clients reconnect to the new slot. Zero disables this lame-duck interval.
+The 10-second cap stays below the unit's 30-second watchdog: a healthy new
+slot's shared-port probe can temporarily reach the draining old slot's 503.
 After that interval, it closes the listener and lets in-flight requests and
 SSE streams finish. The subsequent drain is bounded by
 `server.shutdown_timeout_ms` (default 60000, valid range 1–86400000 ms). It exits

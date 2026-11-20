@@ -3,7 +3,7 @@ listen = "127.0.0.1:8080"
 client_keys = ["env:LLMUX_CLIENT_KEY"]
 request_timeout_ms = 120000
 shutdown_timeout_ms = 60000 # drain in-flight requests/streams, then exit; 1–86400000 ms
-drain_grace_ms = 2000 # keep accepting with Connection: close before graceful drain; 0–86400000 ms
+drain_grace_ms = 2000 # 0–10000 ms; cap below WatchdogSec=30 (shared-port probes may hit draining slot)
 expose_routing_headers = true
 # dashboard_key = "env:LLMUX_DASHBOARD_KEY"
 

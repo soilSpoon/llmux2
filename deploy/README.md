@@ -66,7 +66,9 @@ watchdog handle crashes and wedged processes. Slot logs are
 `$HOME/llmux2/server-a.log` and `server-b.log`; arrange log rotation externally.
 On SIGTERM the old slot immediately sends STOPPING=1 and reports healthz 503,
 but keeps accepting/serving for `server.drain_grace_ms` (default 2000 ms,
-range 0–86400000; 0 disables the grace). Its HTTP/1 responses carry
+range 0–10000; 0 disables the grace). The 10-second cap stays well below
+WatchdogSec=30 because the new slot's shared-port watchdog probe can reach
+the draining old slot's 503. Its HTTP/1 responses carry
 `Connection: close`, giving keep-alive clients time to migrate before the old
 listener closes. Only then does the bounded in-flight/SSE drain start.
 Keep `server.drain_grace_ms + server.shutdown_timeout_ms` below the service's

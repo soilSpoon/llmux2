@@ -238,9 +238,9 @@ impl RawConfig {
             models,
         } = self;
         let request_timeout = timeout(server.request_timeout_ms)?;
-        if server.drain_grace_ms > MAX_TIMEOUT_MS {
+        if server.drain_grace_ms > 10_000 {
             return Err(invalid(
-                "server.drain_grace_ms must be between 0 and 86400000",
+                "server.drain_grace_ms must be between 0 and 10000",
             ));
         }
         if server.client_keys.is_empty() {
@@ -659,14 +659,14 @@ refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
             RuntimeConfig::parse(&base).unwrap().server.drain_grace,
             Duration::from_millis(2000)
         );
-        for value in [0, 1, 2000, 86_400_000] {
+        for value in [0, 1, 2000, 10_000] {
             let input = base.replace("[server]", &format!("[server]\ndrain_grace_ms = {value}"));
             assert_eq!(
                 RuntimeConfig::parse(&input).unwrap().server.drain_grace,
                 Duration::from_millis(value)
             );
         }
-        let input = base.replace("[server]", "[server]\ndrain_grace_ms = 86400001");
+        let input = base.replace("[server]", "[server]\ndrain_grace_ms = 10001");
         assert!(RuntimeConfig::parse(&input)
             .err()
             .unwrap()
