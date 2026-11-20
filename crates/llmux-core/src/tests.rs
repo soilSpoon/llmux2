@@ -773,7 +773,6 @@ async fn after_a_cooldown_other_requests_fall_back_while_a_probe_is_open() {
     let (executor, adapter, _, _server) = fixture(
         vec![UpstreamError::RateLimited {
             retry_after: Some(Duration::from_millis(50)),
-            scope: llmux_types::LimitScope::Unknown,
         }],
         false,
     )
