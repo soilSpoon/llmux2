@@ -53,6 +53,20 @@ are sanitized and deduplicated. If there are no client keys, set
 
 Built-ins: openai, anthropic, openrouter, groq, deepseek (`ds` step alias),
 mistral, xai, together, fireworks, cerebras, gemini, morph, aihorde, kilo, kilocode.
+One reviewed Antigravity route is imported through existing Gemini API-key
+connections: `antigravity/gemini-3-flash` uses `gemini-3-flash-preview`, verified
+by the operator using Gemini `models.list` on OCI
+(https://ai.google.dev/api/models#method:-models.list).
+The direct name, aliases, and combo legs use all eligible built-in Gemini
+connections in priority order. Antigravity source connection pins/allowlists
+cannot transfer to Gemini and are replaced with that eligible set, with a warning;
+step `usable: false` and malformed restrictions still fail closed.
+Antigravity OAuth connections remain skipped; no other Antigravity models are
+mapped. Without an eligible Gemini connection, no native replacement is emitted.
+The optional OmniRoute fallback follows native deployments using the normal
+fallback rules; omitting the fallback flags leaves only Gemini deployments.
+These use the existing Gemini accounts' quota/billing, not a free-tier guarantee.
+To roll back the mapping, regenerate using the previous importer version.
 Official DeepSeek deployments set
 `strip_request_fields = ["seed", "user", "safety_identifier", "reasoning.effort"]`
 using the core per-deployment option. `logprobs` and `top_logprobs` are preserved.

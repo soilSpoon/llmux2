@@ -319,7 +319,14 @@ impl Expander<'_> {
                 ));
                 continue;
             }
-            let replacement = if p.is_builtin("openrouter") && self.policy.openrouter_replacements {
+            let antigravity =
+                p.is_builtin("antigravity") && replacements::antigravity(model).is_some();
+            let replacement = if antigravity {
+                if !pinned.is_empty() || !allowed.is_empty() {
+                    self.warnings.push(format!("combo {name} step {index}: reviewed Antigravity replacement uses eligible Gemini connections instead of source connection restrictions"));
+                }
+                replacements::antigravity(model)
+            } else if p.is_builtin("openrouter") && self.policy.openrouter_replacements {
                 let replacement = replacements::find(model);
                 if replacement.is_none() || !pinned.is_empty() || !allowed.is_empty() {
                     self.warnings.push(format!("combo {name} step {index}: no verified connected OpenRouter replacement (or source connection restriction)"));
@@ -333,13 +340,20 @@ impl Expander<'_> {
                 .connections
                 .iter()
                 .filter(|c| {
-                    replacement.map_or(c.provider == p, |r| replacements::matches(r, c))
-                        && if !pinned.is_empty() {
-                            c.source_id == pinned
+                    replacement.map_or(c.provider == p, |r| {
+                        if antigravity {
+                            replacements::antigravity_connection(r, c)
                         } else {
-                            allowed.is_empty()
-                                || allowed.iter().any(|id| id.as_str() == Some(&c.source_id))
+                            replacements::matches(r, c)
                         }
+                    }) && if antigravity {
+                        true
+                    } else if !pinned.is_empty() {
+                        c.source_id == pinned
+                    } else {
+                        allowed.is_empty()
+                            || allowed.iter().any(|id| id.as_str() == Some(&c.source_id))
+                    }
                 })
                 .collect();
             if replacement.is_some() {
@@ -360,7 +374,11 @@ impl Expander<'_> {
             if !pinned.is_empty() && !allowed.is_empty() {
                 self.warnings.push(format!("combo {name} step {index}: connectionId takes precedence over allowedConnectionIds"));
             }
-            for id in allowed.iter().filter_map(Value::as_str) {
+            for id in allowed
+                .iter()
+                .filter(|_| !antigravity)
+                .filter_map(Value::as_str)
+            {
                 if !self
                     .connections
                     .iter()
@@ -742,6 +760,7 @@ pub fn import_with_options(
     }
     let nodes = array(&root, "providerNodes");
     let mut direct = direct::collect(&combos, nodes, &connections);
+    replacements::seed_antigravity(&mut direct, &connections);
     if policy.openrouter_replacements {
         replacements::seed(&mut direct, &connections);
     }
