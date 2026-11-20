@@ -37,7 +37,7 @@ THEN it SHALL leave the new slot running and report that handoff stage.
 
 WHEN CI runs deployment tests
 THEN it SHALL run the Rust tests once in the coverage job, using fake waits,
-while the check job SHALL retain the remaining Python merge-gate tests.
+and merge-gate Rust tests SHALL also run there rather than in the check job.
 
 ### Requirement: Bounded fallback traffic visibility
 The gateway SHALL expose reporting-only deployment `fallback` flags, defaulting

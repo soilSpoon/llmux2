@@ -174,7 +174,7 @@ fn evaluate(data: &Value, required: &[String], policy: &Value) -> Result<Vec<Str
         }) {
             errors.push(format!(
                 "Required check {} has no completed successful run on {sha}.",
-                python_repr(context)
+                quoted(context)
             ));
         }
     }
@@ -196,7 +196,7 @@ fn evaluate(data: &Value, required: &[String], policy: &Value) -> Result<Vec<Str
         ) {
             errors.push(format!(
                 "Check {} failed: {}.",
-                python_repr(&name),
+                quoted(&name),
                 text(conclusion)?
             ));
         }
@@ -312,7 +312,7 @@ fn evaluate(data: &Value, required: &[String], policy: &Value) -> Result<Vec<Str
     }
     Ok(errors)
 }
-fn python_repr(value: &str) -> String {
+fn quoted(value: &str) -> String {
     let quote = if value.contains('\'') && !value.contains('"') {
         '"'
     } else {
@@ -345,7 +345,7 @@ fn gh(args: &[String]) -> Result<Value> {
         let command = std::iter::once("gh")
             .chain(std::iter::once("api"))
             .chain(args.iter().map(String::as_str))
-            .map(python_repr)
+            .map(quoted)
             .collect::<Vec<_>>()
             .join(", ");
         return Err(format!(
@@ -482,12 +482,9 @@ fn required_checks(root: &Path) -> Result<Vec<String>> {
 }
 pub fn run(number: &str) -> Result<bool> {
     let result = (|| {
-        let number = number.parse::<i64>().map_err(|_| {
-            format!(
-                "argument number: invalid int value: {}",
-                python_repr(number)
-            )
-        })?;
+        let number = number
+            .parse::<i64>()
+            .map_err(|_| format!("argument number: invalid int value: {}", quoted(number)))?;
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let required = required_checks(root)?;
         let policy: Value = serde_json::from_slice(

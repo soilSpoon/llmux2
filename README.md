@@ -440,8 +440,8 @@ node --test crates/llmux-server/tests/dashboard.cjs
 
 In CI, `coverage` runs the Rust unit and integration tests once with coverage
 instrumentation, including `llmux2-ops` deployment tests, while `check` runs Rust
-doctests, lint, dashboard tests, and the remaining Python repository tooling tests
-(including the merge gate). The `xtask` workspace member contains CI policy tools
+doctests, lint, and dashboard tests. Merge-gate tests also run in `coverage`.
+The `xtask` workspace member contains CI policy tools
 and repository-file checks; its tests run in `coverage`, not again in `check`.
 Use `cargo test --locked --workspace` to run all Rust
 tests locally without instrumentation.

@@ -36,7 +36,6 @@ cargo test --locked -p llmux2-ops # standalone deployment and guard tools; no re
 cargo xtask pr-policy # PR_BODY, BASE_SHA, HEAD_SHA
 cargo xtask coverage-ratchet coverage.json # optional BASE_SHA
 cargo test --locked -p llmux-bench
-python3 -B -m unittest discover -s scripts -v
 ```
 
 ## Merge
