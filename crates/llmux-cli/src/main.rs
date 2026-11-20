@@ -33,7 +33,10 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         match arg.as_str() {
             "--url" => parsed.url = args.next().ok_or("--url needs a value")?,
             "--key" => parsed.key = Some(args.next().ok_or("--key needs a value")?),
-            flag if flag.starts_with("--") => return Err(format!("unknown flag {flag}")),
+            flag if flag.starts_with("--") => {
+                // Report the flag name only: `--key=SECRET` must not echo the key.
+                return Err(format!("unknown flag {}", flag.split('=').next().unwrap()));
+            }
             command if parsed.command.is_empty() => parsed.command = command.to_owned(),
             arg => {
                 if parsed.arg.replace(arg.to_owned()).is_some() {
@@ -70,9 +73,10 @@ async fn run() -> Result<String, String> {
         ("credentials", None) => (Method::GET, "/admin/credentials".into()),
         ("models", None) => (Method::GET, "/admin/models".into()),
         ("reload", None) => (Method::POST, "/admin/reload".into()),
-        ("enable", Some(id)) | ("disable", Some(id)) => {
-            (Method::POST, format!("/admin/credentials/{id}/disabled"))
-        }
+        ("enable", Some(id)) | ("disable", Some(id)) => (
+            Method::POST,
+            format!("/admin/credentials/{}/disabled", urlencoding(id)),
+        ),
         (command, _) => return Err(format!("unknown command `{command}`\n{USAGE}")),
     };
     let body = match args.command.as_str() {
@@ -80,6 +84,29 @@ async fn run() -> Result<String, String> {
         "disable" => serde_json::json!({"disabled": true}),
         _ => serde_json::json!({}),
     };
+    // Percent-encode credential ids: config accepts `/`, `?` and `%` in ids,
+    // and those must not change the route or resolve to another credential.
+    fn urlencoding(id: &str) -> String {
+        let mut encoded = String::new();
+        for byte in id.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                encoded.push(byte as char);
+            } else {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+        encoded
+    }
+    let parsed_url = url::Url::parse(&args.url).map_err(|err| format!("bad --url: {err}"))?;
+    let loopback = matches!(
+        parsed_url.host_str(),
+        Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+    );
+    if parsed_url.scheme() == "http" && !loopback && args.key.is_some() {
+        return Err(
+            "refusing to send the admin key over plaintext http to a non-loopback host".into(),
+        );
+    }
     let connector = HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_or_http()
@@ -93,14 +120,17 @@ async fn run() -> Result<String, String> {
     if let Some(key) = &args.key {
         request = request.header(header::AUTHORIZATION, format!("Bearer {key}"));
     }
-    let response = client
-        .request(
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client.request(
             request
                 .body(Full::new(Bytes::from(body.to_string())))
                 .map_err(|err| err.to_string())?,
-        )
-        .await
-        .map_err(|err| format!("request failed: {err}"))?;
+        ),
+    )
+    .await
+    .map_err(|_| "request timed out after 30s".to_string())?
+    .map_err(|err| format!("request failed: {err}"))?;
     let status = response.status();
     let body = response
         .into_body()
@@ -116,6 +146,6 @@ async fn run() -> Result<String, String> {
         return Err(format!("{status}: {detail}"));
     }
     let pretty: serde_json::Value =
-        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        serde_json::from_slice(&body).map_err(|err| format!("invalid JSON response: {err}"))?;
     Ok(serde_json::to_string_pretty(&pretty).unwrap())
 }

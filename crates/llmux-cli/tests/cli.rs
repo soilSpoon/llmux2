@@ -31,6 +31,7 @@ async fn admin() -> (TestServer, Arc<AtomicUsize>) {
                     Json(json!({"uptime_ms": 1, "version": "test"})).into_response()
                 }),
             )
+            .route("/admin/models", get(|| async { "not json" }))
             .route(
                 "/admin/reload",
                 post(|| async { Json(json!({"reloaded": true})) }),
@@ -42,7 +43,6 @@ async fn admin() -> (TestServer, Arc<AtomicUsize>) {
                      Path(id): Path<String>,
                      Json(body): Json<Value>| async move {
                         calls.fetch_add(1, Ordering::Relaxed);
-                        assert_eq!(id, "key");
                         Json(json!({"id": id, "disabled": body["disabled"]}))
                     },
                 ),
@@ -149,4 +149,59 @@ async fn bad_usage_and_api_error_fail() {
     .await;
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("denied"));
+}
+
+#[tokio::test]
+async fn escaped_credential_id_reaches_the_right_route() {
+    let (server, _) = admin().await;
+    let out = run_cli(vec![
+        "--url".into(),
+        server.url(),
+        "--key".into(),
+        "admin-key".into(),
+        "disable".into(),
+        "team/key%3Aone".into(),
+    ])
+    .await;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(body["id"], "team/key%3Aone");
+}
+
+#[tokio::test]
+async fn secrets_never_echo_and_plaintext_remote_is_refused() {
+    let out = run(&["--key=supersecret", "status"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--key"), "{stderr}");
+    assert!(
+        !stderr.contains("supersecret"),
+        "key value leaked: {stderr}"
+    );
+
+    let out = run(&[
+        "--url",
+        "http://example.com",
+        "--key",
+        "admin-key",
+        "status",
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("plaintext"));
+
+    let (server, _) = admin().await;
+    let out = run_cli(vec![
+        "--url".into(),
+        server.url(),
+        "--key".into(),
+        "admin-key".into(),
+        "models".into(),
+    ])
+    .await;
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid JSON"));
 }
