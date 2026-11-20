@@ -157,5 +157,12 @@ pub(super) fn resolve(
     if id == "morph" && url != "https://api.morphllm.com/v1" {
         return Err("Morph requires its public official Morph endpoint");
     }
+    if matches!(
+        super::connection::identity(connection, nodes),
+        "kilo" | "kilocode"
+    ) && url != "https://ai-gateway.kilo.ai/api/v1"
+    {
+        return Err("Kilo requires its public official gateway endpoint");
+    }
     Ok((kind.into(), url.into()))
 }
