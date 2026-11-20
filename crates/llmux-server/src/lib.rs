@@ -64,6 +64,10 @@ pub async fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Se
         );
         oauth.client_secret = credential.client_secret.map(|secret| secret.to_string());
         oauth.scopes = credential.scopes;
+        if let Some(resource) = credential.resource {
+            oauth.extra_params.push(("resource".into(), resource));
+        }
+        oauth.refresh_token_path = credential.refresh_token_path;
         oauth.refresh_skew = credential.refresh_skew;
         oauth.request_timeout = credential.request_timeout;
         sources.insert(id, Arc::new(OAuthCredentialSource::start(oauth).await?));

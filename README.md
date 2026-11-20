@@ -38,7 +38,7 @@ Rejecting is the default. To trim instead, set `context_overflow = "middle-out"`
 
 `x-llmux-deployment` and `x-llmux-attempts` identify the winning deployment and number of HTTP attempts (not skipped deployments). Set `server.expose_routing_headers = false` to hide them. A stream commits on its first complete SSE event; after that, failures end the stream with an error payload rather than replaying the request.
 
-The MVP does not implement multi-format routing, hot reload, circuit breakers, or failover on errors other than 429. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local RPM uses a bounded per-deployment sliding window only when configured.
+Before a response is committed, the gateway can fail over on upstream server, connection, and timeout errors within its attempt and time limits. Rate-limit and quota-exhaustion failover are controlled by `routing.fallback_on` and enabled by default. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local RPM uses a bounded per-deployment sliding window only when configured.
 
 ## Credentials
 
@@ -56,6 +56,7 @@ client_id = "gateway-client"
 refresh_token = "env:UPSTREAM_REFRESH_TOKEN"
 client_secret = "env:UPSTREAM_CLIENT_SECRET" # optional for public clients
 scopes = ["inference"] # optional
+resource = "https://api.openai.com/v1" # optional; omit scopes for Sign in with ChatGPT
 refresh_skew_ms = 60000 # optional; default 60 seconds, zero allowed
 request_timeout_ms = 30000 # optional; default 30 seconds
 ```
@@ -65,9 +66,14 @@ must be `env:` or `file:` references, never inline values. Token endpoints requi
 HTTPS (HTTP is allowed only on loopback), with no userinfo, query or fragment.
 Timeouts are 1–86400000 ms; refresh skew is 0–86400000 ms. OAuth startup fetches
 the initial access token and fails if that request fails. Access tokens are cached
-and refreshed in the background; rotated refresh tokens are kept in memory only,
-so persist them externally before restarting if your provider invalidates old ones.
-Authentication-error fallback / on-demand refresh retries are not implemented.
+and refreshed in the background. For `refresh_token = "file:/path/to/token"`, rotations
+atomically replace that file (mode 0600 on Unix), so restarts use the latest token.
+The directory must be writable; a failed write retains the token in memory but may
+require reauthorization after restart. `env:` references are memory-only. Optional
+`resource` must be an absolute HTTPS URL without credentials or fragment. For Sign in
+with ChatGPT, use `https://auth.openai.com/api/accounts/oauth/token` as `token_url`,
+the issued client ID, `resource = "https://api.openai.com/v1"`, and omit `scopes`.
+A refreshable authentication error can trigger one on-demand refresh and retry for the attempted deployment, still subject to request and admission limits. If refresh fails or authentication is rejected again, the gateway disables that credential for routing and can try another eligible deployment.
 
 ## Development
 
@@ -84,8 +90,11 @@ credential snippet. A stable `host_id` survives restarts. Re-running with the sa
 directory reauthorizes its saved client/account; use a separate directory to add a
 different account or workspace. Treat the entire directory as sensitive, never
 commit it, and do not run concurrent login/gateway processes for the same session.
-The snippet targets `provider = "openai_responses"` and the OAuth `resource` field;
-the Responses upstream adapter and resource configuration support are separate work.
+The snippet targets `provider = "openai_responses"` and sets
+`resource = "https://api.openai.com/v1"`, matching the OAuth configuration schema.
+The Responses upstream adapter remains separate work.
+
+See the [engineering standards](AGENTS.md) for test-first development, reliability checks, and PR evidence.
 
 - `llmux-types` defines the shared model, IR, and provider contracts.
 - `llmux-config` parses and validates TOML and secret references.
