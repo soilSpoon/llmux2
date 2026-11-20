@@ -1,0 +1,12 @@
+[package]
+name = "llmux-bench"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+serde_json.workspace = true
