@@ -214,12 +214,13 @@ impl PendingLogin {
 
     /// Retry an invalid_grant with the callback's issued client ID, never the old
     /// code or PKCE values. The registration is not saved until identity validates.
-    /// Only dynamic-registration flows (codex) support this.
+    /// Fixed-client flows (xai) have no issued client and start a fresh sign-in.
     pub async fn retry(dir: impl AsRef<Path>, flow: Flow, client: &str) -> Result<Self> {
-        if client.is_empty() || client == DYNAMIC_CLIENT || !flow.dynamic() {
+        if client.is_empty() || client == DYNAMIC_CLIENT {
             return Err(Error::Incomplete);
         }
-        Self::start_inner(dir.as_ref(), flow, Some(client)).await
+        let issued = flow.dynamic().then_some(client);
+        Self::start_inner(dir.as_ref(), flow, issued).await
     }
 
     async fn start_inner(dir: &Path, flow: Flow, retry: Option<&str>) -> Result<Self> {

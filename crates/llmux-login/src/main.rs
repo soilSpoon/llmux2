@@ -85,11 +85,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     eprintln!(
                         "Authorization code expired or was already used; restarting sign-in."
                     );
-                    pending = if flow.dynamic() {
-                        PendingLogin::retry(&dir, flow.clone(), client).await?
-                    } else {
-                        PendingLogin::start(&dir, flow.clone()).await?
-                    };
+                    pending = PendingLogin::retry(&dir, flow.clone(), client).await?;
                 } else {
                     return Err(error.into());
                 }

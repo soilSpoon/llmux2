@@ -338,11 +338,10 @@ async fn xai_invalid_grant_recovers_with_a_fresh_sign_in() {
     callback(&first, &[("state", &first["state"]), ("code", "code +&")]).await;
     let error = task.await.unwrap().err().unwrap();
     assert_eq!(error.retry_client_id().unwrap(), CLIENT_ID);
-    // Fixed-client flows recover with a fresh sign-in, not PendingLogin::retry.
-    assert!(PendingLogin::retry(dir.path(), flow.clone(), CLIENT_ID)
+    // A fixed-client flow retries as a fresh sign-in with fresh PKCE values.
+    let pending = PendingLogin::retry(dir.path(), flow.clone(), CLIENT_ID)
         .await
-        .is_err());
-    let pending = PendingLogin::start(dir.path(), flow).await.unwrap();
+        .unwrap();
     let next = params(&pending);
     assert_ne!(next["state"], first["state"]);
     assert_ne!(next["nonce"], first["nonce"]);
