@@ -64,8 +64,12 @@ pub(crate) fn with_chat_usage(
             }
             // Delta chunks carry no "usage" key; skip the DOM parse and forward them
             // untouched. Only usage-bearing chunks (or every chunk when include=true
-            // rewrites usage:null) need the Value walk.
-            if !include && !event.data.contains("\"usage\"") {
+            // rewrites usage:null) need the Value walk. A `\u0075`-escaped key still
+            // decodes as `usage`, so those take the DOM path too.
+            if !include
+                && !event.data.contains("\"usage\"")
+                && !event.data.contains("\\u0075")
+            {
                 yield event;
                 continue;
             }
@@ -267,6 +271,10 @@ mod tests {
                 Ok(SseEvent {
                     event: None,
                     data: r#"{"choices":[],"usage":{"total":10}}"#.into(),
+                }),
+                Ok(SseEvent {
+                    event: None,
+                    data: r#"{"choices":[],"\u0075sage":{"total":5}}"#.into(),
                 }),
                 Ok(SseEvent {
                     event: None,
