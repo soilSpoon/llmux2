@@ -351,6 +351,28 @@ Gemini, and Mistral keys may still be billable; this flag is not a promise of
 free access on those providers. Without it, existing OpenRouter behavior remains
 unchanged.
 
+The same flag also enables `src/bridge.rs`'s explicit reviewed DuckDuckGo and
+DeepAI Code replacements. It does not call either web bridge or import their
+authentication. Declared model identities come from OmniRoute's DuckDuckGo
+model registry/catalog and the export's DeepAI node, aliases and same-model
+combos; targets use exact existing imported model IDs. Only the listed
+family/version/size variants are replaced. In particular, GPT Luna/Sol aliases,
+Haiku effort suffixes, nested `ddgw/` wrappers and Gemma 31B are not inferred.
+Numes replacements require its exact official API URL and a keyed OpenAI-compatible
+connection; the other targets retain the reviewed official-endpoint checks.
+Workers AI still requires opt-in and its curated/snapshot model checks.
+
+Bridge legs expand in place, preserving declared order and existing reviewed
+Morph ordering. Valid source bridge connection pins/allow-lists select no target
+credentials: as with Antigravity, replacements use eligible official connections
+instead, with a warning. Malformed restrictions and unusable legs remain skipped.
+Existing combo/alias/mapping precedence is unchanged, and unavailable targets
+remain unavailable. Explicit OmniRoute fallback follows the normal policy,
+including owner-only Codex exclusions; bridge replacements do not add a new
+fallback bypass. Removing the flag restores the previous bridge-skip behavior.
+This is static declared-model equivalence, not a live inference or key-entitlement
+check; existing official keys may be billable.
+
 ### Public model aliases
 
 The importer uses llmux's existing model `aliases` field: aliases share their

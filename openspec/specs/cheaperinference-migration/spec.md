@@ -280,6 +280,37 @@ THEN documentation identifies the snapshot as static evidence rather than
 live cost enforcement; paid models and missing pricing do not become keyed
 deployments through names or free-status hints alone.
 
+### Requirement: Reviewed same-model bridge replacements
+
+With `--openrouter-replacements`, the importer SHALL also replace only the
+DuckDuckGo and DeepAI Code model IDs explicitly reviewed in `src/bridge.rs`
+with the same declared model family, version and size on eligible connected
+official endpoints. It SHALL NOT import bridge authentication, infer a similar
+model, use Codex/Factory/OpenRouter targets, or relax Workers AI eligibility.
+
+#### Scenario: Bridge leg expansion and precedence
+
+WHEN a reviewed bridge leg appears in a combo, nested combo or direct alias
+THEN its official deployments expand in place in the original leg order,
+subject to existing reviewed Morph ordering; source combo/alias/mapping
+precedence is retained, including unavailable winning mappings.
+
+#### Scenario: Source restrictions and missing targets
+
+WHEN a bridge leg has valid source connection restrictions
+THEN eligible official connections replace those restrictions with a warning,
+as for Antigravity; unusable legs and malformed restrictions remain skipped.
+WHEN its model is unreviewed or no eligible target is connected
+THEN no replacement deployment is generated.
+
+#### Scenario: Opt-in and explicit fallback
+
+WHEN the flag is absent
+THEN bridges retain their previous skipped behavior.
+WHEN explicit OmniRoute fallback is configured
+THEN it follows the normal last-deployment and Codex exclusion policy; bridge
+replacement introduces no new fallback bypass.
+
 ### Requirement: Reviewed official OpenRouter replacements
 
 With `--openrouter-replacements`, the importer SHALL route only reviewed
