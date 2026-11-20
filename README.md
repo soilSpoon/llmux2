@@ -102,6 +102,7 @@ Authentication-error fallback / on-demand refresh retries are not implemented.
 ```sh
 cargo test --locked --workspace
 cargo test --locked -p llmux-server --test chat -- --nocapture
+node --test crates/llmux-server/tests/dashboard.cjs
 ```
 
 ## Mock-upstream load benchmark

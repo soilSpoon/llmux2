@@ -20,7 +20,7 @@ function status(label, tone) {
 function lock(message = "") {
   if (session) {
     clearTimeout(session.timer);
-    session.controller.abort();
+    if (session.request) session.request.abort();
     session.key = "";
     session = undefined;
   }
@@ -40,7 +40,6 @@ byId("key-form").addEventListener("submit", (event) => {
   if (session) return;
   session = {
     key: byId("key").value.trim(),
-    controller: new AbortController(),
     points: [],
     previous: null,
   };
@@ -52,13 +51,16 @@ byId("key-form").addEventListener("submit", (event) => {
 });
 
 async function poll(current) {
+  const request = new AbortController();
+  current.request = request;
+  const deadline = setTimeout(() => request.abort(), 5_000);
   try {
     const response = await fetch("/dashboard/stats", {
       cache: "no-store",
       credentials: "omit",
       redirect: "error",
       headers: { Authorization: "Bearer " + current.key },
-      signal: AbortSignal.any([current.controller.signal, AbortSignal.timeout(5_000)]),
+      signal: request.signal,
     });
     if (current !== session) return;
     if (response.status === 401) return lock("The dashboard key was not accepted.");
@@ -82,6 +84,9 @@ async function poll(current) {
     status("Stale", "warn");
     text("connection-error", "Live updates interrupted. Showing the last snapshot; retrying automatically.");
     byId("connection-error").hidden = false;
+  } finally {
+    clearTimeout(deadline);
+    current.request = undefined;
   }
   current.timer = setTimeout(() => poll(current), POLL_MS);
 }
@@ -132,7 +137,7 @@ function draw(now, points) {
   let last = -Infinity;
   for (const point of points) {
     if (point.at - last >= 3 * POLL_MS) segments.push([]);
-    segments.at(-1).push(point);
+    segments[segments.length - 1].push(point);
     last = point.at;
   }
   const x = ({ at }) => Math.max(1, Math.min(599, (at - now + WINDOW_MS) / WINDOW_MS * 600));
@@ -143,7 +148,7 @@ function draw(now, points) {
   byId("traffic-ok").setAttribute("d", segments.map((series) => line(series, "ok")).join(" "));
   byId("traffic-errors").setAttribute("d", segments.map((series) => line(series, "errors")).join(" "));
   byId("traffic-fill").setAttribute("d", segments.map((series) =>
-    line(series, "ok") + "L" + x(series.at(-1)) + " 119 L" + x(series[0]) + " 119 Z").join(" "));
+    line(series, "ok") + "L" + x(series[series.length - 1]) + " 119 L" + x(series[0]) + " 119 Z").join(" "));
 }
 
 function cell(row, value, className = "") {
