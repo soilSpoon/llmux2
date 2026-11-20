@@ -343,6 +343,43 @@ fn synthetic_direct_steps_preserve_resolved_provider_identity() {
 }
 
 #[test]
+fn question_mark_model_ids_do_not_create_direct_names() {
+    assert_no_direct_names(&["vendor/text?variant"]);
+}
+
+#[test]
+fn whitespace_model_ids_do_not_create_direct_names() {
+    assert_no_direct_names(&[
+        "vendor/white space",
+        "vendor/tab\tname",
+        "vendor/line\nname",
+        "vendor/unicode\u{a0}name",
+    ]);
+}
+
+fn assert_no_direct_names(models: &[&str]) {
+    let mut root = fixture();
+    for model in models {
+        root["combos"][0]["models"].as_array_mut().unwrap().extend([
+            json!(format!("gateway/{model}")),
+            json!({"providerId":"node","model":model}),
+        ]);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let config = RuntimeConfig::load(output).unwrap();
+    for model in models {
+        for prefix in ["gateway", "node"] {
+            let name = format!("{prefix}/{model}");
+            assert!(!config.model_names.contains_key(name.as_str()), "{name:?}");
+        }
+    }
+    assert!(config.model_names.contains_key("gateway/deepseek/text"));
+    assert!(config.model_names.contains_key("node/deepseek/text"));
+}
+
+#[test]
 fn malformed_restrictions_and_nested_combo_names_are_not_model_sources() {
     let mut root = fixture();
     root["combos"]
