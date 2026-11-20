@@ -35,6 +35,9 @@ class MainRulesetTest(unittest.TestCase):
     def test_changes_go_through_a_squash_merged_pull_request(self):
         self.assertEqual(self.rules["pull_request"]["allowed_merge_methods"], ["squash"])
 
+    def test_review_threads_must_be_resolved(self):
+        self.assertTrue(self.rules["pull_request"]["required_review_thread_resolution"])
+
     def test_every_pull_request_job_is_required(self):
         required = {c["context"] for c in self.rules["required_status_checks"]["required_status_checks"]}
         self.assertEqual(required, pull_request_jobs())

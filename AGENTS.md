@@ -36,6 +36,15 @@ python3 -B -m unittest discover -s bench -v
 python3 -B -m unittest discover -s scripts -v
 ```
 
+## Merge
+
+- Head-specific Devin Review evidence is either a marked review from `devin-ai-integration` or a successful latest `Devin Review` commit status created by that app. A pending, failed, or errored latest status blocks even with a marked review. The context and body markers are configured in `.github/merge-policy.json`.
+- Run the gate from a trusted, up-to-date `main` checkout so a PR cannot weaken its own policy. Bootstrap changes to the gate require independent review before using the updated gate.
+- Verification markers count only from accounts in `.github/merge-policy.json`'s `verifier_logins` allowlist (`devin-ai-integration` and `soilspoon`, case-insensitive with `[bot]` stripped).
+- The owner never merges. Devin bots merge as the `devin-ai-integration` app, only after `python3 scripts/merge_gate.py <n>` succeeds; then run `command gh pr merge <n> --squash --match-head-commit <sha>` using the exact SHA the gate passed. Until the ruleset is imported, this gate is the enforcement; do not bypass it.
+- Put exactly one `Author-Session: <id>` line in the PR body. Session IDs use letters, digits, `.`, `_`, `:`, or `-`. A different verifier session must check every applicable `REVIEW.md` item against the diff and inspect the red/green evidence, then post an issue comment with `<!-- llmux-verify:v1 sha=<full head sha> verdict=pass reviewer=<session id> -->` (use `verdict=fail` for a failure). The latest marker for that SHA wins. These are trusted session attestations, not authenticated identities.
+- Any new commit invalidates Devin Review and independent verification: obtain both for the new head. Resolve all review threads and blocking latest reviews. The gate reads required checks from `.github/rulesets/main.json` and reviewer markers from `.github/merge-policy.json`; API errors and unknown mergeability block merging.
+
 ## Compound what was learned
 
 When a fix or review corrects an assumption likely to recur, keep the lesson in the smallest durable form: a regression test or lint for a checkable invariant, an update to the existing docs or examples for user-visible behavior, or a short linked note in `docs/solutions/` if the rationale is not recoverable from those. Include the symptom, why it happened, and how to verify it. Update stale guidance rather than duplicating it. Link the result in the PR, or say why no new lesson belongs in the repo.
