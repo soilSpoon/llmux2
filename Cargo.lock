@@ -744,6 +744,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
+name = "llmux-cli"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper-rustls",
+ "hyper-util",
+ "llmux-testkit",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "llmux-config"
 version = "0.1.0"
 dependencies = [
