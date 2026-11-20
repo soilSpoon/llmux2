@@ -1,10 +1,13 @@
 use bytes::Bytes;
+use futures_util::StreamExt;
 #[cfg(test)]
 use http::HeaderValue;
 use http::{header, HeaderMap};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use llmux_types::{BoxStream, SseEvent, UpstreamError};
+use serde::Deserialize;
+use serde_json::Value;
 
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
 
@@ -27,6 +30,71 @@ pub(crate) fn is_event_stream(headers: &HeaderMap) -> bool {
 
 pub(crate) fn decode(body: Incoming) -> BoxStream<'static, Result<SseEvent, UpstreamError>> {
     decode_until(body, false)
+}
+
+pub(crate) fn requested_usage(body: &[u8]) -> Option<bool> {
+    #[derive(Deserialize)]
+    struct Chat {
+        stream_options: Option<StreamOptions>,
+    }
+    #[derive(Deserialize)]
+    struct StreamOptions {
+        include_usage: Option<bool>,
+    }
+    serde_json::from_slice::<Chat>(body)
+        .ok()?
+        .stream_options?
+        .include_usage
+}
+
+pub(crate) fn with_chat_usage(
+    mut stream: BoxStream<'static, Result<SseEvent, UpstreamError>>,
+    include: bool,
+) -> BoxStream<'static, Result<SseEvent, UpstreamError>> {
+    Box::pin(async_stream::try_stream! {
+        let mut final_usage = None;
+        while let Some(event) = stream.next().await {
+            let mut event = event?;
+            if event.data == "[DONE]" {
+                if let Some(usage) = final_usage.take() {
+                    yield usage;
+                }
+                yield event;
+                return;
+            }
+            if let Ok(Value::Object(mut chunk)) = serde_json::from_str(&event.data) {
+                if let Some(choices) = chunk.get("choices").and_then(Value::as_array) {
+                    let empty = choices.is_empty();
+                    if chunk.get("usage").is_some_and(Value::is_object) {
+                        if include {
+                            final_usage = Some(if empty {
+                                event.clone()
+                            } else {
+                                let mut usage = chunk.clone();
+                                usage.insert("choices".into(), Value::Array(Vec::new()));
+                                SseEvent {
+                                    event: event.event.clone(),
+                                    data: Value::Object(usage).to_string(),
+                                }
+                            });
+                        }
+                        if empty {
+                            continue;
+                        }
+                    }
+                    if include {
+                        if !empty && chunk.get("usage") != Some(&Value::Null) {
+                            chunk.insert("usage".into(), Value::Null);
+                            event.data = Value::Object(chunk).to_string();
+                        }
+                    } else if chunk.remove("usage").is_some() {
+                        event.data = Value::Object(chunk).to_string();
+                    }
+                }
+            }
+            yield event;
+        }
+    })
 }
 
 pub(crate) fn decode_until(

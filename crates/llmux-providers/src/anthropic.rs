@@ -79,9 +79,6 @@ fn blocks(content: &Value) -> Result<Vec<Value>, BuildError> {
 
 fn convert_request(body: &[u8], model: &str) -> Result<Bytes, BuildError> {
     let input: Value = serde_json::from_slice(body).map_err(|_| BuildError::InvalidBody)?;
-    if input["n"].as_u64().is_some_and(|n| n > 1) {
-        return Err(BuildError::InvalidBody);
-    }
     let mut messages: Vec<Value> = Vec::new();
     let mut system = Vec::new();
     for message in input["messages"]
@@ -661,7 +658,6 @@ mod tests {
     fn invalid_requests_are_rejected() {
         for v in [
             json!({}),
-            json!({"messages":[],"n":2}),
             json!({"messages":[{"role":"user","content":[{"type":"audio"}]}]}),
             json!({"messages":[{"role":"assistant","tool_calls":[{"id":"t","function":{"name":"f","arguments":"{"}}]}]}),
             json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"file:///x"}}]}]}),
