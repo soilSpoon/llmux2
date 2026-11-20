@@ -1,5 +1,53 @@
 use super::*;
 use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+fn checks_from_rules(rules: Value) -> Result<Vec<String>> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "llmux-gate-rules-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let directory = root.join(".github/rulesets");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        directory.join("main.json"),
+        json!({"rules": rules}).to_string(),
+    )
+    .unwrap();
+    let result = required_checks(&root);
+    fs::remove_dir_all(root).unwrap();
+    result
+}
+
+#[test]
+fn required_checks_rejects_empty_list() {
+    let mut rules = json!([{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"check"},{"context":"coverage"}]}}]);
+    assert_eq!(
+        checks_from_rules(rules.clone()),
+        Ok(vec!["check".into(), "coverage".into()])
+    );
+    rules[0]["parameters"]["required_status_checks"] = json!([]);
+    assert_eq!(
+        checks_from_rules(rules),
+        Err("Ruleset contains no required checks".into())
+    );
+}
+
+#[test]
+fn required_checks_rejects_missing_list_or_rule() {
+    for (rules, message) in [
+        (
+            json!([{"type":"required_status_checks","parameters":{}}]),
+            "'required_status_checks'",
+        ),
+        (json!([]), "Ruleset contains no required checks"),
+    ] {
+        assert_eq!(checks_from_rules(rules), Err(message.into()));
+    }
+}
+
 fn sha() -> String {
     "a".repeat(40)
 }
