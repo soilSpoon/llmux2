@@ -38,6 +38,7 @@ environment variable to a strong key distinct from the gateway client keys,
 and restart llmux2. Open `http://127.0.0.1:8080/dashboard` (or the configured
 gateway address) and enter the dashboard key. Use TLS when accessing it
 remotely. The page keeps the key in memory until you lock or close it.
+The dashboard UI is in Korean.
 
 The dashboard shows response rate, status counts, mean time to response
 (first upstream event for streams), and routed requests, failed attempts,

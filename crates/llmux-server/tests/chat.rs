@@ -373,7 +373,9 @@ async fn dashboard_reports_fallback_and_committed_stream_errors_without_exposing
         .to_str()
         .unwrap()
         .contains("frame-ancestors 'none'"));
-    assert!(body(page).await.contains("Traffic overview"));
+    let page = body(page).await;
+    assert!(page.contains("<html lang=\"ko\">"));
+    assert!(page.contains("게이트웨이 현황"));
     assert!(body(fixture.get("/dashboard/app.js", None).await)
         .await
         .contains("/dashboard/stats"));
