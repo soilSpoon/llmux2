@@ -112,6 +112,16 @@ upstream IDs too; the catch-all is unchanged. Substring lookalikes such as
 are preserved. Non-DeepSeek upstream IDs remain unchanged, including on an
 official DeepSeek connection. Roll back by regenerating with the prior importer.
 Remove that deployment field to roll back stripping.
+Gemini OpenAI-compatible deployments on the exact host
+`generativelanguage.googleapis.com` also strip `seed` and `user`, independent of
+provider or model name. Only those two fields are added: Google's
+[compatibility documentation](https://ai.google.dev/gemini-api/docs/openai) does
+not specify their rejection, while OmniRoute's native Gemini request translator
+constructs a new payload without them. No additional unsupported-field rejection
+is inferred from that translation. Reasoning and logprobs fields are preserved;
+existing DeepSeek stripping is retained if both rules match. Other hosts and
+unsupported adapters are unchanged. Remove the field or regenerate with the
+previous importer to roll back.
 The URL/protocol table comes from
 OmniRoute `open-sse/config/providers/registry/<provider>/index.ts`.
 Custom `openai-compatible` chat and `anthropic-compatible` nodes use `baseUrl`;
