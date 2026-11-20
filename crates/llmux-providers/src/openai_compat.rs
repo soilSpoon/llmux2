@@ -1,4 +1,4 @@
-use crate::sse;
+use crate::{responses, sse};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use http::{
@@ -134,6 +134,7 @@ impl ProviderAdapter for OpenAiCompat {
     fn supports(&self, inbound: InboundFormat) -> Support {
         match inbound {
             InboundFormat::OpenAiChat => Support::Passthrough,
+            InboundFormat::OpenAiResponses => Support::Convert,
             _ => Support::No,
         }
     }
@@ -159,7 +160,11 @@ impl ProviderAdapter for OpenAiCompat {
                     "application/json"
                 },
             )
-            .body(rewrite_model(&req.body, &dep.upstream_model)?)?;
+            .body(if req.format == InboundFormat::OpenAiResponses {
+                responses::request(&req.body, &dep.upstream_model)?
+            } else {
+                rewrite_model(&req.body, &dep.upstream_model)?
+            })?;
 
         match auth {
             AuthMaterial::Bearer(token) => {
@@ -211,17 +216,33 @@ impl ProviderAdapter for OpenAiCompat {
             if !is_sse {
                 return Err(bad_gateway());
             }
-            Ok(GatewayResponse::Stream(sse::decode(body)))
+            let stream = sse::decode(body);
+            Ok(GatewayResponse::Stream(
+                if req.format == InboundFormat::OpenAiResponses {
+                    responses::stream(stream)
+                } else {
+                    stream
+                },
+            ))
         } else {
             let body = collect(body).await?;
             if let Some(error) = embedded_error(&body, &parts.headers, SystemTime::now()) {
                 return Err(error);
             }
+            let (body, usage) = if req.format == InboundFormat::OpenAiResponses {
+                responses::complete(&body).map_err(|()| bad_gateway())?
+            } else {
+                (body, None)
+            };
+            let mut headers = parts.headers;
+            if req.format == InboundFormat::OpenAiResponses {
+                headers.remove(header::CONTENT_LENGTH);
+            }
             Ok(GatewayResponse::Complete {
                 status,
-                headers: parts.headers,
+                headers,
                 body,
-                usage: None,
+                usage,
             })
         }
     }

@@ -1,6 +1,6 @@
 # llmux2
 
-Rust gateway exposing multiple API-key upstreams under one OpenAI-compatible model name. The MVP supports JSON and SSE at `POST /v1/chat/completions`.
+Rust gateway exposing multiple API-key upstreams under one OpenAI-compatible model name. Both `POST /v1/chat/completions` and `POST /v1/responses` support JSON and SSE.
 
 ## Run
 
@@ -15,7 +15,16 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"llama-70b","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-For SSE, add `"stream":true` to the request and use `curl -N`. The gateway rewrites just the top-level request model to the upstream ID; other request fields and successful response payloads pass through.
+For Chat Completions on OpenAI-compatible upstreams, the gateway rewrites only the top-level request model. Other request fields and successful response payloads pass through.
+
+```sh
+curl -sS http://127.0.0.1:8080/v1/responses \
+  -H "Authorization: Bearer $LLMUX_CLIENT_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"llama-70b","input":"Hello"}'
+```
+
+The Responses route translates requests to Chat Completions on OpenAI-compatible upstreams and converts replies back. Stateful Responses conversations and built-in non-function tools are unsupported. For SSE on either route, add `"stream":true` and use `curl -N`.
 
 Credentials use `provider = "openai"` or `"openai_compat"` for OpenAI-compatible upstreams, or `provider = "anthropic"` for the Anthropic Messages API. Anthropic deployments use a base URL such as `https://api.anthropic.com/v1` (the adapter appends `/messages`) and send the key as `x-api-key`. The gateway converts chat requests, JSON responses and SSE chunks between the OpenAI Chat and Anthropic formats, so a model can mix both kinds of deployments and fail over between them.
 
@@ -25,14 +34,14 @@ Lower numeric priority wins, with round-robin ordering among equal priorities. O
 
 `x-llmux-deployment` and `x-llmux-attempts` identify the winning deployment and number of HTTP attempts (not skipped deployments). Set `server.expose_routing_headers = false` to hide them. A stream commits on its first complete SSE event; after that, failures end the stream with an error payload rather than replaying the request.
 
-The MVP does not wire OAuth into server configuration, or implement multi-format translation, hot reload, circuit breakers, or failover on errors other than 429. The providers crate offers an OAuth 2.0 refresh-token credential source for programmatic use. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local RPM uses a bounded per-deployment sliding window only when configured.
+The MVP does not wire OAuth into server configuration, or implement multi-format routing, hot reload, circuit breakers, or failover on errors other than 429. The providers crate offers an OAuth 2.0 refresh-token credential source for programmatic use. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local RPM uses a bounded per-deployment sliding window only when configured.
 
 ## Development
 
 - `llmux-types` defines the shared model, IR, and provider contracts.
 - `llmux-config` parses and validates TOML and secret references.
 - `llmux-core` selects deployments, enforces limits, and executes attempts.
-- `llmux-providers` implements the OpenAI-compatible and Anthropic Messages adapters with static API-key and OAuth refresh-token credential sources (OAuth configuration wiring is not yet available).
+- `llmux-providers` implements the OpenAI-compatible and Anthropic Messages adapters with static API-key and OAuth refresh-token credential sources (OAuth configuration wiring is not yet available), including Responses-to-Chat-Completions conversion.
 - `llmux-server` assembles those crates and serves the HTTP API.
 - `llmux-testkit` provides loopback HTTP fixtures.
 
@@ -50,7 +59,7 @@ python3 bench/mock_upstream.py
 ```
 
 The command builds the release gateway and the `llmux-testkit` Axum mock, starts and stops them
-on ephemeral loopback ports with dummy API keys, and prints a Markdown table
+on ephemeral loopback ports with dummy API keys, and prints Markdown tables
 with direct, via-gateway, and via-minus-direct results. Use `--requests`,
 `--concurrency`, and `--workers` to tune the run, or `--upstream-delay-ms` to
 inject a fixed delay before every mock response. Defaults: no artificial delay, 4,096 timed
@@ -68,8 +77,16 @@ workers per server process.
 - **1,000 RPS JSON target:** An independent arrival schedule offers one request
   per millisecond, without waiting for previous responses. Latency is measured
   from each scheduled arrival through completion, so client queueing is
-  included when workers lag. Via-gateway p99 minus direct p99 is compared to
-  the design's **< 1 ms** target; the result is advisory, not a CI gate.
+  included when workers lag. One untimed direct/gateway warm-up pair is
+  discarded before nine timed pairs alternate the run order. With default
+  settings the fixed-rate workload takes about 82 seconds to schedule. Use
+  `--fixed-rate-rounds` to change the number of timed pairs (at least two;
+  odd counts select an observed pair as the median). The report shows each
+  round's gateway-minus-direct p99, the range of those differences, and
+  separate direct and gateway p99 medians. The median of the paired
+  differences, not the difference of the route medians, is compared to the
+  design's **< 1 ms** target. The verdict is advisory, not a CI gate; a wide
+  range signals noisy measurements.
 - **Memory:** In fresh processes primed with one JSON request, capture idle
   proportional set size (PSS), open the configured number of streams, and hold
   them after their first content event. Report the median of five PSS samples

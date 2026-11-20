@@ -31,6 +31,7 @@ enum Reply {
     Limit(u64),
     Quota(Option<u64>),
     Complete,
+    ResponseStream { complete: bool },
     AbortStream,
     GatedStream(Arc<Semaphore>),
     BadRequest,
@@ -50,7 +51,13 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
     let request: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(request["model"], mock.model);
     assert_eq!(request["messages"][0]["content"], "Hello");
-    assert_eq!(request["vendor_option"]["model"], "leave-me-alone");
+    if request.get("max_completion_tokens").is_some() {
+        assert_eq!(request["max_completion_tokens"], 16);
+        assert!(request.get("input").is_none());
+        assert!(request.get("max_output_tokens").is_none());
+    } else {
+        assert_eq!(request["vendor_option"]["model"], "leave-me-alone");
+    }
     assert_eq!(
         headers[header::AUTHORIZATION],
         format!("Bearer {}", mock.key)
@@ -78,6 +85,16 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
             "object": "chat.completion",
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello!"}, "finish_reason": "stop"}],
         })).into_response(),
+        Reply::ResponseStream { complete } => {
+            assert_eq!(request["stream"], true);
+            assert_eq!(request["stream_options"]["include_usage"], true);
+            let chunk = r#"{"id":"chatcmpl-1","model":"vendor-primary","choices":[{"index":0,"delta":{"content":"Hello!"},"finish_reason":"stop"}]}"#;
+            let tail = if complete { "data: [DONE]\n\n" } else { "" };
+            (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                format!("data: {chunk}\n\n{tail}"),
+            ).into_response()
+        }
         Reply::AbortStream => (
             [(header::CONTENT_TYPE, "text/event-stream")],
             "data: {\"id\":\"partial\"}\n\n",
@@ -231,10 +248,22 @@ priority = 0
             "messages": [{"role": "user", "content": "Hello"}],
             "vendor_option": {"model": "leave-me-alone"},
         });
-        let request = Request::post(format!("{}/v1/chat/completions", self.gateway.url()))
+        self.post("/v1/chat/completions", key, payload.to_string())
+            .await
+    }
+
+    async fn responses(&self, key: &str, model: &str, stream: bool) -> Response {
+        let payload = json!({
+            "model": model, "stream": stream, "input": "Hello", "max_output_tokens": 16,
+        });
+        self.post("/v1/responses", key, payload.to_string()).await
+    }
+
+    async fn post(&self, path: &str, key: &str, payload: impl Into<Bytes>) -> Response {
+        let request = Request::post(format!("{}{path}", self.gateway.url()))
             .header(header::AUTHORIZATION, format!("Bearer {key}"))
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Full::new(Bytes::from(payload.to_string())))
+            .body(Full::new(payload.into()))
             .unwrap();
         timeout(
             Duration::from_secs(5),
@@ -262,6 +291,118 @@ async fn body(response: Response) -> String {
         .unwrap()
         .to_bytes();
     String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn responses_json_uses_alias_and_fails_over() {
+    let fixture = Fixture::start(
+        [Reply::Limit(5), Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture.responses("test-client", "alias", false).await;
+    check_route(&response, "d2", "2");
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+    let output: Value = serde_json::from_str(&body(response).await).unwrap();
+    assert_eq!(output["object"], "response");
+    assert_eq!(output["status"], "completed");
+    assert_eq!(output["output"][0]["content"][0]["text"], "Hello!");
+    assert_eq!(fixture.counts(), [1, 1]);
+}
+
+#[tokio::test]
+async fn responses_sse_preserves_event_names_and_reports_interrupted_streams() {
+    for complete in [true, false] {
+        let fixture = Fixture::start(
+            [Reply::ResponseStream { complete }, Reply::Complete],
+            [Reply::Complete, Reply::Complete],
+            "",
+        )
+        .await;
+        let response = fixture.responses("test-client", "shared", true).await;
+        check_route(&response, "d1", "1");
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+        let text = body(response).await;
+        assert!(!text.contains("[DONE]"));
+        let events: Vec<_> = text.trim_end().split("\n\n").collect();
+        assert!(events[0]
+            .lines()
+            .any(|line| line == "event: response.created"));
+        assert!(events.iter().any(|event| {
+            event
+                .lines()
+                .any(|line| line == "event: response.output_text.delta")
+                && event.contains(r#""delta":"Hello!""#)
+        }));
+        let name = if complete {
+            "response.completed"
+        } else {
+            "error"
+        };
+        let terminal = events.last().unwrap();
+        assert_eq!(
+            terminal
+                .lines()
+                .find_map(|line| line.strip_prefix("event: ")),
+            Some(name)
+        );
+        let payload: Value = serde_json::from_str(
+            terminal
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["type"], name);
+        assert_eq!(payload["sequence_number"], events.len() - 1);
+        if complete {
+            assert_eq!(
+                payload["response"]["output"][0]["content"][0]["text"],
+                "Hello!"
+            );
+        } else {
+            assert_eq!(payload["code"], "stream_broken");
+        }
+        assert_eq!(fixture.counts(), [1, 0]);
+    }
+}
+
+#[tokio::test]
+async fn responses_rejects_invalid_requests_before_contacting_upstream() {
+    let fixture = Fixture::start(
+        [Reply::Complete, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let unauthorized = fixture.responses("wrong", "shared", false).await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(unauthorized.headers()[header::WWW_AUTHENTICATE], "Bearer");
+    let unknown = fixture.responses("test-client", "missing", false).await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    for payload in [
+        r#"{"model":"shared","#,
+        r#"{"model":"shared","input":123}"#,
+        r#"{"model":"shared","input":"Hello","previous_response_id":"resp_old"}"#,
+    ] {
+        let response = fixture.post("/v1/responses", "test-client", payload).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: Value = serde_json::from_str(&body(response).await).unwrap();
+        assert_eq!(payload["error"]["code"], "invalid_request_error");
+    }
+    let oversized = fixture
+        .post(
+            "/v1/responses",
+            "test-client",
+            vec![b' '; 2 * 1024 * 1024 + 1],
+        )
+        .await;
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(fixture.counts(), [0, 0]);
 }
 
 async fn verify_failover(streaming: bool) {

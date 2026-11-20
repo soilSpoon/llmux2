@@ -3,6 +3,7 @@
 mod anthropic;
 pub mod oauth;
 mod openai_compat;
+mod responses;
 mod sse;
 
 pub use anthropic::Anthropic;

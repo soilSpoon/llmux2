@@ -435,13 +435,17 @@ dependencies = [
 name = "llmux-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "axum",
  "bytes",
  "futures-util",
  "http",
  "http-body-util",
+ "hyper",
  "hyper-rustls",
  "hyper-util",
  "llmux-config",
+ "llmux-testkit",
  "llmux-types",
  "thiserror",
  "tokio",
