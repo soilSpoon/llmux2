@@ -636,6 +636,39 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn exhausted_token_windows_observe_the_latest_applicable_reset() {
+        let adapter = Anthropic::new(provider::ANTHROPIC);
+        for (remaining, expected_seconds) in [
+            (["9", "0", "9"], 30),
+            (["9", "9", "0"], 20),
+            (["0", "0", "0"], 30),
+        ] {
+            let now = OffsetDateTime::now_utc();
+            let mut headers = HeaderMap::new();
+            for (((count_header, reset_header), count), seconds) in
+                TOKEN_LIMITS.into_iter().zip(remaining).zip([10, 30, 20])
+            {
+                headers.insert(count_header, HeaderValue::from_static(count));
+                let reset = now + Duration::from_secs(seconds);
+                headers.insert(
+                    reset_header,
+                    reset.format(&Rfc3339).unwrap().parse().unwrap(),
+                );
+            }
+            let before = OffsetDateTime::now_utc();
+            let observation = adapter.observe_limits(&headers).unwrap();
+            let after = OffsetDateTime::now_utc();
+            let selected = now + Duration::from_secs(expected_seconds);
+            assert_eq!(observation.remaining_tokens, Some(0), "{remaining:?}");
+            let actual = observation.reset_tokens.unwrap();
+            assert!(
+                before + actual <= selected && after + actual >= selected,
+                "unexpected reset duration {actual:?} for {remaining:?}"
+            );
+        }
+    }
+
+    #[test]
     fn limit_header_names_match_the_upstream_contract() {
         assert_eq!(
             LIMIT_REMAINING_REQUESTS,
