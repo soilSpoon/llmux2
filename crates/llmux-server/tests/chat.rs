@@ -329,9 +329,13 @@ async fn responses_sse_preserves_event_names_and_reports_interrupted_streams() {
         let text = body(response).await;
         assert!(!text.contains("[DONE]"));
         let events: Vec<_> = text.trim_end().split("\n\n").collect();
-        assert!(events[0].contains("event: response.created\n"));
+        assert!(events[0]
+            .lines()
+            .any(|line| line == "event: response.created"));
         assert!(events.iter().any(|event| {
-            event.contains("event: response.output_text.delta\n")
+            event
+                .lines()
+                .any(|line| line == "event: response.output_text.delta")
                 && event.contains(r#""delta":"Hello!""#)
         }));
         let name = if complete {
@@ -340,7 +344,12 @@ async fn responses_sse_preserves_event_names_and_reports_interrupted_streams() {
             "error"
         };
         let terminal = events.last().unwrap();
-        assert!(terminal.contains(&format!("event: {name}\n")));
+        assert_eq!(
+            terminal
+                .lines()
+                .find_map(|line| line.strip_prefix("event: ")),
+            Some(name)
+        );
         let payload: Value = serde_json::from_str(
             terminal
                 .lines()
