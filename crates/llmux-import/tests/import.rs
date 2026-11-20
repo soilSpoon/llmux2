@@ -399,7 +399,22 @@ fn provider_table_uses_adapter_base_urls_and_unique_ids() {
     });
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("out.toml");
-    llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let catalog = dir.path().join("kilo-models.json");
+    fs::write(
+        &catalog,
+        r#"[{"id":"org/model","pricing":{"prompt":"0","completion":"0"}}]"#,
+    )
+    .unwrap();
+    llmux_import::import_with_options(
+        &root.to_string(),
+        &output,
+        None,
+        &llmux_import::ImportOptions {
+            kilo_free_models: Some(&catalog),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let config = RuntimeConfig::load(output).unwrap();
     for (dep, (_, kind, url)) in config.deployments.iter().zip(llmux_import::PROVIDERS) {
         assert_eq!(dep.provider.0.as_ref(), *kind);

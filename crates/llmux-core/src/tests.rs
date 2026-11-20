@@ -50,16 +50,24 @@ impl ProviderAdapter for Adapter {
         self.observed.lock().unwrap().take()
     }
 
-    fn supports(&self, _: InboundFormat) -> Support {
-        Support::Passthrough
+    fn supports(&self, format: InboundFormat) -> Support {
+        match format {
+            InboundFormat::AnthropicMessages => Support::Convert,
+            _ => Support::Passthrough,
+        }
     }
 
     async fn build_request(
         &self,
-        _: &GatewayRequest,
+        req: &GatewayRequest,
         dep: &Deployment,
         auth: &AuthMaterial,
     ) -> Result<Request<Bytes>, BuildError> {
+        if req.format == InboundFormat::AnthropicMessages
+            && (req.body == "document" || req.body == "image" && dep.idx == DeploymentIdx(2))
+        {
+            return Err(BuildError::UnsupportedConversion);
+        }
         let AuthMaterial::Bearer(token) = auth else {
             panic!("expected bearer")
         };
@@ -172,6 +180,7 @@ async fn fixture_full(
     });
     let deployments = (0..3)
         .map(|i| Deployment {
+            fallback: false,
             idx: DeploymentIdx(i),
             id: format!("dep{i}").into(),
             provider: adapter.kind.clone(),
@@ -736,6 +745,45 @@ async fn repeated_limit_errors_after_stream_start_back_off() {
         cooldowns[1] > Duration::from_millis(1500),
         "a stream that started then hit a limit is not a success: {cooldowns:?}"
     );
+}
+
+#[tokio::test]
+async fn conversion_rejection_distinguishes_rate_limited_compatible_deployments() {
+    for cooldown in [false, true] {
+        let (executor, adapter, _, _server) = fixture_with_models(
+            Vec::new(),
+            false,
+            [None; 3],
+            &[("model", &[0, 2])],
+            llmux_types::QuotaSpec {
+                rpm: (!cooldown).then_some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        let result = executor.execute(request()).await.unwrap();
+        assert_eq!(result.deployment.as_ref(), "dep0");
+        if cooldown {
+            executor.bindings[0]
+                .limits
+                .cool_down(Duration::from_secs(30));
+        }
+        let messages = |body| GatewayRequest {
+            format: InboundFormat::AnthropicMessages,
+            body: Bytes::from_static(body),
+            ..request()
+        };
+        assert!(matches!(
+            executor.execute(messages(b"document")).await,
+            Err(GatewayError::InvalidRequest)
+        ));
+        assert_eq!(adapter.calls.lock().unwrap().len(), 1);
+        assert!(matches!(
+            executor.execute(messages(b"image")).await,
+            Err(GatewayError::AllCandidatesExhausted { attempts: 0, retry_after })
+                if !retry_after.is_zero()
+        ));
+    }
 }
 
 #[tokio::test]

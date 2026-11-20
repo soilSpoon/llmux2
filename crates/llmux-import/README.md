@@ -88,8 +88,8 @@ rules and must resolve to the official gateway URL. Native Horde `/api/v2` roots
 are normalized to its official chat facade; other Horde roots are rejected.
 
 Skip precedence is: unusable/inactive, replacement policy, auth/key validation,
-then provider/URL validation (including loopback). Cloudflare direct/playground
-connections remain skipped with an official Workers AI replacement hint;
+then provider/URL validation (including loopback). Without explicit Workers AI
+opt-in, Cloudflare direct/playground connections remain skipped with an official replacement hint;
 DuckDuckGo/DeepAI bridges are dropped without an official replacement; HMS is
 skipped because custom headers are unsupported. Hints identify custom nodes
 by their provider prefix and contain only fixed documentation URLs, never
@@ -98,6 +98,87 @@ When an anonymous-only import has no client keys, loader validation uses a
 unique temporary public marker file, safe for concurrent imports sharing a
 secrets directory, which is removed on success or error; generated config
 still requires `LLMUX_CLIENT_KEY` and retains no upstream credentials.
+
+### Workers AI, free-only keyed Kilo, and official OpenRouter replacements
+
+```sh
+cargo run --locked -p llmux-import -- \
+  --input export.json --output llmux.toml \
+  --cloudflare-account-id-file /private/cloudflare-account-id \
+  --cloudflare-token-file /private/cloudflare-workers-ai.token \
+  --kilo-free-models /private/kilo-models.json \
+  --kilo-key-file /private/kilo.key \
+  --openrouter-replacements
+```
+
+The public API retains `import(...)` with safe defaults and adds
+`import_with_options(..., &ImportOptions { ... })` for these flags. Both
+Cloudflare paths are required together. The account ID file is read and trimmed;
+it must contain 32 hexadecimal characters. llmux-config does not interpolate
+file references inside URLs, so only that non-secret account ID is embedded in
+`https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1`.
+The token file is **never opened or copied by the importer**; the output contains
+its absolute `file:` reference. The same applies to the optional external Kilo
+key. The runtime must be able to read both files. Import-time validation uses
+the real loader with a temporary public stand-in for external credentials;
+existence, permissions, and contents of these runtime-owned files are deliberately
+not validated. All stand-ins are removed, including on errors. Source-export
+credentials continue to be validated and written as before.
+
+Workers AI opt-in replaces `cloudflare-direct`/`cfpd` and
+`cloudflare-playground`/`cfp` (including custom nodes with those prefixes) with
+the official endpoint, never the bridge URL. Inactive/unusable/OAuth connections
+remain excluded. Other providers' loopback checks are unchanged. Models use a
+small source-linked allowlist in `src/policy.rs`, emitting exact `@cf/...` IDs.
+Unknown, deprecated, and explicitly paid-plan-only models are warned and skipped;
+in particular `@cf/meta/llama-3.2-1b-instruct` is never emitted. Catalog and billing
+eligibility can change; review this allowlist before deployment.
+
+**There is no Workers AI neuron or account-wide spending budget.** Core supports
+`rpm`, `rpd`, `tpm`, `tpd`, and concurrency limits, but request/token counts cannot
+enforce Cloudflare's model-dependent free neuron allowance. Imported Workers AI
+deployments use conservative `quota.rpm = 1`. This is **per deployment**, not per
+account: combos, direct names, and failover can multiply usage. It does not
+guarantee zero charges or stop daily allowance exhaustion. Use a Workers Free
+account/no paid overage at Cloudflare and monitor its account-wide allowance.
+See https://developers.cloudflare.com/workers-ai/platform/pricing/.
+
+Keyed Kilo routes now fail closed unless `--kilo-free-models` supplies a saved
+Kilo `/models` object (`{"data":[...]}`) or an array of model objects. Each row
+needs `id` and `pricing.prompt` **and** `pricing.completion`, both exactly zero.
+Use integer JSON `0` or decimal zero strings such as `"0.000"`; floating-point
+numbers/exponent notation are conservatively rejected to avoid underflow or
+rounding positive prices to zero. A bare array of names, `:free` suffix, or
+`isFree` flag is not pricing evidence. Conflicting duplicate rows fail closed.
+An empty catalog permits no keyed models; missing/malformed pricing excludes the
+model. Refresh the snapshot before deployment; this is static policy, not live
+price enforcement. Without a snapshot, keyed Kilo connections are skipped before
+writing secrets. Anonymous Kilo behavior and authentication are unchanged.
+`--kilo-key-file` adds keyed, official-endpoint free-only fallback connections,
+after existing connections, without replacing anonymous authentication.
+
+`--openrouter-replacements` explicitly enables the reviewed source-linked table
+in `src/replacements.rs`; it never selects OpenRouter or xAI. It emits the listed
+`openrouter/...` names only when the matching official endpoint is already
+connected (including Mistral custom nodes such as `vibe`) or Workers AI is opted
+in. This mode reserves the `openrouter/` namespace: available source combo/alias/
+mapping routes for those names are replaced, not reused with unverified fallback
+legs. Unavailable winning mappings still fail closed; all other namespaces keep
+their existing precedence. Aliases targeting those OpenRouter IDs use the same
+replacement path. Unknown IDs, new-key/paid-only
+providers, unverified transports (including Gemma 31B via Gemini Interactions),
+and unavailable targets remain unrouted with warnings. Source OpenRouter
+connections are skipped in this mode; there is no OpenRouter fallback. Pinned
+OpenRouter connection restrictions are not redirected to unrelated connections.
+Even with `--omniroute-fallback`, OpenRouter names and source aliases, mappings,
+and nested routes are excluded from both fallback deployments and the catch-all.
+Codex exclusions are computed before rewriting source combos, so replacement
+cannot erase owner-only fallback restrictions.
+Reviewed `:batch` IDs are synchronous same-model alternatives, with a warning:
+batch scheduling and discounts are not preserved. Existing connected Anthropic,
+Gemini, and Mistral keys may still be billable; this flag is not a promise of
+free access on those providers. Without it, existing OpenRouter behavior remains
+unchanged.
 
 ### Public model aliases
 

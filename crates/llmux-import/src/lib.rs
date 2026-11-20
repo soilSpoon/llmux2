@@ -5,6 +5,8 @@ mod connection;
 mod db_dump;
 mod direct;
 mod fallback;
+mod policy;
+mod replacements;
 mod upstream;
 mod validation;
 
@@ -27,6 +29,17 @@ pub struct ImportReport {
     pub client_keys: usize,
 }
 
+#[derive(Default)]
+pub struct ImportOptions<'a> {
+    pub cloudflare_account_id_file: Option<&'a Path>,
+    pub cloudflare_token_file: Option<&'a Path>,
+    pub kilo_free_models: Option<&'a Path>,
+    pub kilo_key_file: Option<&'a Path>,
+    pub openrouter_replacements: bool,
+    pub omniroute_fallback: Option<OmniRouteFallback<'a>>,
+}
+
+#[derive(Clone, Copy)]
 pub struct OmniRouteFallback<'a> {
     pub base_url: &'a str,
     pub key: &'a str,
@@ -34,11 +47,12 @@ pub struct OmniRouteFallback<'a> {
 
 struct Connection {
     source_id: String,
-    provider: String,
+    provider: upstream::ProviderIdentity,
     credential: Option<String>,
     kind: String,
     base_url: String,
     priority: i64,
+    policy: policy::ModelPolicy,
 }
 
 // OmniRoute registry/<id>/index.ts; Gemini uses Google's documented OpenAI compatibility API.
@@ -185,6 +199,7 @@ struct Expander<'a> {
     warnings: &'a mut Vec<String>,
     remaining_steps: usize,
     exhausted: bool,
+    policy: &'a policy::Policy,
 }
 
 impl Expander<'_> {
@@ -262,11 +277,21 @@ impl Expander<'_> {
                 ));
                 continue;
             }
-            let candidates: Vec<_> = self
+            let replacement = if p.is_builtin("openrouter") && self.policy.openrouter_replacements {
+                let replacement = replacements::find(model);
+                if replacement.is_none() || !pinned.is_empty() || !allowed.is_empty() {
+                    self.warnings.push(format!("combo {name} step {index}: no verified connected OpenRouter replacement (or source connection restriction)"));
+                    continue;
+                }
+                replacement
+            } else {
+                None
+            };
+            let mut candidates: Vec<_> = self
                 .connections
                 .iter()
                 .filter(|c| {
-                    c.provider == p
+                    replacement.map_or(c.provider == p, |r| replacements::matches(r, c))
                         && if !pinned.is_empty() {
                             c.source_id == pinned
                         } else {
@@ -275,6 +300,13 @@ impl Expander<'_> {
                         }
                 })
                 .collect();
+            if replacement.is_some() {
+                let mut seen = HashSet::new();
+                candidates.retain(|c| seen.insert((&c.base_url, &c.credential)));
+                if model.contains(":batch") {
+                    self.warnings.push(format!("combo {name} step {index}: synchronous same-model replacement does not preserve batch scheduling or discounts"));
+                }
+            }
             if candidates.is_empty() {
                 self.warnings.push(format!("combo {name} step {index}: skipped provider {p}: no eligible imported connection"));
             }
@@ -301,7 +333,19 @@ impl Expander<'_> {
                 self.warnings.push(format!("combo {name} step {index}: truncated connections at 10000-deployment safety limit"));
             }
             for c in candidates.into_iter().take(10_000 - out.len()) {
+                let target = replacement.map_or(model, |r| r.2);
+                let model = match self.policy.model(c.policy, target) {
+                    Ok(model) => model,
+                    Err(reason) => {
+                        self.warnings
+                            .push(format!("combo {name} step {index}: skipped {reason}"));
+                        continue;
+                    }
+                };
                 let mut deployment = json!({"base_url":c.base_url,"upstream_model":model});
+                if c.policy == policy::ModelPolicy::Workers {
+                    deployment["quota"] = json!({"rpm":1});
+                }
                 if let Some(credential) = &c.credential {
                     deployment["credential"] = credential.clone().into();
                 } else {
@@ -322,7 +366,7 @@ pub fn import(
     output: &Path,
     secrets_dir: Option<&Path>,
 ) -> Result<ImportReport, String> {
-    import_with_fallback(input, output, secrets_dir, None)
+    import_with_options(input, output, secrets_dir, &ImportOptions::default())
 }
 
 pub fn import_with_fallback(
@@ -331,6 +375,25 @@ pub fn import_with_fallback(
     secrets_dir: Option<&Path>,
     fallback: Option<OmniRouteFallback<'_>>,
 ) -> Result<ImportReport, String> {
+    import_with_options(
+        input,
+        output,
+        secrets_dir,
+        &ImportOptions {
+            omniroute_fallback: fallback,
+            ..Default::default()
+        },
+    )
+}
+
+pub fn import_with_options(
+    input: &str,
+    output: &Path,
+    secrets_dir: Option<&Path>,
+    options: &ImportOptions<'_>,
+) -> Result<ImportReport, String> {
+    let policy = policy::Policy::load(options)?;
+    let fallback = options.omniroute_fallback;
     if let Some(options) = &fallback {
         if !["env:", "file:"].iter().any(|prefix| {
             options
@@ -397,16 +460,41 @@ pub fn import_with_fallback(
     let mut credentials = Vec::new();
     let mut connections = Vec::new();
     let mut source_ids = HashSet::new();
+    let workers_credential = policy.workers.as_ref().map(|workers| {
+        let id = unique("workers-ai", &mut ids);
+        credentials.push(json!({"id":id,"kind":"api_key","provider":"openai_compat","key":workers.reference}));
+        warnings.push("Workers AI uses rpm=1 per deployment, NOT an account-wide neuron/daily spending cap; enforce free-only billing at Cloudflare".into());
+        connections.push(Connection {source_id:"workers-ai-opt-in".into(),provider:upstream::ProviderIdentity::Builtin("workers-ai".into()),credential:Some(id.clone()),kind:"openai_compat".into(),base_url:workers.base_url.clone(),priority:i64::MAX,policy:policy::ModelPolicy::Workers});
+        id
+    });
     for (index, c) in array(&root, "providerConnections").iter().enumerate() {
         let label = format!("connection {index} ({})", string(c, "id"));
-        let auth = match connection::select_auth(c, array(&root, "providerNodes")) {
+        let identity = connection::identity(c, array(&root, "providerNodes"));
+        if policy.openrouter_replacements && identity == "openrouter" {
+            warnings.push(format!(
+                "{label}: skipped OpenRouter; only verified connected replacements enabled"
+            ));
+            continue;
+        }
+        let auth = match connection::select_auth(
+            c,
+            array(&root, "providerNodes"),
+            policy.workers.is_some(),
+        ) {
             Ok(key) => key,
             Err(reason) => {
                 warnings.push(format!("{label}: skipped {reason}"));
                 continue;
             }
         };
-        let (kind, base_url) = match upstream::resolve(c, array(&root, "providerNodes")) {
+        let (kind, base_url) = match if matches!(auth, connection::SelectedAuth::Workers) {
+            Ok((
+                "openai_compat".into(),
+                policy.workers.as_ref().unwrap().base_url.clone(),
+            ))
+        } else {
+            upstream::resolve(c, array(&root, "providerNodes"))
+        } {
             Ok(provider) => provider,
             Err(reason) => {
                 warnings.push(format!("{label}: skipped {reason}"));
@@ -419,7 +507,14 @@ pub fn import_with_fallback(
             continue;
         }
         let credential = match auth {
+            connection::SelectedAuth::Workers => workers_credential.clone(),
             connection::SelectedAuth::Key(value) => {
+                if policy::kilo(identity) && policy.kilo_free.is_none() {
+                    warnings.push(format!(
+                        "{label}: keyed Kilo requires --kilo-free-models; skipped to avoid cost"
+                    ));
+                    continue;
+                }
                 let id = unique(&format!("upstream-{source_id}"), &mut ids);
                 let key = write_secret(&dir, &id, value)?;
                 credentials.push(json!({"id":id,"kind":"api_key","provider":kind,"key":key}));
@@ -443,11 +538,21 @@ pub fn import_with_fallback(
         };
         connections.push(Connection {
             source_id: source_id.into(),
-            provider: string(c, "provider").into(),
+            provider: upstream::ProviderIdentity::connection(
+                string(c, "provider"),
+                array(&root, "providerNodes"),
+            ),
             credential,
             kind,
             base_url,
             priority: c["priority"].as_i64().unwrap_or(0),
+            policy: if policy::cloudflare(identity) {
+                policy::ModelPolicy::Workers
+            } else if policy::kilo(identity) && matches!(auth, connection::SelectedAuth::Key(_)) {
+                policy::ModelPolicy::KiloFree
+            } else {
+                policy::ModelPolicy::Any
+            },
         });
         if c.get("globalPriority").is_some()
             || c.get("maxConcurrent").is_some()
@@ -456,6 +561,42 @@ pub fn import_with_fallback(
             warnings.push(format!(
                 "{label}: ignored global priority and account-level limits"
             ));
+        }
+    }
+    if let Some(reference) = &policy.kilo_key {
+        if policy.kilo_free.is_none() {
+            warnings.push(
+                "keyed Kilo requires --kilo-free-models; external key skipped to avoid cost".into(),
+            );
+        } else {
+            let id = unique("kilo-external", &mut ids);
+            credentials
+                .push(json!({"id":id,"kind":"api_key","provider":"openai_compat","key":reference}));
+            let mut providers: Vec<_> = connections
+                .iter()
+                .filter(|c| c.base_url == "https://ai-gateway.kilo.ai/api/v1")
+                .map(|c| c.provider.clone())
+                .collect();
+            providers.extend(
+                ["kilo", "kilocode"].map(|id| upstream::ProviderIdentity::Builtin(id.into())),
+            );
+            providers.sort();
+            providers.dedup();
+            let mut external_ids: HashSet<_> = array(&root, "providerConnections")
+                .iter()
+                .map(|c| string(c, "id").to_owned())
+                .collect();
+            for provider in providers {
+                connections.push(Connection {
+                    source_id: unique(&format!("kilo-external-{provider}"), &mut external_ids),
+                    provider,
+                    credential: Some(id.clone()),
+                    kind: "openai_compat".into(),
+                    base_url: "https://ai-gateway.kilo.ai/api/v1".into(),
+                    priority: i64::MAX,
+                    policy: policy::ModelPolicy::KiloFree,
+                });
+            }
         }
     }
     connections.sort_by_key(|c| c.priority);
@@ -499,19 +640,115 @@ pub fn import_with_fallback(
         }
         combos.insert(name, combo);
     }
+    let fallback_exclusions = fallback
+        .map(|_| {
+            let mut excluded = fallback::exclusions(&root, &combos, &combo_ids, "codex")?;
+            if policy.openrouter_replacements {
+                excluded.extend(fallback::exclusions(
+                    &root,
+                    &combos,
+                    &combo_ids,
+                    "openrouter",
+                )?);
+            }
+            Ok::<_, String>(excluded)
+        })
+        .transpose()?;
+    if policy.openrouter_replacements {
+        for name in &order {
+            if let Some(model) = name.strip_prefix("openrouter/") {
+                if let Some(combo) = combos.get_mut(name) {
+                    combo["models"] =
+                        json!([
+                            upstream::ProviderIdentity::Builtin("openrouter".into()).step(model)
+                        ]);
+                    warnings.push(format!(
+                        "combo {name}: source combo replaced by reviewed official-only policy"
+                    ));
+                }
+            }
+        }
+    }
     let nodes = array(&root, "providerNodes");
     let mut direct = direct::collect(&combos, nodes, &connections);
-    let (aliases, mut synthetic) = aliases::prepare(
+    if policy.openrouter_replacements {
+        replacements::seed(&mut direct, &connections);
+    }
+    let mut unavailable_combos = HashSet::new();
+    if policy.openrouter_replacements {
+        let mappings = aliases::sorted_mappings(&root);
+        let targets: HashSet<_> = mappings
+            .iter()
+            .filter_map(|row| combo_ids.get(string(row, "comboId")))
+            .collect();
+        loop {
+            unavailable_combos.clear();
+            for target in &targets {
+                let mut deployments = Vec::new();
+                Expander {
+                    combos: &combos,
+                    connections: &connections,
+                    nodes,
+                    warnings: &mut Vec::new(),
+                    remaining_steps: 1024,
+                    exhausted: false,
+                    policy: &policy,
+                }
+                .expand(target, &mut Vec::new(), &mut deployments);
+                if deployments.is_empty() {
+                    unavailable_combos.insert((*target).clone());
+                }
+            }
+            let blocked: Vec<_> = combos
+                .iter()
+                .filter(|(name, combo)| {
+                    name.starts_with("openrouter/") && !array(combo, "models").is_empty()
+                })
+                .filter(|(name, _)| {
+                    mappings
+                        .iter()
+                        .find(|row| aliases::matches(string(row, "pattern"), name))
+                        .is_some_and(|mapping| {
+                            aliases::mapping_target(
+                                mapping,
+                                &combos,
+                                &combo_ids,
+                                Some(&unavailable_combos),
+                            )
+                            .is_none()
+                        })
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+            if blocked.is_empty() {
+                break;
+            }
+            for name in blocked {
+                if let Some(combo) = combos.get_mut(&name) {
+                    combo["models"] = json!([]);
+                }
+            }
+        }
+    }
+    let (aliases, mut synthetic, unavailable_aliases) = aliases::prepare(
         &root,
         &combos,
         &combo_ids,
         &direct,
         &mut order,
         &mut warnings,
+        policy
+            .openrouter_replacements
+            .then_some(&unavailable_combos),
     );
     direct.extend(direct::collect(&synthetic, nodes, &connections));
     for (name, model) in direct {
-        if combos.contains_key(&name) || direct::reserved(&root, &name) {
+        let official = policy.openrouter_replacements
+            && name
+                .strip_prefix("openrouter/")
+                .is_some_and(|model| replacements::find(model).is_some())
+            && !unavailable_aliases.contains(&name);
+        if combos.contains_key(&name) || (!official && direct::reserved(&root, &name)) {
             warnings.push(format!(
                 "direct {name}: collision; existing combo/alias wins"
             ));
@@ -549,6 +786,7 @@ pub fn import_with_fallback(
             warnings: &mut warnings,
             remaining_steps: 1024,
             exhausted: false,
+            policy: &policy,
         }
         .expand(&name, &mut Vec::new(), &mut deployments);
         if deployments.is_empty() {
@@ -563,8 +801,7 @@ pub fn import_with_fallback(
         models.push(json!({"name":name,"aliases":[],"deployments":deployments}));
     }
     aliases::attach(&mut models, aliases, &mut warnings);
-    if let Some(options) = fallback {
-        let exclusions = fallback::exclusions(&root, &combos, &combo_ids)?;
+    if let (Some(options), Some(exclusions)) = (fallback, fallback_exclusions) {
         let credential = unique("omniroute-fallback", &mut ids);
         credentials.push(
             json!({"id":credential,"kind":"api_key","provider":"openai_compat","key":options.key}),
@@ -607,7 +844,12 @@ pub fn import_with_fallback(
         );
     }
     let config = json!({"server":{"listen":"127.0.0.1:8080","client_keys":client_keys},"credentials":credentials,"models":models});
-    validation::validate(&config, client_count == 0, &dir)?;
+    validation::validate(
+        &config,
+        client_count == 0,
+        &dir,
+        &policy.external_references(),
+    )?;
     let value = toml::Value::try_from(&config).map_err(|_| "could not encode configuration")?;
     let content = toml::to_string_pretty(&value).map_err(|_| "could not encode configuration")?;
     let mut file = OpenOptions::new()

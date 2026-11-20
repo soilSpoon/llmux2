@@ -6,10 +6,9 @@ mod stats;
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
-use http::StatusCode;
+use http::{Request, StatusCode};
 use http_body_util::Full;
 use hyper_util::{
     client::legacy::Client,
@@ -23,7 +22,7 @@ use llmux_types::{
     UpstreamError,
 };
 use stats::AttemptStats;
-pub use stats::DeploymentStats;
+pub use stats::{CatchAllStats, DeploymentStats, FallbackStats};
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
@@ -34,7 +33,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use thiserror::Error;
-use tokio::time::{timeout, timeout_at, Instant};
+use tokio::time::{timeout_at, Instant};
 
 #[derive(Debug, Error)]
 pub enum InitError {
@@ -95,6 +94,7 @@ struct ModelOrder {
 }
 
 pub struct Executor {
+    catch_all_stats: Option<stats::CatchAllCounter>,
     cfg: Arc<RuntimeConfig>,
     bindings: Box<[Binding]>,
     orders: Box<[ModelOrder]>,
@@ -225,6 +225,7 @@ impl Executor {
             .pool_idle_timeout(Duration::from_secs(30))
             .retry_canceled_requests(false);
         Ok(Self {
+            catch_all_stats: cfg.server.dashboard_key.is_some().then(Default::default),
             cfg,
             bindings,
             orders,
@@ -256,6 +257,13 @@ impl Executor {
                 })
             })
             .collect()
+    }
+
+    pub fn catch_all_stats(&self) -> CatchAllStats {
+        self.catch_all_stats
+            .as_ref()
+            .map(|stats| stats.lock().unwrap().clone())
+            .unwrap_or_default()
     }
 
     pub async fn execute(&self, req: GatewayRequest) -> Result<RoutedResponse, GatewayError> {
@@ -327,6 +335,8 @@ impl Executor {
         let deadline = Instant::now() + self.cfg.server.request_timeout;
         let mut attempts = 0;
         let mut last_transient = None;
+        let mut incompatible = Vec::new();
+        let mut unavailable = false;
         'groups: for group in &order.groups {
             let shift = sequence % group.len();
             let (before, after) = model.deployments[group.clone()].split_at(shift);
@@ -337,14 +347,14 @@ impl Executor {
                 let idx = index(idx);
                 let dep = &self.cfg.deployments[idx];
                 let binding = &self.bindings[idx];
-                if binding.disabled.load(Ordering::Relaxed)
-                    || binding.adapter.supports(req.format) == Support::No
-                    || !fits(dep)
+                let support = binding.adapter.supports(req.format);
+                if binding.disabled.load(Ordering::Relaxed) || support == Support::No || !fits(dep)
                 {
                     continue;
                 }
                 let now = Instant::now();
-                if binding.limits.cooldown_until(now).is_some() {
+                if support != Support::Convert && binding.limits.cooldown_until(now).is_some() {
+                    unavailable = true;
                     last_transient = None;
                     continue;
                 }
@@ -356,21 +366,58 @@ impl Executor {
                     if attempts == self.cfg.routing.max_attempts {
                         break 'groups;
                     }
-                    let Some(permit) = binding.limits.admit(needed) else {
+                    let permit = if support == Support::Convert {
+                        None
+                    } else if let Some(permit) = binding.limits.admit(needed) {
+                        Some(permit)
+                    } else {
+                        unavailable = true;
+                        last_transient = None;
+                        break;
+                    };
+                    let attempt_deadline = deadline.min(Instant::now() + dep.timeout);
+                    let upstream =
+                        timeout_at(attempt_deadline, Self::build_request(&req, dep, binding)).await;
+                    if matches!(upstream, Ok(Err(BuildError::UnsupportedConversion))) {
+                        incompatible.push(idx);
+                        break;
+                    }
+                    let Some(permit) = permit.or_else(|| {
+                        if binding.limits.cooldown_until(Instant::now()).is_some() {
+                            None
+                        } else {
+                            binding.limits.admit(needed)
+                        }
+                    }) else {
+                        unavailable = true;
                         last_transient = None;
                         break;
                     };
                     attempts += 1;
-                    let attempt_deadline = deadline.min(Instant::now() + dep.timeout);
-                    let result = timeout_at(attempt_deadline, self.attempt(&req, dep, binding))
-                        .await
-                        .unwrap_or(Err(GatewayError::Client(UpstreamError::Timeout)));
+                    let timed_out = Err(GatewayError::Client(UpstreamError::Timeout));
+                    let result = match upstream {
+                        Ok(Ok(upstream)) => {
+                            timeout_at(attempt_deadline, self.attempt(&req, dep, binding, upstream))
+                                .await
+                                .unwrap_or(timed_out)
+                        }
+                        Ok(Err(BuildError::InvalidBody | BuildError::UnsupportedFormat)) => {
+                            Err(GatewayError::InvalidRequest)
+                        }
+                        Ok(Err(_)) => Err(GatewayError::Internal),
+                        Err(_) => timed_out,
+                    };
                     if let Some(stats) = &binding.stats {
                         stats.record_attempt(result.is_ok());
                     }
                     last_transient = None;
                     match result {
                         Ok(response) => {
+                            if self.cfg.catch_all == Some(model_idx) {
+                                if let Some(stats) = &self.catch_all_stats {
+                                    stats.lock().unwrap().record(&req.model);
+                                }
+                            }
                             if matches!(response, GatewayResponse::Complete { .. }) {
                                 binding.limits.succeeded();
                             }
@@ -445,11 +492,15 @@ impl Executor {
         if let Some(err) = last_transient {
             return Err(GatewayError::Client(err));
         }
+        if attempts == 0 && !unavailable && !incompatible.is_empty() {
+            return Err(GatewayError::InvalidRequest);
+        }
         // The next request can use any compatible deployment, even if retries stopped early.
         let now = Instant::now();
         let earliest = model
             .deployments
             .iter()
+            .filter(|idx| !incompatible.contains(&index(**idx)))
             .filter(|idx| fits(&self.cfg.deployments[index(**idx)]))
             .map(|idx| &self.bindings[index(*idx)])
             .filter(|binding| {
@@ -465,27 +516,26 @@ impl Executor {
         })
     }
 
+    async fn build_request(
+        req: &GatewayRequest,
+        dep: &Deployment,
+        binding: &Binding,
+    ) -> Result<Request<Bytes>, BuildError> {
+        let auth = binding
+            .auth
+            .as_ref()
+            .map_or(Ok(AuthMaterial::None), |source| source.current())
+            .map_err(|_| BuildError::InvalidAuth)?;
+        binding.adapter.build_request(req, dep, &auth).await
+    }
+
     async fn attempt(
         &self,
         req: &GatewayRequest,
         dep: &Deployment,
         binding: &Binding,
+        upstream: Request<Bytes>,
     ) -> Result<GatewayResponse, GatewayError> {
-        let auth = binding
-            .auth
-            .as_ref()
-            .map_or(Ok(AuthMaterial::None), |source| source.current())
-            .map_err(|_| GatewayError::Internal)?;
-        let upstream = binding
-            .adapter
-            .build_request(req, dep, &auth)
-            .await
-            .map_err(|err| match err {
-                BuildError::InvalidBody | BuildError::UnsupportedFormat => {
-                    GatewayError::InvalidRequest
-                }
-                _ => GatewayError::Internal,
-            })?;
         let response = self
             .http
             .request(upstream.map(Full::new))
@@ -519,19 +569,32 @@ impl Executor {
                 let idle_timeout = self.cfg.server.request_timeout.min(dep.timeout);
                 let cooldown = (self.cfg.cooldown.default, self.cfg.cooldown.max);
                 let events = stream::unfold(
-                    Some((events, binding.stats.clone(), binding.limits.clone())),
+                    Some((
+                        events,
+                        binding.stats.clone(),
+                        binding.limits.clone(),
+                        Box::pin(tokio::time::sleep(idle_timeout)),
+                    )),
                     move |state| async move {
-                        let (mut events, stats, limits) = state?;
-                        let error = match timeout(idle_timeout, events.next()).await {
-                            Ok(Some(Ok(event))) => {
-                                return Some((Ok(event), Some((events, stats, limits))))
-                            }
-                            Ok(Some(Err(err))) => err,
-                            Ok(None) => {
-                                limits.succeeded();
-                                return None;
-                            }
-                            Err(_) => UpstreamError::Timeout,
+                        let (mut events, stats, limits, mut idle) = state?;
+                        // Measure idle from each poll, not from the last event: a
+                        // downstream pause must not eat into the upstream idle window.
+                        idle.as_mut().reset(Instant::now() + idle_timeout);
+                        let error = tokio::select! {
+                            next = events.next() => match next {
+                                Some(Ok(event)) => {
+                                    return Some((
+                                        Ok(event),
+                                        Some((events, stats, limits, idle)),
+                                    ));
+                                }
+                                Some(Err(err)) => err,
+                                None => {
+                                    limits.succeeded();
+                                    return None;
+                                }
+                            },
+                            () = &mut idle => UpstreamError::Timeout,
                         };
                         if let Some(stats) = &stats {
                             stats.record_stream_error();

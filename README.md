@@ -88,6 +88,24 @@ over appears as a failed attempt, not a gateway 429. Gateway counts cover
 authorized requests to the chat and Responses endpoints. They count
 responses when ready, not when downstream transfer finishes.
 
+Mark a deployment with optional `fallback = true` (default false) to report
+cutover traffic; this flag never changes routing. Catch-all deployments are
+always fallback, even if explicitly set false. The OmniRoute importer marks
+its generated fallback legs automatically.
+
+`/dashboard/stats` adds a boolean `fallback` per deployment and a top-level
+`fallback` summary (`routed`, `total_routed`, and `share`, a fraction from 0 to 1).
+It uses the existing `routed` counter: an upstream response was obtained, or
+the first stream event was ready. Failed attempts are excluded; later stream
+errors do not undo a routed request. Empty traffic has share zero.
+The UI shows this share and the ten most-used retained catch-all model IDs.
+`catch_all.models` retains the first 256 distinct requested IDs up to 256 UTF-8
+bytes each; additional or longer IDs count in `catch_all.other`. Counts are
+case-sensitive and contain model IDs only, never prompts or authentication
+headers. Model IDs themselves are user-supplied; do not embed secrets in them.
+All counters reset on restart. Remove explicit flags to roll back reporting
+labels; catch-all traffic remains classified as fallback.
+
 Metrics stay in memory on each instance and reset on restart. The chart
 starts collecting when opened; it polls every two seconds. The dashboard
 does not collect prompts, responses, upstream URLs or credential values
@@ -275,7 +293,7 @@ are omitted, so they do not constrain upstream generation. Stateful conversation
 references, explicit Responses system items, and unsupported hosted tools are
 rejected with 400. An incomplete, failed, or interrupted stream is not successful;
 after SSE commitment errors terminate the stream without replaying the request.
-Anthropic inbound is not supported by this adapter.
+Anthropic Messages requests can also be converted through this adapter, with the same model key restrictions and Codex limitations as Chat Completions.
 
 ## xAI OAuth (api.x.ai)
 

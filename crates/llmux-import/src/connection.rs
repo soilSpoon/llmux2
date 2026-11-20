@@ -1,9 +1,11 @@
 use crate::{array, string, valid_secret};
 use serde_json::Value;
 
+#[derive(Clone, Copy)]
 pub(super) enum SelectedAuth<'a> {
     Key(&'a str),
     None,
+    Workers,
 }
 
 pub(super) fn valid_restrictions(step: &Value) -> bool {
@@ -29,7 +31,7 @@ pub(super) fn identity<'a>(connection: &'a Value, nodes: &'a [Value]) -> &'a str
 
 fn replacement(provider: &str) -> Option<&'static str> {
     match provider {
-        "cloudflare-direct" | "cloudflare-playground" => Some(
+        "cloudflare-direct" | "cloudflare-playground" | "cfpd" | "cfp" => Some(
             "replace with a Cloudflare Workers AI account API token at https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1 and a free-eligible model",
         ),
         "duckduckgo-web" | "deepai" | "deepai-code" => Some("no official replacement; dropped"),
@@ -41,6 +43,7 @@ fn replacement(provider: &str) -> Option<&'static str> {
 pub(super) fn select_auth<'a>(
     connection: &'a Value,
     nodes: &[Value],
+    workers: bool,
 ) -> Result<SelectedAuth<'a>, &'static str> {
     if connection["usable"] == false {
         return Err("usable: false");
@@ -49,6 +52,15 @@ pub(super) fn select_auth<'a>(
         return Err("inactive");
     }
     let provider = identity(connection, nodes);
+    if workers && crate::policy::cloudflare(provider) {
+        if matches!(
+            string(connection, "authType"),
+            "apikey" | "api_key" | "api-key" | "none" | "no-auth"
+        ) {
+            return Ok(SelectedAuth::Workers);
+        }
+        return Err("OAuth/token or unsupported auth");
+    }
     if let Some(reason) = replacement(provider) {
         return Err(reason);
     }

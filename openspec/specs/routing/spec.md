@@ -57,6 +57,18 @@ priority ordering.
 WHEN the top-priority deployment is in cooldown
 THEN the request goes to the next eligible deployment regardless of priority.
 
+#### Scenario: Request cannot be converted for the first deployment
+
+WHEN a request uses a feature the selected deployment's adapter cannot convert
+THEN the gateway skips that deployment without consuming an attempt or quota
+or recording an upstream failure, and considers the next deployment.
+
+#### Scenario: Conversion rejected even by rate-limited deployments
+
+WHEN no eligible-format deployment can convert the request, including those
+temporarily rate-limited
+THEN the gateway returns an invalid-request error rather than a rate-limit error.
+
 ### Requirement: Quota-expiry-first priority
 
 Among eligible deployments the gateway SHALL order by:

@@ -1,4 +1,4 @@
-use crate::{responses, sse};
+use crate::{messages, responses, sse};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use http::{
@@ -405,12 +405,44 @@ impl OpenAiCompat {
     }
 }
 
-fn chat_uri(base: &Uri) -> Result<Uri, BuildError> {
+/// `base` joined with an endpoint suffix like `/chat/completions`.
+pub(crate) fn endpoint_uri(base: &Uri, suffix: &str) -> Result<Uri, BuildError> {
     let mut parts = base.clone().into_parts();
-    let path = format!("{}/chat/completions", base.path().trim_end_matches('/'));
+    let path = format!("{}{}", base.path().trim_end_matches('/'), suffix);
     parts.path_and_query = Some(path.parse()?);
     Uri::from_parts(parts).map_err(|err| BuildError::InvalidRequest(err.into()))
 }
+
+/// Insert the credential's headers: `bearer_name: <prefix><token>` for Bearer,
+/// the stored name/value for Header, nothing for None.
+pub(crate) fn apply_auth(
+    headers: &mut HeaderMap,
+    auth: &AuthMaterial,
+    bearer_name: HeaderName,
+    bearer_prefix: &str,
+) -> Result<(), BuildError> {
+    match auth {
+        AuthMaterial::Bearer(token) => {
+            let mut value = HeaderValue::from_str(&format!("{bearer_prefix}{token}"))
+                .map_err(|_| BuildError::InvalidAuth)?;
+            value.set_sensitive(true);
+            headers.insert(bearer_name, value);
+        }
+        AuthMaterial::Header { name, value } => {
+            let mut value = value.clone();
+            value.set_sensitive(true);
+            headers.insert(name.clone(), value);
+        }
+        AuthMaterial::None => {}
+    }
+    Ok(())
+}
+
+/// OpenAI-family rate-limit header names.
+pub(crate) const LIMIT_REMAINING_REQUESTS: &str = "x-ratelimit-remaining-requests";
+pub(crate) const LIMIT_REMAINING_TOKENS: &str = "x-ratelimit-remaining-tokens";
+pub(crate) const LIMIT_RESET_REQUESTS: &str = "x-ratelimit-reset-requests";
+pub(crate) const LIMIT_RESET_TOKENS: &str = "x-ratelimit-reset-tokens";
 
 #[async_trait]
 impl ProviderAdapter for OpenAiCompat {
@@ -421,8 +453,7 @@ impl ProviderAdapter for OpenAiCompat {
     fn supports(&self, inbound: InboundFormat) -> Support {
         match inbound {
             InboundFormat::OpenAiChat => Support::Passthrough,
-            InboundFormat::OpenAiResponses => Support::Convert,
-            _ => Support::No,
+            InboundFormat::OpenAiResponses | InboundFormat::AnthropicMessages => Support::Convert,
         }
     }
 
@@ -437,7 +468,7 @@ impl ProviderAdapter for OpenAiCompat {
         }
         let mut request = Request::builder()
             .method(Method::POST)
-            .uri(chat_uri(&dep.base_url)?)
+            .uri(endpoint_uri(&dep.base_url, "/chat/completions")?)
             .header(header::CONTENT_TYPE, "application/json")
             .header(
                 header::ACCEPT,
@@ -447,26 +478,24 @@ impl ProviderAdapter for OpenAiCompat {
                     "application/json"
                 },
             )
-            .body(if req.format == InboundFormat::OpenAiResponses {
-                responses::request(&req.body, crate::upstream_model(req, dep))?
-            } else {
-                rewrite_model(&req.body, crate::upstream_model(req, dep))?
+            .body(match req.format {
+                InboundFormat::OpenAiResponses => {
+                    responses::request(&req.body, crate::upstream_model(req, dep))?
+                }
+                InboundFormat::AnthropicMessages => {
+                    messages::request(&req.body, crate::upstream_model(req, dep))?
+                }
+                InboundFormat::OpenAiChat => {
+                    rewrite_model(&req.body, crate::upstream_model(req, dep))?
+                }
             })?;
 
-        match auth {
-            AuthMaterial::Bearer(token) => {
-                let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
-                    .map_err(|_| BuildError::InvalidAuth)?;
-                value.set_sensitive(true);
-                request.headers_mut().insert(header::AUTHORIZATION, value);
-            }
-            AuthMaterial::Header { name, value } => {
-                let mut value = value.clone();
-                value.set_sensitive(true);
-                request.headers_mut().insert(name, value);
-            }
-            AuthMaterial::None => {}
-        }
+        apply_auth(
+            request.headers_mut(),
+            auth,
+            header::AUTHORIZATION,
+            "Bearer ",
+        )?;
         Ok(request)
     }
 
@@ -494,6 +523,9 @@ impl ProviderAdapter for OpenAiCompat {
                 return Err(bad_gateway());
             }
             let stream = sse::decode(body);
+            if req.format == InboundFormat::AnthropicMessages {
+                return Ok(GatewayResponse::Stream(messages::stream(stream)));
+            }
             Ok(GatewayResponse::Stream(
                 if req.format == InboundFormat::OpenAiResponses {
                     responses::stream(stream)
@@ -508,13 +540,15 @@ impl ProviderAdapter for OpenAiCompat {
             if let Some(error) = embedded_error(&body, &parts.headers, SystemTime::now()) {
                 return Err(error);
             }
-            let body = if req.format == InboundFormat::OpenAiResponses {
-                responses::complete(&body).map_err(|()| bad_gateway())?
-            } else {
-                body
+            let body = match req.format {
+                InboundFormat::OpenAiResponses => {
+                    responses::complete(&body).map_err(|()| bad_gateway())?
+                }
+                InboundFormat::AnthropicMessages => messages::complete(&body)?,
+                InboundFormat::OpenAiChat => body,
             };
             let mut headers = parts.headers;
-            if req.format == InboundFormat::OpenAiResponses {
+            if req.format != InboundFormat::OpenAiChat {
                 headers.remove(header::CONTENT_LENGTH);
             }
             Ok(GatewayResponse::Complete {
@@ -532,12 +566,10 @@ impl ProviderAdapter for OpenAiCompat {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u32>().ok())
         };
-        let remaining_requests = count("x-ratelimit-remaining-requests");
-        let remaining_tokens = count("x-ratelimit-remaining-tokens");
-        let reset_requests =
-            header_text(headers, "x-ratelimit-reset-requests").and_then(parse_duration);
-        let reset_tokens =
-            header_text(headers, "x-ratelimit-reset-tokens").and_then(parse_duration);
+        let remaining_requests = count(LIMIT_REMAINING_REQUESTS);
+        let remaining_tokens = count(LIMIT_REMAINING_TOKENS);
+        let reset_requests = header_text(headers, LIMIT_RESET_REQUESTS).and_then(parse_duration);
+        let reset_tokens = header_text(headers, LIMIT_RESET_TOKENS).and_then(parse_duration);
         if remaining_requests.is_none()
             && remaining_tokens.is_none()
             && reset_requests.is_none()
@@ -658,9 +690,9 @@ fn classify_error_details(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_ascii_lowercase();
-    let scope = if header_text(headers, "x-ratelimit-remaining-requests") == Some("0") {
+    let scope = if header_text(headers, LIMIT_REMAINING_REQUESTS) == Some("0") {
         Scope::Requests
-    } else if header_text(headers, "x-ratelimit-remaining-tokens") == Some("0")
+    } else if header_text(headers, LIMIT_REMAINING_TOKENS) == Some("0")
         || message.contains("tokens per")
         || kind.contains("tokens")
         || code.contains("tokens")
@@ -683,12 +715,8 @@ fn classify_error_details(
                 .map(|n| Duration::from_secs_f64((n / 1000.0).min(MAX_RETRY.as_secs_f64())))
         })
         .or_else(|| match scope {
-            Scope::Requests => {
-                header_text(headers, "x-ratelimit-reset-requests").and_then(parse_duration)
-            }
-            Scope::Tokens => {
-                header_text(headers, "x-ratelimit-reset-tokens").and_then(parse_duration)
-            }
+            Scope::Requests => header_text(headers, LIMIT_RESET_REQUESTS).and_then(parse_duration),
+            Scope::Tokens => header_text(headers, LIMIT_RESET_TOKENS).and_then(parse_duration),
             Scope::Unknown => None,
         });
     let quota = [code, kind].iter().any(|marker| {
@@ -811,6 +839,160 @@ pub(crate) fn retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Durati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn converts_anthropic_messages_json_and_stream_for_openai_chat() {
+        use futures_util::StreamExt;
+        use http_body_util::Full;
+        use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+        use llmux_testkit::TestServer;
+        use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
+        use serde_json::{json, Value};
+
+        let server = TestServer::start(axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                use axum::response::IntoResponse;
+                assert_eq!(body["model"], "chat-model");
+                assert_eq!(body["max_tokens"], 64);
+                assert_eq!(body["stop"], json!(["end"]));
+                assert_eq!(body["messages"][0], json!({"role":"system","content":"Be brief"}));
+                assert_eq!(body["messages"][1], json!({"role":"user","content":"Hello"}));
+                assert_eq!(body["tools"][0]["function"]["name"], "lookup");
+                assert_eq!(body["tool_choice"]["function"]["name"], "lookup");
+                if body["stream"] == true {
+                    assert_eq!(body["stream_options"]["include_usage"], true);
+                    (
+                        [(header::CONTENT_TYPE,"text/event-stream")],
+                        concat!(
+                            "data: {\"id\":\"chat-1\",\"model\":\"chat-model\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+                            "data: {\"id\":\"chat-1\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+                            "data: {\"id\":\"chat-1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\"}}]}}]}\n\n",
+                            "data: {\"id\":\"chat-1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}\n\n",
+                            "data: [DONE]\n\n",
+                        ),
+                    ).into_response()
+                } else {
+                    axum::Json(json!({
+                        "id":"chat-1","model":"chat-model",
+                        "choices":[{"message":{"content":"Hi","tool_calls":[{"id":"call_1","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}],
+                        "usage":{"prompt_tokens":3,"completion_tokens":4}
+                    })).into_response()
+                }
+            }),
+        )).await.unwrap();
+        let adapter = OpenAiCompat::new("openai_compat");
+        assert_eq!(
+            adapter.supports(InboundFormat::AnthropicMessages),
+            Support::Convert
+        );
+        let deployment = Deployment {
+            idx: DeploymentIdx(0),
+            id: "d".into(),
+            provider: adapter.kind().clone(),
+            credential: "key".into(),
+            base_url: format!("{}/v1", server.url()).parse().unwrap(),
+            upstream_model: "chat-model".into(),
+            priority: 0,
+            quota: QuotaSpec::default(),
+            timeout: Duration::from_secs(5),
+            max_context: None,
+            fallback: false,
+        };
+        let client = Client::builder(TokioExecutor::new()).build_http();
+        for stream in [false, true] {
+            let req = GatewayRequest {
+                format: InboundFormat::AnthropicMessages,
+                model: "alias".into(),
+                stream,
+                body: Bytes::from(
+                    json!({
+                        "model":"alias","stream":stream,"max_tokens":64,"system":"Be brief",
+                        "messages":[{"role":"user","content":"Hello"}],"stop_sequences":["end"],
+                        "tools":[{"name":"lookup","input_schema":{"type":"object"}}],
+                        "tool_choice":{"type":"tool","name":"lookup"}
+                    })
+                    .to_string(),
+                ),
+                est_input_tokens: 0,
+                anthropic_headers: HeaderMap::new(),
+                max_output_tokens: Some(64),
+                context_overflow: None,
+                request_id: RequestId("r".into()),
+            };
+            let upstream = adapter
+                .build_request(&req, &deployment, &AuthMaterial::None)
+                .await
+                .unwrap();
+            let upstream = client.request(upstream.map(Full::new)).await.unwrap();
+            match adapter
+                .parse_response(&req, &deployment, upstream)
+                .await
+                .unwrap()
+            {
+                GatewayResponse::Complete { body, .. } if !stream => {
+                    let message: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(
+                        message["content"],
+                        json!([
+                            {"type":"text","text":"Hi"},
+                            {"type":"tool_use","id":"call_1","name":"lookup","input":{}}
+                        ])
+                    );
+                    assert_eq!(message["stop_reason"], "tool_use");
+                    assert_eq!(
+                        message["usage"],
+                        json!({"input_tokens":3,"output_tokens":4})
+                    );
+                }
+                GatewayResponse::Stream(events) if stream => {
+                    let mut output = Vec::new();
+                    let mut events = events;
+                    while let Some(event) = events.next().await {
+                        let event = event.unwrap();
+                        let value: Value = serde_json::from_str(&event.data).unwrap();
+                        assert_eq!(event.event.as_deref(), value["type"].as_str());
+                        output.push(value);
+                    }
+                    let types: Vec<_> = output
+                        .iter()
+                        .map(|event| event["type"].as_str().unwrap())
+                        .collect();
+                    assert_eq!(
+                        types,
+                        [
+                            "message_start",
+                            "content_block_start",
+                            "content_block_delta",
+                            "content_block_stop",
+                            "content_block_start",
+                            "content_block_delta",
+                            "content_block_delta",
+                            "content_block_stop",
+                            "message_delta",
+                            "message_stop",
+                        ]
+                    );
+                    assert_eq!(output[2]["delta"]["text"], "Hi");
+                    assert_eq!(output[4]["content_block"]["name"], "lookup");
+                    assert_eq!(output[5]["delta"]["partial_json"], "{");
+                    assert_eq!(output[6]["delta"]["partial_json"], "}");
+                    assert_eq!(output[8]["delta"]["stop_reason"], "tool_use");
+                    assert_eq!(output[8]["usage"]["output_tokens"], 4);
+                }
+                _ => panic!("incorrect response format"),
+            }
+        }
+    }
+
+    #[test]
+    fn limit_header_names_match_the_upstream_contract() {
+        assert_eq!(LIMIT_REMAINING_REQUESTS, "x-ratelimit-remaining-requests");
+        assert_eq!(LIMIT_REMAINING_TOKENS, "x-ratelimit-remaining-tokens");
+        assert_eq!(LIMIT_RESET_REQUESTS, "x-ratelimit-reset-requests");
+        assert_eq!(LIMIT_RESET_TOKENS, "x-ratelimit-reset-tokens");
+    }
 
     fn classify(status: u16, body: &str) -> UpstreamError {
         classify_error(
@@ -951,16 +1133,10 @@ mod tests {
             );
         };
         check(&headers, None);
-        headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("20ms"));
+        headers.insert(LIMIT_RESET_TOKENS, HeaderValue::from_static("20ms"));
         check(&headers, Some(Duration::from_millis(20)));
-        headers.insert(
-            "x-ratelimit-remaining-requests",
-            HeaderValue::from_static("0"),
-        );
-        headers.insert(
-            "x-ratelimit-reset-requests",
-            HeaderValue::from_static("6m0s"),
-        );
+        headers.insert(LIMIT_REMAINING_REQUESTS, HeaderValue::from_static("0"));
+        headers.insert(LIMIT_RESET_REQUESTS, HeaderValue::from_static("6m0s"));
         check(&headers, Some(Duration::from_secs(360)));
         headers.insert("retry-after-ms", HeaderValue::from_static("1250"));
         check(&headers, Some(Duration::from_millis(1250)));
@@ -985,31 +1161,19 @@ mod tests {
         let mut headers = HeaderMap::new();
         assert_eq!(adapter.observe_limits(&headers), None);
         headers.insert(
-            "x-ratelimit-remaining-requests",
+            LIMIT_REMAINING_REQUESTS,
             HeaderValue::from_static("invalid"),
         );
-        headers.insert(
-            "x-ratelimit-reset-tokens",
-            HeaderValue::from_static("invalid"),
-        );
+        headers.insert(LIMIT_RESET_TOKENS, HeaderValue::from_static("invalid"));
         assert_eq!(adapter.observe_limits(&headers), None);
-        headers.insert(
-            "x-ratelimit-reset-requests",
-            HeaderValue::from_static("1h2m3.5s"),
-        );
+        headers.insert(LIMIT_RESET_REQUESTS, HeaderValue::from_static("1h2m3.5s"));
         assert_eq!(
             adapter.observe_limits(&headers).unwrap().reset_requests,
             Some(Duration::from_millis(3723500))
         );
-        headers.insert(
-            "x-ratelimit-remaining-requests",
-            HeaderValue::from_static("0"),
-        );
-        headers.insert(
-            "x-ratelimit-remaining-tokens",
-            HeaderValue::from_static("42"),
-        );
-        headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("20ms"));
+        headers.insert(LIMIT_REMAINING_REQUESTS, HeaderValue::from_static("0"));
+        headers.insert(LIMIT_REMAINING_TOKENS, HeaderValue::from_static("42"));
+        headers.insert(LIMIT_RESET_TOKENS, HeaderValue::from_static("20ms"));
         assert_eq!(
             adapter.observe_limits(&headers),
             Some(LimitObservation {

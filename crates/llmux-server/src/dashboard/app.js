@@ -109,7 +109,12 @@ async function poll(current) {
   current.timer = setTimeout(() => poll(current), POLL_MS);
 }
 
-function render(current, { uptime_ms: now, responses, deployments }) {
+function render(current, { uptime_ms: now, responses, deployments, fallback, catch_all }) {
+  text("fallback-share", fmt.format(100 * fallback.share) + "%");
+  text("fallback-count", fmt.format(fallback.routed) + " / " + fmt.format(fallback.total_routed) + "건 라우팅");
+  const models = Object.entries(catch_all.models).sort((a, b) => b[1] - a[1]).slice(0, 10);
+  text("catch-all-models", models.map(([id, count]) => id + " · " + fmt.format(count)).join(" / ") || "아직 요청 없음");
+  text("catch-all-other", "기타 · " + fmt.format(catch_all.other));
   const previous = current.previous;
   const count = total(responses);
   let rate;
@@ -204,6 +209,7 @@ function renderDeployments(deployments) {
     }
     const row = group.insertRow();
     const name = cell(row, dep.id, "deployment");
+    if (dep.fallback) name.append(stateLabel("Fallback", "warn"));
     const provider = document.createElement("small");
     provider.textContent = dep.provider;
     name.append(provider);
