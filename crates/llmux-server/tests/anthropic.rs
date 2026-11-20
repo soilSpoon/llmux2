@@ -41,6 +41,7 @@ const ANTHROPIC_SSE: &str = concat!(
 enum Reply {
     Ok,
     Limit,
+    Image,
 }
 
 struct Upstream {
@@ -75,10 +76,16 @@ async fn messages(State(up): State<Arc<Upstream>>, headers: HeaderMap, body: Byt
     assert_eq!(request["model"], "claude-upstream");
     assert_eq!(request["max_tokens"], 4096);
     assert_eq!(request["system"], "Be brief");
-    assert_eq!(
-        request["messages"],
-        json!([{"role": "user", "content": [{"type": "text", "text": "Hello"}]}])
-    );
+    if matches!(up.reply, Reply::Image) {
+        let source = &request["messages"][0]["content"][0]["source"];
+        assert_eq!(source["type"], "base64");
+        assert_eq!(source["data"].as_str().unwrap().len(), 32_000);
+    } else {
+        assert_eq!(
+            request["messages"],
+            json!([{"role": "user", "content": [{"type": "text", "text": "Hello"}]}])
+        );
+    }
     if let Some(limited) = up.limited() {
         return limited;
     }
@@ -123,6 +130,14 @@ struct Fixture {
 
 impl Fixture {
     async fn start(anthropic: (Reply, i32), openai: (Reply, i32)) -> Self {
+        Self::with_context(anthropic, openai, "").await
+    }
+
+    async fn with_context(
+        anthropic: (Reply, i32),
+        openai: (Reply, i32),
+        capabilities: &str,
+    ) -> Self {
         let (anthropic_reply, anthropic_priority) = anthropic;
         let (openai_reply, openai_priority) = openai;
         let anthropic = Upstream::new(anthropic_reply);
@@ -166,6 +181,7 @@ key = "file:{base}/test-openai"
 
 [[models]]
 name = "assistant"
+{capabilities}
 
 [[models.deployments]]
 id = "claude"
@@ -317,6 +333,25 @@ async fn native_messages_authentication_and_passthrough() {
         );
     }
     assert_eq!(fixture.counts(), [2, 0]);
+}
+
+#[tokio::test]
+async fn native_messages_base64_image_does_not_use_prompt_text_budget() {
+    let fixture = Fixture::with_context(
+        (Reply::Image, 0),
+        (Reply::Ok, 10),
+        "capabilities = { max_context = 4500 }",
+    )
+    .await;
+    let (response, _) = fixture.send_to(
+        "/v1/messages", header::AUTHORIZATION, "Bearer test-client",
+        json!({"model":"assistant","max_tokens":4096,"system":"Be brief",
+            "messages":[{"role":"user","content":[{"type":"image",
+                "source":{"type":"base64","media_type":"image/png","data":"A".repeat(32_000)}}]}]
+        }),
+    ).await;
+    check_route(&response, "claude", "1");
+    assert_eq!(fixture.counts(), [1, 0]);
 }
 
 #[tokio::test]

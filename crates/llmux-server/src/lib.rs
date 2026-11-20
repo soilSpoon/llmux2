@@ -20,7 +20,8 @@ use llmux_config::{ApiKey, RuntimeConfig};
 use llmux_core::{Executor, GatewayError};
 use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
 use llmux_providers::{
-    truncate_middle, Anthropic, OpenAiCompat, OpenAiResponses, RequestMetadata, StaticKey,
+    truncate_middle_for_format, Anthropic, OpenAiCompat, OpenAiResponses, RequestMetadata,
+    StaticKey,
 };
 use llmux_types::{
     ContextOverflow, CredentialSource, GatewayRequest, GatewayResponse, InboundFormat,
@@ -261,11 +262,12 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
         ..
     }) = result
     {
-        if let Some(truncated) = truncate_middle(
+        if let Some(truncated) = truncate_middle_for_format(
             &body,
             metadata.prompt_bytes,
             metadata.max_output_tokens,
             limit,
+            format,
         ) {
             dropped = truncated.dropped;
             result = state
