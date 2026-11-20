@@ -53,10 +53,13 @@ are sanitized and deduplicated. If there are no client keys, set
 
 Built-ins: openai, anthropic, openrouter, groq, deepseek (`ds` step alias),
 mistral, xai, together, fireworks, cerebras, gemini, morph, aihorde, kilo, kilocode.
-One reviewed Antigravity route is imported through existing Gemini API-key
+Two reviewed Antigravity routes are imported through existing Gemini API-key
 connections: `antigravity/gemini-3-flash` uses `gemini-3-flash-preview`, verified
 by the operator using Gemini `models.list` on OCI
 (https://ai.google.dev/api/models#method:-models.list).
+`antigravity/gemini-3.1-flash-lite` uses the GA `gemini-3.1-flash-lite`:
+OCI verified all five Gemini keys list it and `generateContent` returned 200
+with that `modelVersion`. Both routes receive Gemini's `seed`/`user` stripping.
 The direct name, aliases, and combo legs use all eligible built-in Gemini
 connections in priority order. Antigravity source connection pins/allowlists
 cannot transfer to Gemini and are replaced with that eligible set, with a warning;
@@ -174,6 +177,27 @@ and logprobs on DeepSeek; the Free tier allows 10 RPM and 1M tokens/day shared,
 so a 429 falls through to the next leg. Billed XPLabs models (Haiku 5.5,
 Qwen3.8 27B, the 1017 model) keep their declared position. Round-robin combos and
 other names are unchanged.
+
+The existing source combo `gpt-6-luna` also has a reviewed Respan secondary
+policy. After its surviving source legs (Experlabs stays first), the importer
+appends `gpt-6-luna`, `openai/gpt-6-luna`, and `perplexity/gpt-6-luna`, in that
+order, on one active API-key custom OpenAI-compatible connection with prefix
+`respan` and normalized base URL `https://api.respan.ai/api/v1`. OCI verified
+Responses JSON and SSE on this reviewed direct route. Azure OpenAI, Azure
+Foundry, and Bedrock variants are not included. Missing, inactive, OAuth,
+anonymous, Codex, wrong-protocol and wrong-endpoint connections are ineligible.
+The first eligible connection in existing connection-priority order is used;
+this does not rotate across keys. Each upstream ID already present on that
+endpoint is skipped. Existing legs retain their order, appended legs receive
+consecutive priorities, and optional OmniRoute fallback remains last.
+No primary is synthesized for an empty/missing combo. Round-robin combos are
+unchanged with a warning because equal priorities cannot express a secondary.
+Normal endpoint normalization applies (trailing slash and `/chat/completions`
+suffix removal), including connection-level base URL overrides. No live model
+discovery or credential values are included in the generated config/warnings.
+To roll back an individual route, remove its model ID from `secondary.rs`;
+remove the reviewed row to disable all three, then regenerate config.
+
 Gemini uses Google's documented OpenAI-compatible endpoint
 `https://generativelanguage.googleapis.com/v1beta/openai`, not OmniRoute's native
 Gemini protocol endpoint. See https://ai.google.dev/gemini-api/docs/openai.

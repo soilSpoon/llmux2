@@ -38,17 +38,28 @@ THEN the row is skipped with a warning.
 
 ### Requirement: Reviewed Antigravity Gemini replacement
 
-The importer SHALL map only antigravity/gemini-3-flash to
-gemini-3-flash-preview on all eligible built-in Gemini API-key connections in
+The importer SHALL map antigravity/gemini-3-flash to
+gemini-3-flash-preview and antigravity/gemini-3.1-flash-lite to the GA
+gemini-3.1-flash-lite on all eligible built-in Gemini API-key connections in
 priority order, preserving aliases and combo references. Source Antigravity
 connection restrictions SHALL be replaced by the eligible Gemini set with a
 warning. Antigravity OAuth connections SHALL remain skipped. Ordinary OmniRoute
 fallback semantics SHALL apply after native deployments when enabled.
+No other Antigravity models SHALL be mapped. Both reviewed routes SHALL receive
+the Gemini endpoint's seed/user request-field stripping.
 
 #### Scenario: Reviewed Flash route
 
 WHEN a combo or alias resolves to antigravity/gemini-3-flash
 THEN it uses Gemini deployments followed by the optional OmniRoute fallback.
+
+#### Scenario: OCI-verified GA Flash Lite route
+
+WHEN a combo or alias resolves to antigravity/gemini-3.1-flash-lite
+THEN it uses gemini-3.1-flash-lite on eligible Gemini connections in priority
+order, strips seed/user, and appends the optional OmniRoute fallback last.
+OCI verified all five keys list the GA model and generateContent returns 200
+with modelVersion gemini-3.1-flash-lite.
 
 #### Scenario: No eligible Gemini connection
 
@@ -147,6 +158,32 @@ declared position.
 - **WHEN** the XPLabs connection is inactive, unusable, OAuth, on another host or
   prefix, the combo is unreviewed or billed, or the combo uses round-robin
 - **THEN** the combo's deployments are unchanged
+
+### Requirement: Reviewed Respan secondary routes
+For the existing source combo `gpt-6-luna`, the importer SHALL append the
+ordered upstream IDs `gpt-6-luna`, `openai/gpt-6-luna`, and
+`perplexity/gpt-6-luna` after surviving source legs, using one active, usable
+API-key custom openai_compat connection whose node prefix is `respan` and whose
+normalized endpoint is exactly `https://api.respan.ai/api/v1`. This reviewed
+tuple follows OCI verification of Responses JSON and SSE. Azure OpenAI, Azure
+Foundry and Bedrock variants SHALL NOT be added by this policy.
+The importer SHALL use the first eligible connection in existing priority
+order, skip each upstream ID already deployed on that endpoint, preserve source
+leg order and assign consecutive priorities before optional OmniRoute fallback.
+It SHALL NOT use Codex, OAuth or anonymous connections, synthesize a primary for
+an empty/missing combo, or augment unrelated combos. Round-robin combos SHALL
+remain unchanged with a warning. Normal upstream endpoint normalization SHALL
+apply, including connection overrides; generated config and warnings SHALL NOT
+contain credential values. Removing an ID or the reviewed row and regenerating
+config SHALL roll back that part or all of this policy.
+
+#### Scenario: Reviewed secondary follows Experlabs
+- **WHEN** a non-round-robin Luna combo has surviving legs and an eligible Respan connection
+- **THEN** the missing reviewed IDs are appended in declared order on one connection, before fallback
+
+#### Scenario: Unavailable or already declared route
+- **WHEN** the reviewed connection is unavailable or an ID already exists on the reviewed endpoint
+- **THEN** no unavailable or duplicate deployment is added
 
 ### Requirement: Gemini OpenAI endpoint parameter compatibility
 
