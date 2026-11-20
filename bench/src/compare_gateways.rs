@@ -1,7 +1,6 @@
 use crate::Result;
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Bytes, Request};
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -774,12 +773,7 @@ async fn send(gateway: &Value, case: &Value, timeout: f64, secrets: &[String]) -
             case["path"].as_str().ok_or("missing path")?
         );
         validate_url(&url)?;
-        let connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .build();
-        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(connector);
+        let client = crate::http_client::client()?;
         let request = Request::post(url)
             .header(
                 "authorization",
@@ -989,6 +983,7 @@ impl Inputs {
 }
 pub async fn run(args: &[String]) -> Result<()> {
     let inputs=Inputs::parse(args).map_err(|_|"Invalid inputs, over-budget plan, unreadable key/model file, or output already exists. Nothing sent.")?;
+    crate::http_client::client()?;
     let secrets: Vec<_> = inputs
         .gateways
         .iter()

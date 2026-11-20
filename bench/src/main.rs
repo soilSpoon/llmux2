@@ -1,4 +1,5 @@
 mod compare_gateways;
+mod http_client;
 mod live_reliability;
 mod mock_upstream;
 mod process;

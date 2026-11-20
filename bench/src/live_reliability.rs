@@ -1,4 +1,8 @@
-use crate::{process::Directory, Result};
+use crate::{
+    http_client::{client, HttpClient},
+    process::Directory,
+    Result,
+};
 use futures_util::stream;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full, StreamBody};
 use hyper::{
@@ -6,10 +10,7 @@ use hyper::{
     service::service_fn,
     Request, Response,
 };
-use hyper_util::{
-    client::legacy::Client,
-    rt::{TokioExecutor, TokioIo},
-};
+use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -39,10 +40,6 @@ fn deployment_timeout(normal_ms: u64) -> u64 {
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Body = UnsyncBoxBody<Bytes, Error>;
-type HttpClient = Client<
-    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-    Full<Bytes>,
->;
 const PROMPT: &str = "Reply with the single word OK.";
 const HOP: &[&str] = &[
     "connection",
@@ -235,15 +232,6 @@ fn json_response(status: u16, payload: Value) -> Response<Body> {
         .body(full(payload.to_string()))
         .expect("valid response")
 }
-fn client() -> HttpClient {
-    Client::builder(TokioExecutor::new()).build(
-        hyper_rustls::HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .build(),
-    )
-}
 #[derive(Clone)]
 struct Route(Arc<Mutex<RouteState>>);
 struct RouteState {
@@ -302,7 +290,7 @@ impl Lab {
                 fail: false,
                 grants: 0,
             }),
-            client: client(),
+            client: client()?,
         });
         let inner = state.clone();
         let task = tokio::spawn(async move {
@@ -707,7 +695,7 @@ async fn request(url: &str, key: &str, payload: Value) -> Result<Reply> {
         stream: payload["stream"] == true,
     };
     let operation = async {
-        let response = client()
+        let response = client()?
             .request(
                 Request::post(url)
                     .header("authorization", format!("Bearer {key}"))

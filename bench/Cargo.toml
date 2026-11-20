@@ -8,7 +8,7 @@ publish = false
 tokio.workspace = true
 hyper = { workspace = true, features = ["server"] }
 hyper-util.workspace = true
-hyper-rustls.workspace = true
+hyper-rustls = { workspace = true, features = ["native-tokio"] }
 url.workspace = true
 chrono.workspace = true
 http-body-util.workspace = true
