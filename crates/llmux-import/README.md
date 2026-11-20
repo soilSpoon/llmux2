@@ -53,6 +53,11 @@ are sanitized and deduplicated. If there are no client keys, set
 
 Built-ins: openai, anthropic, openrouter, groq, deepseek (`ds` step alias),
 mistral, xai, together, fireworks, cerebras, gemini, morph, aihorde, kilo, kilocode.
+Official DeepSeek deployments set
+`strip_request_fields = ["seed", "user", "safety_identifier", "reasoning.effort"]`
+using the core per-deployment option. `logprobs` and `top_logprobs` are preserved.
+Other providers and custom nodes serving DeepSeek-named models are unchanged.
+Remove that deployment field to roll back stripping.
 The URL/protocol table comes from
 OmniRoute `open-sse/config/providers/registry/<provider>/index.ts`.
 Custom `openai-compatible` chat and `anthropic-compatible` nodes use `baseUrl`;
