@@ -28,6 +28,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn assistant_text_parts_use_valid_input_content() {
+        let value = chat_request(&json!({"messages":[
+            {"role":"assistant","content":"Hello"},
+            {"role":"assistant","content":[{"type":"text","text":"Hello"}]},
+            {"role":"assistant","content":[]},
+        ]}))
+        .unwrap();
+        assert_eq!(
+            value["input"][0],
+            json!({"role":"assistant","content":"Hello"})
+        );
+        assert_eq!(
+            value["input"][1],
+            json!({"role":"assistant","content":[{"type":"input_text","text":"Hello"}]})
+        );
+        assert_eq!(value["input"][2], json!({"role":"assistant","content":[]}));
+        assert!(chat_request(
+            &json!({"messages":[{"role":"assistant","content":[{"type":"text","text":5}]}]})
+        )
+        .is_err());
+    }
+
+    #[test]
     fn assistant_refusals_survive_chat_history_conversion() {
         for message in [
             json!({"role":"assistant","content":null,"refusal":"No"}),
@@ -292,7 +315,7 @@ fn chat_request(chat: &Value) -> Result<Value, BuildError> {
                 let mut content = Vec::new();
                 for part in parts {
                     content.push(match part["type"].as_str() {
-                        Some("text") => json!({"type":if role == "assistant" {"output_text"} else {"input_text"},"text":part["text"].as_str().ok_or(BuildError::InvalidBody)?}),
+                        Some("text") => json!({"type":"input_text","text":part["text"].as_str().ok_or(BuildError::InvalidBody)?}),
                         Some("image_url") => {
                             let mut image = json!({"type":"input_image","image_url":part["image_url"]["url"].as_str().ok_or(BuildError::InvalidBody)?});
                             if let Some(detail) = part["image_url"].get("detail") { image["detail"] = detail.clone(); }
