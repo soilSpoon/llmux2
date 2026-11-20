@@ -117,7 +117,7 @@ impl Default for RawRouting {
             default_strategy: Strategy::Priority,
             max_attempts: 4,
             retry_same_deployment: false,
-            fallback_on: vec![ErrorKind::RateLimited],
+            fallback_on: vec![ErrorKind::RateLimited, ErrorKind::QuotaExhausted],
         }
     }
 }
