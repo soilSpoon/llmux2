@@ -45,15 +45,30 @@ THEN no node headers are inherited.
 
 ### Requirement: DeepSeek parameter compatibility
 
-The importer SHALL configure built-in DeepSeek deployments to strip seed, user,
-safety_identifier, and reasoning.effort through the core strip_request_fields
-option. It SHALL preserve logprobs and top_logprobs, and leave other providers
-and custom nodes unchanged.
+The importer SHALL configure openai and openai_compat adapter deployments with
+DeepSeek upstream model IDs to strip seed, user, safety_identifier, and
+reasoning.effort through the core
+strip_request_fields option. It SHALL preserve logprobs and top_logprobs, and
+leave non-DeepSeek model deployments unchanged. Classification SHALL be
+case-insensitive after routing-prefix stripping: a nonempty deepseek-* final
+model segment or an exact deepseek or
+deepseek-ai vendor segment. The rule SHALL be independent of connection provider
+and public model name, and SHALL include matching fallback upstream IDs.
 
 #### Scenario: DeepSeek combo or direct route
 
-WHEN a route expands onto a built-in DeepSeek connection
+WHEN a route expands onto a DeepSeek upstream model on any connection
 THEN the generated deployment loads with exactly those four stripped fields.
+
+#### Scenario: Non-DeepSeek model or substring lookalike
+
+WHEN the upstream ID is not a DeepSeek model under the matching rule
+THEN no DeepSeek field stripping is added, even on a DeepSeek provider connection.
+
+#### Scenario: DeepSeek model on an unsupported adapter
+
+WHEN a DeepSeek upstream model uses an anthropic-compatible node
+THEN the deployment imports successfully without strip_request_fields.
 
 ### Requirement: Exact API compatibility
 

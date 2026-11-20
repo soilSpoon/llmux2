@@ -15,6 +15,22 @@ fn fixture() -> Value {
 }
 
 #[test]
+fn deepseek_models_on_anthropic_nodes_import_without_stripping() {
+    let mut root = fixture();
+    root["providerNodes"][0]["type"] = json!("anthropic-compatible");
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let config = RuntimeConfig::load(output).unwrap();
+    assert!(!config.deployments.is_empty());
+    for dep in &config.deployments {
+        assert_eq!(dep.upstream_model.as_ref(), "deepseek/test");
+        assert_eq!(dep.provider.0.as_ref(), "anthropic");
+        assert!(dep.strip_request_fields.is_empty());
+    }
+}
+
+#[test]
 fn custom_headers_are_secret_files_and_connection_overrides_replace_node_headers() {
     for override_headers in [
         None,
@@ -119,7 +135,9 @@ fn deepseek_deployments_strip_only_the_four_rejected_fields_through_loader() {
     let config = RuntimeConfig::load(&output).unwrap();
     let mut deepseek = 0;
     for dep in &config.deployments {
-        if dep.credential.as_ref() == "upstream-deepseek" {
+        if dep.credential.as_ref() == "upstream-deepseek"
+            || dep.upstream_model.as_ref() == "deepseek/test"
+        {
             deepseek += 1;
             assert_eq!(
                 dep.strip_request_fields.as_ref(),
@@ -327,4 +345,135 @@ fn empty_model_after_stripping_does_not_emit_a_deployment() {
         .unwrap();
     assert_eq!(error, "no importable models; no configuration written");
     assert!(!output.exists());
+}
+
+#[test]
+fn deepseek_model_ids_on_compatible_hosts_strip_only_rejected_fields() {
+    use llmux_types::ChatRequestField;
+    let deepseek = [
+        "deepseek/deepseek-v4.1-flash:free",
+        "deepseek-v4-1-flash-1017",
+        "deepseek-v4.1-flash",
+        "deepseek/deepseek-v4.1-flash",
+        "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "dealignai/deepseek-v4.1-flash-1017-uncensored",
+        "dealignai/deepseek-v4.1-flash-uncensored-fp8",
+        "deepseek/deepseek-chat",
+        "deepseek/deepseek-chat-v3.1",
+        "deepseek/deepseek-ocr-2",
+        "deepseek/deepseek-r1-0528",
+        "deepseek/deepseek-r1-0528-qwen3-8b",
+        "deepseek/deepseek-r1-turbo",
+        "deepseek/deepseek-v3.2",
+        "deepseek-ai/DeepSeek-V4.1-Flash",
+        "deepseek-v4.1-flash-free",
+        "deepseek-v4-1-flash",
+        "deepseek-v4-flash-1017",
+        "DEEPSEEK/Reasoner",
+        "DEEPSEEK-AI/R1",
+        "vendor/DeEpSeEk-R1:free",
+    ];
+    let other = [
+        "gpt-4.1",
+        "gemini-3-flash-preview",
+        "qwen/qwen3",
+        "notdeepseek-r1",
+        "vendor/not-deepseek-r1",
+        "mydeepseek/model",
+        "deepseekish/r1",
+        "deepseek-ai-tools/other-model",
+        "vendor/deepseek-helper/claude",
+        "deepseek",
+        "deepseek-",
+        "vendor/deepseek-notes.txt/model",
+    ];
+    let mut root = fixture();
+    root["combos"][0]["models"] = deepseek
+        .iter()
+        .chain(other.iter())
+        .map(|id| json!(format!("gateway/{id}")))
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let config = RuntimeConfig::load(output).unwrap();
+    for dep in &config.deployments {
+        if deepseek.contains(&dep.upstream_model.as_ref()) {
+            assert_eq!(
+                dep.strip_request_fields.as_ref(),
+                &[
+                    ChatRequestField::Seed,
+                    ChatRequestField::User,
+                    ChatRequestField::SafetyIdentifier,
+                    ChatRequestField::ReasoningEffort
+                ],
+                "{}",
+                dep.upstream_model
+            );
+            assert!(!dep
+                .strip_request_fields
+                .contains(&ChatRequestField::Logprobs));
+            assert!(!dep
+                .strip_request_fields
+                .contains(&ChatRequestField::TopLogprobs));
+        } else {
+            assert!(other.contains(&dep.upstream_model.as_ref()));
+            assert!(
+                dep.strip_request_fields.is_empty(),
+                "{}",
+                dep.upstream_model
+            );
+        }
+    }
+    let model = &config.models[config.model_names["test"]];
+    assert_eq!(model.deployments.len(), deepseek.len() + other.len());
+}
+
+#[test]
+fn deepseek_stripping_uses_model_identity_not_provider_or_public_combo_name() {
+    let mut root = fixture();
+    root["providerConnections"].as_array_mut().unwrap().push(json!({"id":"official","provider":"deepseek","authType":"apikey","apiKey":"synthetic-official"}));
+    root["combos"] = json!([
+        {"name":"deepseek-public-name","models":["gateway/gpt-4.1"]},
+        {"name":"other-provider-model","models":["deepseek/qwen3"]}
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let config = RuntimeConfig::load(output).unwrap();
+    assert!(config
+        .deployments
+        .iter()
+        .all(|dep| dep.strip_request_fields.is_empty()));
+}
+
+#[test]
+fn deepseek_matching_also_applies_to_fallback_upstream_ids_but_not_catch_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let key = dir.path().join("fallback-key");
+    std::fs::write(&key, "synthetic-fallback").unwrap();
+    let reference = format!("file:{}", key.display());
+    llmux_import::import_with_fallback(
+        &fixture().to_string(),
+        &output,
+        None,
+        Some(llmux_import::OmniRouteFallback {
+            base_url: "http://127.0.0.1:20128/v1",
+            key: &reference,
+        }),
+    )
+    .unwrap();
+    let config = RuntimeConfig::load(output).unwrap();
+    let mut fallback_match = false;
+    for dep in &config.deployments {
+        match dep.upstream_model.as_ref() {
+            "deepseek/test" | "gateway/deepseek/test" | "node/deepseek/test" => {
+                assert_eq!(dep.strip_request_fields.len(), 4);
+                fallback_match |= dep.fallback;
+            }
+            _ => assert!(dep.strip_request_fields.is_empty()),
+        }
+    }
+    assert!(fallback_match);
 }

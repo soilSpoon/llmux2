@@ -67,10 +67,20 @@ The optional OmniRoute fallback follows native deployments using the normal
 fallback rules; omitting the fallback flags leaves only Gemini deployments.
 These use the existing Gemini accounts' quota/billing, not a free-tier guarantee.
 To roll back the mapping, regenerate using the previous importer version.
-Official DeepSeek deployments set
+Deployments with a DeepSeek upstream model ID set
 `strip_request_fields = ["seed", "user", "safety_identifier", "reasoning.effort"]`
-using the core per-deployment option. `logprobs` and `top_logprobs` are preserved.
-Other providers and custom nodes serving DeepSeek-named models are unchanged.
+using the core per-deployment option on `openai` and `openai_compat` adapters,
+independent of the connection provider or public combo name. Other adapters,
+including `anthropic-compatible` nodes, import without field stripping because
+the core does not support it on those protocols.
+After routing-prefix stripping, matching is case-insensitive:
+the final model segment starts with `deepseek-` and has a nonempty suffix, or a
+preceding vendor segment is exactly `deepseek` or `deepseek-ai`. This includes
+DeepSeek models hosted by compatible gateways and applies to matching fallback
+upstream IDs too; the catch-all is unchanged. Substring lookalikes such as
+`notdeepseek-r1` or `deepseekish/r1` do not match. `logprobs` and `top_logprobs`
+are preserved. Non-DeepSeek upstream IDs remain unchanged, including on an
+official DeepSeek connection. Roll back by regenerating with the prior importer.
 Remove that deployment field to roll back stripping.
 The URL/protocol table comes from
 OmniRoute `open-sse/config/providers/registry/<provider>/index.ts`.
