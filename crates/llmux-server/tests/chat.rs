@@ -33,6 +33,7 @@ enum Reply {
     AbortStream,
     GatedStream(Arc<Semaphore>),
     BadRequest,
+    HtmlPayloadTooLarge,
 }
 
 struct Mock {
@@ -82,6 +83,9 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
         }
         Reply::BadRequest => (
             StatusCode::BAD_REQUEST, Json(json!({"error": {"message": "bad input"}})),
+        ).into_response(),
+        Reply::HtmlPayloadTooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE, axum::response::Html("<h1>Proxy error</h1>"),
         ).into_response(),
     }
 }
@@ -366,6 +370,22 @@ async fn invalid_client_key_unknown_model_and_upstream_400_do_not_fail_over() {
         body(bad_request).await,
         r#"{"error":{"message":"bad input"}}"#
     );
+    assert_eq!(fixture.counts(), [1, 0]);
+}
+
+#[tokio::test]
+async fn non_json_upstream_error_preserves_status_and_returns_a_json_error() {
+    let fixture = Fixture::start(
+        [Reply::HtmlPayloadTooLarge, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture.request("test-client", "shared", false).await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+    let output: Value = serde_json::from_str(&body(response).await).unwrap();
+    assert_eq!(output["error"]["code"], "upstream_client_error");
     assert_eq!(fixture.counts(), [1, 0]);
 }
 

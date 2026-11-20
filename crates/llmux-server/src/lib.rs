@@ -20,7 +20,7 @@ use llmux_types::{
     CredentialSource, GatewayRequest, GatewayResponse, InboundFormat, ProviderRegistry, RequestId,
     UpstreamError,
 };
-use serde_json::json;
+use serde_json::{json, value::RawValue};
 use std::{convert::Infallible, error::Error, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 
@@ -180,7 +180,15 @@ fn gateway_error(err: GatewayError) -> Response {
             rate_limited(retry_after.unwrap_or_default())
         }
         GatewayError::Client(UpstreamError::BadRequest { status, body }) => {
-            json_body(status, Body::from(body))
+            if serde_json::from_slice::<&RawValue>(&body).is_ok() {
+                json_body(status, Body::from(body))
+            } else {
+                error(
+                    status,
+                    "upstream_client_error",
+                    "Upstream rejected the request",
+                )
+            }
         }
         GatewayError::Client(UpstreamError::Timeout) => error(
             StatusCode::GATEWAY_TIMEOUT,
