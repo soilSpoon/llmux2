@@ -21,6 +21,10 @@ ADDED_TEST_LINE = re.compile(
 EXEMPTION = re.compile(r"^[ \t]*[-*]?[ \t]*Test exemption:[ \t]*\S.*$", re.IGNORECASE | re.MULTILINE)
 
 
+def is_section(heading):
+    return heading.group(2).strip().lower() in {name.lower() for name in SECTIONS}
+
+
 def sections(body):
     text = COMMENT.sub("", body)
     matches = list(HEADING.finditer(text))
@@ -28,7 +32,8 @@ def sections(body):
     for i, match in enumerate(matches):
         level = len(match.group(1))
         end = next(
-            (m.start() for m in matches[i + 1 :] if len(m.group(1)) <= level), len(text)
+            (m.start() for m in matches[i + 1 :] if len(m.group(1)) <= level or is_section(m)),
+            len(text),
         )
         found[match.group(2).strip().lower()] = HEADING.sub("", text[match.end() : end]).strip()
     return found

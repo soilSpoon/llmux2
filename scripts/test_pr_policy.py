@@ -61,6 +61,12 @@ class TestRequirementTest(unittest.TestCase):
         )
         self.assertEqual(pr_policy.check(body, [], ""), [])
 
+    def test_template_section_at_deeper_level_still_ends_previous_section(self):
+        body = FILLED.replace("Adds X.\n\n## Verification", "### Verification")
+        errors = pr_policy.check(body, [], "")
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Summary", errors[0])
+
     def test_section_with_only_empty_subheading_is_empty(self):
         body = FILLED.replace(
             "Red: `cargo test -p llmux-core x` failed with 500; green: passes.", "### Red"
