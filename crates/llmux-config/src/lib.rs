@@ -649,6 +649,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn credential_quotas_are_shared_limits_that_must_be_positive() {
+        RuntimeConfig::parse(&config(&format!(
+            "{REQUIRED}\nquota = {{ rpm = 20, rpd = 50 }}"
+        )))
+        .expect("credential quota");
+        for quota in ["rpm = 0", "concurrent = 2"] {
+            let err = RuntimeConfig::parse(&config(&format!("{REQUIRED}\nquota = {{ {quota} }}")))
+                .err()
+                .expect(quota);
+            assert!(
+                err.to_string().contains("credential quota"),
+                "{quota}: {err}"
+            );
+        }
+    }
+
     fn config(fields: &str) -> String {
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| std::env::set_var("LLMUX_CONFIG_OAUTH_TEST_SECRET", "test-secret"));
