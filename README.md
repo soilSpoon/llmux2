@@ -82,11 +82,15 @@ probe; only a successful HTTP 200 sends WATCHDOG=1. See the
 migration and rollback instructions, including the host's TCP queue migration
 sysctl.
 
-Deployment uses standalone `llmux2-deploy` and `llmux2-guard` binaries from the
+Deployment uses standalone `llmux2-deploy`, `llmux2-guard` and `llmux2-alert`
+binaries from the
 non-default `llmux2-ops` workspace package. Build them with
 `cargo build --locked --release -p llmux-server -p llmux2-ops`; production hosts
 need neither Python nor Cargo. Installed binary paths and systemd units are
-unchanged; see the guide above for installation commands.
+unchanged; see the guide above for installation commands. `llmux2-alert`
+evaluates `alerts.toml` thresholds (failure ratio over new attempts, cooldown
+and disabled counts, health) against the running gateway and exits nonzero
+with `ALERT` lines for a timer to surface.
 
 ## Live dashboard
 

@@ -1,4 +1,4 @@
-use crate::{scoped_address_parts, Result, Runtime};
+use crate::{alert::Monitor, scoped_address_parts, Result, Runtime};
 use serde_json::{json, Value};
 use std::{
     io::{self, BufRead, BufReader, Read, Write},
@@ -73,6 +73,95 @@ pub fn health(listen: &str) -> Result<bool> {
     };
     Ok(operation().unwrap_or(false))
 }
+/// Authenticated GET against the gateway over plain loopback HTTP.
+/// Returns the status code and full body (capped at 4 MiB).
+pub fn http_get(listen: &str, path: &str, bearer: Option<&str>) -> Result<(u16, Vec<u8>)> {
+    let (host, scope, port) = scoped_address_parts(listen)?;
+    let port = u16::try_from(port).map_err(|_| "Port out of range 0-65535")?;
+    let timeout = Duration::from_secs(2);
+    let address = socket_address(host, port, scope)?;
+    let mut stream = TcpStream::connect_timeout(&address, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let mut request = format!("GET {path} HTTP/1.0\r\nHost: {address}\r\n");
+    if let Some(token) = bearer {
+        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    request.push_str("Connection: close\r\n\r\n");
+    stream.write_all(request.as_bytes())?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    Read::by_ref(&mut reader).take(65537).read_line(&mut line)?;
+    let mut status = line.split_whitespace();
+    if !status.next().is_some_and(|s| s.starts_with("HTTP/")) {
+        return Err("malformed HTTP status line".into());
+    }
+    let code: u16 = status
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or("malformed HTTP status code")?;
+    let mut content_length = None;
+    let mut chunked = false;
+    for _ in 0..100 {
+        line.clear();
+        Read::by_ref(&mut reader).take(65537).read_line(&mut line)?;
+        if line.len() > 65536 {
+            return Err("malformed HTTP headers".into());
+        }
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        if line.is_empty() {
+            return Err("connection closed in headers".into());
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                content_length = Some(
+                    value
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                );
+            }
+            if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+                chunked = value.trim().eq_ignore_ascii_case("chunked");
+            }
+        }
+    }
+    const CAP: u64 = 4 * 1024 * 1024;
+    let mut body = Vec::new();
+    if chunked {
+        loop {
+            let mut size_line = String::new();
+            Read::by_ref(&mut reader)
+                .take(65537)
+                .read_line(&mut size_line)?;
+            let size = u64::from_str_radix(size_line.split(';').next().unwrap_or("").trim(), 16)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if size == 0 {
+                break;
+            }
+            if body.len() as u64 + size > CAP {
+                return Err("response body exceeds 4 MiB cap".into());
+            }
+            let start = body.len();
+            body.resize(start + size as usize, 0);
+            reader.read_exact(&mut body[start..])?;
+            let mut crlf = [0; 2];
+            reader.read_exact(&mut crlf)?;
+            if crlf != *b"\r\n" {
+                return Err("invalid chunk terminator".into());
+            }
+        }
+    } else {
+        let length = content_length.unwrap_or(CAP).min(CAP);
+        Read::by_ref(&mut reader)
+            .take(length)
+            .read_to_end(&mut body)?;
+    }
+    Ok((code, body))
+}
+
 fn health_body(
     reader: &mut impl BufRead,
     chunked: bool,
@@ -191,6 +280,14 @@ impl Runtime for Host {
     }
     fn sleep(&mut self, seconds: f64) {
         thread::sleep(Duration::from_secs_f64(seconds));
+    }
+}
+impl Monitor for Host {
+    fn get(&mut self, listen: &str, path: &str, bearer: Option<&str>) -> Result<(u16, Vec<u8>)> {
+        http_get(listen, path, bearer)
+    }
+    fn health(&mut self, listen: &str) -> Result<bool> {
+        health(listen)
     }
 }
 fn capture(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<io::Result<Vec<u8>>> {
