@@ -27,7 +27,7 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 jsonwebtoken = "9.3"
 rand = "0.8"
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3"
 url = { version = "2", features = ["serde"] }
 webbrowser = "1"
