@@ -33,6 +33,7 @@ pub struct ImportReport {
 pub struct ImportOptions<'a> {
     pub cloudflare_account_id_file: Option<&'a Path>,
     pub cloudflare_token_file: Option<&'a Path>,
+    pub workers_ai_models: Option<&'a Path>,
     pub kilo_free_models: Option<&'a Path>,
     pub kilo_key_file: Option<&'a Path>,
     pub openrouter_replacements: bool,

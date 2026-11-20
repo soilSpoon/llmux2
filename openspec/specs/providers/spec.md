@@ -37,6 +37,18 @@ no credential, for providers that allow anonymous access.
 WHEN a deployment is configured with `auth = "none"` and no credential
 THEN requests are sent upstream without an authorization header.
 
+### Requirement: Deployment-specific Chat Completions field filtering
+
+The OpenAI Chat adapter SHALL omit configured unsupported fields from the
+outbound payload for that deployment in JSON and streaming mode. Unconfigured
+deployments SHALL retain their existing request handling.
+
+#### Scenario: Strict OpenAI-compatible deployment
+
+WHEN an OpenAI Chat deployment is configured to strip an unsupported field
+THEN only the configured field is dropped, including only the `effort` member
+for `reasoning.effort` unless the enclosing object becomes empty.
+
 ### Requirement: Native Anthropic protocol headers
 
 The gateway SHALL forward client `anthropic-version` and `anthropic-beta`

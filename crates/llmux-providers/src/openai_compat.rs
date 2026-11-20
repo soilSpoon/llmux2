@@ -8,9 +8,9 @@ use http::{
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use llmux_types::{
-    AuthError, AuthMaterial, BuildError, CredentialSource, Deployment, GatewayRequest,
-    GatewayResponse, InboundFormat, LimitObservation, ProviderAdapter, ProviderKind, Support,
-    UpstreamError,
+    AuthError, AuthMaterial, BuildError, ChatRequestField, CredentialSource, Deployment,
+    GatewayRequest, GatewayResponse, InboundFormat, LimitObservation, ProviderAdapter,
+    ProviderKind, Support, UpstreamError,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -371,6 +371,54 @@ pub(crate) fn rewrite_model(body: &Bytes, model: &str) -> Result<Bytes, BuildErr
     Ok(rewritten.freeze())
 }
 
+fn strip_request_fields(body: Bytes, strip: &[ChatRequestField]) -> Result<Bytes, BuildError> {
+    if strip.is_empty() {
+        return Ok(body);
+    }
+    let mut fields: RawFields<'_> =
+        serde_json::from_slice(&body).map_err(|_| BuildError::InvalidBody)?;
+    let mut changed = false;
+    let mut reasoning = None;
+    for field in strip {
+        let key = match field {
+            ChatRequestField::Seed => "seed",
+            ChatRequestField::User => "user",
+            ChatRequestField::SafetyIdentifier => "safety_identifier",
+            ChatRequestField::Logprobs => "logprobs",
+            ChatRequestField::TopLogprobs => "top_logprobs",
+            ChatRequestField::ReasoningEffort => {
+                if let Some(mut object) = fields
+                    .get("reasoning")
+                    .and_then(|value| serde_json::from_str::<RawFields<'_>>(value.get()).ok())
+                {
+                    if object.remove("effort").is_some() {
+                        fields.remove("reasoning");
+                        changed = true;
+                        if !object.is_empty() {
+                            reasoning = Some(
+                                serde_json::value::to_raw_value(&object)
+                                    .map_err(|_| BuildError::InvalidBody)?,
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+        };
+        changed |= fields.remove(key).is_some();
+    }
+    if let Some(value) = &reasoning {
+        fields.insert("reasoning".into(), value.as_ref());
+    }
+    if changed {
+        serde_json::to_vec(&fields)
+            .map(Bytes::from)
+            .map_err(|_| BuildError::InvalidBody)
+    } else {
+        Ok(body)
+    }
+}
+
 pub struct StaticKey(AuthMaterial);
 
 impl StaticKey {
@@ -466,6 +514,15 @@ impl ProviderAdapter for OpenAiCompat {
         if self.supports(req.format) == Support::No {
             return Err(BuildError::UnsupportedFormat);
         }
+        let body = match req.format {
+            InboundFormat::OpenAiResponses => {
+                responses::request(&req.body, crate::upstream_model(req, dep))?
+            }
+            InboundFormat::AnthropicMessages => {
+                messages::request(&req.body, crate::upstream_model(req, dep))?
+            }
+            InboundFormat::OpenAiChat => rewrite_model(&req.body, crate::upstream_model(req, dep))?,
+        };
         let mut request = Request::builder()
             .method(Method::POST)
             .uri(endpoint_uri(&dep.base_url, "/chat/completions")?)
@@ -478,17 +535,7 @@ impl ProviderAdapter for OpenAiCompat {
                     "application/json"
                 },
             )
-            .body(match req.format {
-                InboundFormat::OpenAiResponses => {
-                    responses::request(&req.body, crate::upstream_model(req, dep))?
-                }
-                InboundFormat::AnthropicMessages => {
-                    messages::request(&req.body, crate::upstream_model(req, dep))?
-                }
-                InboundFormat::OpenAiChat => {
-                    rewrite_model(&req.body, crate::upstream_model(req, dep))?
-                }
-            })?;
+            .body(strip_request_fields(body, &dep.strip_request_fields)?)?;
 
         apply_auth(
             request.headers_mut(),
@@ -894,6 +941,7 @@ mod tests {
             credential: "key".into(),
             base_url: format!("{}/v1", server.url()).parse().unwrap(),
             upstream_model: "chat-model".into(),
+            strip_request_fields: Box::default(),
             priority: 0,
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(5),

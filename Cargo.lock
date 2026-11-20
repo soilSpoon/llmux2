@@ -775,6 +775,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "llmux-cli"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper-rustls",
+ "hyper-util",
+ "llmux-testkit",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "llmux-config"
 version = "0.1.0"
 dependencies = [
@@ -877,6 +893,7 @@ dependencies = [
 name = "llmux-server"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "axum",
  "futures-util",
  "http",
@@ -887,6 +904,7 @@ dependencies = [
  "llmux-providers",
  "llmux-testkit",
  "llmux-types",
+ "serde",
  "serde_json",
  "subtle",
  "tempfile",

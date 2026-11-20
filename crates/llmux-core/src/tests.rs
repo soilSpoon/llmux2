@@ -191,6 +191,7 @@ async fn fixture_full(
             },
             base_url: server.url().parse().unwrap(),
             upstream_model: "upstream".into(),
+            strip_request_fields: Box::default(),
             priority: i as i32,
             quota: if i < 2 {
                 shared_quota
@@ -222,6 +223,7 @@ async fn fixture_full(
         },
         api_keys: HashMap::new(),
         credential_quotas: HashMap::from([("second".into(), second_quota)]),
+        credential_meta: HashMap::new(),
         oauth: HashMap::new(),
         catch_all: None,
         catch_all_exclude: Vec::new(),
