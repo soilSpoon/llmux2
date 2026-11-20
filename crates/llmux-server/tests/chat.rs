@@ -999,6 +999,8 @@ async fn responses_rejects_invalid_requests_before_contacting_upstream() {
     ] {
         let response = fixture.post("/v1/responses", "test-client", payload).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!response.headers().contains_key("x-llmux-deployment"));
+        assert!(!response.headers().contains_key("x-llmux-attempts"));
         let payload: Value = serde_json::from_str(&body(response).await).unwrap();
         assert_eq!(payload["error"]["code"], "invalid_request_error");
     }

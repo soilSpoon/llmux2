@@ -517,6 +517,12 @@ impl Executor {
                         last_transient = None;
                         break;
                     };
+                    if matches!(
+                        upstream,
+                        Ok(Err(BuildError::InvalidBody | BuildError::UnsupportedFormat))
+                    ) {
+                        return Err(GatewayError::InvalidRequest);
+                    }
                     trace.attempts += 1;
                     trace.last_attempted = Some(idx);
                     let timed_out = Err(GatewayError::Client(UpstreamError::Timeout));
@@ -525,9 +531,6 @@ impl Executor {
                             timeout_at(attempt_deadline, self.attempt(&req, dep, binding, upstream))
                                 .await
                                 .unwrap_or(timed_out)
-                        }
-                        Ok(Err(BuildError::InvalidBody | BuildError::UnsupportedFormat)) => {
-                            Err(GatewayError::InvalidRequest)
                         }
                         Ok(Err(_)) => Err(GatewayError::Internal),
                         Err(_) => timed_out,

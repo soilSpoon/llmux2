@@ -51,7 +51,7 @@ impl FallbackStats {
 
 pub(crate) type CatchAllCounter = Mutex<CatchAllStats>;
 
-const FAILURE_CLASSES: [&str; 11] = [
+const FAILURE_CLASSES: [&str; 10] = [
     "rate_limited",
     "quota_exhausted",
     "auth",
@@ -61,7 +61,6 @@ const FAILURE_CLASSES: [&str; 11] = [
     "timeout",
     "connect_error",
     "stream_broken",
-    "invalid_request",
     "internal",
 ];
 
@@ -146,8 +145,7 @@ impl AttemptStats {
             self.failed_attempts.fetch_add(1, Relaxed);
             let index = match error {
                 GatewayError::Client(error) => failure_index(error.kind()),
-                GatewayError::InvalidRequest => 9,
-                _ => 10,
+                _ => 9,
             };
             self.failure_classes[index].fetch_add(1, Relaxed);
         } else {
