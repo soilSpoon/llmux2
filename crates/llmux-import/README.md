@@ -22,7 +22,8 @@ retrying. Non-Unix secure file creation is not supported.
 Active API-key connections become credentials. Each nonempty combo becomes a
 canonical model; connection priorities sort ascending within each step. Pinned
 connections and allowed-connection lists restrict selection. Nested combos expand
-inline (cycle/depth/deployment limits); nested routing policy is not preserved.
+inline (cycle/depth/deployment limits and a 1024-step work budget per top-level
+combo, including references producing no deployments); nested routing policy is not preserved.
 Round-robin combos use equal deployment priority; other unsupported strategies
 are approximated as sequential priority. Warnings and an import summary go to
 stderr. Model names may contain spaces or punctuation in llmux; generated IDs

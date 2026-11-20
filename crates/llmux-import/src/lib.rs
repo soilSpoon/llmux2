@@ -174,6 +174,8 @@ struct Expander<'a> {
     connections: &'a [Connection],
     nodes: &'a [Value],
     warnings: &'a mut Vec<String>,
+    remaining_steps: usize,
+    exhausted: bool,
 }
 
 impl Expander<'_> {
@@ -191,6 +193,18 @@ impl Expander<'_> {
         };
         stack.push(name.to_owned());
         for (index, step) in array(combo, "models").iter().enumerate() {
+            if self.exhausted {
+                break;
+            }
+            if self.remaining_steps == 0 {
+                self.exhausted = true;
+                self.warnings.push(format!(
+                    "combo {}: stopped expansion at 1024-step work budget",
+                    stack[0]
+                ));
+                break;
+            }
+            self.remaining_steps -= 1;
             if out.len() >= 10_000 {
                 self.warnings.push(format!(
                     "combo {name}: skipped remaining steps at 10000-deployment safety limit"
@@ -468,6 +482,8 @@ pub fn import(
             connections: &connections,
             nodes: array(&root, "providerNodes"),
             warnings: &mut warnings,
+            remaining_steps: 1024,
+            exhausted: false,
         }
         .expand(&name, &mut Vec::new(), &mut deployments);
         if deployments.is_empty() {

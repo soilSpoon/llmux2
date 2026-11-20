@@ -360,3 +360,34 @@ fn restricted_client_policies_fail_closed() {
         llmux_import::import(&root.to_string(), &dir.path().join("out.toml"), None).unwrap();
     assert_eq!(report.client_keys, 1);
 }
+
+#[test]
+fn shared_empty_combo_diamonds_have_bounded_work() {
+    let mut root: Value = serde_json::from_str(FIXTURE).unwrap();
+    let mut combos = vec![json!({"name":"usable", "models":["openai/ok"]})];
+    for i in 0..31 {
+        let child = if i == 30 {
+            "unknown/empty".to_owned()
+        } else {
+            format!("diamond-{}", i + 1)
+        };
+        combos.push(json!({"name":format!("diamond-{i}"), "models":[child,child]}));
+    }
+    root["combos"] = combos.into();
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let started = std::time::Instant::now();
+    let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(report.models, 1);
+    assert!(report.warnings.len() < 70_000);
+    assert_eq!(
+        report
+            .warnings
+            .iter()
+            .filter(|w| w.contains("combo diamond-0: stopped expansion at 1024-step work budget"))
+            .count(),
+        1
+    );
+    assert!(RuntimeConfig::load(output).is_ok());
+}
