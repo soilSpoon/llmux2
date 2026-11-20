@@ -169,6 +169,13 @@ pub(crate) fn complete_chat(chat: &Value) -> Result<(Value, Option<Usage>), Upst
     if let Some(text) = message.get("content").and_then(Value::as_str) {
         content.push(json!({"type":"text","text":text}));
     }
+    let refusal = message
+        .get("refusal")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    if let Some(text) = refusal {
+        content.push(json!({"type":"text","text":text}));
+    }
     if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
         for call in calls {
             let parameters: Value = serde_json::from_str(
@@ -191,7 +198,11 @@ pub(crate) fn complete_chat(chat: &Value) -> Result<(Value, Option<Usage>), Upst
     let body = envelope(
         chat,
         content,
-        json!(stop(&choice["finish_reason"])),
+        json!(if refusal.is_some() {
+            "refusal"
+        } else {
+            stop(&choice["finish_reason"])
+        }),
         usage.unwrap_or_default(),
     );
     Ok((body, usage))
@@ -219,10 +230,12 @@ pub(crate) fn stream(
         let mut next = 0;
         let mut tokens = Usage::default();
         let mut reason = None;
+        let mut refusal = false;
         while let Some(chunk) = input.next().await {
             let chunk = chunk?;
             if chunk.data == "[DONE]" {
                 let finish = reason.ok_or_else(bad_gateway)?;
+                let finish = if refusal { "refusal" } else { finish };
                 if let Some(index) = text {
                     yield block_stop(index);
                 }
@@ -247,7 +260,12 @@ pub(crate) fn stream(
                 started = true;
             }
             let delta = &choice["delta"];
-            if let Some(fragment) = delta["content"].as_str().filter(|s| !s.is_empty()) {
+            if delta["refusal"].as_str().is_some_and(|s| !s.is_empty()) {
+                refusal = true;
+            }
+            for fragment in ["content", "refusal"].into_iter()
+                .filter_map(|field| delta[field].as_str().filter(|s| !s.is_empty()))
+            {
                 let index = if let Some(index) = text { index } else {
                     let index = next;
                     next += 1;
@@ -283,4 +301,43 @@ pub(crate) fn stream(
         }
         Err(bad_gateway())?;
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::stream;
+
+    #[tokio::test]
+    async fn messages_conversion_preserves_refusals() {
+        let chat = json!({
+            "id":"chat","model":"model","choices":[{"message":{"content":null,"refusal":"Cannot help."},"finish_reason":"stop"}]
+        });
+        let (complete, _) = complete_chat(&chat).unwrap();
+        let input = [
+            json!({"id":"chat","model":"model","choices":[{"delta":{"refusal":"Cannot "}}]})
+                .to_string(),
+            json!({"choices":[{"delta":{"refusal":"help."},"finish_reason":"stop"}]}).to_string(),
+            "[DONE]".into(),
+        ];
+        let events: Vec<_> = super::stream(Box::pin(stream::iter(
+            input
+                .into_iter()
+                .map(|data| Ok(SseEvent { event: None, data })),
+        )))
+        .map(|event| serde_json::from_str::<Value>(&event.unwrap().data).unwrap())
+        .collect()
+        .await;
+        let text: String = events
+            .iter()
+            .filter_map(|event| event["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(
+            complete["content"],
+            json!([{"type":"text","text":"Cannot help."}])
+        );
+        assert_eq!(complete["stop_reason"], "refusal");
+        assert_eq!(text, "Cannot help.");
+        assert_eq!(events[events.len() - 2]["delta"]["stop_reason"], "refusal");
+    }
 }

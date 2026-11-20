@@ -506,6 +506,45 @@ fn chat_stream(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn messages_conversion_preserves_responses_refusals() {
+        let response = json!({"id":"r1","model":"model","status":"completed","output":[
+            {"type":"message","content":[{"type":"refusal","refusal":"Cannot help."}]}
+        ]});
+        let (message, _) = messages::complete_chat(&chat_complete(&response).unwrap()).unwrap();
+        assert_eq!(
+            message["content"],
+            json!([{"type":"text","text":"Cannot help."}])
+        );
+        assert_eq!(message["stop_reason"], "refusal");
+
+        let upstream = [
+            json!({"type":"response.created","response":response}),
+            json!({"type":"response.refusal.delta","delta":"Cannot help."}),
+            json!({"type":"response.completed","response":response}),
+        ];
+        let events: Vec<Value> = messages::stream(chat_stream(
+            Box::pin(futures_util::stream::iter(upstream.into_iter().map(
+                |value| {
+                    Ok(SseEvent {
+                        event: None,
+                        data: value.to_string(),
+                    })
+                },
+            ))),
+            false,
+        ))
+        .map(|event| serde_json::from_str(&event.unwrap().data).unwrap())
+        .collect()
+        .await;
+        assert!(events
+            .iter()
+            .any(|event| event["delta"]["text"] == "Cannot help."));
+        assert!(events
+            .iter()
+            .any(|event| event["delta"]["stop_reason"] == "refusal"));
+    }
+
     #[test]
     fn converts_anthropic_messages_for_responses_deployments() {
         assert_eq!(
