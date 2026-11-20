@@ -90,18 +90,7 @@ impl ProviderAdapter for OpenAiResponses {
                 SystemTime::now(),
             ));
         }
-        if !parts
-            .headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| {
-                v.split(';')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .eq_ignore_ascii_case("text/event-stream")
-            })
-        {
+        if !sse::is_event_stream(&parts.headers) {
             return Err(bad_gateway());
         }
         let stream = validated(sse::decode(body));

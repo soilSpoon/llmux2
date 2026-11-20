@@ -491,18 +491,7 @@ impl ProviderAdapter for Anthropic {
             _ => {}
         }
         if req.stream {
-            if !parts
-                .headers
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|s| {
-                    s.split(';')
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .eq_ignore_ascii_case("text/event-stream")
-                })
-            {
+            if !sse::is_event_stream(&parts.headers) {
                 return Err(bad_gateway());
             }
             let events = sse::decode_until(body, true);
