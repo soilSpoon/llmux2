@@ -6,6 +6,36 @@ Moving CheaperInference traffic from OmniRoute onto llmux2.
 
 ## Requirements
 
+### Requirement: Import native context-window overrides
+
+The importer SHALL map valid model_context_overrides rows, and their camel-case
+export equivalents, to the existing native deployment max_context field using
+the routing provider identity and exact upstream model ID. Token counts SHALL
+be positive u32 integers. Invalid and duplicate rows SHALL warn without exposing
+their values. Reports SHALL count applied, unmatched, and invalid rows separately.
+Unsupported capability override rows SHALL be counted and SHALL NOT be treated
+as total context windows. No new output-token clamp or model-list metadata SHALL
+be introduced by this import behavior.
+
+#### Scenario: Mixed native combo and aliases
+
+WHEN native combo members have different context overrides
+THEN direct, nested, and aliased routes retain each deployment's own limit
+AND existing context-fit routing uses those limits.
+
+#### Scenario: Unimported target or unknown fallback capacity
+
+WHEN an override targets no imported native deployment
+THEN it is counted as ignored and does not create a route
+AND OmniRoute fallback deployments do not inherit native context overrides.
+
+#### Scenario: Missing or invalid overrides
+
+WHEN the override table is absent or empty
+THEN existing deployment limits remain unchanged
+WHEN a row has an invalid token count
+THEN the row is skipped with a warning.
+
 ### Requirement: Reviewed Antigravity Gemini replacement
 
 The importer SHALL map only antigravity/gemini-3-flash to

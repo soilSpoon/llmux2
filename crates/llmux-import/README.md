@@ -67,6 +67,36 @@ The optional OmniRoute fallback follows native deployments using the normal
 fallback rules; omitting the fallback flags leaves only Gemini deployments.
 These use the existing Gemini accounts' quota/billing, not a free-tier guarantee.
 To roll back the mapping, regenerate using the previous importer version.
+
+### Context-window overrides
+
+`modelContextOverrides` export rows (`provider`, `modelId`, `realContext`)
+and SQLite `model_context_overrides` rows (`provider`, `model_id`, `real_context`)
+set the existing deployment `max_context` field. Values must be positive integer
+token counts that fit `u32`. Provider identities use the same custom-node and
+registry-alias rules as routing. Model IDs match the actual upstream model
+exactly, including embedded slashes; limits are not copied from a replaced
+checkpoint onto its replacement. Both manual and auto-discovered rows apply.
+
+Combos, nested combos, and aliases retain each native deployment's own limit;
+there is no invented single window for a heterogeneous combo. OmniRoute fallback
+deployments remain unchecked because their capacity is unknown. This uses the
+gateway's existing context-fit routing (prompt estimate plus requested output),
+not a new token clamp or output-limit policy. `/v1/models` is unchanged and does
+not advertise these limits; the admin model metadata still exposes the existing
+model-level capability field, not per-deployment overrides.
+
+The import report counts applied rows once, ignored rows with no imported native
+deployment, and invalid rows. Duplicate normalized provider/model keys keep the
+first valid row and warn. Invalid values warn without echoing their contents.
+`model_capability_overrides` / `modelCapabilityOverrides` rows are counted as
+unsupported: input-only limits, output-only limits, and message-part limits must
+not be misrepresented as total context windows. No capability/output enforcement
+is added. With no context rows, deployment limits remain unchanged. To roll back,
+regenerate with the previous importer or omit the context override table.
+
+### Provider parameter compatibility
+
 Deployments with a DeepSeek upstream model ID set
 `strip_request_fields = ["seed", "user", "safety_identifier", "reasoning.effort"]`
 using the core per-deployment option on `openai` and `openai_compat` adapters,
