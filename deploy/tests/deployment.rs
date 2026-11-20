@@ -345,6 +345,25 @@ fn stopped_slots_deploy_to_the_unrecorded_slot() {
     }
 }
 #[test]
+fn record_with_only_a_valid_slot_still_guides_slot_choice() {
+    let mut f = Fixture::new();
+    f.ops.runtime.active.clear();
+    fs::create_dir(f.temp.0.join("bin")).unwrap();
+    fs::write(f.temp.0.join("bin/llmux-server-a"), b"good").unwrap();
+    fs::write(
+        f.temp.0.join("active.json"),
+        json!({"slot":"a","listen":"bad"}).to_string(),
+    )
+    .unwrap();
+    f.ops.runtime.healthy = false;
+    assert!(f.deploy().unwrap_err().to_string().contains("health"));
+    assert_eq!(
+        fs::read(f.temp.0.join("bin/llmux-server-a")).unwrap(),
+        b"good"
+    );
+    assert!(f.called("stop", "b"));
+}
+#[test]
 fn invalid_record_does_not_block_redeploy() {
     let mut f = Fixture::new();
     f.ops.runtime.active.clear();

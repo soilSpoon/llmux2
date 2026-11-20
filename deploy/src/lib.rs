@@ -112,6 +112,14 @@ impl<R: Runtime> Deployment<R> {
         }
         Ok(active)
     }
+    fn recorded_slot(&self) -> Option<String> {
+        let record: Value =
+            serde_json::from_slice(&fs::read(self.root.join("active.json")).ok()?).ok()?;
+        match record["slot"].as_str() {
+            Some(slot @ ("a" | "b")) => Some(slot.into()),
+            _ => None,
+        }
+    }
     pub fn record(&self) -> Result<Option<Value>> {
         let bytes = match fs::read(self.root.join("active.json")) {
             Ok(bytes) => bytes,
@@ -175,10 +183,10 @@ impl<R: Runtime> Deployment<R> {
             Some(_) => "a",
             // With nothing running, stage over the slot the record does not
             // name so a failed deploy leaves a working recovery build.
-            None => match self.record() {
-                Ok(Some(record)) if record["slot"] == "a" => "b",
-                // An unreadable record cannot identify a recovery build; a
-                // successful deploy rewrites it, so do not block on it.
+            None => match self.recorded_slot().as_deref() {
+                Some("a") => "b",
+                // A record without a usable slot cannot identify a recovery
+                // build; a successful deploy rewrites it, so do not block.
                 _ => "a",
             },
         };
