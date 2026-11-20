@@ -34,6 +34,7 @@ enum Reply {
     NegotiatedStream(Value),
     ResponseStream { complete: bool },
     AbortStream,
+    EmptyStream,
     GatedStream(Arc<Semaphore>),
     BadRequest,
     StructuredBadRequest(Value),
@@ -112,6 +113,7 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
             [(header::CONTENT_TYPE, "text/event-stream")],
             "data: {\"id\":\"partial\"}\n\n",
         ).into_response(),
+        Reply::EmptyStream => ([(header::CONTENT_TYPE, "text/event-stream")], "").into_response(),
         Reply::GatedStream(gate) => {
             let events = stream::once(async { Ok::<_, Infallible>(Bytes::from_static(b"data: {\"id\":\"chunk-1\"}\n\n")) })
                 .chain(stream::once(async move {
@@ -830,6 +832,21 @@ async fn never_retries_after_stream_event() {
     assert!(output.contains("\"code\":\"stream_broken\""));
     assert!(!output.contains("[DONE]"));
     assert_eq!(fixture.counts(), [1, 0]);
+}
+
+#[tokio::test]
+async fn stream_closed_before_first_event_fails_over() {
+    let fixture = Fixture::start(
+        [Reply::EmptyStream, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture.request("test-client", "shared", true).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    check_route(&response, "d2", "2");
+    assert!(body(response).await.contains("[DONE]"));
+    assert_eq!(fixture.counts(), [1, 1]);
 }
 
 #[tokio::test]
