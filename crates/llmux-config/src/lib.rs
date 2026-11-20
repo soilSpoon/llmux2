@@ -98,6 +98,7 @@ struct RawConfig {
     routing: RawRouting,
     #[serde(default)]
     cooldown: RawCooldown,
+    #[serde(default)]
     credentials: Vec<RawCredential>,
     models: Vec<RawModel>,
 }
@@ -202,7 +203,9 @@ struct RawModel {
 #[serde(deny_unknown_fields)]
 struct RawDeployment {
     id: String,
-    credential: String,
+    credential: Option<String>,
+    auth: Option<DeploymentAuth>,
+    provider: Option<String>,
     base_url: String,
     upstream_model: String,
     #[serde(default)]
@@ -214,6 +217,12 @@ struct RawDeployment {
     quota: QuotaSpec,
     timeout_ms: Option<u64>,
     max_context: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DeploymentAuth {
+    None,
 }
 
 impl RawConfig {
@@ -397,10 +406,18 @@ impl RawConfig {
                 if !valid_identifier(&id) || !deployment_ids.insert(id.clone()) {
                     return Err(invalid("deployment IDs must be unique and use ASCII letters, digits, '.', '_' or '-'"));
                 }
-                let provider = provider_kinds
-                    .get(dep.credential.as_str())
-                    .cloned()
-                    .ok_or_else(|| invalid("deployment references an unknown credential"))?;
+                let provider = match (&dep.auth, &dep.credential, &dep.provider) {
+                    (Some(DeploymentAuth::None), None, Some(provider))
+                        if matches!(provider.as_str(), "openai" | "openai_compat") =>
+                    {
+                        ProviderKind(provider.as_str().into())
+                    }
+                    (None, Some(credential), None) => provider_kinds
+                        .get(credential.as_str())
+                        .cloned()
+                        .ok_or_else(|| invalid("deployment references an unknown credential"))?,
+                    _ => return Err(invalid("deployment requires a credential, or auth = 'none' with an OpenAI-compatible provider; do not combine them")),
+                };
                 if dep.upstream_model.is_empty() || dep.weight == Some(0) {
                     return Err(invalid(
                         "upstream_model must not be empty and weight must be positive",
@@ -424,7 +441,7 @@ impl RawConfig {
                     idx,
                     id,
                     provider,
-                    credential: dep.credential.into(),
+                    credential: dep.credential.unwrap_or_default().into(),
                     base_url: upstream_uri(&dep.base_url)?,
                     upstream_model: dep.upstream_model.into(),
                     priority: dep.priority,
@@ -547,6 +564,33 @@ fn resolve_secret(reference: &str) -> Result<Arc<str>, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anonymous_auth_requires_explicit_unambiguous_opt_in() {
+        let _ = self::config("");
+        let prefix = "[server]\nclient_keys = [\"env:LLMUX_CONFIG_OAUTH_TEST_SECRET\"]\n";
+        let config = |auth: &str| {
+            format!("{prefix}\n[[models]]\nname = \"test\"\n[[models.deployments]]\nid = \"anonymous\"\nbase_url = \"https://example.com/v1\"\nupstream_model = \"test\"\n{auth}\n")
+        };
+        assert!(super::RuntimeConfig::parse(&config(
+            "auth = \"none\"\nprovider = \"openai_compat\""
+        ))
+        .is_ok());
+        for auth in [
+            "",
+            "provider = \"openai_compat\"",
+            "auth = \"none\"",
+            "auth = \"none\"\nprovider = \"anthropic\"",
+            "auth = \"typo\"\nprovider = \"openai_compat\"",
+            "auth = \"none\"\nprovider = \"openai_compat\"\ncredential = \"missing\"",
+            "credential = \"missing\"",
+        ] {
+            assert!(
+                super::RuntimeConfig::parse(&config(auth)).is_err(),
+                "{auth}"
+            );
+        }
+    }
 
     fn config(fields: &str) -> String {
         static INIT: std::sync::Once = std::sync::Once::new();

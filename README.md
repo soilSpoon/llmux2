@@ -20,6 +20,8 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
 
 For Chat Completions on OpenAI-compatible upstreams, the gateway rewrites only the top-level request model. Other request fields and successful response payloads pass through.
 
+Use authenticated `GET /v1/models` to list the exact model IDs accepted by the gateway. The list contains configured model names and aliases, not upstream deployment names or the full CheaperInference catalog.
+
 ```sh
 curl -sS http://127.0.0.1:8080/v1/responses \
   -H "Authorization: Bearer $LLMUX_CLIENT_KEY" \
@@ -27,9 +29,11 @@ curl -sS http://127.0.0.1:8080/v1/responses \
   -d '{"model":"llama-70b","input":"Hello"}'
 ```
 
-The Responses route translates requests to Chat Completions on OpenAI-compatible upstreams and converts replies back. Stateful Responses conversations and built-in non-function tools are unsupported. For SSE on either route, add `"stream":true` and use `curl -N`.
+The Responses route translates requests to Chat Completions on OpenAI-compatible upstreams and converts replies back. It accepts reasoning effort as either `reasoning.effort` or `reasoning_effort`; conflicting values are rejected. Stateful Responses conversations and built-in non-function tools are unsupported. For SSE on either route, add `"stream":true` and use `curl -N`.
 
 Credentials use `provider = "openai"` or `"openai_compat"` for OpenAI-compatible upstreams, or `provider = "anthropic"` for the Anthropic Messages API. Anthropic deployments use a base URL such as `https://api.anthropic.com/v1` (the adapter appends `/messages`) and send the key as `x-api-key`. The gateway converts chat requests, JSON responses and SSE chunks between the OpenAI Chat and Anthropic formats, so a model can mix both kinds of deployments and fail over between them.
+
+For converted Anthropic Chat streams, set `stream_options.include_usage` to `true` for a separate usage chunk just before `[DONE]`, or `false` to omit usage. Without this option, usage remains on the finish chunk. Reported cache reads appear in `usage.prompt_tokens_details.cached_tokens` and cache writes in `usage.cache_creation_input_tokens`.
 
 ## Health, shutdown and deployment
 
@@ -64,6 +68,8 @@ environment variable to a strong key distinct from the gateway client keys,
 and restart llmux2. Open `http://127.0.0.1:8080/dashboard` (or the configured
 gateway address) and enter the dashboard key. Use TLS when accessing it
 remotely. The page keeps the key in memory until you lock or close it.
+The dashboard UI is in Korean. It defaults to a light theme and remembers
+the theme you choose in this browser; the dashboard key is never stored.
 
 The dashboard shows response rate, status counts, mean time to response
 (first upstream event for streams), and routed requests, failed attempts,
@@ -91,6 +97,16 @@ Rejecting is the default. To trim instead, set `context_overflow = "middle-out"`
 Before a response is committed, the gateway can fail over on upstream server, connection, and timeout errors within its attempt and time limits. Rate-limit and quota-exhaustion failover are controlled by `routing.fallback_on` and enabled by default. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local RPM uses a bounded per-deployment sliding window only when configured.
 
 ## Credentials
+
+OpenAI-compatible deployments can explicitly opt into anonymous access with
+`auth = "none"` and `provider = "openai_compat"`, omitting `credential`. They
+send no upstream Authorization header. Omitting a credential without this opt-in,
+or combining it with `auth = "none"`, is a configuration error. Keyed deployments
+keep their existing `credential = "id"` spelling. A model can mix both forms,
+with independent deployment limits and cooldowns; see the
+[mixed Kilo example](docs/free-providers.md#kilo-gateway-mixed-anonymous-and-keyed).
+Use anonymous access only when the upstream officially documents it. Multiple
+anonymous deployments do not multiply a provider's per-IP quota.
 
 Credentials support `kind = "api_key"` (with a `key` secret reference) and
 `kind = "oauth"` (OAuth 2.0 refresh-token grant). Deployments select either by

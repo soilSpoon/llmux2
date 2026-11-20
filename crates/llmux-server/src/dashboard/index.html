@@ -1,10 +1,10 @@
 <!doctype html>
-<html lang="en">
+<html lang="ko">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
-  <title>llmux2 · Gateway dashboard</title>
+  <meta name="color-scheme" content="light dark">
+  <title>llmux2 · 게이트웨이 현황</title>
   <link rel="stylesheet" href="/dashboard/app.css">
   <script src="/dashboard/app.js" defer></script>
 </head>
@@ -12,94 +12,93 @@
   <header class="masthead">
     <div class="shell masthead-inner">
       <div class="brand">
-        <svg aria-hidden="true" width="36" height="36" viewBox="0 0 36 36" class="mark">
-          <rect x="1" y="1" width="34" height="34" rx="9"/>
-          <path d="M10 18h5m0 0 7-7h4m-11 7 7 7h4M15 18h11"/>
+        <svg aria-hidden="true" width="18" height="18" viewBox="0 0 18 18" class="mark">
+          <path d="M2 9h5m0 0 5-5h4M7 9l5 5h4M7 9h9"/>
         </svg>
-        <span>llmux2</span><span class="section-name">/ Operations</span>
+        <span>llmux2</span>
       </div>
       <div class="session">
-        <span id="connection" class="pill" data-tone="neutral" role="status">Locked</span>
-        <button id="lock" type="button" class="quiet" hidden>Lock</button>
+        <button id="theme" type="button" class="quiet" aria-label="어두운 테마로 전환">어둡게</button>
+        <span id="connection" class="connection" data-tone="neutral" role="status">잠김</span>
+        <button id="lock" type="button" class="quiet" hidden>잠그기</button>
       </div>
     </div>
   </header>
   <main class="shell">
-    <section id="signin" class="signin panel" aria-labelledby="signin-title">
-      <div class="eyebrow">Read-only observability</div>
-      <h1 id="signin-title">Gateway dashboard</h1>
-      <p>Enter your dashboard key to see live traffic and routing. The key is held only while this page is open.</p>
+    <section id="signin" class="signin" aria-labelledby="signin-title">
+      <h1 id="signin-title">게이트웨이 대시보드</h1>
+      <p>대시보드 키로 실시간 트래픽과 라우팅 상태를 확인할 수 있습니다. 키는 이 페이지를 잠그거나 닫을 때 지워집니다.</p>
       <form id="key-form" autocomplete="off">
-        <label for="key">Dashboard key</label>
+        <label for="key">대시보드 키</label>
         <input id="key" type="password" required spellcheck="false" autocomplete="off">
-        <button id="unlock" type="submit">Open dashboard</button>
+        <button id="unlock" type="submit">대시보드 열기</button>
       </form>
       <p id="signin-error" class="notice" role="alert"></p>
     </section>
-    <div id="dashboard" hidden>
+    <div id="dashboard" class="dashboard" hidden>
       <header class="overview">
         <div>
-          <div class="eyebrow">Gateway operations</div>
-          <h1>Traffic overview</h1>
-          <p>Requests, upstream routing, and active cooldowns.</p>
+          <h1>게이트웨이 현황</h1>
+          <p>응답 흐름과 업스트림 라우팅 상태</p>
         </div>
-        <div class="uptime"><span>INSTANCE UPTIME</span><strong id="uptime">—</strong></div>
+        <div class="uptime"><span>가동 시간</span><strong id="uptime">—</strong></div>
       </header>
-      <p id="connection-error" class="notice panel" hidden></p>
-      <section class="metrics" aria-label="Traffic metrics">
-        <article class="panel metric">
-          <h2>Responses / sec</h2><strong id="rps">—</strong>
-          <p id="total">Since startup · —</p>
+      <p id="connection-error" class="notice" hidden></p>
+      <section class="metrics" aria-label="응답 지표">
+        <article class="metric">
+          <h2>초당 응답</h2><strong id="rps">—</strong>
+          <p id="total">누적 —</p>
         </article>
-        <article class="panel metric">
-          <h2>Successful responses</h2><strong id="success">—</strong>
-          <p id="success-note">Since startup</p>
+        <article class="metric">
+          <h2>성공 응답</h2><strong id="success">—</strong>
+          <p id="success-note">시작 이후</p>
         </article>
-        <article class="panel metric">
-          <h2>429 responses</h2><strong id="limited">—</strong>
-          <p id="errors-note">Since startup</p>
+        <article class="metric">
+          <h2>요청 제한 (429)</h2><strong id="limited">—</strong>
+          <p id="errors-note">시작 이후</p>
         </article>
-        <article class="panel metric">
-          <h2>Response ready</h2><strong id="latency">—</strong>
-          <p>Mean · first event for streams</p>
+        <article class="metric">
+          <h2>평균 응답 준비 시간</h2><strong id="latency">—</strong>
+          <p>게이트웨이 기준 · 스트림은 첫 이벤트까지</p>
         </article>
       </section>
-      <section class="panel traffic" aria-labelledby="traffic-title">
+      <section class="traffic" aria-labelledby="traffic-title">
         <div class="section-header">
-          <div><h2 id="traffic-title">Live traffic</h2><p>Responses per second · last 2 minutes in this tab</p></div>
-          <div class="legend" aria-hidden="true"><span class="good-dot">2xx</span><span class="warn-dot">Errors</span></div>
+          <div><h2 id="traffic-title">실시간 트래픽</h2><p>이 탭에서 수집한 최근 2분간의 초당 응답</p></div>
+          <div class="legend" aria-hidden="true"><span class="legend-ok">성공</span><span class="legend-error">오류</span></div>
         </div>
         <div class="plot">
           <div class="axis" aria-hidden="true"><span id="axis-max">1</span><span id="axis-mid">0.5</span><span>0</span></div>
           <div class="chart">
-            <svg viewBox="0 0 600 120" preserveAspectRatio="none" role="img" aria-label="Traffic rate over time: successful and error responses">
-              <path class="grid" d="M0 1H600 M0 60H600 M0 119H600"/>
+            <svg viewBox="0 0 600 120" preserveAspectRatio="none" role="img" aria-label="시간에 따른 초당 성공 및 오류 응답 수">
+              <path class="grid" d="M0 1H600 M0 60H600 M0 119H600 M150 1V119 M300 1V119 M450 1V119"/>
               <path id="traffic-fill" class="fill"/>
               <path id="traffic-ok" class="series good"/>
               <path id="traffic-errors" class="series warn"/>
+              <path id="traffic-latest" class="series latest"/>
             </svg>
-            <span id="chart-empty">Waiting for the next sample…</span>
-            <div class="time-axis" aria-hidden="true"><span>−2 min</span><span>Now</span></div>
+            <span id="chart-empty">다음 응답 집계를 기다리는 중</span>
+            <div class="time-axis" aria-hidden="true"><span>2분 전</span><span>1분 전</span><span>현재</span></div>
           </div>
         </div>
       </section>
-      <section class="panel routes" aria-labelledby="routes-title">
+      <section class="routes" aria-labelledby="routes-title">
         <div class="section-header">
-          <div><h2 id="routes-title">Upstream deployments</h2><p>Grouped by model, in routing priority order. Lower priority number wins.</p></div>
-          <span id="deployment-count" class="pill" data-tone="neutral"></span>
+          <div><h2 id="routes-title">업스트림 배포</h2><p>모델별로 우선순위 숫자가 낮은 배포부터 사용합니다.</p></div>
+          <span id="deployment-count"></span>
         </div>
-        <div class="table-scroll" tabindex="0" role="region" aria-label="Deployment routing table">
+        <div class="table-scroll" tabindex="0" role="region" aria-label="배포별 라우팅 상태">
           <table>
             <thead><tr>
-              <th scope="col">Deployment</th><th scope="col">Priority</th><th scope="col">State</th>
-              <th scope="col" class="numeric">Routed</th><th scope="col" class="numeric">Failed attempts</th>
-              <th scope="col" class="numeric">Stream errors</th><th scope="col">Local limits</th>
+              <th scope="col">배포</th><th scope="col">우선순위</th><th scope="col">상태</th>
+              <th scope="col" class="numeric">라우팅 성공</th><th scope="col" class="numeric">실패한 시도</th>
+              <th scope="col" class="numeric">스트림 오류</th><th scope="col">게이트웨이 제한</th>
             </tr></thead>
           </table>
         </div>
-        <p class="table-note">Routed includes committed streams. Stream errors are counted separately after the first event.</p>
+        <p class="table-note">첫 이벤트를 보낸 스트림은 라우팅 성공에 포함합니다. 이후 오류는 별도로 집계합니다.</p>
       </section>
-      <footer><span>Instance-local counters reset at restart.</span><span id="updated"></span></footer>
+      <footer><span>집계는 인스턴스별로 기록하며 서버를 재시작하면 초기화됩니다.</span><span id="updated"></span></footer>
     </div>
   </main>
 </body>
