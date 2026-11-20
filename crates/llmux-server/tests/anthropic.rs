@@ -41,6 +41,8 @@ const ANTHROPIC_SSE: &str = concat!(
 enum Reply {
     Ok,
     Limit,
+    Image,
+    BrokenStream,
 }
 
 struct Upstream {
@@ -75,14 +77,27 @@ async fn messages(State(up): State<Arc<Upstream>>, headers: HeaderMap, body: Byt
     assert_eq!(request["model"], "claude-upstream");
     assert_eq!(request["max_tokens"], 4096);
     assert_eq!(request["system"], "Be brief");
-    assert_eq!(
-        request["messages"],
-        json!([{"role": "user", "content": [{"type": "text", "text": "Hello"}]}])
-    );
+    if matches!(up.reply, Reply::Image) {
+        let source = &request["messages"][0]["content"][0]["source"];
+        assert_eq!(source["type"], "base64");
+        assert_eq!(source["data"].as_str().unwrap().len(), 32_000);
+    } else {
+        assert_eq!(
+            request["messages"],
+            json!([{"role": "user", "content": [{"type": "text", "text": "Hello"}]}])
+        );
+    }
     if let Some(limited) = up.limited() {
         return limited;
     }
     if request["stream"] == true {
+        if matches!(up.reply, Reply::BrokenStream) {
+            return (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                ANTHROPIC_SSE.split_once("event: message_stop").unwrap().0,
+            )
+                .into_response();
+        }
         return ([(header::CONTENT_TYPE, "text/event-stream")], ANTHROPIC_SSE).into_response();
     }
     Json(json!({
@@ -123,6 +138,14 @@ struct Fixture {
 
 impl Fixture {
     async fn start(anthropic: (Reply, i32), openai: (Reply, i32)) -> Self {
+        Self::with_config(anthropic, (openai.0, Some(openai.1)), "").await
+    }
+
+    async fn with_config(
+        anthropic: (Reply, i32),
+        openai: (Reply, Option<i32>),
+        capabilities: &str,
+    ) -> Self {
         let (anthropic_reply, anthropic_priority) = anthropic;
         let (openai_reply, openai_priority) = openai;
         let anthropic = Upstream::new(anthropic_reply);
@@ -146,6 +169,21 @@ impl Fixture {
             fs::write(secrets.path().join(key), format!("{key}\n")).unwrap();
         }
         let base = secrets.path().display();
+        let openai_deployment = openai_priority
+            .map(|priority| {
+                format!(
+                    r#"
+[[models.deployments]]
+id = "gpt"
+credential = "openai-key"
+base_url = "{}/v1"
+upstream_model = "gpt-upstream"
+priority = {priority}
+"#,
+                    o.url()
+                )
+            })
+            .unwrap_or_default();
         let config = format!(
             r#"
 [server]
@@ -166,6 +204,7 @@ key = "file:{base}/test-openai"
 
 [[models]]
 name = "assistant"
+{capabilities}
 
 [[models.deployments]]
 id = "claude"
@@ -174,15 +213,9 @@ base_url = "{}/v1"
 upstream_model = "claude-upstream"
 priority = {anthropic_priority}
 
-[[models.deployments]]
-id = "gpt"
-credential = "openai-key"
-base_url = "{}/v1"
-upstream_model = "gpt-upstream"
-priority = {openai_priority}
+{openai_deployment}
 "#,
-            a.url(),
-            o.url()
+            a.url()
         );
         let gateway = TestServer::start(
             llmux_server::app(RuntimeConfig::parse(&config).unwrap())
@@ -216,8 +249,24 @@ priority = {openai_priority}
     }
 
     async fn send(&self, payload: Value) -> (Response<Body>, String) {
-        let request = Request::post(format!("{}/v1/chat/completions", self.gateway.url()))
-            .header(header::AUTHORIZATION, "Bearer test-client")
+        self.send_to(
+            "/v1/chat/completions",
+            header::AUTHORIZATION,
+            "Bearer test-client",
+            payload,
+        )
+        .await
+    }
+
+    async fn send_to(
+        &self,
+        path: &str,
+        auth_header: header::HeaderName,
+        key: &str,
+        payload: Value,
+    ) -> (Response<Body>, String) {
+        let request = Request::post(format!("{}{path}", self.gateway.url()))
+            .header(auth_header, key)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from(payload.to_string())))
             .unwrap();
@@ -247,6 +296,128 @@ fn check_route(response: &Response, deployment: &str, attempts: &str) {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["x-llmux-deployment"], deployment);
     assert_eq!(response.headers()["x-llmux-attempts"], attempts);
+}
+
+#[tokio::test]
+async fn native_messages_authentication_and_passthrough() {
+    let fixture = Fixture::start((Reply::Ok, 0), (Reply::Ok, 10)).await;
+    let mut payload = json!({
+        "model":"assistant","max_tokens":4096,"system":"Be brief",
+        "messages":[{"role":"user","content":[{"type":"text","text":"Hello"}]}]
+    });
+    let api_key = header::HeaderName::from_static("x-api-key");
+    let (response, body) = fixture
+        .send_to("/v1/messages", api_key.clone(), "invalid", payload.clone())
+        .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["type"], "authentication_error");
+    assert_eq!(fixture.counts(), [0, 0]);
+
+    let (response, body) = fixture
+        .send_to("/v1/messages", api_key, "test-client", payload.clone())
+        .await;
+    check_route(&response, "claude", "1");
+    let message: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(message["type"], "message");
+    assert_eq!(message["content"][0]["text"], "Hi from Claude");
+    assert_eq!(message["usage"]["output_tokens"], 4);
+
+    payload["stream"] = json!(true);
+    let (response, body) = fixture
+        .send_to(
+            "/v1/messages",
+            header::AUTHORIZATION,
+            "Bearer test-client",
+            payload,
+        )
+        .await;
+    check_route(&response, "claude", "1");
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    for prefix in ["event: ", "data: "] {
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.starts_with(prefix))
+                .collect::<Vec<_>>(),
+            ANTHROPIC_SSE
+                .lines()
+                .filter(|line| line.starts_with(prefix))
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(fixture.counts(), [2, 0]);
+}
+
+#[tokio::test]
+async fn native_messages_base64_image_does_not_use_prompt_text_budget() {
+    let fixture = Fixture::with_config(
+        (Reply::Image, 0),
+        (Reply::Ok, Some(10)),
+        "capabilities = { max_context = 4500 }",
+    )
+    .await;
+    let (response, _) = fixture.send_to(
+        "/v1/messages", header::AUTHORIZATION, "Bearer test-client",
+        json!({"model":"assistant","max_tokens":4096,"system":"Be brief",
+            "messages":[{"role":"user","content":[{"type":"image",
+                "source":{"type":"base64","media_type":"image/png","data":"A".repeat(32_000)}}]}]
+        }),
+    ).await;
+    check_route(&response, "claude", "1");
+    assert_eq!(fixture.counts(), [1, 0]);
+}
+
+#[tokio::test]
+async fn native_messages_preserves_anthropic_rate_limit_error() {
+    let fixture = Fixture::with_config((Reply::Limit, 0), (Reply::Ok, None), "").await;
+    let (response, body) = fixture
+        .send_to(
+            "/v1/messages",
+            header::AUTHORIZATION,
+            "Bearer test-client",
+            json!({"model":"assistant","max_tokens":4096,"system":"Be brief",
+                "messages":[{"role":"user","content":[{"type":"text","text":"Hello"}]}]
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "30");
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["type"], "rate_limit_error");
+    assert_eq!(fixture.counts(), [1, 0]);
+}
+
+#[tokio::test]
+async fn native_messages_emits_anthropic_broken_stream_error() {
+    let fixture = Fixture::start((Reply::BrokenStream, 0), (Reply::Ok, 10)).await;
+    let (response, body) = fixture
+        .send_to(
+            "/v1/messages",
+            header::AUTHORIZATION,
+            "Bearer test-client",
+            json!({"model":"assistant","stream":true,"max_tokens":4096,"system":"Be brief",
+                "messages":[{"role":"user","content":[{"type":"text","text":"Hello"}]}]
+            }),
+        )
+        .await;
+    check_route(&response, "claude", "1");
+    assert!(body.contains("event: message_start"));
+    let last = body.trim_end().split("\n\n").last().unwrap();
+    assert!(last.lines().any(|line| line == "event: error"));
+    let data = last
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .unwrap();
+    let error: Value = serde_json::from_str(data).unwrap();
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["type"], "api_error");
+    assert!(!body.contains("event: message_stop"));
+    assert_eq!(fixture.counts(), [1, 0]);
 }
 
 #[tokio::test]

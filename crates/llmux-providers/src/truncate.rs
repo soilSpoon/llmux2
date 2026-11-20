@@ -1,7 +1,8 @@
 //! Opt-in middle-out truncation for requests that fit no deployment's context window.
 
-use crate::openai_compat::TextBytes;
+use crate::openai_compat::{native_message_bytes, TextBytes};
 use bytes::{BufMut, Bytes, BytesMut};
+use llmux_types::InboundFormat;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
@@ -103,6 +104,22 @@ pub fn truncate_middle(
     max_output_tokens: Option<u32>,
     limit: u32,
 ) -> Option<Truncated> {
+    truncate_middle_for_format(
+        body,
+        prompt_bytes,
+        max_output_tokens,
+        limit,
+        InboundFormat::OpenAiChat,
+    )
+}
+
+pub fn truncate_middle_for_format(
+    body: &Bytes,
+    prompt_bytes: u64,
+    max_output_tokens: Option<u32>,
+    limit: u32,
+    format: InboundFormat,
+) -> Option<Truncated> {
     let conversation: Conversation<'_> = serde_json::from_slice(body).ok()?;
     let list = conversation.messages.or(conversation.input)?;
     let items: Vec<&RawValue> = serde_json::from_str(list.get()).ok()?;
@@ -117,7 +134,11 @@ pub fn truncate_middle(
     let mut seen = std::collections::HashMap::new();
     for (i, raw) in items.iter().enumerate() {
         let item: Item = serde_json::from_str(raw.get()).unwrap_or_default();
-        bytes_of[i] = serde_json::from_str::<TextBytes>(raw.get()).ok()?.0;
+        bytes_of[i] = if format == InboundFormat::AnthropicMessages {
+            native_message_bytes(raw).ok()?
+        } else {
+            serde_json::from_str::<TextBytes>(raw.get()).ok()?.0
+        };
         if matches!(item.role.as_deref(), Some("system" | "developer")) {
             continue;
         }
