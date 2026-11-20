@@ -319,7 +319,7 @@ impl Executor {
                     if attempts == self.cfg.routing.max_attempts {
                         break 'groups;
                     }
-                    let Some(permit) = binding.limits.admit() else {
+                    let Some(permit) = binding.limits.admit(needed) else {
                         last_transient = None;
                         break;
                     };
