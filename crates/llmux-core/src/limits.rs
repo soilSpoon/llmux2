@@ -32,11 +32,14 @@ impl DeploymentLimits {
 
     /// Headroom left under the request-per-minute and concurrency limits.
     pub fn remaining(&self, now: Instant) -> crate::request_log::QuotaRemaining {
+        // Shared (credential) windows bound admission too: report the
+        // tightest RPM window, not just the deployment's own.
         let rpm = self
             .windows
             .iter()
-            .find(|window| window.span == MINUTE && matches!(window.unit, Unit::Requests))
-            .map(|window| window.max.saturating_sub(window.lock(now).total));
+            .filter(|window| window.span == MINUTE && matches!(window.unit, Unit::Requests))
+            .map(|window| window.max.saturating_sub(window.lock(now).total))
+            .min();
         let concurrent = self
             .concurrent
             .map(|max| max.saturating_sub(self.inflight.load(Ordering::Relaxed)));
