@@ -532,10 +532,12 @@ impl Executor {
                     )),
                     move |state| async move {
                         let (mut events, stats, limits, mut idle) = state?;
+                        // Measure idle from each poll, not from the last event: a
+                        // downstream pause must not eat into the upstream idle window.
+                        idle.as_mut().reset(Instant::now() + idle_timeout);
                         let error = tokio::select! {
                             next = events.next() => match next {
                                 Some(Ok(event)) => {
-                                    idle.as_mut().reset(Instant::now() + idle_timeout);
                                     return Some((
                                         Ok(event),
                                         Some((events, stats, limits, idle)),
