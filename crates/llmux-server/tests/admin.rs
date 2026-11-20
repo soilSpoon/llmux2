@@ -106,7 +106,7 @@ async fn admin_requires_dashboard_key() {
 
 #[tokio::test]
 async fn admin_routes_absent_without_dashboard_key() {
-    std::env::set_var("LLMUX_ADMIN_TEST_CLIENT", "client-key");
+    env();
     let upstream = upstream().await;
     let config =
         config(&upstream.url()).replace("dashboard_key = \"env:LLMUX_ADMIN_TEST_ADMIN\"\n", "");
