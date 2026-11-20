@@ -2,30 +2,17 @@ use crate::{Error, Result};
 use bytes::Bytes;
 use http::{header, Request, StatusCode};
 use http_body_util::{BodyExt, Full, Limited};
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::{
-    client::legacy::{connect::HttpConnector, Client},
-    rt::TokioExecutor,
-};
+use llmux_types::{host_is_loopback, HttpClient};
+
 use serde::de::DeserializeOwned;
 use std::time::Duration;
 use url::Url;
 
-pub(crate) struct Http(Client<HttpsConnector<HttpConnector>, Full<Bytes>>);
+pub(crate) struct Http(HttpClient);
 
 impl Http {
     pub(crate) fn new() -> Self {
-        let connector = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .build();
-        Self(
-            Client::builder(TokioExecutor::new())
-                .retry_canceled_requests(false)
-                .build(connector),
-        )
+        Self(llmux_types::http_client())
     }
 
     pub(crate) async fn json<T: DeserializeOwned>(&self, url: &Url) -> Result<T> {
@@ -89,11 +76,7 @@ impl Http {
 }
 
 pub(crate) fn validate_url(url: &Url) -> Result<()> {
-    let loopback = url.host_str().is_some_and(|host| {
-        host.trim_matches(['[', ']'])
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
-    });
+    let loopback = url.host_str().is_some_and(host_is_loopback);
     if url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
