@@ -27,6 +27,16 @@ def marker(sha=SHA, verdict='pass', reviewer='independent'):
 
 
 class MergeGateTest(unittest.TestCase):
+    def test_latest_check_run_wins(self):
+        for name in ('check', 'extra'):
+            for conclusion, passes in [('success', True), ('failure', False), (None, name == 'extra')]:
+                with self.subTest(name=name, conclusion=conclusion):
+                    data = fixture()
+                    data['checks'] += [
+                        dict(data['checks'][0], name=name, id=2, started_at='2026-01-01T00:00:00Z', conclusion='failure' if passes else 'success'),
+                        dict(data['checks'][0], name=name, id=3, started_at='2026-01-02T00:00:00Z', conclusion=conclusion, status='completed' if conclusion else 'in_progress')]
+                    self.assertEqual(not evaluate(data, ['check'], POLICY), passes)
+
     def test_untrusted_verifier_is_ignored(self):
         data = fixture()
         data['comments'][0]['user']['login'] = 'outsider'

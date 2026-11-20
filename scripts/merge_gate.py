@@ -32,7 +32,13 @@ def evaluate(data, required, policy):
     if pr['mergeable'] is not True:
         errors.append('GitHub has not reported the PR mergeable (conflict or unknown).')
 
-    checks = [c for c in data['checks'] if c['head_sha'] == sha]
+    latest_checks = {}
+    for check in sorted(data['checks'], key=lambda c: (
+            c.get('started_at') or c.get('completed_at') or '',
+            c.get('completed_at') or '', c.get('id', 0))):
+        if check['head_sha'] == sha:
+            latest_checks[check['name']] = check
+    checks = list(latest_checks.values())
     for context in required:
         if not any(c['name'] == context and c['status'] == 'completed'
                    and c['conclusion'] == 'success' for c in checks):

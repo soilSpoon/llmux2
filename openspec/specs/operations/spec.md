@@ -33,6 +33,7 @@ conflict-free PR targeting the default branch, successful required head checks,
 no failed head checks or unresolved review threads, a head-specific Devin Review,
 no blocking latest reviews, and a passing head-specific independent session attestation.
 Verification comments SHALL come from a policy-allowlisted account.
+Only the latest run of each head check name SHALL determine its outcome.
 Required checks SHALL come from the checked-in ruleset and review markers from
 the merge policy. Fetch failures SHALL block merging.
 
