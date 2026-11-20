@@ -21,6 +21,8 @@ pub struct GatewayRequest {
     pub body: Bytes,
     pub parsed: OnceCell<ChatRequest>,
     pub est_input_tokens: u32,
+    /// Completion tokens the client asked for, reserved against the context window.
+    pub max_output_tokens: Option<u32>,
     pub request_id: RequestId,
 }
 

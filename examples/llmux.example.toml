@@ -47,7 +47,7 @@ key = "env:ANTHROPIC_API_KEY"
 [[models]]
 name = "llama-3.3-70b"
 aliases = ["llama-70b"]
-capabilities = { stream = true }
+capabilities = { stream = true, max_context = 131072 }
 
 [[models.deployments]]
 id = "groq-llama70b"

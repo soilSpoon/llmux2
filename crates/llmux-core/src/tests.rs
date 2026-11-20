@@ -81,15 +81,22 @@ impl ProviderAdapter for Adapter {
     }
 }
 
-async fn fixture(
-    errors: Vec<UpstreamError>,
-    refresh_fails: bool,
-) -> (
+type Fixture = (
     Executor,
     Arc<Adapter>,
     Arc<Credential>,
     llmux_testkit::TestServer,
-) {
+);
+
+async fn fixture(errors: Vec<UpstreamError>, refresh_fails: bool) -> Fixture {
+    fixture_with_context(errors, refresh_fails, [None; 3]).await
+}
+
+async fn fixture_with_context(
+    errors: Vec<UpstreamError>,
+    refresh_fails: bool,
+    max_context: [Option<u32>; 3],
+) -> Fixture {
     let server = llmux_testkit::TestServer::start(axum::Router::new().fallback(|| async { "ok" }))
         .await
         .unwrap();
@@ -119,7 +126,7 @@ async fn fixture(
             billing: Default::default(),
             quota: Default::default(),
             timeout: Duration::from_secs(1),
-            max_context: None,
+            max_context: max_context[i as usize],
         })
         .collect();
     let cfg = RuntimeConfig {
@@ -179,6 +186,7 @@ fn request() -> GatewayRequest {
         body: Bytes::new(),
         parsed: Default::default(),
         est_input_tokens: 0,
+        max_output_tokens: None,
         request_id: RequestId("test".into()),
     }
 }
@@ -341,4 +349,68 @@ async fn no_errors_succeeds_without_refresh() {
     let (executor, _, credential, _server) = fixture(vec![], false).await;
     assert_eq!(executor.execute(request()).await.unwrap().attempts, 1);
     assert_eq!(credential.refreshes.load(Ordering::Relaxed), 0);
+}
+
+fn sized_request(prompt_tokens: u32, max_output_tokens: Option<u32>) -> GatewayRequest {
+    GatewayRequest {
+        est_input_tokens: prompt_tokens,
+        max_output_tokens,
+        ..request()
+    }
+}
+
+#[tokio::test]
+async fn skips_deployments_whose_context_is_too_small() {
+    let (executor, adapter, _, _server) =
+        fixture_with_context(vec![], false, [Some(100), None, Some(1000)]).await;
+    let response = executor.execute(sized_request(80, Some(30))).await.unwrap();
+    assert_eq!(response.deployment.as_ref(), "dep1");
+    assert_eq!(response.attempts, 1);
+    let response = executor.execute(sized_request(80, Some(20))).await.unwrap();
+    assert_eq!(response.deployment.as_ref(), "dep0");
+    assert_eq!(adapter.calls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn rejects_requests_that_fit_no_deployment_without_calling_upstream() {
+    let (executor, adapter, _, _server) =
+        fixture_with_context(vec![], false, [Some(100), Some(4000), Some(1000)]).await;
+    assert!(matches!(
+        executor.execute(sized_request(3990, Some(20))).await,
+        Err(GatewayError::ContextLengthExceeded {
+            limit: 4000,
+            prompt_tokens: 3990,
+            max_output_tokens: Some(20),
+        })
+    ));
+    assert!(matches!(
+        executor
+            .execute(sized_request(u32::MAX, Some(u32::MAX)))
+            .await,
+        Err(GatewayError::ContextLengthExceeded { limit: 4000, .. })
+    ));
+    assert!(adapter.calls.lock().unwrap().is_empty());
+    let response = executor.execute(sized_request(3990, None)).await.unwrap();
+    assert_eq!(response.deployment.as_ref(), "dep1");
+}
+
+#[tokio::test]
+async fn exhaustion_retry_hint_ignores_deployments_that_do_not_fit() {
+    let (executor, _, _, _server) = fixture_with_context(
+        vec![UpstreamError::RateLimited {
+            retry_after: Some(Duration::from_secs(3)),
+            scope: llmux_types::LimitScope::Requests,
+        }],
+        false,
+        [None, Some(10), Some(10)],
+    )
+    .await;
+    let Err(GatewayError::AllCandidatesExhausted {
+        attempts: 1,
+        retry_after,
+    }) = executor.execute(sized_request(50, None)).await
+    else {
+        panic!("expected exhaustion")
+    };
+    assert!(retry_after > Duration::from_secs(2));
 }

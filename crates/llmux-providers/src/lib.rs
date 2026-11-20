@@ -7,4 +7,4 @@ mod responses;
 mod sse;
 
 pub use anthropic::Anthropic;
-pub use openai_compat::{OpenAiChatMetadata, OpenAiCompat, StaticKey};
+pub use openai_compat::{OpenAiChatMetadata, OpenAiCompat, RequestMetadata, StaticKey};
