@@ -216,8 +216,24 @@ priority = {openai_priority}
     }
 
     async fn send(&self, payload: Value) -> (Response<Body>, String) {
-        let request = Request::post(format!("{}/v1/chat/completions", self.gateway.url()))
-            .header(header::AUTHORIZATION, "Bearer test-client")
+        self.send_to(
+            "/v1/chat/completions",
+            header::AUTHORIZATION,
+            "Bearer test-client",
+            payload,
+        )
+        .await
+    }
+
+    async fn send_to(
+        &self,
+        path: &str,
+        auth_header: header::HeaderName,
+        key: &str,
+        payload: Value,
+    ) -> (Response<Body>, String) {
+        let request = Request::post(format!("{}{path}", self.gateway.url()))
+            .header(auth_header, key)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from(payload.to_string())))
             .unwrap();
@@ -247,6 +263,60 @@ fn check_route(response: &Response, deployment: &str, attempts: &str) {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["x-llmux-deployment"], deployment);
     assert_eq!(response.headers()["x-llmux-attempts"], attempts);
+}
+
+#[tokio::test]
+async fn native_messages_authentication_and_passthrough() {
+    let fixture = Fixture::start((Reply::Ok, 0), (Reply::Ok, 10)).await;
+    let mut payload = json!({
+        "model":"assistant","max_tokens":4096,"system":"Be brief",
+        "messages":[{"role":"user","content":[{"type":"text","text":"Hello"}]}]
+    });
+    let api_key = header::HeaderName::from_static("x-api-key");
+    let (response, body) = fixture
+        .send_to("/v1/messages", api_key.clone(), "invalid", payload.clone())
+        .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let error: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["type"], "authentication_error");
+    assert_eq!(fixture.counts(), [0, 0]);
+
+    let (response, body) = fixture
+        .send_to("/v1/messages", api_key, "test-client", payload.clone())
+        .await;
+    check_route(&response, "claude", "1");
+    let message: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(message["type"], "message");
+    assert_eq!(message["content"][0]["text"], "Hi from Claude");
+    assert_eq!(message["usage"]["output_tokens"], 4);
+
+    payload["stream"] = json!(true);
+    let (response, body) = fixture
+        .send_to(
+            "/v1/messages",
+            header::AUTHORIZATION,
+            "Bearer test-client",
+            payload,
+        )
+        .await;
+    check_route(&response, "claude", "1");
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    for prefix in ["event: ", "data: "] {
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.starts_with(prefix))
+                .collect::<Vec<_>>(),
+            ANTHROPIC_SSE
+                .lines()
+                .filter(|line| line.starts_with(prefix))
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(fixture.counts(), [2, 0]);
 }
 
 #[tokio::test]

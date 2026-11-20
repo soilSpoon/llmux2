@@ -94,6 +94,7 @@ pub async fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Se
     let mut router = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/messages", post(messages))
         .route("/v1/responses", post(responses));
     if state.dashboard.is_some() {
         router = router.merge(dashboard::routes());
@@ -122,8 +123,40 @@ async fn responses(State(state): State<Arc<AppState>>, request: Request) -> Resp
     execute(state, request, InboundFormat::OpenAiResponses).await
 }
 
+async fn messages(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    let response = execute(state, request, InboundFormat::AnthropicMessages).await;
+    if response.status().is_success() {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let mut payload: Value = body::to_bytes(body, MAX_REQUEST_BYTES)
+        .await
+        .ok()
+        .and_then(|body| serde_json::from_slice(&body).ok())
+        .unwrap_or_default();
+    if !payload["error"].is_object() {
+        payload = json!({"error":{"message":"Gateway request failed"}});
+    }
+    payload["type"] = json!("error");
+    payload["error"]["type"] = json!(match parts.status {
+        StatusCode::UNAUTHORIZED => "authentication_error",
+        StatusCode::FORBIDDEN => "permission_error",
+        StatusCode::NOT_FOUND => "not_found_error",
+        StatusCode::PAYLOAD_TOO_LARGE => "request_too_large",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        status if status.is_server_error() => "api_error",
+        _ => "invalid_request_error",
+    });
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Response::from_parts(parts, Body::from(payload.to_string()))
+}
+
 async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) -> Response {
-    if !authorized(request.headers(), &state.config.server.client_keys) {
+    if !authorized_for_format(request.headers(), &state.config.server.client_keys, format) {
         return unauthorized();
     }
     let start = state.dashboard.as_ref().map(|_| std::time::Instant::now());
@@ -196,7 +229,7 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
         .model_names
         .get(model.as_ref())
         .and_then(|idx| state.config.model_allowed_keys.get(idx))
-        .is_some_and(|keys| !authorized(&parts.headers, keys))
+        .is_some_and(|keys| !authorized_for_format(&parts.headers, keys, format))
     {
         return error(
             StatusCode::FORBIDDEN,
@@ -274,6 +307,9 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
                             .to_string(),
                         )
                     }
+                    Err(_) if format == InboundFormat::AnthropicMessages => Event::default()
+                        .event("error")
+                        .data(r#"{"type":"error","error":{"type":"api_error","message":"Upstream stream ended unexpectedly"}}"#),
                     Err(_) => Event::default().data(
                         r#"{"error":{"message":"Upstream stream ended unexpectedly","type":"upstream_error","param":null,"code":"stream_broken"}}"#,
                     ),
@@ -301,6 +337,16 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
     response
 }
 
+fn authorized_for_format(headers: &HeaderMap, keys: &[Arc<str>], format: InboundFormat) -> bool {
+    if format == InboundFormat::AnthropicMessages && !headers.contains_key(header::AUTHORIZATION) {
+        let mut values = headers.get_all(ANTHROPIC_KEY_HEADER).iter();
+        return values
+            .next()
+            .is_some_and(|value| values.next().is_none() && matches_key(value.as_bytes(), keys));
+    }
+    authorized(headers, keys)
+}
+
 fn authorized(headers: &HeaderMap, keys: &[Arc<str>]) -> bool {
     let mut auth = headers.get_all(header::AUTHORIZATION).iter();
     let Some((scheme, value)) = auth
@@ -313,10 +359,13 @@ fn authorized(headers: &HeaderMap, keys: &[Arc<str>]) -> bool {
     if auth.next().is_some() || !scheme.eq_ignore_ascii_case("bearer") {
         return false;
     }
-    let value = value.trim_start_matches(' ');
+    matches_key(value.trim_start_matches(' ').as_bytes(), keys)
+}
+
+fn matches_key(value: &[u8], keys: &[Arc<str>]) -> bool {
     keys.iter()
         .fold(subtle::Choice::from(0), |matched, key| {
-            matched | key.as_bytes().ct_eq(value.as_bytes())
+            matched | key.as_bytes().ct_eq(value)
         })
         .into()
 }
