@@ -334,7 +334,9 @@ impl Executor {
                     last_transient = None;
                     match result {
                         Ok(response) => {
-                            binding.limits.succeeded();
+                            if matches!(response, GatewayResponse::Complete { .. }) {
+                                binding.limits.succeeded();
+                            }
                             return Ok(RoutedResponse {
                                 deployment: dep.id.clone(),
                                 attempts,
@@ -480,7 +482,10 @@ impl Executor {
                                 return Some((Ok(event), Some((events, stats, limits))))
                             }
                             Ok(Some(Err(err))) => err,
-                            Ok(None) => return None,
+                            Ok(None) => {
+                                limits.succeeded();
+                                return None;
+                            }
                             Err(_) => UpstreamError::Timeout,
                         };
                         if let Some(stats) = &stats {

@@ -617,3 +617,37 @@ async fn limit_error_after_stream_start_cools_down_the_deployment() {
         );
     }
 }
+
+#[tokio::test]
+async fn repeated_limit_errors_after_stream_start_back_off() {
+    let (executor, adapter, _, _server) = fixture(Vec::new(), false).await;
+    let streaming = || GatewayRequest {
+        stream: true,
+        ..request()
+    };
+    let mut cooldowns = Vec::new();
+    for _ in 0..2 {
+        adapter
+            .stream_errors
+            .lock()
+            .unwrap()
+            .push_back(UpstreamError::RateLimited {
+                retry_after: None,
+                scope: llmux_types::LimitScope::Unknown,
+            });
+        let routed = executor.execute(streaming()).await.unwrap();
+        assert_eq!(routed.deployment.as_ref(), "dep0");
+        let GatewayResponse::Stream(events) = routed.response else {
+            panic!("expected stream")
+        };
+        let _: Vec<_> = events.collect().await;
+        let now = Instant::now();
+        let until = executor.bindings[0].limits.cooldown_until(now).unwrap();
+        cooldowns.push(until - now);
+        tokio::time::sleep(until - now + Duration::from_millis(50)).await;
+    }
+    assert!(
+        cooldowns[1] > Duration::from_millis(1500),
+        "a stream that started then hit a limit is not a success: {cooldowns:?}"
+    );
+}
