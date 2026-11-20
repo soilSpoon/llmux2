@@ -43,6 +43,7 @@ pub struct OpenAiChatMetadata<'a> {
 pub struct RequestMetadata<'a> {
     pub model: Cow<'a, str>,
     pub stream: bool,
+    pub temperature: Option<&'a RawValue>,
     /// Bytes of strings and object keys in prompt fields, excluding `data:` URLs.
     pub prompt_bytes: u64,
     /// The output limit the inbound format forwards: Responses `max_output_tokens`,
@@ -56,6 +57,8 @@ struct RawRequestMetadata<'a> {
     model: &'a RawValue,
     #[serde(default)]
     stream: Option<bool>,
+    #[serde(default, borrow)]
+    temperature: Option<&'a RawValue>,
     #[serde(default, borrow)]
     max_completion_tokens: Option<&'a RawValue>,
     #[serde(default, borrow)]
@@ -91,6 +94,7 @@ impl<'a> RequestMetadata<'a> {
         Ok(Self {
             model,
             stream: raw.stream.unwrap_or_default(),
+            temperature: raw.temperature,
             prompt_bytes: [
                 raw.messages,
                 raw.input,
