@@ -155,13 +155,14 @@ not accept arbitrary nonofficial Morph hosts or unspecified bind addresses.
 The reviewed combos `deepseek-v4.1-flash`, `deepseek-v4.1-flash-fast`,
 `deepseek-v4.1-flash-1017`, `deepseek-v4.1-flash-1017-fast`, and
 `deepseek-v4.1-flash-1017-ultrafast` move the official Morph
-`morph-dsv41flash-1017` deployments immediately before the Vibe/Mistral
-`deepseek-v4-1-flash-1017` deployments, retaining the relative order of other
-legs. OCI observed Mistral rejects logprobs for this model; this is an explicit
+`morph-dsv41flash-1017` deployments ahead of Vibe/Mistral and bridge replacements.
+The three fast combos start with Morph; the two base combos keep declared Numes
+ahead of Morph. Remaining legs retain their relative order. OCI observed Mistral
+rejects logprobs and could not verify Numes logprobs (503); this is an explicit
 reviewed routing-policy change, not a general capability sort or a claim about
 OmniRoute's original order. Other combo names/models/endpoints are unchanged.
-No logprobs fields are stripped. Earlier non-Mistral legs remain earlier, and
-an enabled OmniRoute fallback remains last. To roll back, remove the reviewed
+No logprobs fields are stripped. An enabled OmniRoute fallback remains last.
+To roll back, remove the reviewed
 Morph endpoint exception and combo-order policy before regenerating config.
 Gemini uses Google's documented OpenAI-compatible endpoint
 `https://generativelanguage.googleapis.com/v1beta/openai`, not OmniRoute's native
@@ -350,6 +351,32 @@ batch scheduling and discounts are not preserved. Existing connected Anthropic,
 Gemini, and Mistral keys may still be billable; this flag is not a promise of
 free access on those providers. Without it, existing OpenRouter behavior remains
 unchanged.
+
+The same flag also enables `src/bridge.rs`'s explicit reviewed DuckDuckGo and
+DeepAI Code replacements. It does not call either web bridge or import their
+authentication. Declared model identities come from OmniRoute's DuckDuckGo
+model registry/catalog and the export's DeepAI node, aliases and same-model
+combos; targets use exact existing imported model IDs. Only the listed
+family/version/size variants are replaced. In particular, GPT Luna/Sol aliases,
+Haiku effort suffixes, nested `ddgw/` wrappers and Gemma 31B are not inferred.
+Numes replacements require its exact official API URL and a keyed OpenAI-compatible
+connection; the other targets retain the reviewed official-endpoint checks.
+Workers AI still requires opt-in and its curated/snapshot model checks.
+Custom DeepAI nodes supply both node-ID and unambiguous prefix direct names;
+existing combos, aliases and mappings still win collisions.
+
+Bridge legs expand in place, except for the five reviewed DeepSeek-flash combos:
+their verified Morph deployment precedes bridge replacements; the three fast
+combos start with Morph, while the two base combos keep declared Numes ahead of
+Morph. Other legs retain their relative order. Valid source bridge connection pins/allow-lists select no target
+credentials: as with Antigravity, replacements use eligible official connections
+instead, with a warning. Malformed restrictions and unusable legs remain skipped.
+Existing combo/alias/mapping precedence is unchanged, and unavailable targets
+remain unavailable. Explicit OmniRoute fallback follows the normal policy,
+including owner-only Codex exclusions; bridge replacements do not add a new
+fallback bypass. Removing the flag restores the previous bridge-skip behavior.
+This is static declared-model equivalence, not a live inference or key-entitlement
+check; existing official keys may be billable.
 
 ### Public model aliases
 

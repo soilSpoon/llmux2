@@ -110,7 +110,9 @@ The reviewed combo names `deepseek-v4.1-flash`, `deepseek-v4.1-flash-fast`,
 `deepseek-v4.1-flash-1017`, `deepseek-v4.1-flash-1017-fast` and
 `deepseek-v4.1-flash-1017-ultrafast` SHALL place official Morph
 `morph-dsv41flash-1017` deployments before Vibe/Mistral
-`deepseek-v4-1-flash-1017` deployments, preserving other legs' relative order.
+`deepseek-v4-1-flash-1017` deployments and bridge replacements. The three fast
+combos SHALL start with Morph; the two base combos SHALL retain declared Numes
+ahead of Morph. Remaining legs SHALL preserve their relative order.
 This explicit policy follows OCI verification of Morph models.list and chat
 logprobs, and Mistral's rejection of logprobs for this model; it SHALL NOT strip
 logprobs, reorder unrelated combos, or replace the optional final fallback.
@@ -279,6 +281,39 @@ WHEN the operator supplies a snapshot
 THEN documentation identifies the snapshot as static evidence rather than
 live cost enforcement; paid models and missing pricing do not become keyed
 deployments through names or free-status hints alone.
+
+### Requirement: Reviewed same-model bridge replacements
+
+With `--openrouter-replacements`, the importer SHALL also replace only the
+DuckDuckGo and DeepAI Code model IDs explicitly reviewed in `src/bridge.rs`
+with the same declared model family, version and size on eligible connected
+official endpoints. It SHALL NOT import bridge authentication, infer a similar
+model, use Codex/Factory/OpenRouter targets, or relax Workers AI eligibility.
+
+#### Scenario: Bridge leg expansion and precedence
+
+WHEN a reviewed bridge leg appears in a combo, nested combo or direct alias
+THEN its official deployments expand in place in the original leg order,
+except that the five reviewed DeepSeek-flash combos place verified Morph ahead
+of bridge replacements, the three fast combos start with Morph, and the two
+base combos keep declared Numes ahead of Morph; source combo/alias/mapping
+precedence is retained, including unavailable winning mappings.
+
+#### Scenario: Source restrictions and missing targets
+
+WHEN a bridge leg has valid source connection restrictions
+THEN eligible official connections replace those restrictions with a warning,
+as for Antigravity; unusable legs and malformed restrictions remain skipped.
+WHEN its model is unreviewed or no eligible target is connected
+THEN no replacement deployment is generated.
+
+#### Scenario: Opt-in and explicit fallback
+
+WHEN the flag is absent
+THEN bridges retain their previous skipped behavior.
+WHEN explicit OmniRoute fallback is configured
+THEN it follows the normal last-deployment and Codex exclusion policy; bridge
+replacement introduces no new fallback bypass.
 
 ### Requirement: Reviewed official OpenRouter replacements
 
