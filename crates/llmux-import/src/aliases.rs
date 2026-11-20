@@ -15,7 +15,7 @@ fn target(value: &Value) -> Option<String> {
     Some(format!("{provider}/{model}"))
 }
 
-fn alias_map(root: &Value, warnings: &mut Vec<String>) -> BTreeMap<String, String> {
+pub(super) fn alias_map(root: &Value, warnings: &mut Vec<String>) -> BTreeMap<String, String> {
     let mut result = BTreeMap::new();
     if let Some(aliases) = root.get("modelAliases") {
         if let Some(aliases) = aliases.as_object() {

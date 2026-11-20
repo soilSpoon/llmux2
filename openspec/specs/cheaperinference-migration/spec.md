@@ -27,6 +27,41 @@ WHEN comparing OmniRoute's routed models against llmux2's coverage
 THEN every model and request shape OmniRoute serves is mapped before the
 switch.
 
+### Requirement: Optional OmniRoute cutover fallback
+
+The importer SHALL accept `--omniroute-fallback` and `--omniroute-key` together
+or neither. The key SHALL be a nonempty `env:` or `file:` reference and SHALL
+remain a reference in generated TOML. The URL SHALL obey gateway base URL
+validation: HTTPS, or HTTP only for loopback, without credentials, query, or
+fragment. Generated configuration SHALL pass the existing runtime config parser.
+Without these flags, existing import output SHALL remain byte-identical.
+
+#### Scenario: Fallback leg is last
+
+WHEN fallback flags are provided for an unrestricted non-Codex imported model
+THEN its OmniRoute deployment has priority strictly greater than every native
+deployment, a unique ID, and an upstream model equal to the llmux model name.
+
+#### Scenario: Codex and allowed-key models get no fallback leg
+
+WHEN an imported model can reach Codex or has `allowed_keys`
+THEN the importer adds no OmniRoute deployment to that model.
+
+#### Scenario: Codex IDs excluded from catch-all
+
+WHEN fallback flags are provided
+THEN the importer emits a `*` model with `upstream_model = "*"`
+AND excludes Codex provider aliases and node prefixes, every Codex-reaching
+combo and model alias, enabled mapping patterns that can reach Codex, and the
+names and aliases of every allowed-key model, even if Codex connections were
+not imported.
+
+#### Scenario: Unsafe mapping cannot be expressed
+
+WHEN an enabled Codex-routing mapping pattern cannot be expressed as an exact
+ID or a prefix with a single trailing `*`
+THEN import fails clearly without writing the output configuration.
+
 ### Requirement: Revenue-oriented allocation
 
 Provider and capacity allocation SHALL favor increasing CheaperInference

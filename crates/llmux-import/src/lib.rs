@@ -4,6 +4,7 @@ mod aliases;
 mod connection;
 mod db_dump;
 mod direct;
+mod fallback;
 mod upstream;
 mod validation;
 
@@ -21,6 +22,11 @@ pub struct ImportReport {
     pub deployments: usize,
     pub credentials: usize,
     pub client_keys: usize,
+}
+
+pub struct OmniRouteFallback<'a> {
+    pub base_url: &'a str,
+    pub key: &'a str,
 }
 
 struct Connection {
@@ -305,6 +311,25 @@ pub fn import(
     output: &Path,
     secrets_dir: Option<&Path>,
 ) -> Result<ImportReport, String> {
+    import_with_fallback(input, output, secrets_dir, None)
+}
+
+pub fn import_with_fallback(
+    input: &str,
+    output: &Path,
+    secrets_dir: Option<&Path>,
+    fallback: Option<OmniRouteFallback<'_>>,
+) -> Result<ImportReport, String> {
+    if let Some(options) = &fallback {
+        if !["env:", "file:"].iter().any(|prefix| {
+            options
+                .key
+                .strip_prefix(prefix)
+                .is_some_and(|value| !value.is_empty())
+        }) {
+            return Err("--omniroute-key must be a nonempty env: or file: secret reference".into());
+        }
+    }
     let root: Value =
         serde_json::from_str(input).map_err(|_| "invalid OmniRoute JSON".to_owned())?;
     if !root.is_object() {
@@ -527,6 +552,24 @@ pub fn import(
         models.push(json!({"name":name,"aliases":[],"deployments":deployments}));
     }
     aliases::attach(&mut models, aliases, &mut warnings);
+    if let Some(options) = fallback {
+        let exclusions = fallback::exclusions(&root, &combos, &combo_ids)?;
+        let credential = unique("omniroute-fallback", &mut ids);
+        credentials.push(
+            json!({"id":credential,"kind":"api_key","provider":"openai_compat","key":options.key}),
+        );
+        fallback::append(
+            &mut models,
+            &options,
+            &credential,
+            &mut deployment_ids,
+            exclusions,
+        )?;
+        deployment_count = models
+            .iter()
+            .map(|model| array(model, "deployments").len())
+            .sum();
+    }
     if models.is_empty() {
         return Err("no importable models; no configuration written".into());
     }
