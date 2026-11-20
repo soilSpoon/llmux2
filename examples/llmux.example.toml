@@ -6,6 +6,7 @@ shutdown_timeout_ms = 60000 # drain in-flight requests/streams, then exit; 1–8
 drain_grace_ms = 2000 # 0–10000 ms; cap below WatchdogSec=30 (shared-port probes may hit draining slot)
 expose_routing_headers = true
 # dashboard_key = "env:LLMUX_DASHBOARD_KEY"
+# request_log = "/var/log/llmux/requests.jsonl" # append-only per-request routing records (JSONL)
 
 [routing]
 max_attempts = 2

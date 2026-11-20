@@ -146,11 +146,13 @@ async fn fixture_with_models(
         shared_quota,
         Default::default(),
         false,
+        None,
     )
     .await
 }
 
 /// `second_quota` is the quota of credential "second", used only by dep2.
+#[allow(clippy::too_many_arguments)]
 async fn fixture_full(
     errors: Vec<UpstreamError>,
     refresh_fails: bool,
@@ -159,6 +161,7 @@ async fn fixture_full(
     shared_quota: llmux_types::QuotaSpec,
     second_quota: llmux_types::QuotaSpec,
     split_routes: bool,
+    request_log: Option<std::path::PathBuf>,
 ) -> Fixture {
     let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
     let served_status = status.clone();
@@ -220,6 +223,7 @@ async fn fixture_full(
             drain_grace: Duration::from_secs(2),
             expose_routing_headers: true,
             dashboard_key: None,
+            request_log,
         },
         routing: llmux_config::RoutingConfig {
             max_attempts: 4,
@@ -877,6 +881,7 @@ async fn credential_quota_limits_the_credentials_deployments() {
             ..Default::default()
         },
         false,
+        None,
     )
     .await;
     executor.execute(request()).await.unwrap();
@@ -897,6 +902,7 @@ async fn exhausted_quota_cools_every_deployment_on_the_credential() {
         Default::default(),
         Default::default(),
         true,
+        None,
     )
     .await;
     let to = |model: &str| GatewayRequest {
@@ -931,6 +937,7 @@ async fn credential_peers_cool_only_until_the_quota_resets() {
         Default::default(),
         Default::default(),
         true,
+        None,
     )
     .await;
     *adapter.observed.lock().unwrap() = Some(LimitObservation {
@@ -957,4 +964,58 @@ async fn credential_peers_cool_only_until_the_quota_resets() {
         ["dep0", "dep1"],
         "dep0's own route limit is not the key's"
     );
+}
+
+#[tokio::test]
+async fn request_log_records_each_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, _adapter, _, _server) = fixture_full(
+        vec![UpstreamError::RateLimited {
+            retry_after: Some(Duration::from_secs(1)),
+        }],
+        false,
+        [None; 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+    )
+    .await;
+
+    assert!(matches!(
+        executor.execute(request()).await,
+        Err(GatewayError::AllCandidatesExhausted { .. })
+    ));
+    // The exhausted request reached dep0 before its cooldown; the next one
+    // cannot even start an attempt.
+    assert!(matches!(
+        executor.execute(request()).await,
+        Err(GatewayError::AllCandidatesExhausted { .. })
+    ));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    executor.execute(request()).await.unwrap();
+    drop(executor);
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0]["outcome"], "error");
+    assert_eq!(lines[0]["error_kind"], "all_candidates_exhausted");
+    assert_eq!(lines[0]["deployment"], "dep0");
+    assert_eq!(lines[0]["provider"], "test");
+    assert_eq!(lines[0]["attempts"], 1);
+    assert_eq!(lines[1]["outcome"], "error");
+    assert_eq!(lines[1]["attempts"], 0);
+    assert!(lines[1].get("deployment").is_none());
+    assert_eq!(lines[2]["outcome"], "routed");
+    assert_eq!(lines[2]["model"], "model");
+    assert_eq!(lines[2]["deployment"], "dep0");
+    assert_eq!(lines[2]["attempts"], 1);
+    assert!(lines[2]["latency_ms"].is_number());
+    assert!(lines[2]["ts_ms"].is_number());
 }

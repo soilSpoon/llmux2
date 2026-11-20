@@ -37,6 +37,8 @@ pub struct ServerConfig {
     pub drain_grace: Duration,
     pub expose_routing_headers: bool,
     pub dashboard_key: Option<Arc<str>>,
+    /// Append-only JSONL file for per-request routing records.
+    pub request_log: Option<PathBuf>,
 }
 
 pub struct RoutingConfig {
@@ -126,6 +128,7 @@ struct RawServer {
     drain_grace_ms: u64,
     expose_routing_headers: bool,
     dashboard_key: Option<String>,
+    request_log: Option<PathBuf>,
 }
 
 impl Default for RawServer {
@@ -138,6 +141,7 @@ impl Default for RawServer {
             drain_grace_ms: 2_000,
             expose_routing_headers: true,
             dashboard_key: None,
+            request_log: None,
         }
     }
 }
@@ -601,6 +605,7 @@ impl RawConfig {
                 drain_grace: Duration::from_millis(server.drain_grace_ms),
                 expose_routing_headers: server.expose_routing_headers,
                 dashboard_key,
+                request_log: server.request_log,
             },
             routing: RoutingConfig {
                 max_attempts: routing.max_attempts,
@@ -1149,5 +1154,21 @@ refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
                 .to_string()
                 .contains("max_context must be positive"));
         }
+    }
+
+    #[test]
+    fn request_log_path_parses_and_defaults_absent() {
+        let base = config(REQUIRED);
+        let loaded = RuntimeConfig::parse(&base.replace(
+            "[server]",
+            "[server]\nrequest_log = \"/var/log/llmux/requests.jsonl\"",
+        ))
+        .unwrap();
+        assert_eq!(
+            loaded.server.request_log.as_deref(),
+            Some(Path::new("/var/log/llmux/requests.jsonl"))
+        );
+        let loaded = RuntimeConfig::parse(&base).unwrap();
+        assert!(loaded.server.request_log.is_none());
     }
 }

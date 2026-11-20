@@ -1,6 +1,7 @@
 //! Priority routing, deployment limits, and HTTP execution.
 
 mod limits;
+mod request_log;
 mod stats;
 
 #[cfg(test)]
@@ -21,6 +22,7 @@ use llmux_types::{
     ErrorKind, GatewayRequest, GatewayResponse, ProviderAdapter, ProviderRegistry, Support,
     UpstreamError,
 };
+use request_log::{RequestLog, RequestRecord};
 use stats::AttemptStats;
 pub use stats::{CatchAllStats, DeploymentStats, FallbackStats};
 use std::{
@@ -41,6 +43,8 @@ pub enum InitError {
     UnknownProvider(Arc<str>),
     #[error("deployment has no credential source")]
     MissingCredential,
+    #[error("cannot open request log: {0}")]
+    RequestLog(std::io::Error),
 }
 
 #[derive(Debug, Error)]
@@ -102,6 +106,15 @@ pub struct Executor {
     orders: Box<[ModelOrder]>,
     credentials: HashMap<Arc<str>, Arc<AtomicBool>>,
     http: HttpClient,
+    request_log: Option<RequestLog>,
+}
+
+/// What a routing pass learned about the deployments it touched.
+#[derive(Default)]
+struct RouteMeta {
+    attempts: usize,
+    /// Last deployment actually attempted, successful or not.
+    last_dep: Option<usize>,
 }
 
 impl Executor {
@@ -251,6 +264,7 @@ impl Executor {
             .pool_timer(TokioTimer::new())
             .pool_idle_timeout(Duration::from_secs(30))
             .retry_canceled_requests(false);
+        let request_log = cfg.server.request_log.clone();
         Ok(Self {
             catch_all_stats: cfg.server.dashboard_key.is_some().then(Default::default),
             cfg,
@@ -258,6 +272,11 @@ impl Executor {
             orders,
             credentials: disabled,
             http: builder.build(connector),
+            request_log: request_log
+                .as_deref()
+                .map(RequestLog::open)
+                .transpose()
+                .map_err(InitError::RequestLog)?,
         })
     }
 
@@ -314,6 +333,40 @@ impl Executor {
     }
 
     pub async fn execute(&self, req: GatewayRequest) -> Result<RoutedResponse, GatewayError> {
+        if self.request_log.is_none() {
+            return self.route(req, &mut RouteMeta::default()).await;
+        }
+        let started = Instant::now();
+        let request_id = req.request_id.0.clone();
+        let model = req.model.clone();
+        let mut meta = RouteMeta::default();
+        let result = self.route(req, &mut meta).await;
+        if let Some(log) = &self.request_log {
+            let latency_ms = started.elapsed().as_millis() as u64;
+            let dep = meta.last_dep.map(|idx| &self.cfg.deployments[idx]);
+            log.record(&RequestRecord {
+                ts_ms: request_log::now_ms(),
+                request_id: &request_id,
+                model: &model,
+                deployment: dep.map(|dep| dep.id.as_ref()),
+                provider: dep.map(|dep| dep.provider.0.as_ref()),
+                attempts: meta.attempts,
+                latency_ms,
+                outcome: if result.is_ok() { "routed" } else { "error" },
+                error_kind: result.as_ref().err().map(request_log::error_kind),
+                quota_remaining: meta
+                    .last_dep
+                    .map(|idx| self.bindings[idx].limits.remaining(Instant::now())),
+            });
+        }
+        result
+    }
+
+    async fn route(
+        &self,
+        req: GatewayRequest,
+        meta: &mut RouteMeta,
+    ) -> Result<RoutedResponse, GatewayError> {
         let model_idx = self
             .cfg
             .model_names
@@ -441,6 +494,8 @@ impl Executor {
                         break;
                     };
                     attempts += 1;
+                    meta.attempts = attempts;
+                    meta.last_dep = Some(idx);
                     let timed_out = Err(GatewayError::Client(UpstreamError::Timeout));
                     let result = match upstream {
                         Ok(Ok(upstream)) => {

@@ -780,6 +780,8 @@ dependencies = [
  "llmux-testkit",
  "llmux-types",
  "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]

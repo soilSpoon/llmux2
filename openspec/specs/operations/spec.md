@@ -59,6 +59,25 @@ fallback share, top retained IDs and fallback deployment labels.
 - THEN new IDs count in the other bucket while retained IDs continue accumulating.
 - WHEN an upstream attempt fails before a response is ready
 - THEN it does not increment served counts or the catch-all breakdown.
+### Requirement: Durable per-request routing records
+When `server.request_log` names a path, the gateway SHALL append one JSON
+object per routed request as a JSONL line. Each record SHALL carry the
+timestamp, request ID, requested model, last-attempted deployment ID and
+provider, attempt count, total latency, the outcome (`routed` or `error`),
+the failure kind on errors, and the remaining RPM/concurrency headroom of
+the last-attempted deployment. Optional fields SHALL be omitted rather than
+written as null, and the file SHALL be created on startup, failing startup
+when it cannot be opened. Records SHALL contain no credentials or request
+bodies. When `server.request_log` is unset, no file is written.
+
+#### Scenario: Failed request still recorded
+- WHEN a request exhausts every candidate
+- THEN the record names the last-attempted deployment, the attempt count and `all_candidates_exhausted`.
+
+#### Scenario: No attempts made
+- WHEN every candidate is cooling or limited before any attempt
+- THEN the record omits `deployment`, `provider` and `quota_remaining`.
+
 ### Requirement: Korean dashboard
 
 The gateway SHALL offer an at-a-glance dashboard in Korean, light theme by
