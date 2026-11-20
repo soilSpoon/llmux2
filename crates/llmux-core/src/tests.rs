@@ -429,3 +429,44 @@ async fn exhaustion_retry_hint_ignores_deployments_that_do_not_fit() {
     };
     assert!(retry_after > Duration::from_secs(2));
 }
+
+#[tokio::test]
+async fn repeated_rate_limits_lengthen_cooldown_until_a_success() {
+    let limited = || UpstreamError::RateLimited {
+        retry_after: None,
+        scope: llmux_types::LimitScope::Unknown,
+    };
+    let (executor, adapter, _, _server) = fixture(vec![limited()], false).await;
+    let cooldown = |executor: &Executor| {
+        let now = Instant::now();
+        executor.bindings[0]
+            .limits
+            .cooldown_until(now)
+            .map_or(Duration::ZERO, |end| end - now)
+    };
+    let served = |adapter: &Adapter| adapter.calls.lock().unwrap().last().unwrap().0.clone();
+
+    executor.execute(request()).await.unwrap();
+    assert_eq!(served(&adapter).as_ref(), "dep1");
+    assert!(cooldown(&executor) <= Duration::from_secs(1));
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    adapter.errors.lock().unwrap().push_back(limited());
+    executor.execute(request()).await.unwrap();
+    assert_eq!(served(&adapter).as_ref(), "dep1");
+    let second = cooldown(&executor);
+    assert!(
+        second > Duration::from_millis(1500) && second <= Duration::from_secs(2),
+        "second consecutive 429 should double the cooldown, got {second:?}"
+    );
+
+    tokio::time::sleep(second + Duration::from_millis(100)).await;
+    executor.execute(request()).await.unwrap();
+    assert_eq!(served(&adapter).as_ref(), "dep0");
+    adapter.errors.lock().unwrap().push_back(limited());
+    executor.execute(request()).await.unwrap();
+    assert!(
+        cooldown(&executor) <= Duration::from_secs(1),
+        "a success resets the backoff"
+    );
+}
