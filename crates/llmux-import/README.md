@@ -145,7 +145,24 @@ credential. Remove custom headers to roll back; no header values appear in TOML.
 Loopback, localhost (including subdomains), unspecified addresses, and mapped
 IPv4 loopback addresses are skipped with a warning before writing credentials.
 This does not test DNS resolution or network reachability. Morph is imported
-only at its official `https://api.morphllm.com/v1` endpoint.
+only at its official `https://api.morphllm.com/v1` endpoint. A built-in Morph
+connection's loopback override is replaced with that official endpoint, with a
+warning: OCI verified the existing key lists `morph-dsv41flash-1017` at
+`https://api.morphllm.com/v1/models` and returns chat logprobs. This reviewed
+exception does not apply to custom nodes or other loopback providers, and does
+not accept arbitrary nonofficial Morph hosts or unspecified bind addresses.
+
+The reviewed combos `deepseek-v4.1-flash`, `deepseek-v4.1-flash-fast`,
+`deepseek-v4.1-flash-1017`, `deepseek-v4.1-flash-1017-fast`, and
+`deepseek-v4.1-flash-1017-ultrafast` move the official Morph
+`morph-dsv41flash-1017` deployments immediately before the Vibe/Mistral
+`deepseek-v4-1-flash-1017` deployments, retaining the relative order of other
+legs. OCI observed Mistral rejects logprobs for this model; this is an explicit
+reviewed routing-policy change, not a general capability sort or a claim about
+OmniRoute's original order. Other combo names/models/endpoints are unchanged.
+No logprobs fields are stripped. Earlier non-Mistral legs remain earlier, and
+an enabled OmniRoute fallback remains last. To roll back, remove the reviewed
+Morph endpoint exception and combo-order policy before regenerating config.
 Gemini uses Google's documented OpenAI-compatible endpoint
 `https://generativelanguage.googleapis.com/v1beta/openai`, not OmniRoute's native
 Gemini protocol endpoint. See https://ai.google.dev/gemini-api/docs/openai.

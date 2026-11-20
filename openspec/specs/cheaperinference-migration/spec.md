@@ -100,6 +100,29 @@ THEN no DeepSeek field stripping is added, even on a DeepSeek provider connectio
 WHEN a DeepSeek upstream model uses an anthropic-compatible node
 THEN the deployment imports successfully without strip_request_fields.
 
+### Requirement: Reviewed Morph official migration and logprobs order
+The importer SHALL migrate only built-in Morph loopback connection overrides to
+`https://api.morphllm.com/v1`, warning about the reviewed endpoint substitution.
+Other loopback providers, custom nodes, nonofficial Morph hosts and unspecified
+bind addresses SHALL remain excluded. The existing Morph credential is reused.
+
+The reviewed combo names `deepseek-v4.1-flash`, `deepseek-v4.1-flash-fast`,
+`deepseek-v4.1-flash-1017`, `deepseek-v4.1-flash-1017-fast` and
+`deepseek-v4.1-flash-1017-ultrafast` SHALL place official Morph
+`morph-dsv41flash-1017` deployments before Vibe/Mistral
+`deepseek-v4-1-flash-1017` deployments, preserving other legs' relative order.
+This explicit policy follows OCI verification of Morph models.list and chat
+logprobs, and Mistral's rejection of logprobs for this model; it SHALL NOT strip
+logprobs, reorder unrelated combos, or replace the optional final fallback.
+
+#### Scenario: Reviewed loopback Morph leg and Mistral leg
+- **WHEN** a reviewed combo contains both verified legs
+- **THEN** the official Morph leg precedes Mistral and a migration warning is emitted
+
+#### Scenario: Unreviewed model or combo
+- **WHEN** the Morph model or combo name is not reviewed, or either leg is absent
+- **THEN** no reviewed logprobs-order policy is applied
+
 ### Requirement: Gemini OpenAI endpoint parameter compatibility
 
 The importer SHALL add seed and user stripping to openai and openai_compat
