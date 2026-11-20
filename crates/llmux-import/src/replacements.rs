@@ -8,6 +8,34 @@ pub(super) fn find(model: &str) -> Option<&'static Route> {
     ROUTES.iter().find(|row| row.0 == model)
 }
 
+pub(super) fn antigravity(model: &str) -> Option<&'static Route> {
+    ANTIGRAVITY_ROUTES.iter().find(|row| row.0 == model)
+}
+
+pub(super) fn antigravity_connection(route: &Route, connection: &Connection) -> bool {
+    connection.provider.is_builtin("gemini")
+        && connection.credential.is_some()
+        && matches(route, connection)
+}
+
+pub(super) fn seed_antigravity(direct: &mut BTreeMap<String, Value>, connections: &[Connection]) {
+    for route in ANTIGRAVITY_ROUTES {
+        if connections
+            .iter()
+            .any(|connection| antigravity_connection(route, connection))
+        {
+            let name = format!("antigravity/{}", route.0);
+            direct.entry(name.clone()).or_insert_with(|| json!({"name":name,"models":[crate::upstream::ProviderIdentity::Builtin("antigravity".into()).step(route.0)]}));
+        }
+    }
+}
+
+const ANTIGRAVITY_ROUTES: &[Route] = &[
+    // Operator verified gemini-3-flash-preview via OCI Gemini models.list.
+    // https://ai.google.dev/api/models#method:-models.list
+    ("gemini-3-flash", "gemini", "gemini-3-flash-preview"),
+];
+
 pub(super) fn matches(route: &Route, connection: &Connection) -> bool {
     if route.1 != "anthropic" && !matches!(connection.kind.as_str(), "openai" | "openai_compat") {
         return false;

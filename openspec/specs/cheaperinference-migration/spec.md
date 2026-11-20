@@ -6,6 +6,25 @@ Moving CheaperInference traffic from OmniRoute onto llmux2.
 
 ## Requirements
 
+### Requirement: Reviewed Antigravity Gemini replacement
+
+The importer SHALL map only antigravity/gemini-3-flash to
+gemini-3-flash-preview on all eligible built-in Gemini API-key connections in
+priority order, preserving aliases and combo references. Source Antigravity
+connection restrictions SHALL be replaced by the eligible Gemini set with a
+warning. Antigravity OAuth connections SHALL remain skipped. Ordinary OmniRoute
+fallback semantics SHALL apply after native deployments when enabled.
+
+#### Scenario: Reviewed Flash route
+
+WHEN a combo or alias resolves to antigravity/gemini-3-flash
+THEN it uses Gemini deployments followed by the optional OmniRoute fallback.
+
+#### Scenario: No eligible Gemini connection
+
+WHEN no eligible Gemini API-key connection exists
+THEN no native replacement deployment is emitted and a warning explains why.
+
 ### Requirement: DeepSeek parameter compatibility
 
 The importer SHALL configure built-in DeepSeek deployments to strip seed, user,
