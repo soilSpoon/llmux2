@@ -18,6 +18,7 @@ pub(super) struct DeploymentLimits {
     concurrent: Option<u32>,
     inflight: AtomicU32,
     rpm: Option<(u32, Mutex<VecDeque<Instant>>)>,
+    limit_strikes: AtomicU32,
 }
 
 impl DeploymentLimits {
@@ -33,6 +34,27 @@ impl DeploymentLimits {
             concurrent: spec.concurrent,
             inflight: AtomicU32::new(0),
             rpm: spec.rpm.map(|rpm| (rpm, Mutex::default())),
+            limit_strikes: AtomicU32::new(0),
+        }
+    }
+
+    /// Cools down after a 429. Without a provider hint, each consecutive limit doubles the wait;
+    /// a limit that lands while the deployment is already cooling does not count as another one.
+    pub fn limited(&self, hint: Option<Duration>, default: Duration, max: Duration) -> Instant {
+        let strikes = if self.cooldown_until(Instant::now()).is_some() {
+            self.limit_strikes.load(Ordering::Relaxed).max(1)
+        } else {
+            self.limit_strikes
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1)
+        };
+        let backoff = default.saturating_mul(1u32.checked_shl(strikes - 1).unwrap_or(u32::MAX));
+        self.cool_down(hint.unwrap_or(backoff).min(max))
+    }
+
+    pub fn succeeded(&self) {
+        if self.limit_strikes.load(Ordering::Relaxed) != 0 {
+            self.limit_strikes.store(0, Ordering::Relaxed);
         }
     }
 
@@ -142,5 +164,55 @@ mod tests {
         assert_eq!(limits.cool_down(Duration::from_secs(1)), reset);
         assert_eq!(limits.cooldown_until(Instant::now()), Some(reset));
         assert_eq!(limits.cooldown_until(reset), None);
+    }
+
+    #[test]
+    fn repeated_unhinted_limits_back_off_exponentially_until_success() {
+        let limits = DeploymentLimits::new(QuotaSpec::default());
+        let (default, max) = (Duration::from_secs(1), Duration::from_secs(5));
+        let wait_with = |limits: &DeploymentLimits, default, max| {
+            let start = Instant::now();
+            limits.limited(None, default, max).duration_since(start)
+        };
+        let wait = |limits: &DeploymentLimits, hint| {
+            let start = Instant::now();
+            limits.limited(hint, default, max).duration_since(start)
+        };
+        let near = |actual: Duration, expected: Duration| {
+            assert!(
+                actual.abs_diff(expected) < Duration::from_millis(50),
+                "{actual:?} vs {expected:?}"
+            );
+        };
+        near(wait(&limits, None), default);
+        // A concurrent 429 that lands during the cooldown does not escalate it.
+        near(wait(&limits, None), default);
+        limits.cooldown_until_ns.store(0, Ordering::Relaxed);
+        near(wait(&limits, None), 2 * default);
+        limits.cooldown_until_ns.store(0, Ordering::Relaxed);
+        near(wait(&limits, None), 4 * default);
+        limits.cooldown_until_ns.store(0, Ordering::Relaxed);
+        near(wait(&limits, None), max);
+        limits.cooldown_until_ns.store(0, Ordering::Relaxed);
+        near(
+            wait(&limits, Some(Duration::from_millis(300))),
+            Duration::from_millis(300),
+        );
+        limits.cooldown_until_ns.store(0, Ordering::Relaxed);
+        limits.succeeded();
+        near(wait(&limits, None), default);
+        for _ in 0..40 {
+            limits.cooldown_until_ns.store(0, Ordering::Relaxed);
+            limits.limited(None, Duration::from_millis(1), Duration::from_secs(3_600));
+        }
+        limits.cooldown_until_ns.store(0, Ordering::Relaxed);
+        near(
+            wait_with(
+                &limits,
+                Duration::from_millis(1),
+                Duration::from_secs(3_600),
+            ),
+            Duration::from_secs(3_600),
+        );
     }
 }
