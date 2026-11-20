@@ -455,6 +455,7 @@ dependencies = [
 name = "llmux-import"
 version = "0.1.0"
 dependencies = [
+ "http",
  "llmux-config",
  "serde_json",
  "tempfile",
