@@ -18,6 +18,34 @@ WHEN canonical model `m` maps to deployments on two providers with different
 upstream model IDs
 THEN a client requesting `m` is served by whichever deployment routing selects.
 
+### Requirement: Configured catch-all route
+
+The gateway SHALL optionally route unknown model IDs through a single model
+named `*`, passing the requested ID unchanged to its deployments. The catch-all
+SHALL have no aliases or allowed keys, SHALL require `upstream_model = "*"`,
+and SHALL NOT appear in model discovery. Other models SHALL NOT use that upstream
+model value. Only the catch-all MAY declare `exclude`, containing nonempty exact
+IDs or prefixes with a single trailing `*`, matched ASCII case-insensitively.
+The literal request model `*` SHALL always be unknown. Normal routing limits,
+priority, retries, and stream-commit rules SHALL remain unchanged.
+
+#### Scenario: Unknown ID routed to catch-all
+
+WHEN an ID has no configured name or alias and is not excluded
+AND a catch-all is configured
+THEN the catch-all deployments receive the original requested ID.
+
+#### Scenario: Excluded ID retains unknown-model error
+
+WHEN an unknown ID matches an exact exclusion or case-insensitive prefix exclusion
+THEN the gateway returns the existing unknown-model error without an upstream call.
+
+#### Scenario: Known model never uses catch-all
+
+WHEN a configured name or alias is requested
+THEN only that model's deployments are eligible, even if they are exhausted
+AND its existing allowed-key restrictions remain enforced.
+
 ### Requirement: Eligibility before ranking
 
 The gateway SHALL skip a deployment that cannot serve right now — in cooldown,

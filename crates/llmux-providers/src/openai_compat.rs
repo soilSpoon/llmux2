@@ -448,12 +448,14 @@ impl ProviderAdapter for OpenAiCompat {
             )
             .body(match req.format {
                 InboundFormat::OpenAiResponses => {
-                    responses::request(&req.body, &dep.upstream_model)?
+                    responses::request(&req.body, crate::upstream_model(req, dep))?
                 }
                 InboundFormat::AnthropicMessages => {
-                    messages::request(&req.body, &dep.upstream_model)?
+                    messages::request(&req.body, crate::upstream_model(req, dep))?
                 }
-                InboundFormat::OpenAiChat => rewrite_model(&req.body, &dep.upstream_model)?,
+                InboundFormat::OpenAiChat => {
+                    rewrite_model(&req.body, crate::upstream_model(req, dep))?
+                }
             })?;
 
         match auth {
@@ -492,17 +494,7 @@ impl ProviderAdapter for OpenAiCompat {
         }
 
         if req.stream {
-            let is_sse = parts
-                .headers
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| {
-                    v.split(';')
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .eq_ignore_ascii_case("text/event-stream")
-                });
+            let is_sse = sse::is_event_stream(&parts.headers);
             if !is_sse {
                 return Err(bad_gateway());
             }

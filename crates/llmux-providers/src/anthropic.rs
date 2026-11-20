@@ -429,8 +429,8 @@ impl ProviderAdapter for Anthropic {
     ) -> Result<Request<Bytes>, BuildError> {
         let body = match self.supports(req.format) {
             Support::No => return Err(BuildError::UnsupportedFormat),
-            Support::Passthrough => rewrite_model(&req.body, &dep.upstream_model)?,
-            Support::Convert => convert_request(&req.body, &dep.upstream_model)?,
+            Support::Passthrough => rewrite_model(&req.body, crate::upstream_model(req, dep))?,
+            Support::Convert => convert_request(&req.body, crate::upstream_model(req, dep))?,
         };
         let mut parts = dep.base_url.clone().into_parts();
         parts.path_and_query =
@@ -490,18 +490,7 @@ impl ProviderAdapter for Anthropic {
             _ => {}
         }
         if req.stream {
-            if !parts
-                .headers
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|s| {
-                    s.split(';')
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .eq_ignore_ascii_case("text/event-stream")
-                })
-            {
+            if !sse::is_event_stream(&parts.headers) {
                 return Err(bad_gateway());
             }
             let events = sse::decode_until(body, true);
@@ -917,7 +906,7 @@ mod tests {
     #[test]
     fn auth_passthrough_and_support() {
         let a = Anthropic::new("anthropic");
-        let dep = Deployment {
+        let mut dep = Deployment {
             idx: DeploymentIdx(0),
             id: "a".into(),
             provider: a.kind().clone(),
@@ -982,5 +971,26 @@ mod tests {
                 .unwrap(),
             Err(BuildError::UnsupportedFormat)
         ));
+        dep.upstream_model = "*".into();
+        req.format = InboundFormat::AnthropicMessages;
+        let request = a
+            .build_request(&req, &dep, &AuthMaterial::None)
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            request.body().as_ref(),
+            br#"{ "model":"alias", "future":{"model":"untouched"} }"#
+        );
+        req.format = InboundFormat::OpenAiChat;
+        req.body =
+            Bytes::from_static(br#"{"model":"alias","messages":[{"role":"user","content":"hi"}]}"#);
+        let request = a
+            .build_request(&req, &dep, &AuthMaterial::None)
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        let body: Value = serde_json::from_slice(request.body()).unwrap();
+        assert_eq!(body["model"], "alias");
     }
 }
