@@ -662,6 +662,24 @@ mod tests {
     }
 
     #[test]
+    fn removed_routing_and_deployment_knobs_are_rejected() {
+        let base = config(REQUIRED);
+        for legacy in [
+            "[routing]\ndefault_strategy = \"priority\"\n",
+            "[routing]\nretry_same_deployment = true\n",
+            "[models]\nstrategy = \"priority\"\n[[models]",
+            "weight = 2\n",
+            "billing = \"free\"\n",
+        ] {
+            let input = base.replace("[[models]]", &format!("{legacy}[[models]]"));
+            assert!(
+                RuntimeConfig::parse(&input).is_err(),
+                "legacy key still accepted: {legacy}"
+            );
+        }
+    }
+
+    #[test]
     fn credential_quotas_are_shared_limits_that_must_be_positive() {
         RuntimeConfig::parse(&config(&format!(
             "{REQUIRED}\nquota = {{ rpm = 20, rpd = 50 }}"
