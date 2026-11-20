@@ -174,6 +174,7 @@ impl Executor {
         };
         let deadline = Instant::now() + self.cfg.server.request_timeout;
         let mut attempts = 0;
+        let mut last_transient = None;
         'groups: for group in &order.groups {
             let shift = sequence % group.len();
             let (before, after) = model.deployments[group.clone()].split_at(shift);
@@ -191,12 +192,14 @@ impl Executor {
                 }
                 let now = Instant::now();
                 if binding.limits.cooldown_until(now).is_some() {
+                    last_transient = None;
                     continue;
                 }
                 if now >= deadline {
                     return Err(GatewayError::Client(UpstreamError::Timeout));
                 }
                 let Some(permit) = binding.limits.admit() else {
+                    last_transient = None;
                     continue;
                 };
 
@@ -210,6 +213,7 @@ impl Executor {
                     let result = timeout_at(attempt_deadline, self.attempt(&req, dep, binding))
                         .await
                         .unwrap_or(Err(GatewayError::Client(UpstreamError::Timeout)));
+                    last_transient = None;
                     match result {
                         Ok(response) => {
                             return Ok(RoutedResponse {
@@ -265,15 +269,18 @@ impl Executor {
                             }
                         }
                         Err(GatewayError::Client(
-                            UpstreamError::Server { .. }
+                            err @ (UpstreamError::Server { .. }
                             | UpstreamError::Timeout
-                            | UpstreamError::Connect,
-                        )) => {}
+                            | UpstreamError::Connect),
+                        )) => last_transient = Some(err),
                         Err(err) => return Err(err),
                     }
                     break;
                 }
             }
+        }
+        if let Some(err) = last_transient {
+            return Err(GatewayError::Client(err));
         }
         // The next request can use any compatible deployment, even if retries stopped early.
         let now = Instant::now();

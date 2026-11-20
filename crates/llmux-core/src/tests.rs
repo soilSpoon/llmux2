@@ -251,6 +251,42 @@ async fn transient_errors_fall_back() {
 }
 
 #[tokio::test]
+async fn exhausted_transient_errors_return_last_error() {
+    let (executor, _, _, _server) = fixture(
+        vec![
+            UpstreamError::Server {
+                status: StatusCode::BAD_GATEWAY,
+            },
+            UpstreamError::Connect,
+            UpstreamError::Timeout,
+        ],
+        false,
+    )
+    .await;
+    assert!(matches!(
+        executor.execute(request()).await,
+        Err(GatewayError::Client(UpstreamError::Timeout))
+    ));
+}
+
+#[tokio::test]
+async fn exhaustion_after_transient_then_quota_returns_limits() {
+    let (executor, _, _, _server) = fixture(
+        vec![
+            UpstreamError::Timeout,
+            UpstreamError::QuotaExhausted { reset_at: None },
+            UpstreamError::QuotaExhausted { reset_at: None },
+        ],
+        false,
+    )
+    .await;
+    assert!(matches!(
+        executor.execute(request()).await,
+        Err(GatewayError::AllCandidatesExhausted { attempts: 3, .. })
+    ));
+}
+
+#[tokio::test]
 async fn client_error_does_not_fall_back() {
     let (executor, adapter, _, _server) = fixture(
         vec![UpstreamError::BadRequest {
