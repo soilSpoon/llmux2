@@ -1,0 +1,11 @@
+[Unit]
+Description=Probe llmux2 routes every 5 minutes
+
+[Timer]
+OnBootSec=300
+OnUnitActiveSec=300
+AccuracySec=30
+Unit=llmux2-probe.service
+
+[Install]
+WantedBy=timers.target

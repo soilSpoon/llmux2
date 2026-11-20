@@ -1,0 +1,384 @@
+use serde_json::{json, Value};
+use std::{
+    collections::VecDeque,
+    fs,
+    io::{BufRead, BufReader, Read, Write},
+    net::TcpListener,
+    path::PathBuf,
+    process::{Command, Output},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc, Mutex,
+    },
+    thread,
+    time::Duration,
+};
+
+struct Home(PathBuf);
+impl Home {
+    fn new() -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "llmux2-ops-probe-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+    fn key(&self) -> PathBuf {
+        let path = self.0.join("client.key");
+        fs::write(&path, "probe-test-key\n").unwrap();
+        path
+    }
+    fn state(&self) -> PathBuf {
+        self.0.join("probe-state.json")
+    }
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_llmux2-probe"))
+            .args(args)
+            .env("HOME", &self.0)
+            .output()
+            .unwrap()
+    }
+}
+impl Drop for Home {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[derive(Clone)]
+struct Reply {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+impl Reply {
+    fn json(status: u16, body: Value) -> Self {
+        Self {
+            status,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: body.to_string(),
+        }
+    }
+    fn text(status: u16, body: &str) -> Self {
+        Self {
+            status,
+            headers: vec![],
+            body: body.into(),
+        }
+    }
+}
+struct Request {
+    method: String,
+    path: String,
+    authorization: Option<String>,
+    body: Value,
+}
+struct Gateway {
+    listen: String,
+    requests: Arc<Mutex<Vec<Request>>>,
+}
+impl Gateway {
+    fn start(replies: Vec<Reply>) -> (Self, mpsc::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen = listener.local_addr().unwrap().to_string();
+        let replies = Arc::new(Mutex::new(VecDeque::from(replies)));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (stop, stopped) = mpsc::channel();
+        let capture = requests.clone();
+        thread::spawn(move || loop {
+            listener.set_nonblocking(true).unwrap();
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let request = read_request(&mut stream);
+                    capture.lock().unwrap().push(request);
+                    let reply = replies
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or_else(|| Reply::text(500, "no scripted reply"));
+                    let mut response = format!("HTTP/1.1 {}\r\n", status_line(reply.status));
+                    let mut headers = reply.headers;
+                    headers.push(("content-length".into(), reply.body.len().to_string()));
+                    headers.push(("connection".into(), "close".into()));
+                    for (name, value) in headers {
+                        response += &format!("{name}: {value}\r\n");
+                    }
+                    response += "\r\n";
+                    response += &reply.body;
+                    stream.write_all(response.as_bytes()).unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if stopped.try_recv().is_ok() {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => return,
+            }
+        });
+        (Self { listen, requests }, stop)
+    }
+    fn paths(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.path))
+            .collect()
+    }
+    fn chat_models(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.path == "/v1/chat/completions")
+            .filter_map(|r| r.body["model"].as_str().map(str::to_string))
+            .collect()
+    }
+    fn authorized(&self) -> bool {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.path != "/healthz")
+            .all(|r| r.authorization.as_deref() == Some("Bearer probe-test-key"))
+    }
+}
+fn status_line(status: u16) -> &'static str {
+    match status {
+        200 => "200 OK",
+        400 => "400 Bad Request",
+        401 => "401 Unauthorized",
+        429 => "429 Too Many Requests",
+        503 => "503 Service Unavailable",
+        _ => "500 Internal Server Error",
+    }
+}
+fn read_request(stream: &mut std::net::TcpStream) -> Request {
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let mut parts = line.split_whitespace();
+    let (method, path) = (
+        parts.next().unwrap().to_string(),
+        parts.next().unwrap().to_string(),
+    );
+    let mut authorization = None;
+    let mut length = 0;
+    loop {
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        if line.trim().is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("authorization") {
+                authorization = Some(value.trim().to_string());
+            }
+            if name.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse().unwrap();
+            }
+        }
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+    Request {
+        method,
+        path,
+        authorization,
+        body: serde_json::from_slice(&body).unwrap_or(Value::Null),
+    }
+}
+fn models_reply() -> Reply {
+    Reply::json(
+        200,
+        json!({"object":"list","data":[
+            {"id":"beta","object":"model"},
+            {"id":"alpha","object":"model"},
+            {"id":"gamma","object":"model"}
+        ]}),
+    )
+}
+fn listen_flag(home: &Home, gateway: &Gateway, extra: &[&str]) -> Output {
+    let mut args = vec![
+        "--listen".into(),
+        gateway.listen.clone(),
+        "--key-file".into(),
+        home.key().to_string_lossy().into_owned(),
+        "--state-file".into(),
+        home.state().to_string_lossy().into_owned(),
+    ];
+    args.extend(extra.iter().map(|s| s.to_string()));
+    let output = Command::new(env!("CARGO_BIN_EXE_llmux2-probe"))
+        .args(&args)
+        .env("HOME", &home.0)
+        .output()
+        .unwrap();
+    output
+}
+fn summary(output: &Output) -> Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+        panic!(
+            "stdout was not JSON: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
+#[test]
+fn probe_help_and_argument_errors() {
+    let home = Home::new();
+    let output = home.run(&["--help"]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("usage:"));
+    let output = home.run(&["--bogus"]);
+    assert_eq!(output.status.code(), Some(2));
+    let output = home.run(&["--timeout", "abc"]);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn healthy_gateway_probes_each_route_and_reports_json() {
+    let home = Home::new();
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        models_reply(),
+        Reply::json(200, json!({"id":"chatcmpl-1"})),
+    ]);
+    let output = listen_flag(&home, &gateway, &[]);
+    assert_eq!(output.status.code(), Some(0));
+    let report = summary(&output);
+    assert_eq!(report["ok"], true);
+    let names: Vec<_> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["healthz", "models", "chat:alpha"]);
+    assert!(gateway.authorized());
+    assert_eq!(
+        gateway.paths(),
+        [
+            "GET /healthz",
+            "GET /v1/models",
+            "POST /v1/chat/completions"
+        ]
+    );
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn rotation_walks_the_sorted_model_list_across_runs() {
+    let home = Home::new();
+    for (expected, code) in [("alpha", 0), ("beta", 0), ("gamma", 0), ("alpha", 0)] {
+        let (gateway, stop) = Gateway::start(vec![
+            Reply::text(200, "ok"),
+            models_reply(),
+            Reply::json(200, json!({"id":"ok"})),
+        ]);
+        let output = listen_flag(&home, &gateway, &[]);
+        assert_eq!(output.status.code(), Some(code));
+        assert_eq!(gateway.chat_models(), [expected]);
+        stop.send(()).unwrap();
+    }
+    let state: Value = serde_json::from_str(&fs::read_to_string(home.state()).unwrap()).unwrap();
+    assert_eq!(state["next"], 1);
+}
+
+#[test]
+fn failing_model_probe_exits_one_and_reports_status() {
+    let home = Home::new();
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        models_reply(),
+        Reply::json(429, json!({"error":{"message":"quota"}})),
+    ]);
+    let output = listen_flag(&home, &gateway, &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let report = summary(&output);
+    assert_eq!(report["ok"], false);
+    let chat = &report["checks"][2];
+    assert_eq!(chat["status"], 429);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("probe-test-key"));
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn unreachable_gateway_reports_error_and_exits_one() {
+    let home = Home::new();
+    let dead = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().to_string()
+    };
+    let output = listen_flag(
+        &home,
+        &Gateway {
+            listen: dead,
+            requests: Arc::new(Mutex::new(vec![])),
+        },
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn explicit_models_probe_each_listed_model() {
+    let home = Home::new();
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        models_reply(),
+        Reply::json(200, json!({"id":"a"})),
+        Reply::json(200, json!({"id":"b"})),
+    ]);
+    let output = listen_flag(&home, &gateway, &["--models", "gamma,alpha"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(gateway.chat_models(), ["gamma", "alpha"]);
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn all_formats_adds_responses_and_anthropic_probes() {
+    let home = Home::new();
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        models_reply(),
+        Reply::json(200, json!({"id":"c"})),
+        Reply::json(200, json!({"id":"r"})),
+        Reply::json(200, json!({"id":"m"})),
+    ]);
+    let output = listen_flag(&home, &gateway, &["--all-formats"]);
+    assert_eq!(output.status.code(), Some(0));
+    let report = summary(&output);
+    let names: Vec<_> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "healthz",
+            "models",
+            "chat:alpha",
+            "responses:alpha",
+            "anthropic:alpha"
+        ]
+    );
+    assert_eq!(
+        gateway.paths(),
+        [
+            "GET /healthz",
+            "GET /v1/models",
+            "POST /v1/chat/completions",
+            "POST /v1/responses",
+            "POST /v1/messages"
+        ]
+    );
+    stop.send(()).unwrap();
+}

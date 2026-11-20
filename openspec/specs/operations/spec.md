@@ -219,6 +219,34 @@ WHEN comparing two gateways or injecting reliability faults
 THEN the Rust tools SHALL preserve request caps, secret-reference inputs,
 redaction, offline mode, and JSON/HTML/Markdown report contracts.
 
+### Requirement: Synthetic route probes
+
+The `llmux2-ops` package SHALL provide a standalone `llmux2-probe` binary that
+verifies the running gateway as a client sees it: `GET /healthz` and
+`GET /v1/models` on every run, then a one-token `POST /v1/chat/completions`
+for `--per-run` canonical models (default 1) chosen by a rotation cursor in
+`--state-file`, so each timer interval costs one synthetic provider request
+per run rather than one per model. `--models` SHALL pin an explicit set and
+`--all-formats` SHALL add one `/v1/responses` and one `/v1/messages` probe.
+The probe SHALL authenticate with the gateway client key from `--key-file`,
+bound each request by `--timeout`, bound response bodies, print a JSON report
+naming each check's status and latency, never print the key, and exit 0 only
+when every probe passes (1 on failure, 2 on usage errors). A
+`llmux2-probe.service`/`llmux2-probe.timer` pair under `deploy/systemd` SHALL
+run it periodically as a oneshot user unit.
+
+#### Scenario: Rotating coverage bounds provider cost
+
+WHEN the timer fires repeatedly
+THEN each run probes `--per-run` models in sorted rotation, persisting the
+cursor atomically so every canonical model is covered over successive runs.
+
+#### Scenario: Failure is observable
+
+WHEN healthz, the models route, or a probed model returns a non-2xx answer
+THEN the run exits 1 and the JSON report names the failing check with its
+status, so the failed unit is visible in the journal.
+
 ### Requirement: Simple and extensible
 
 The codebase SHALL stay simple with low overhead, and be easy to extend and
