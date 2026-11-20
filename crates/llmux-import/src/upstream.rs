@@ -3,9 +3,14 @@ use http::Uri;
 use serde_json::{json, Value};
 use std::net::IpAddr;
 
+pub(super) const PROVIDER_ALIASES: &[(&str, &str)] = &[("ds", "deepseek"), ("kc", "kilocode")];
+
 pub(super) fn canonical_provider<'a>(provider: &'a str, nodes: &'a [Value]) -> &'a str {
-    if provider == "ds" {
-        return "deepseek";
+    if let Some((_, canonical)) = PROVIDER_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == provider)
+    {
+        return canonical;
     }
     nodes
         .iter()
@@ -22,7 +27,9 @@ pub(super) fn model_id<'a>(raw: &'a str, provider: &str, nodes: &[Value]) -> &'a
             return model;
         };
         if segment == provider
-            || (provider == "deepseek" && segment == "ds")
+            || PROVIDER_ALIASES
+                .iter()
+                .any(|(alias, id)| *id == provider && *alias == segment)
             || node.is_some_and(|node| segment == string(node, "prefix"))
         {
             model = rest;
@@ -33,6 +40,37 @@ pub(super) fn model_id<'a>(raw: &'a str, provider: &str, nodes: &[Value]) -> &'a
             return model;
         }
     }
+}
+
+pub(super) fn model_target<'a>(step: &'a Value, nodes: &'a [Value]) -> Option<(&'a str, &'a str)> {
+    let raw = step
+        .as_str()
+        .unwrap_or_else(|| string(step, "model"))
+        .trim();
+    let provider_id = match string(step, "providerId") {
+        "" => string(step, "provider"),
+        id => id,
+    };
+    let (provider, model) = if provider_id.is_empty() {
+        raw.split_once('/')?
+    } else {
+        (provider_id, raw)
+    };
+    let canonical = canonical_provider(provider, nodes);
+    let model =
+        if !provider_id.is_empty() || nodes.iter().any(|node| string(node, "id") == canonical) {
+            model_id(model, canonical, nodes)
+        } else {
+            model
+        };
+    if provider.is_empty()
+        || model.is_empty()
+        || model.contains('*')
+        || string(step, "kind") == "provider-wildcard"
+    {
+        return None;
+    }
+    Some((canonical, model))
 }
 
 fn local_host(url: &str) -> bool {

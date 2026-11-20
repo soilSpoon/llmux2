@@ -17,7 +17,7 @@ fn imports_raw_sqlite_dump_through_shared_mapping() {
             report.credentials,
             report.client_keys
         ),
-        (3, 6, 3, 1)
+        (7, 12, 3, 1)
     );
     let config = RuntimeConfig::load(&output).unwrap();
     assert_eq!(
@@ -140,7 +140,7 @@ fn imports_and_validates_real_config() {
             report.credentials,
             report.client_keys
         ),
-        (8, 18, 5, 1)
+        (15, 26, 5, 1)
     );
     assert_eq!(
         config.model_names.get("legacy-alias"),
@@ -335,7 +335,7 @@ fn cli_reports_without_leaking_secrets() {
         String::from_utf8_lossy(&result.stderr)
     );
     let stderr = String::from_utf8(result.stderr).unwrap();
-    assert!(stderr.contains("imported 8 models"));
+    assert!(stderr.contains("imported 15 models"));
     assert!(stderr.contains("warning:"));
     assert!(!stderr.contains("-secret"));
     assert!(result.stdout.is_empty());
@@ -369,9 +369,11 @@ fn skips_malformed_steps_and_unsupported_custom_protocols() {
     let output = dir.path().join("out.toml");
     let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
     let config = RuntimeConfig::load(output).unwrap();
-    assert_eq!(config.models.len(), 1);
+    assert_eq!(config.models.len(), 2);
     assert_eq!(config.models[0].name.as_ref(), "safe");
-    assert_eq!(config.deployments.len(), 1);
+    assert_eq!(config.deployments.len(), 3);
+    assert_eq!(config.models[0].deployments.len(), 1);
+    assert!(!config.model_names.contains_key("openai/no"));
     assert_eq!(config.deployments[0].upstream_model.as_ref(), "yes");
     let warnings = report.warnings.join("\n");
     for expected in [
@@ -507,7 +509,7 @@ fn shared_empty_combo_diamonds_have_bounded_work() {
     let started = std::time::Instant::now();
     let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
-    assert_eq!(report.models, 1);
+    assert_eq!(report.models, 2);
     assert!(report.warnings.len() < 70_000);
     assert_eq!(
         report

@@ -3,6 +3,7 @@
 mod aliases;
 mod connection;
 mod db_dump;
+mod direct;
 mod upstream;
 mod validation;
 
@@ -230,49 +231,15 @@ impl Expander<'_> {
                 self.expand(target, stack, out);
                 continue;
             }
-            let (p, model) = if provider_id.is_empty() {
-                raw.split_once('/').unwrap_or(("", raw))
-            } else {
-                (provider_id, raw)
-            };
-            let canonical = upstream::canonical_provider(p, self.nodes);
-            let model = if provider_id.is_empty() {
-                // The routing segment was already consumed by split_once.
-                if self
-                    .nodes
-                    .iter()
-                    .any(|node| string(node, "id") == canonical)
-                {
-                    upstream::model_id(model, canonical, self.nodes)
-                } else {
-                    model
-                }
-            } else {
-                upstream::model_id(model, canonical, self.nodes)
-            };
-            if p.is_empty()
-                || model.is_empty()
-                || model.contains('*')
-                || string(step, "kind") == "provider-wildcard"
-            {
+            let Some((p, model)) = upstream::model_target(step, self.nodes) else {
                 self.warnings.push(format!(
                     "combo {name} step {index}: skipped invalid or wildcard model"
                 ));
                 continue;
-            }
-            let p = canonical;
+            };
             let pinned = string(step, "connectionId");
             let allowed = array(step, "allowedConnectionIds");
-            if step
-                .get("connectionId")
-                .is_some_and(|v| !v.is_null() && !v.is_string())
-                || step
-                    .get("allowedConnectionIds")
-                    .is_some_and(|v| !v.is_null() && !v.is_array())
-                || allowed
-                    .iter()
-                    .any(|v| v.as_str().is_none_or(|s| s.trim().is_empty()))
-            {
+            if !connection::valid_restrictions(step) {
                 self.warnings.push(format!(
                     "combo {name} step {index}: skipped malformed connection restriction"
                 ));
@@ -496,8 +463,29 @@ pub fn import(
         }
         combos.insert(name, combo);
     }
-    let (aliases, synthetic) =
-        aliases::prepare(&root, &combos, &combo_ids, &mut order, &mut warnings);
+    let nodes = array(&root, "providerNodes");
+    let mut direct = direct::collect(&combos, nodes, &connections);
+    let (aliases, mut synthetic) = aliases::prepare(
+        &root,
+        &combos,
+        &combo_ids,
+        &direct,
+        &mut order,
+        &mut warnings,
+    );
+    direct.extend(direct::collect(&synthetic, nodes, &connections));
+    for (name, model) in direct {
+        if combos.contains_key(&name) || direct::reserved(&root, &name) {
+            warnings.push(format!(
+                "direct {name}: collision; existing combo/alias wins"
+            ));
+        } else if let std::collections::hash_map::Entry::Vacant(entry) =
+            synthetic.entry(name.clone())
+        {
+            order.push(name);
+            entry.insert(model);
+        }
+    }
     let mut models = Vec::new();
     let mut deployment_ids = HashSet::new();
     let mut deployment_count = 0;

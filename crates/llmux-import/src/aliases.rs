@@ -33,7 +33,7 @@ fn alias_map(root: &Value, warnings: &mut Vec<String>) -> BTreeMap<String, Strin
     result
 }
 
-fn matches(pattern: &str, name: &str) -> bool {
+pub(super) fn matches(pattern: &str, name: &str) -> bool {
     let pattern: Vec<_> = pattern.chars().collect();
     let name: Vec<_> = name.chars().collect();
     let (mut p, mut n, mut star) = (0, 0, None);
@@ -59,6 +59,7 @@ pub(super) fn prepare(
     root: &Value,
     combos: &HashMap<String, Value>,
     combo_ids: &HashMap<String, String>,
+    direct: &BTreeMap<String, Value>,
     order: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) -> (BTreeMap<String, String>, HashMap<String, Value>) {
@@ -75,6 +76,7 @@ pub(super) fn prepare(
             .then_with(|| string(a, "createdAt").cmp(string(b, "createdAt")))
     });
     let mut names: BTreeSet<_> = aliases.keys().cloned().collect();
+    names.extend(direct.keys().cloned());
     for row in &mappings {
         let pattern = string(row, "pattern");
         if exact(pattern) {

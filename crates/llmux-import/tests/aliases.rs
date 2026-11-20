@@ -69,7 +69,7 @@ fn aliases_share_canonical_models_and_mapping_precedence() {
     }
     assert_eq!(
         (report.models, report.deployments, report.credentials),
-        (1, 1, 1)
+        (2, 2, 1)
     );
     let warnings = report.warnings.join("\n");
     assert!(warnings.contains("collision"));
@@ -106,7 +106,7 @@ fn direct_aliases_use_shared_provider_expansion_and_rows_are_supported() {
     assert!(config.model_names.contains_key("object"));
     assert_eq!(
         (report.models, report.deployments, report.credentials),
-        (3, 3, 1)
+        (4, 4, 1)
     );
     assert!(report
         .warnings
