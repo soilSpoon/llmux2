@@ -177,6 +177,45 @@ with ChatGPT, use `https://auth.openai.com/api/accounts/oauth/token` as `token_u
 the issued client ID, `resource = "https://api.openai.com/v1"`, and omit `scopes`.
 A refreshable authentication error can trigger one on-demand refresh and retry for the attempted deployment, still subject to request and admission limits. If refresh fails or authentication is rejected again, the gateway disables that credential for routing and can try another eligible deployment.
 
+## Import from OmniRoute
+
+Import an OmniRoute JSON export or SQLite table dump into a new configuration:
+
+```sh
+cargo run -p llmux-import -- \
+  --input /private/omniroute-export.json \
+  --output /private/llmux.toml \
+  --secrets-dir /private/llmux-secrets
+```
+
+For a staged cutover, optionally add both flags:
+
+```sh
+  --omniroute-fallback http://127.0.0.1:20128/v1 \
+  --omniroute-key file:/private/omniroute-client.key
+```
+
+The key must be an `env:VARIABLE` or `file:/path` reference, never a literal.
+The importer writes only that reference, not its value, to the TOML. Referenced
+secrets must be available during import because the generated config is checked
+with the gateway's config parser. URLs must use HTTPS, or HTTP on loopback, with
+no credentials, query, or fragment. Existing output and secret files are never
+overwritten.
+
+Each non-Codex, unrestricted imported model gets an OmniRoute deployment after
+all its native deployments, forwarding its llmux model name as the OmniRoute ID.
+The catch-all forwards otherwise unknown IDs unchanged. Its exclusions cover
+Codex provider IDs and node prefixes, Codex-reaching combos and alias chains,
+enabled mapping patterns, and names/aliases of models with `allowed_keys`.
+Codex-reaching models and models with `allowed_keys` get no fallback leg.
+Exclusions are conservative: even a lower-precedence mapping that can reach
+Codex is excluded. If such a pattern cannot be represented as an exact ID or a
+prefix with one trailing `*` (for example, `owner-?` or `owner-*-suffix`), import
+fails rather than opening a routing gap. Review the emitted `exclude` list
+before cutover. Omitting both flags preserves the existing import output;
+remove the generated fallback credential, deployments, and catch-all to roll
+back to native-only routing.
+
 ## Codex / Sign in with ChatGPT
 
 `provider = "openai_responses"` calls the public Responses endpoint with an OAuth
