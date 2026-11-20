@@ -185,6 +185,8 @@ def send(gateway, case, timeout, secrets):
         raw = bytearray()
         pending = bytearray()
         event = []
+        first_line = True
+        skip_lf = False
         is_sse = case["kind"] == "stream" and 200 <= response.status < 300
         def consume_event():
             nonlocal code, message
@@ -214,11 +216,19 @@ def send(gateway, case, timeout, secrets):
             if not chunk:
                 break
             if is_sse:
-                pending.extend(chunk)
-                while b"\n" in pending:
-                    line, _, tail = pending.partition(b"\n")
-                    pending = bytearray(tail)
-                    line = line.rstrip(b"\r")
+                for byte in chunk:
+                    if skip_lf and byte == 10:
+                        skip_lf = False
+                        continue
+                    skip_lf = byte == 13
+                    if byte not in (10, 13):
+                        pending.append(byte)
+                        continue
+                    line = bytes(pending)
+                    pending.clear()
+                    if first_line:
+                        line = line.removeprefix(b'\xef\xbb\xbf')
+                        first_line = False
                     if not line:
                         consume_event()
                     elif line.startswith(b"data:"):

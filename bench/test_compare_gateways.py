@@ -253,6 +253,12 @@ class TransportTest(unittest.TestCase):
                 if req['model'] == 'slow':
                     time.sleep(0.15)
                 if req.get("stream"):
+                    if req['model'] in ('cr-only', 'bom-error'):
+                        if req['model'] == 'bom-error':
+                            self.wfile.write(b'\xef\xbb\xbfdata: {"error":{"code":"unknown_model","message":"rejected"}}\r\rdata: [DONE]\r\r')
+                        else:
+                            self.wfile.write(b'data: {"choices":[{"delta":{"content":"hello"}}]}\r\rdata: [DONE]\r\r')
+                        return
                     if req['model'] == 'malformed':
                         self.wfile.write(b'data: {"choices":1}\n\ndata: [DONE]\n\n')
                         return
@@ -312,6 +318,15 @@ class TransportTest(unittest.TestCase):
         row = compare.send(self.gateway, compare.generate_cases(['malformed'])[1], 2, [])
         self.assertEqual(row['status'], 200)
         self.assertEqual(row['error_class'], 'connection')
+
+    def test_cr_only_events_complete_and_leading_bom_does_not_hide_errors(self):
+        row = compare.send(self.gateway, compare.generate_cases(['cr-only'])[1], 2, [])
+        self.assertEqual(row['error_class'], 'ok')
+        self.assertTrue(row['done'])
+        self.assertIsNotNone(row['ttft_ms'])
+        row = compare.send(self.gateway, compare.generate_cases(['bom-error'])[1], 2, [])
+        self.assertEqual(row['error_class'], 'gateway_reject')
+        self.assertTrue(row['done'])
 
     def test_successful_responses_with_null_error_is_not_a_failure(self):
         case = compare.generate_cases(['m'], responses=1)[-1]
