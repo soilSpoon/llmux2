@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -10,7 +10,7 @@ pub struct ProviderKind(pub Arc<str>);
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RequestId(pub Arc<str>);
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct QuotaSpec {
     pub rpm: Option<u32>,

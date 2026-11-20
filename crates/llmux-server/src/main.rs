@@ -19,7 +19,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         return Err("usage: llmux-server [--check] [path/to/llmux.toml]".into());
     }
 
-    let config = RuntimeConfig::load(path)?;
+    let config = RuntimeConfig::load(&path)?;
     if check {
         let address = config.server.listen;
         llmux_server::validate_startup(config)?;
@@ -29,7 +29,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let address = config.server.listen;
     let shutdown_timeout = config.server.shutdown_timeout;
     let drain_grace = config.server.drain_grace;
-    let app = llmux_server::app(config).await?;
+    let app = llmux_server::app_with_path(config, Some(path)).await?;
     let listener = llmux_server::bind(address).await?;
     eprintln!("llmux-server listening on {}", listener.local_addr()?);
     #[cfg(unix)]

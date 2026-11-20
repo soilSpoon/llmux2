@@ -846,6 +846,7 @@ dependencies = [
 name = "llmux-server"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "axum",
  "futures-util",
  "http",
@@ -856,6 +857,7 @@ dependencies = [
  "llmux-providers",
  "llmux-testkit",
  "llmux-types",
+ "serde",
  "serde_json",
  "subtle",
  "tempfile",

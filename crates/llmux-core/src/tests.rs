@@ -222,6 +222,7 @@ async fn fixture_full(
         },
         api_keys: HashMap::new(),
         credential_quotas: HashMap::from([("second".into(), second_quota)]),
+        credential_meta: HashMap::new(),
         oauth: HashMap::new(),
         catch_all: None,
         catch_all_exclude: Vec::new(),

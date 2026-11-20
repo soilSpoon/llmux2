@@ -16,7 +16,6 @@ use std::{
 };
 
 pub(crate) struct Dashboard {
-    key: Arc<str>,
     started: Instant,
     ok: AtomicU64,
     rejected: AtomicU64,
@@ -26,9 +25,8 @@ pub(crate) struct Dashboard {
 }
 
 impl Dashboard {
-    pub(crate) fn new(key: Arc<str>) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            key,
             started: Instant::now(),
             ok: 0.into(),
             rejected: 0.into(),
@@ -36,6 +34,20 @@ impl Dashboard {
             failed: 0.into(),
             ready_us: 0.into(),
         }
+    }
+
+    pub(crate) fn uptime_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    pub(crate) fn counters(&self) -> serde_json::Value {
+        json!({
+            "ok": self.ok.load(Relaxed),
+            "rejected": self.rejected.load(Relaxed),
+            "unavailable": self.unavailable.load(Relaxed),
+            "failed": self.failed.load(Relaxed),
+            "ready_us": self.ready_us.load(Relaxed),
+        })
     }
 
     pub(crate) fn record_response(&self, status: StatusCode, elapsed: Duration) {
@@ -98,28 +110,28 @@ async fn stats(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
     let Some(dashboard) = &state.dashboard else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let mut response = if authorized(&headers, std::slice::from_ref(&dashboard.key)) {
-        let deployments = state.executor.deployment_stats();
-        Json(json!({
-            "fallback": llmux_core::FallbackStats::from_deployments(&deployments),
-            "catch_all": state.executor.catch_all_stats(),
-            "uptime_ms": dashboard.started.elapsed().as_millis() as u64,
-            "responses": {
-                "ok": dashboard.ok.load(Relaxed),
-                "rejected": dashboard.rejected.load(Relaxed),
-                "unavailable": dashboard.unavailable.load(Relaxed),
-                "failed": dashboard.failed.load(Relaxed),
-                "ready_us": dashboard.ready_us.load(Relaxed),
-            },
-            "deployments": deployments,
-        }))
-        .into_response()
-    } else {
-        (
+    // Read the key from the live config so a reload that rotates
+    // `server.dashboard_key` immediately revokes the old one.
+    let live_key = state.active.load().config.server.dashboard_key.clone();
+    let mut response = match live_key.as_ref() {
+        Some(key) if authorized(&headers, std::slice::from_ref(key)) => {
+            let active = state.active.load();
+            let deployments = active.executor.deployment_stats();
+            let catch_all = active.executor.catch_all_stats();
+            Json(json!({
+                "fallback": llmux_core::FallbackStats::from_deployments(&deployments),
+                "catch_all": catch_all,
+                "uptime_ms": dashboard.uptime_ms(),
+                "responses": dashboard.counters(),
+                "deployments": deployments,
+            }))
+            .into_response()
+        }
+        _ => (
             StatusCode::UNAUTHORIZED,
             [(header::WWW_AUTHENTICATE, "Bearer")],
         )
-            .into_response()
+            .into_response(),
     };
     response
         .headers_mut()
