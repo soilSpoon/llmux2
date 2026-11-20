@@ -310,6 +310,41 @@ fn canary_window_also_runs_on_first_install() {
     assert!(f.called("stop", "a"));
 }
 #[test]
+fn stopped_slots_deploy_to_the_unrecorded_slot() {
+    for canary in [0.0, 1.0] {
+        let mut f = Fixture::new();
+        f.ops.runtime.active.clear();
+        fs::create_dir(f.temp.0.join("bin")).unwrap();
+        fs::write(f.temp.0.join("bin/llmux-server-a"), b"good").unwrap();
+        fs::write(
+            f.temp.0.join("active.json"),
+            json!({"slot":"a","listen":"127.0.0.1:8080"}).to_string(),
+        )
+        .unwrap();
+        f.ops.runtime.states = VecDeque::from_iter(
+            std::iter::repeat_with(stable)
+                .take(7)
+                .chain([json!({"ActiveState":"failed","NRestarts":"0","MainPID":"1234"})]),
+        );
+        if canary > 0.0 {
+            assert!(f
+                .deploy_canary(canary)
+                .unwrap_err()
+                .to_string()
+                .contains("canary"));
+        } else {
+            f.ops.runtime.healthy = false;
+            assert!(f.deploy().unwrap_err().to_string().contains("health"));
+        }
+        assert_eq!(
+            fs::read(f.temp.0.join("bin/llmux-server-a")).unwrap(),
+            b"good"
+        );
+        assert!(!f.called("stop", "a"));
+        assert!(f.called("stop", "b"));
+    }
+}
+#[test]
 fn invalid_config_does_not_touch_units() {
     let mut f = Fixture::new();
     f.ops.runtime.fail_check = true;

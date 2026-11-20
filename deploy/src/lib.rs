@@ -170,7 +170,16 @@ impl<R: Runtime> Deployment<R> {
             );
         }
         let old = active.first().map(String::as_str);
-        let idle = if old == Some("a") { "b" } else { "a" };
+        let idle = match old {
+            Some("a") => "b",
+            Some(_) => "a",
+            // With nothing running, stage over the slot the record does not
+            // name so a failed deploy leaves a working recovery build.
+            None => match self.record()? {
+                Some(record) if record["slot"] == "a" => "b",
+                _ => "a",
+            },
+        };
         let target_binary = self.root.join(format!("bin/llmux-server-{idle}"));
         let target_config = self.root.join(format!("llmux-{idle}.toml"));
         for (source, target, mode) in [
