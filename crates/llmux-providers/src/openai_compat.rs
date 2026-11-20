@@ -48,6 +48,7 @@ pub struct RequestMetadata<'a> {
     /// The output limit the inbound format forwards: Responses `max_output_tokens`,
     /// Chat `max_completion_tokens` else `max_tokens`, Anthropic `max_tokens`.
     pub max_output_tokens: Option<u32>,
+    pub has_gateway_routing_fields: bool,
 }
 
 #[derive(Deserialize)]
@@ -72,6 +73,16 @@ struct RawRequestMetadata<'a> {
     system: TextBytes,
     #[serde(default)]
     tools: TextBytes,
+    #[serde(default, deserialize_with = "field_present")]
+    min_discount_percent: bool,
+    #[serde(default, deserialize_with = "field_present")]
+    zdr: bool,
+    #[serde(default, deserialize_with = "field_present")]
+    ranking: bool,
+}
+
+fn field_present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer).map(|_| true)
 }
 
 impl<'a> RequestMetadata<'a> {
@@ -108,6 +119,7 @@ impl<'a> RequestMetadata<'a> {
                 }
                 InboundFormat::AnthropicMessages => tokens(raw.max_tokens),
             },
+            has_gateway_routing_fields: raw.min_discount_percent || raw.zdr || raw.ranking,
         })
     }
 }

@@ -31,6 +31,8 @@ curl -sS http://127.0.0.1:8080/v1/responses \
 
 The Responses route translates requests to Chat Completions on OpenAI-compatible upstreams and converts replies back. It accepts reasoning effort as either `reasoning.effort` or `reasoning_effort`; conflicting values are rejected. Stateful Responses conversations and built-in non-function tools are unsupported. For SSE on either route, add `"stream":true` and use `curl -N`.
 
+llmux2 accepts and discards the CheaperInference routing fields `min_discount_percent`, `zdr`, and `ranking`. These fields do not impose a price ceiling, guarantee zero data retention, or change how llmux2 ranks deployments. Enforce any retention requirements in your provider configuration.
+
 Credentials use `provider = "openai"` or `"openai_compat"` for OpenAI-compatible upstreams, or `provider = "anthropic"` for the Anthropic Messages API. Anthropic deployments use a base URL such as `https://api.anthropic.com/v1` (the adapter appends `/messages`) and send the key as `x-api-key`. The gateway converts chat requests, JSON responses and SSE chunks between the OpenAI Chat and Anthropic formats, so a model can mix both kinds of deployments and fail over between them.
 
 For converted Anthropic Chat streams, set `stream_options.include_usage` to `true` for a separate usage chunk just before `[DONE]`, or `false` to omit usage. Without this option, usage remains on the finish chunk. Reported cache reads appear in `usage.prompt_tokens_details.cached_tokens` and cache writes in `usage.cache_creation_input_tokens`.

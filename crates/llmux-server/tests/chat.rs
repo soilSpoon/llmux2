@@ -32,6 +32,7 @@ enum Reply {
     Quota(Option<u64>),
     Complete,
     NegotiatedStream(Value),
+    WithoutGatewayControls,
     ResponseStream { complete: bool },
     AbortStream,
     EmptyStream,
@@ -98,6 +99,24 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
                     "data: [DONE]\n\n",
                 ),
             ).into_response()
+        }
+        Reply::WithoutGatewayControls => {
+            for field in ["min_discount_percent", "zdr", "ranking"] {
+                if request.get(field).is_some() {
+                    return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error":{"message":"unknown field"}}))).into_response();
+                }
+            }
+            if request.get("max_completion_tokens").is_none() {
+                assert_eq!(request["vendor_option"]["zdr"], true);
+                assert_eq!(request["vendor_option"]["ranking"], "nested");
+            }
+            if request["stream"] == true {
+                ([(header::CONTENT_TYPE, "text/event-stream")], "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").into_response()
+            } else {
+                Json(json!({
+                    "id":"c","choices":[{"index":0,"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}]
+                })).into_response()
+            }
         }
         Reply::ResponseStream { complete } => {
             assert_eq!(request["stream"], true);
@@ -407,6 +426,40 @@ async fn openai_chat_preserves_documented_and_extension_parameters_and_usage() {
     assert!(output.ends_with(
         "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2,\"total_tokens\":10}}\n\ndata: [DONE]\n\n"
     ));
+}
+
+#[tokio::test]
+async fn cheaperinference_controls_are_not_sent_to_upstream() {
+    for (endpoint, fields) in [
+        (
+            "/v1/chat/completions",
+            json!({"messages":[{"role":"user","content":"Hello"}],
+                "vendor_option":{"model":"leave-me-alone","zdr":true,"ranking":"nested"}}),
+        ),
+        (
+            "/v1/responses",
+            json!({"input":"Hello","max_output_tokens":16}),
+        ),
+    ] {
+        let fixture = Fixture::start(
+            [Reply::WithoutGatewayControls, Reply::Complete],
+            [Reply::WithoutGatewayControls, Reply::Complete],
+            "",
+        )
+        .await;
+        for stream in [false, true] {
+            let mut request = fields.clone();
+            request["model"] = json!("alias");
+            request["stream"] = json!(stream);
+            request["min_discount_percent"] = json!(99.99);
+            request["zdr"] = json!(true);
+            request["ranking"] = Value::Null;
+            let payload = request.to_string().replace("\"zdr\":", r#""\u007adr":"#);
+            let response = fixture.post(endpoint, "test-client", payload).await;
+            check_route(&response, "d1", "1");
+            assert!(body(response).await.contains("Hi"));
+        }
+    }
 }
 
 #[tokio::test]
