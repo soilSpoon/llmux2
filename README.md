@@ -20,7 +20,7 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
 
 For Chat Completions on OpenAI-compatible upstreams, the gateway rewrites only the top-level request model. Other request fields and successful response payloads pass through.
 
-Use authenticated `GET /v1/models` to list the exact model IDs accepted by the gateway. The list contains configured model names and aliases, not upstream deployment names or the full CheaperInference catalog.
+Use authenticated `GET /v1/models` to list configured model names and aliases, not upstream deployment names or the full CheaperInference catalog. An optional catch-all accepts additional IDs but is not listed.
 
 ```sh
 curl -sS http://127.0.0.1:8080/v1/responses \
@@ -102,6 +102,35 @@ Rejecting is the default. To trim instead, set `context_overflow = "middle-out"`
 `x-llmux-deployment` and `x-llmux-attempts` identify the winning deployment and number of HTTP attempts (not skipped deployments). Set `server.expose_routing_headers = false` to hide them. A stream commits on its first complete SSE event; after that, failures end the stream with an error payload rather than replaying the request.
 
 Before a response is committed, the gateway can fail over on upstream server, connection, and timeout errors within its attempt and time limits. Rate-limit and quota-exhaustion failover are controlled by `routing.fallback_on` and enabled by default. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local request and token quotas use per-deployment sliding windows (one minute for `rpm`/`tpm`, one day for `rpd`/`tpd`) only when configured. Token quotas count the same prompt-plus-output estimate used for context fitting, and a single request larger than a token quota is still admitted when that window is empty. A credential may also set `quota` (`rpm`, `rpd`, `tpm`, `tpd`) for providers that limit per key or project across models; those windows are shared by every deployment that uses the credential.
+
+### Catch-all route for cutover
+
+Add one `[[models]]` entry named `"*"` to forward otherwise unknown IDs, for
+example to a local OmniRoute instance:
+
+```toml
+[[models]]
+name = "*"
+exclude = ["codex/*", "cx/*", "some-exact-id"]
+
+[[models.deployments]]
+id = "omniroute"
+auth = "none"
+provider = "openai_compat"
+base_url = "http://127.0.0.1:20128/v1"
+upstream_model = "*"
+```
+
+The catch-all must have no aliases or `allowed_keys`, and all its deployments
+must use `upstream_model = "*"` to pass through the requested ID unchanged.
+Other models cannot use this upstream model value. `exclude` is valid only on
+the catch-all; entries are nonempty exact IDs or prefixes with one trailing `*`,
+matched ASCII case-insensitively. Excluded unknown IDs and the literal model
+`"*"` retain the existing unknown-model error. Known names and aliases always
+use their own route, including their key restrictions; exhaustion never spills
+them into the catch-all. Existing routing limits and retry rules still apply.
+No migration is needed for existing configs; remove the catch-all entry to
+roll back unknown-ID forwarding (older binaries do not support `exclude`).
 
 ## Credentials
 

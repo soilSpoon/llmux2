@@ -335,9 +335,9 @@ impl ProviderAdapter for OpenAiCompat {
                 },
             )
             .body(if req.format == InboundFormat::OpenAiResponses {
-                responses::request(&req.body, &dep.upstream_model)?
+                responses::request(&req.body, crate::upstream_model(req, dep))?
             } else {
-                rewrite_model(&req.body, &dep.upstream_model)?
+                rewrite_model(&req.body, crate::upstream_model(req, dep))?
             })?;
 
         match auth {

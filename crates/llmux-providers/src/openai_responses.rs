@@ -50,7 +50,7 @@ impl ProviderAdapter for OpenAiResponses {
         if self.supports(req.format) == Support::No {
             return Err(BuildError::UnsupportedFormat);
         }
-        let body = normalize(&req.body, &dep.upstream_model, req.format)?;
+        let body = normalize(&req.body, crate::upstream_model(req, dep), req.format)?;
         let mut parts = dep.base_url.clone().into_parts();
         parts.path_and_query =
             Some(format!("{}/responses", dep.base_url.path().trim_end_matches('/')).parse()?);
@@ -484,6 +484,57 @@ fn chat_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt;
+    use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
+    use std::time::Duration;
+
+    #[test]
+    fn wildcard_deployment_forwards_requested_model() {
+        let adapter = OpenAiResponses::new();
+        let mut dep = Deployment {
+            idx: DeploymentIdx(0),
+            id: "r".into(),
+            provider: adapter.kind().clone(),
+            credential: "key".into(),
+            base_url: "https://example.com/v1".parse().unwrap(),
+            upstream_model: "fixed".into(),
+            priority: 0,
+            quota: QuotaSpec::default(),
+            timeout: Duration::from_secs(10),
+            max_context: None,
+        };
+        for (format, body) in [
+            (
+                InboundFormat::OpenAiResponses,
+                json!({"model":"vendor/New-ID","input":"hi"}),
+            ),
+            (
+                InboundFormat::OpenAiChat,
+                json!({"model":"vendor/New-ID","messages":[{"role":"user","content":"hi"}]}),
+            ),
+        ] {
+            let req = GatewayRequest {
+                format,
+                model: "vendor/New-ID".into(),
+                stream: false,
+                body: Bytes::from(body.to_string()),
+                est_input_tokens: 0,
+                max_output_tokens: None,
+                context_overflow: None,
+                request_id: RequestId("r".into()),
+            };
+            for (upstream, expected) in [("fixed", "fixed"), ("*", "vendor/New-ID")] {
+                dep.upstream_model = upstream.into();
+                let request = adapter
+                    .build_request(&req, &dep, &AuthMaterial::None)
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap();
+                let sent: Value = serde_json::from_slice(request.body()).unwrap();
+                assert_eq!(sent["model"], expected, "{format:?} {upstream}");
+            }
+        }
+    }
 
     #[test]
     fn chat_options_and_multipart_instructions_are_converted() {
