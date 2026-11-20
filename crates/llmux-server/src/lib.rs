@@ -1,6 +1,10 @@
 //! Axum boundary for the OpenAI-compatible gateway.
 
 mod dashboard;
+mod lifecycle;
+#[cfg(unix)]
+mod notify;
+pub use lifecycle::{bind, serve};
 
 use axum::body::Bytes;
 use axum::{
@@ -10,7 +14,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use futures_util::StreamExt;
@@ -89,6 +93,7 @@ pub async fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Se
         dashboard,
     });
     let mut router = Router::new()
+        .route("/healthz", get(|| async { "ok" }))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/responses", post(responses));
     if state.dashboard.is_some() {

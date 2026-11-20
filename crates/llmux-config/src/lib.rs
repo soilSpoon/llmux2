@@ -33,6 +33,7 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     pub client_keys: Box<[Arc<str>]>,
     pub request_timeout: Duration,
+    pub shutdown_timeout: Duration,
     pub expose_routing_headers: bool,
     pub dashboard_key: Option<Arc<str>>,
 }
@@ -107,6 +108,7 @@ struct RawServer {
     listen: SocketAddr,
     client_keys: Vec<String>,
     request_timeout_ms: u64,
+    shutdown_timeout_ms: u64,
     expose_routing_headers: bool,
     dashboard_key: Option<String>,
 }
@@ -117,6 +119,7 @@ impl Default for RawServer {
             listen: SocketAddr::from(([127, 0, 0, 1], 8080)),
             client_keys: Vec::new(),
             request_timeout_ms: DEFAULT_TIMEOUT_MS,
+            shutdown_timeout_ms: 60_000,
             expose_routing_headers: true,
             dashboard_key: None,
         }
@@ -448,6 +451,7 @@ impl RawConfig {
                 listen: server.listen,
                 client_keys,
                 request_timeout,
+                shutdown_timeout: timeout(server.shutdown_timeout_ms)?,
                 expose_routing_headers: server.expose_routing_headers,
                 dashboard_key,
             },
@@ -570,6 +574,30 @@ upstream_model = "upstream"
     const REQUIRED: &str = r#"token_url = "https://example.com/token"
 client_id = "client"
 refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
+
+    #[test]
+    fn shutdown_timeout_validation() {
+        let base = config(REQUIRED);
+        assert_eq!(
+            RuntimeConfig::parse(&base).unwrap().server.shutdown_timeout,
+            Duration::from_secs(60)
+        );
+        for value in [0, 86_400_001] {
+            let input = base.replace(
+                "[server]",
+                &format!("[server]\nshutdown_timeout_ms = {value}"),
+            );
+            assert!(RuntimeConfig::parse(&input)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("timeouts"));
+        }
+        assert!(RuntimeConfig::parse(
+            &base.replace("[server]", "[server]\nshutdown_timeout_ms = 1234")
+        )
+        .is_ok());
+    }
 
     fn error(fields: &str) -> String {
         RuntimeConfig::parse(&config(fields))

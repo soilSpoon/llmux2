@@ -1,7 +1,5 @@
-use axum::serve::ListenerExt;
 use llmux_config::RuntimeConfig;
 use std::{error::Error, path::PathBuf};
-use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() {
@@ -13,22 +11,35 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut args = std::env::args_os().skip(1);
-    let path = args
-        .next()
+    let first = args.next();
+    let check = first.as_deref() == Some(std::ffi::OsStr::new("--check"));
+    let path = (if check { args.next() } else { first })
         .map_or_else(|| PathBuf::from("llmux.toml"), PathBuf::from);
     if args.next().is_some() {
-        return Err("usage: llmux-server [path/to/llmux.toml]".into());
+        return Err("usage: llmux-server [--check] [path/to/llmux.toml]".into());
     }
 
     let config = RuntimeConfig::load(path)?;
+    if check {
+        println!("{}", config.server.listen);
+        return Ok(());
+    }
     let address = config.server.listen;
+    let shutdown_timeout = config.server.shutdown_timeout;
     let app = llmux_server::app(config).await?;
-    let listener = TcpListener::bind(address).await?;
+    let listener = llmux_server::bind(address).await?;
     eprintln!("llmux-server listening on {}", listener.local_addr()?);
-    // SSE writes one small frame per event; Nagle would hold each behind the client's delayed ACK.
-    let listener = listener.tap_io(|tcp| {
-        let _ = tcp.set_nodelay(true);
-    });
-    axum::serve(listener, app).await?;
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let shutdown = async move {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = terminate.recv() => {},
+            _ = tokio::signal::ctrl_c() => {},
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    llmux_server::serve(listener, app, shutdown, shutdown_timeout).await?;
     Ok(())
 }

@@ -134,6 +134,7 @@ async fn fixture_with_context(
             listen: "127.0.0.1:0".parse().unwrap(),
             client_keys: Box::new([]),
             request_timeout: Duration::from_secs(5),
+            shutdown_timeout: Duration::from_secs(60),
             expose_routing_headers: true,
             dashboard_key: None,
         },

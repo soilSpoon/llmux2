@@ -31,6 +31,30 @@ The Responses route translates requests to Chat Completions on OpenAI-compatible
 
 Credentials use `provider = "openai"` or `"openai_compat"` for OpenAI-compatible upstreams, or `provider = "anthropic"` for the Anthropic Messages API. Anthropic deployments use a base URL such as `https://api.anthropic.com/v1` (the adapter appends `/messages`) and send the key as `x-api-key`. The gateway converts chat requests, JSON responses and SSE chunks between the OpenAI Chat and Anthropic formats, so a model can mix both kinds of deployments and fail over between them.
 
+## Health, shutdown and deployment
+
+`GET /healthz` is unauthenticated and returns `200 ok`; it is excluded from
+dashboard statistics. On SIGTERM or SIGINT, the server marks itself draining,
+refuses new work (503 on connections still reaching it), closes its listener,
+and waits for in-flight requests and SSE streams. After
+`server.shutdown_timeout_ms` (default 60000, valid range 1–86400000 ms), it exits
+successfully even if work remains; those unfinished connections are closed.
+Clients should allow streams to finish within that budget.
+
+`llmux-server --check CONFIG` loads and validates configuration without binding
+or contacting upstreams, prints the configured listen address, and exits 0
+(invalid config: exit 1). Existing configs need no changes. Older binaries do
+not recognize `shutdown_timeout_ms`; remove that field when rolling back to an
+older version.
+
+Unix listeners use SO_REUSEADDR and SO_REUSEPORT for overlapping slot handoffs.
+Under systemd, NOTIFY_SOCKET receives READY=1 after application/listener setup
+and STOPPING=1 at drain start. WATCHDOG_USEC enables a periodic TCP HTTP health
+probe; only a successful HTTP 200 sends WATCHDOG=1. See the
+[user-systemd deployment guide](deploy/README.md) for install, recovery,
+migration and rollback instructions, including the host's TCP queue migration
+sysctl.
+
 ## Live dashboard
 
 Add `dashboard_key = "env:LLMUX_DASHBOARD_KEY"` to `[server]`, set that

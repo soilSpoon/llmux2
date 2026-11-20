@@ -336,6 +336,44 @@ async fn body(response: Response) -> String {
 }
 
 #[tokio::test]
+async fn healthz_is_public() {
+    let fixture = Fixture::start_with_options(
+        [Reply::Complete, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+        2,
+        true,
+        true,
+    )
+    .await;
+    let before = body(
+        fixture
+            .get("/dashboard/stats", Some("test-dashboard"))
+            .await,
+    )
+    .await;
+    let response = fixture.get("/healthz", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body(response).await, "ok");
+    let after = body(
+        fixture
+            .get("/dashboard/stats", Some("test-dashboard"))
+            .await,
+    )
+    .await;
+    let before: Value = serde_json::from_str(&before).unwrap();
+    let after: Value = serde_json::from_str(&after).unwrap();
+    assert_eq!(
+        before.get("responses").unwrap(),
+        after.get("responses").unwrap()
+    );
+    assert_eq!(
+        before.get("deployments").unwrap(),
+        after.get("deployments").unwrap()
+    );
+}
+
+#[tokio::test]
 async fn dashboard_routes_are_absent_unless_configured() {
     let fixture = Fixture::start(
         [Reply::Complete, Reply::Complete],
