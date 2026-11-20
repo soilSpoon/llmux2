@@ -161,7 +161,9 @@ impl Flow {
         }
     }
 
-    fn dynamic(&self) -> bool {
+    /// Dynamic-registration flows retry an expired code with the issued
+    /// client ID; fixed-client flows just restart the whole sign-in.
+    pub fn dynamic(&self) -> bool {
         self.client == DYNAMIC_CLIENT
     }
 }

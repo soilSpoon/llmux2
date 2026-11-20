@@ -71,6 +71,9 @@ async fn token(State(state): State<Arc<Mutex<Fake>>>, body: String) -> (StatusCo
     match fake.mode {
         "aud" => claims["aud"] = json!("wrong-client"),
         "nonce" => claims["nonce"] = json!("wrong-nonce"),
+        "no_nonce" => {
+            claims.as_object_mut().unwrap().remove("nonce");
+        }
         "expired" => claims["exp"] = json!(now - 3600),
         "issuer" => claims["iss"] = json!("https://wrong.example"),
         "subject" => claims["sub"] = json!("other-account"),
@@ -336,6 +339,7 @@ async fn invalid_tokens_and_missing_plan_permission_are_rejected() {
         "signature",
         "aud",
         "nonce",
+        "no_nonce",
         "expired",
         "issuer",
         "scope",

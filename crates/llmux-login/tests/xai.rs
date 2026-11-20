@@ -73,6 +73,9 @@ async fn token(State(state): State<Arc<Mutex<Fake>>>, body: String) -> (StatusCo
     match fake.mode {
         "aud" => claims["aud"] = json!("wrong-client"),
         "nonce" => claims["nonce"] = json!("wrong-nonce"),
+        "no_nonce" => {
+            claims.as_object_mut().unwrap().remove("nonce");
+        }
         "expired" => claims["exp"] = json!(now - 3600),
         "issuer" => claims["iss"] = json!("https://wrong.example"),
         "subject" => claims["sub"] = json!("other-account"),
@@ -305,6 +308,49 @@ async fn xai_invalid_tokens_and_missing_api_scope_are_rejected() {
         assert!(!dir.path().join("credentials.json").exists());
         assert!(!dir.path().join("refresh_token").exists());
     }
+}
+
+#[tokio::test]
+async fn xai_accepts_id_token_without_nonce_claim() {
+    let (_server, fake, endpoints) = fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    fake.lock().await.mode = "no_nonce";
+    let pending = PendingLogin::start(dir.path(), Flow::xai(endpoints))
+        .await
+        .unwrap();
+    let params = params(&pending);
+    prepare(&fake, &params).await;
+    let task = tokio::spawn(pending.finish());
+    callback(&params, &[("state", &params["state"]), ("code", "code +&")]).await;
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn xai_invalid_grant_recovers_with_a_fresh_sign_in() {
+    let (_server, fake, endpoints) = fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    fake.lock().await.mode = "invalid_grant";
+    let flow = Flow::xai(endpoints.clone());
+    let pending = PendingLogin::start(dir.path(), flow.clone()).await.unwrap();
+    let first = params(&pending);
+    prepare(&fake, &first).await;
+    let task = tokio::spawn(pending.finish());
+    callback(&first, &[("state", &first["state"]), ("code", "code +&")]).await;
+    let error = task.await.unwrap().err().unwrap();
+    assert_eq!(error.retry_client_id().unwrap(), CLIENT_ID);
+    // Fixed-client flows recover with a fresh sign-in, not PendingLogin::retry.
+    assert!(PendingLogin::retry(dir.path(), flow.clone(), CLIENT_ID)
+        .await
+        .is_err());
+    let pending = PendingLogin::start(dir.path(), flow).await.unwrap();
+    let next = params(&pending);
+    assert_ne!(next["state"], first["state"]);
+    assert_ne!(next["nonce"], first["nonce"]);
+    fake.lock().await.mode = "";
+    prepare(&fake, &next).await;
+    let task = tokio::spawn(pending.finish());
+    callback(&next, &[("state", &next["state"]), ("code", "code +&")]).await;
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test]
