@@ -10,7 +10,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use futures_util::StreamExt;
@@ -24,7 +24,7 @@ use llmux_types::{
     ContextOverflow, CredentialSource, GatewayRequest, GatewayResponse, InboundFormat,
     ProviderRegistry, RequestId, UpstreamError,
 };
-use serde_json::{json, value::RawValue};
+use serde_json::{json, Value};
 use std::{convert::Infallible, error::Error, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 
@@ -89,12 +89,26 @@ pub async fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Se
         dashboard,
     });
     let mut router = Router::new()
+        .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/responses", post(responses));
     if state.dashboard.is_some() {
         router = router.merge(dashboard::routes());
     }
     Ok(router.with_state(state))
+}
+
+async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !authorized(&headers, &state.config.server.client_keys) {
+        return unauthorized();
+    }
+    let mut ids: Vec<&str> = state.config.model_names.keys().map(AsRef::as_ref).collect();
+    ids.sort_unstable();
+    let data: Vec<_> = ids
+        .into_iter()
+        .map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "llmux2"}))
+        .collect();
+    Json(json!({"object": "list", "data": data})).into_response()
 }
 
 async fn chat(State(state): State<Arc<AppState>>, request: Request) -> Response {
@@ -107,21 +121,25 @@ async fn responses(State(state): State<Arc<AppState>>, request: Request) -> Resp
 
 async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) -> Response {
     if !authorized(request.headers(), &state.config.server.client_keys) {
-        let mut response = error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_api_key",
-            "Invalid gateway API key",
-        );
-        response
-            .headers_mut()
-            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-        return response;
+        return unauthorized();
     }
     let start = state.dashboard.as_ref().map(|_| std::time::Instant::now());
     let response = execute_authorized(&state, request, format).await;
     if let (Some(dashboard), Some(start)) = (&state.dashboard, start) {
         dashboard.record_response(response.status(), start.elapsed());
     }
+    response
+}
+
+fn unauthorized() -> Response {
+    let mut response = error(
+        StatusCode::UNAUTHORIZED,
+        "invalid_api_key",
+        "Invalid gateway API key",
+    );
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
     response
 }
 
@@ -240,7 +258,7 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
                         )
                     }
                     Err(_) => Event::default().data(
-                        r#"{"error":{"message":"Upstream stream ended unexpectedly","type":"upstream_error","code":"stream_broken"}}"#,
+                        r#"{"error":{"message":"Upstream stream ended unexpectedly","type":"upstream_error","param":null,"code":"stream_broken"}}"#,
                     ),
                 };
                 Ok::<_, Infallible>(event)
@@ -322,15 +340,7 @@ fn gateway_error(err: GatewayError) -> Response {
             rate_limited(retry_after.unwrap_or_default())
         }
         GatewayError::Client(UpstreamError::BadRequest { status, body }) => {
-            if serde_json::from_slice::<&RawValue>(&body).is_ok() {
-                json_body(status, Body::from(body))
-            } else {
-                error(
-                    status,
-                    "upstream_client_error",
-                    "Upstream rejected the request",
-                )
-            }
+            upstream_client_error(status, body)
         }
         GatewayError::Client(UpstreamError::ContextLength) => error(
             StatusCode::BAD_REQUEST,
@@ -366,6 +376,39 @@ fn rate_limited(wait: Duration) -> Response {
         .headers_mut()
         .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
     response
+}
+
+fn upstream_client_error(status: StatusCode, body: Bytes) -> Response {
+    let Ok(mut payload) = serde_json::from_slice::<Value>(&body) else {
+        return error(
+            status,
+            "upstream_client_error",
+            "Upstream rejected the request",
+        );
+    };
+    let Some(details) = payload.get_mut("error").and_then(Value::as_object_mut) else {
+        return error(
+            status,
+            "upstream_client_error",
+            "Upstream rejected the request",
+        );
+    };
+    let has_message = details.get("message").is_some_and(Value::is_string);
+    let has_type = details.get("type").is_some_and(Value::is_string);
+    if has_message && has_type && details.contains_key("param") && details.contains_key("code") {
+        return json_body(status, Body::from(body));
+    }
+    if !has_message {
+        details.insert("message".into(), json!("Upstream rejected the request"));
+    }
+    if !has_type {
+        details.insert("type".into(), json!("invalid_request_error"));
+    }
+    details.entry("param").or_insert(Value::Null);
+    details
+        .entry("code")
+        .or_insert_with(|| json!("upstream_client_error"));
+    json_body(status, Body::from(payload.to_string()))
 }
 
 fn error(status: StatusCode, code: &str, message: &str) -> Response {
