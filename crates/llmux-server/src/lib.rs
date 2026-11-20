@@ -1,5 +1,6 @@
 //! Axum boundary for the OpenAI-compatible gateway.
 
+mod admin;
 mod dashboard;
 mod lifecycle;
 #[cfg(unix)]
@@ -42,10 +43,16 @@ const CONTEXT_OVERFLOW_HEADER: HeaderName = HeaderName::from_static("x-llmux-con
 const DROPPED_MESSAGES_HEADER: HeaderName = HeaderName::from_static("x-llmux-dropped-messages");
 const ANTHROPIC_KEY_HEADER: HeaderName = HeaderName::from_static(provider::ANTHROPIC_KEY_HEADER);
 
-struct AppState {
+struct Active {
     config: Arc<RuntimeConfig>,
-    executor: Executor,
+    executor: Arc<Executor>,
+}
+
+struct AppState {
+    active: arc_swap::ArcSwap<Active>,
     dashboard: Option<dashboard::Dashboard>,
+    config_path: Option<std::path::PathBuf>,
+    reload_lock: tokio::sync::Mutex<()>,
 }
 
 fn provider_registry() -> ProviderRegistry {
@@ -83,9 +90,53 @@ pub fn validate_startup(mut config: RuntimeConfig) -> Result<(), Box<dyn Error +
     Ok(())
 }
 
-pub async fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Send + Sync>> {
+pub async fn app(config: RuntimeConfig) -> Result<Router, Box<dyn Error + Send + Sync>> {
+    app_with_path(config, None).await
+}
+
+pub async fn app_with_path(
+    config: RuntimeConfig,
+    config_path: Option<std::path::PathBuf>,
+) -> Result<Router, Box<dyn Error + Send + Sync>> {
+    let (config, executor) = build(config).await?;
+    let dashboard = config
+        .server
+        .dashboard_key
+        .is_some()
+        .then(dashboard::Dashboard::new);
+    let state = Arc::new(AppState {
+        active: arc_swap::ArcSwap::from_pointee(Active {
+            config,
+            executor: Arc::new(executor),
+        }),
+        dashboard,
+        config_path,
+        reload_lock: tokio::sync::Mutex::new(()),
+    });
+    let mut router = Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(chat))
+        .route("/v1/messages", post(messages))
+        .route("/v1/responses", post(responses));
+    if state.dashboard.is_some() {
+        router = router.merge(dashboard::routes()).merge(admin::routes());
+    }
+    Ok(router.with_state(state))
+}
+
+async fn build(
+    mut config: RuntimeConfig,
+) -> Result<(Arc<RuntimeConfig>, Executor), Box<dyn Error + Send + Sync>> {
     let registry = provider_registry();
     let mut sources = static_sources(&mut config)?;
+    // Validate before starting OAuth sources: a rejected build must not
+    // rotate refresh tokens the running gateway still relies on.
+    Executor::validate(
+        &config,
+        &registry,
+        &sources.keys().chain(config.oauth.keys()).cloned().collect(),
+    )?;
     for (id, credential) in std::mem::take(&mut config.oauth) {
         let mut oauth = OAuthConfig::new(
             credential.token_url,
@@ -105,33 +156,20 @@ pub async fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Se
 
     let config = Arc::new(config);
     let executor = Executor::new(config.clone(), &registry, &sources)?;
-    let dashboard = config
-        .server
-        .dashboard_key
-        .clone()
-        .map(dashboard::Dashboard::new);
-    let state = Arc::new(AppState {
-        config,
-        executor,
-        dashboard,
-    });
-    let mut router = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
-        .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(chat))
-        .route("/v1/messages", post(messages))
-        .route("/v1/responses", post(responses));
-    if state.dashboard.is_some() {
-        router = router.merge(dashboard::routes());
-    }
-    Ok(router.with_state(state))
+    Ok((config, executor))
 }
 
 async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if !authorized(&headers, &state.config.server.client_keys) {
+    let active = state.active.load();
+    if !authorized(&headers, &active.config.server.client_keys) {
         return unauthorized();
     }
-    let mut ids: Vec<&str> = state.config.model_names.keys().map(AsRef::as_ref).collect();
+    let mut ids: Vec<&str> = active
+        .config
+        .model_names
+        .keys()
+        .map(AsRef::as_ref)
+        .collect();
     ids.sort_unstable();
     let data: Vec<_> = ids
         .into_iter()
@@ -181,11 +219,12 @@ async fn messages(State(state): State<Arc<AppState>>, request: Request) -> Respo
 }
 
 async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) -> Response {
-    if !authorized_for_format(request.headers(), &state.config.server.client_keys, format) {
+    let active = state.active.load();
+    if !authorized_for_format(request.headers(), &active.config.server.client_keys, format) {
         return unauthorized();
     }
     let start = state.dashboard.as_ref().map(|_| std::time::Instant::now());
-    let response = execute_authorized(&state, request, format).await;
+    let response = execute_authorized(&active, request, format).await;
     if let (Some(dashboard), Some(start)) = (&state.dashboard, start) {
         dashboard.record_response(response.status(), start.elapsed());
     }
@@ -204,7 +243,7 @@ fn unauthorized() -> Response {
     response
 }
 
-async fn execute_authorized(state: &AppState, request: Request, format: InboundFormat) -> Response {
+async fn execute_authorized(active: &Active, request: Request, format: InboundFormat) -> Response {
     let context_overflow = match request.headers().get(CONTEXT_OVERFLOW_HEADER) {
         None => None,
         Some(value) => match value.to_str().ok().and_then(ContextOverflow::from_name) {
@@ -258,11 +297,11 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
     }
 
     let model: Arc<str> = Arc::from(metadata.model.as_ref());
-    if state
+    if active
         .config
         .model_names
         .get(model.as_ref())
-        .and_then(|idx| state.config.model_allowed_keys.get(idx))
+        .and_then(|idx| active.config.model_allowed_keys.get(idx))
         .is_some_and(|keys| !authorized_for_format(&parts.headers, keys, format))
     {
         return error(
@@ -305,7 +344,7 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
     };
 
     let mut dropped = 0;
-    let mut result = state
+    let mut result = active
         .executor
         .execute(request(upstream_body.clone(), metadata.prompt_bytes))
         .await;
@@ -323,7 +362,7 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
             format,
         ) {
             dropped = truncated.dropped;
-            result = state
+            result = active
                 .executor
                 .execute(request(truncated.body, truncated.prompt_bytes))
                 .await;
@@ -384,7 +423,7 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
             .headers_mut()
             .insert(DROPPED_MESSAGES_HEADER, HeaderValue::from(dropped));
     }
-    if state.config.server.expose_routing_headers {
+    if active.config.server.expose_routing_headers {
         if let Ok(value) = HeaderValue::from_str(&routed.deployment) {
             response.headers_mut().insert(DEPLOYMENT_HEADER, value);
         }

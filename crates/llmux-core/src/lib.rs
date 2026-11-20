@@ -98,6 +98,7 @@ pub struct Executor {
     cfg: Arc<RuntimeConfig>,
     bindings: Box<[Binding]>,
     orders: Box<[ModelOrder]>,
+    credentials: HashMap<Arc<str>, Arc<AtomicBool>>,
     http: HttpClient,
 }
 
@@ -186,6 +187,11 @@ impl Executor {
                 })
             })
             .collect::<Result<Box<[_]>, _>>()?;
+        // A credential without deployments is still manageable: keep a
+        // flag for every configured credential, not only deployed ones.
+        for id in credentials.keys() {
+            disabled.entry(id.clone()).or_default();
+        }
 
         let orders = cfg
             .models
@@ -229,8 +235,28 @@ impl Executor {
             cfg,
             bindings,
             orders,
+            credentials: disabled,
             http: builder.build(connector),
         })
+    }
+
+    /// Whether the credential is disabled in routing; `None` for unknown ids.
+    pub fn credential_disabled(&self, id: &str) -> Option<bool> {
+        self.credentials
+            .get(id)
+            .map(|flag| flag.load(Ordering::Relaxed))
+    }
+
+    /// Enable or disable every deployment drawing on this credential.
+    /// Returns false for unknown credential ids.
+    pub fn set_credential_disabled(&self, id: &str, disabled: bool) -> bool {
+        match self.credentials.get(id) {
+            Some(flag) => {
+                flag.store(disabled, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn deployment_stats(&self) -> Vec<DeploymentStats<'_>> {

@@ -54,6 +54,12 @@ pub struct ApiKey {
     pub key: Arc<str>,
 }
 
+#[derive(Debug)]
+pub struct CredentialMeta {
+    pub provider: ProviderKind,
+    pub oauth: bool,
+}
+
 pub struct RuntimeConfig {
     pub server: ServerConfig,
     pub routing: RoutingConfig,
@@ -62,6 +68,7 @@ pub struct RuntimeConfig {
     pub oauth: HashMap<Arc<str>, OAuthCredential>,
     /// Quotas shared by every deployment that uses the credential.
     pub credential_quotas: HashMap<Arc<str>, QuotaSpec>,
+    pub credential_meta: HashMap<Arc<str>, CredentialMeta>,
     pub model_names: HashMap<Arc<str>, usize>,
     pub catch_all: Option<usize>,
     pub catch_all_exclude: Vec<String>,
@@ -291,6 +298,7 @@ impl RawConfig {
         }
 
         let mut provider_kinds = HashMap::new();
+        let mut credential_meta = HashMap::new();
         let mut api_keys = HashMap::new();
         let mut oauth = HashMap::new();
         let mut credential_quotas = HashMap::new();
@@ -324,6 +332,13 @@ impl RawConfig {
             let id: Arc<str> = id.as_str().into();
             let provider = ProviderKind(provider.as_str().into());
             provider_kinds.insert(id.clone(), provider.clone());
+            credential_meta.insert(
+                id.clone(),
+                CredentialMeta {
+                    provider: provider.clone(),
+                    oauth: matches!(credential, RawCredential::Oauth { .. }),
+                },
+            );
             if quota != QuotaSpec::default() {
                 credential_quotas.insert(id.clone(), quota);
             }
@@ -577,6 +592,7 @@ impl RawConfig {
             },
             api_keys,
             oauth,
+            credential_meta,
             model_names,
             catch_all,
             catch_all_exclude,
