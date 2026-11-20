@@ -7,7 +7,7 @@ expose_routing_headers = true
 [routing]
 default_strategy = "priority"
 max_attempts = 2
-fallback_on = ["rate_limited"]
+fallback_on = ["rate_limited", "quota_exhausted"]
 
 [cooldown]
 default_ms = 30000
