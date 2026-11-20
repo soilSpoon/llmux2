@@ -29,6 +29,15 @@ const MODULUS: &str = "lIUhiRxKLC2-f2qvAx3XHqKOcWkfMc_gpurKIihs_f3L8mU4fveMmfoHg
 const SCOPES: &str =
     "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
 
+#[test]
+fn pkce_s256_matches_rfc7636_appendix_b() {
+    let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    assert_eq!(
+        URL_SAFE_NO_PAD.encode(Sha256::digest(verifier)),
+        "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+    );
+}
+
 #[derive(Default)]
 struct Fake {
     issuer: String,
