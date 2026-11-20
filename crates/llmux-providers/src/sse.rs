@@ -1,9 +1,29 @@
 use bytes::Bytes;
+#[cfg(test)]
+use http::HeaderValue;
+use http::{header, HeaderMap};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use llmux_types::{BoxStream, SseEvent, UpstreamError};
 
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
+
+/// Terminal SSE payload for OpenAI-compatible streams.
+pub(crate) const DONE: &str = "[DONE]";
+
+/// Whether a response content type is `text/event-stream`, parameters ignored.
+pub(crate) fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+        })
+}
 
 pub(crate) fn decode(body: Incoming) -> BoxStream<'static, Result<SseEvent, UpstreamError>> {
     decode_until(body, false)
@@ -23,7 +43,7 @@ pub(crate) fn decode_until(
                 if let Some(event) = parser.next(&mut chunk)
                     .map_err(|()| UpstreamError::StreamBroken { bytes_sent })?
                 {
-                    let done = event.data == "[DONE]" || (anthropic && event.event.as_deref() == Some("message_stop"));
+                    let done = event.data == DONE || (anthropic && event.event.as_deref() == Some("message_stop"));
                     bytes_sent += event.data.len() as u64;
                     yield event;
                     if done {
@@ -100,6 +120,27 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_stream_accepts_parameters_and_rejects_json() {
+        let mut headers = HeaderMap::new();
+        assert!(!is_event_stream(&headers));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        assert!(!is_event_stream(&headers));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        assert!(is_event_stream(&headers));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("Text/Event-Stream"),
+        );
+        assert!(is_event_stream(&headers));
+    }
 
     #[test]
     fn handles_split_crlf_bom_utf8_and_multiline_data() {
