@@ -3,17 +3,27 @@ use std::{
     collections::HashMap,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::mpsc,
     time::Duration,
 };
 
+#[cfg(not(test))]
+use std::process::Command;
+
+#[cfg(not(test))]
 pub fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace parent")
 }
 
+#[cfg(test)]
+pub fn build() -> Result<HashMap<String, PathBuf>> {
+    crate::test_support::binaries()
+}
+
+#[cfg(not(test))]
 pub fn build() -> Result<HashMap<String, PathBuf>> {
     let output = Command::new("cargo")
         .args([
@@ -60,8 +70,15 @@ pub struct Server {
 }
 impl Server {
     pub fn start(binary: &Path, args: &[String], workers: usize) -> Result<Self> {
-        let mut child = Command::new(binary)
-            .args(args)
+        #[cfg(not(test))]
+        let mut command = {
+            let mut command = Command::new(binary);
+            command.args(args);
+            command
+        };
+        #[cfg(test)]
+        let mut command = crate::test_support::command(binary, args)?;
+        let mut child = command
             .env("TOKIO_WORKER_THREADS", workers.to_string())
             .env("LLMUX_BENCH_CLIENT_KEY", "mock-gateway")
             .env("LLMUX_BENCH_UPSTREAM_KEY", "mock-backend")
@@ -135,6 +152,13 @@ impl Drop for Directory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn test_binaries_use_the_current_harness_without_a_release_build() {
+        let binaries = build().unwrap();
+        for name in ["llmux-server", "mock_load_upstream"] {
+            assert_eq!(binaries[name], std::env::current_exe().unwrap());
+        }
+    }
     #[test]
     fn custom_gateway_binary_can_be_renamed() {
         assert_eq!(

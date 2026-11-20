@@ -472,7 +472,7 @@ async fn memory(target: &Target, concurrency: usize) -> Result<f64> {
     }
     let mut samples = Vec::new();
     for _ in 0..5 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(if cfg!(test) { 1 } else { 50 })).await;
         samples.push(pss_kib(&target.servers)?);
     }
     Ok((median(&samples) - baseline) / concurrency as f64)

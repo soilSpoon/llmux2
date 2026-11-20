@@ -2,6 +2,8 @@ mod compare_gateways;
 mod live_reliability;
 mod mock_upstream;
 mod process;
+#[cfg(test)]
+mod test_support;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 

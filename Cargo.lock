@@ -747,12 +747,16 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 name = "llmux-bench"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "chrono",
  "futures-util",
  "http-body-util",
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "llmux-config",
+ "llmux-server",
+ "llmux-testkit",
  "serde_json",
  "tokio",
  "toml",

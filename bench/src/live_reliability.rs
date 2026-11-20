@@ -1,7 +1,4 @@
-use crate::{
-    process::{Directory, Server},
-    Result,
-};
+use crate::{process::Directory, Result};
 use futures_util::stream;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full, StreamBody};
 use hyper::{
@@ -26,6 +23,19 @@ use tokio::{
     net::TcpListener,
     task::{JoinHandle, JoinSet},
 };
+
+#[cfg(not(test))]
+type GatewayServer = crate::process::Server;
+#[cfg(test)]
+type GatewayServer = llmux_testkit::TestServer;
+
+fn deployment_timeout(normal_ms: u64) -> u64 {
+    if cfg!(test) {
+        100
+    } else {
+        normal_ms
+    }
+}
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Body = UnsyncBoxBody<Bytes, Error>;
@@ -411,7 +421,7 @@ async fn handle(
             events.push("data: [DONE]\n\n".into());
             let body = StreamBody::new(stream::unfold(events.into_iter(), |mut events| async {
                 let event = events.next()?;
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(if cfg!(test) { 1 } else { 50 })).await;
                 Some((Ok::<_, Error>(Frame::data(Bytes::from(event))), events))
             }))
             .boxed_unsync();
@@ -481,7 +491,7 @@ async fn handle(
         "sse_then_close" => {
             route.record(json!(200));
             let body = StreamBody::new(stream::once(async move {
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::time::sleep(Duration::from_millis(if cfg!(test) { 2 } else { 200 })).await;
                 reset_socket(&socket)?;
                 Err::<Frame<Bytes>, Error>("injected close".into())
             }))
@@ -731,7 +741,7 @@ async fn request(url: &str, key: &str, payload: Value) -> Result<Reply> {
     Ok(reply)
 }
 struct Gateway {
-    server: Server,
+    server: GatewayServer,
     _directory: Directory,
     key: String,
 }
@@ -744,10 +754,21 @@ impl Gateway {
         config["server"]["listen"] = json!("127.0.0.1:0");
         config["server"]["client_keys"] = json!([format!("file:{}", path.display())]);
         let path = directory.0.join("llmux.toml");
-        fs::write(&path, render_config(&config)?)?;
+        let text = render_config(&config)?;
+        fs::write(&path, &text)?;
+        #[cfg(test)]
+        let server = {
+            let _ = binary;
+            GatewayServer::start(
+                llmux_server::app(llmux_config::RuntimeConfig::parse(&text)?).await?,
+            )
+            .await?
+        };
+        #[cfg(not(test))]
         let binary = binary.to_owned();
+        #[cfg(not(test))]
         let server = tokio::task::spawn_blocking(move || {
-            Server::start(&binary, &[path.to_string_lossy().into_owned()], 2)
+            GatewayServer::start(&binary, &[path.to_string_lossy().into_owned()], 2)
         })
         .await??;
         Ok(Self {
@@ -770,12 +791,11 @@ impl Gateway {
             payload["messages"] = json!([{"role":"user","content":PROMPT}]);
             payload["max_tokens"] = json!(16);
         }
-        request(
-            &format!("http://{}/v1/{path}", self.server.address),
-            &self.key,
-            payload,
-        )
-        .await
+        #[cfg(not(test))]
+        let base = format!("http://{}", self.server.address);
+        #[cfg(test)]
+        let base = self.server.url();
+        request(&format!("{base}/v1/{path}"), &self.key, payload).await
     }
 }
 
@@ -898,7 +918,8 @@ impl Suite<'_> {
         Ok(())
     }
     async fn run_all(&mut self) -> Result<()> {
-        let (gw,p,_)=self.failover("rate_limit_429_failover","429 + Retry-After on primary -> served by fallback, attempts 2","status",json!({"status":429,"headers":{"Retry-After":"4"},"body":{"error":{"message":"Rate limit reached for requests","type":"requests","code":"rate_limit_exceeded"}}}),json!({}),(false,false)).await?;
+        let retry_after = if cfg!(test) { "1" } else { "4" };
+        let (gw,p,_)=self.failover("rate_limit_429_failover","429 + Retry-After on primary -> served by fallback, attempts 2","status",json!({"status":429,"headers":{"Retry-After":retry_after},"body":{"error":{"message":"Rate limit reached for requests","type":"requests","code":"rate_limit_exceeded"}}}),json!({}),(false,false)).await?;
         let hits = p.hits();
         let r = gw.request("rel", false, false).await?;
         self.check(
@@ -911,7 +932,7 @@ impl Suite<'_> {
             format!("{} primary_hits={}", r.summary(), p.hits() - hits),
         );
         p.fault("pass");
-        tokio::time::sleep(Duration::from_millis(4500)).await;
+        tokio::time::sleep(Duration::from_millis(if cfg!(test) { 1100 } else { 4500 })).await;
         let r = gw.request("rel", false, false).await?;
         self.check(
             "rate_limit_cooldown_expires",
@@ -1005,7 +1026,7 @@ impl Suite<'_> {
                 "timeout_hang_failover",
                 "hang",
                 json!({"seconds":30}),
-                json!({"timeout_ms":3000}),
+                json!({"timeout_ms":deployment_timeout(3000)}),
                 "primary accepts but never answers -> fallback after the 3s deployment timeout",
             ),
             (
@@ -1038,7 +1059,7 @@ impl Suite<'_> {
             (
                 "outage_blackhole",
                 "https://10.255.255.1/v1".into(),
-                json!({"timeout_ms":3000}),
+                json!({"timeout_ms":deployment_timeout(3000)}),
                 "primary packets dropped -> fallback after the 3s deployment timeout",
             ),
         ] {
@@ -1069,7 +1090,7 @@ impl Suite<'_> {
                 "stream_setup_timeout_failover",
                 "hang",
                 json!({"seconds":30}),
-                json!({"timeout_ms":3000}),
+                json!({"timeout_ms":deployment_timeout(3000)}),
                 "stream: primary never sends headers -> fallback after 3s",
             ),
             (
@@ -1083,7 +1104,7 @@ impl Suite<'_> {
             self.failover(name, expect, fault, options, extra, (true, false))
                 .await?;
         }
-        for (name,fault,extra,expect) in [("stream_midstream_cut","cut",json!({}),"stream: primary cut after 2 events -> committed stream ends with stream_broken error, no replay on fallback"),("stream_idle_stall","stall",json!({"timeout_ms":4000}),"stream: primary stalls after 2 events -> stream_broken after the 4s idle timeout, no replay")] {let (gw,_,f)=self.pair(fault,json!({"cut_after_events":2,"seconds":30}),extra).await?;let r=gw.request("rel",true,false).await?;self.check(name,expect,r.status==200 && r.deployment()=="primary" && r.broken() && f.hits()==0 && if fault=="cut" {!r.done() && r.events()>=1}else{r.seconds<20.0},format!("{} fallback_hits={}",r.summary(),f.hits()));}
+        for (name,fault,extra,expect) in [("stream_midstream_cut","cut",json!({}),"stream: primary cut after 2 events -> committed stream ends with stream_broken error, no replay on fallback"),("stream_idle_stall","stall",json!({"timeout_ms":deployment_timeout(4000)}),"stream: primary stalls after 2 events -> stream_broken after the 4s idle timeout, no replay")] {let (gw,_,f)=self.pair(fault,json!({"cut_after_events":2,"seconds":30}),extra).await?;let r=gw.request("rel",true,false).await?;self.check(name,expect,r.status==200 && r.deployment()=="primary" && r.broken() && f.hits()==0 && if fault=="cut" {!r.done() && r.events()>=1}else{r.seconds<20.0},format!("{} fallback_hits={}",r.summary(),f.hits()));}
         if self.fallback.provider == "anthropic" {
             self.skip(
                 "responses_429_failover",
@@ -1603,7 +1624,7 @@ mod tests {
         assert!(parse_config("not TOML").is_err());
         crate::mock_upstream::run(&[
             "--requests".into(),
-            "8".into(),
+            "4".into(),
             "--concurrency".into(),
             "2".into(),
             "--workers".into(),
