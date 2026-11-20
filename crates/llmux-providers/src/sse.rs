@@ -5,7 +5,14 @@ use llmux_types::{BoxStream, SseEvent, UpstreamError};
 
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
 
-pub(crate) fn decode(mut body: Incoming) -> BoxStream<'static, Result<SseEvent, UpstreamError>> {
+pub(crate) fn decode(body: Incoming) -> BoxStream<'static, Result<SseEvent, UpstreamError>> {
+    decode_until(body, false)
+}
+
+pub(crate) fn decode_until(
+    mut body: Incoming,
+    anthropic: bool,
+) -> BoxStream<'static, Result<SseEvent, UpstreamError>> {
     Box::pin(async_stream::try_stream! {
         let mut parser = Parser::default();
         let mut bytes_sent = 0;
@@ -16,7 +23,7 @@ pub(crate) fn decode(mut body: Incoming) -> BoxStream<'static, Result<SseEvent, 
                 if let Some(event) = parser.next(&mut chunk)
                     .map_err(|()| UpstreamError::StreamBroken { bytes_sent })?
                 {
-                    let done = event.data == "[DONE]";
+                    let done = event.data == "[DONE]" || (anthropic && event.event.as_deref() == Some("message_stop"));
                     bytes_sent += event.data.len() as u64;
                     yield event;
                     if done {
