@@ -7,10 +7,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum UpstreamError {
     #[error("rate limited")]
-    RateLimited {
-        retry_after: Option<Duration>,
-        scope: LimitScope,
-    },
+    RateLimited { retry_after: Option<Duration> },
     #[error("quota exhausted")]
     QuotaExhausted { reset_at: Option<SystemTime> },
     #[error("auth failed")]
@@ -27,13 +24,6 @@ pub enum UpstreamError {
     Connect,
     #[error("stream broken after {bytes_sent} bytes")]
     StreamBroken { bytes_sent: u64 },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LimitScope {
-    Requests,
-    Tokens,
-    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -63,10 +53,6 @@ impl UpstreamError {
             Self::Connect => ErrorKind::ConnectError,
             Self::StreamBroken { .. } => ErrorKind::StreamBroken,
         }
-    }
-
-    pub fn is_retryable_elsewhere(&self) -> bool {
-        !matches!(self, Self::BadRequest { .. } | Self::StreamBroken { .. })
     }
 }
 

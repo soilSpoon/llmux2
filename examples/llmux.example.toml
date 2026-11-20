@@ -8,7 +8,6 @@ expose_routing_headers = true
 # dashboard_key = "env:LLMUX_DASHBOARD_KEY"
 
 [routing]
-default_strategy = "priority"
 max_attempts = 2
 fallback_on = ["rate_limited", "quota_exhausted"]
 
@@ -59,7 +58,6 @@ credential = "groq-key"
 base_url = "https://api.groq.com/openai/v1"
 upstream_model = "llama-3.3-70b-versatile"
 priority = 0
-billing = "free"
 timeout_ms = 30000
 
 [[models.deployments]]
@@ -68,7 +66,6 @@ credential = "together-key"
 base_url = "https://api.together.xyz/v1"
 upstream_model = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
 priority = 10
-billing = "pay_as_you_go"
 timeout_ms = 30000
 
 [[models]]
@@ -80,5 +77,4 @@ id = "anthropic-sonnet"
 credential = "anthropic-key"
 base_url = "https://api.anthropic.com/v1"
 upstream_model = "claude-sonnet-4-5"
-billing = "pay_as_you_go"
 timeout_ms = 60000
