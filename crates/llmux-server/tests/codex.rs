@@ -541,7 +541,13 @@ priority = 1
 
 #[tokio::test]
 async fn chat_usage_is_opt_in_and_separate_from_finish() {
-    let (_dir, _upstream, gateway, _) = fixture(events()).await;
+    let prefix = [
+        json!({"type":"response.created","response":{"id":"resp_test","model":"upstream"}}),
+        json!({"type":"response.refusal.delta","delta":"No"}),
+        json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"c1","name":"test","arguments":""}}),
+        json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":"{}"}),
+    ].iter().map(|value| format!("data: {value}\n\n")).collect::<String>();
+    let (_dir, _upstream, gateway, _) = fixture(format!("{prefix}{}", events())).await;
     for include in [None, Some(false), Some(true)] {
         let mut request = json!({"model":"codex","stream":true,"messages":[]});
         if let Some(include) = include {
@@ -557,9 +563,16 @@ async fn chat_usage_is_opt_in_and_separate_from_finish() {
             .collect();
         let finish = chunks
             .iter()
-            .position(|chunk| chunk["choices"][0]["finish_reason"] == "stop")
+            .position(|chunk| chunk["choices"][0]["finish_reason"] == "tool_calls")
             .unwrap();
         assert!(chunks[finish].get("usage").is_none_or(Value::is_null));
+        for chunk in &chunks[..=finish] {
+            if include == Some(true) {
+                assert_eq!(chunk.get("usage"), Some(&Value::Null));
+            } else {
+                assert!(chunk.get("usage").is_none());
+            }
+        }
         assert_eq!(
             chunks.len(),
             finish + if include == Some(true) { 2 } else { 1 }

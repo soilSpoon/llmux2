@@ -443,7 +443,10 @@ fn chunk(response: &Value, delta: Value, finish: Value) -> Value {
     json!({"id":response["id"].as_str().unwrap_or("chatcmpl-responses"),"object":"chat.completion.chunk","created":response["created_at"].as_u64().unwrap_or(0),"model":response["model"],"choices":[{"index":0,"delta":delta,"finish_reason":finish}]})
 }
 
-fn chat_event(value: Value) -> SseEvent {
+fn chat_event(mut value: Value, include_usage: bool) -> SseEvent {
+    if include_usage && value.get("usage").is_none() {
+        value["usage"] = Value::Null;
+    }
     SseEvent {
         event: None,
         data: value.to_string(),
@@ -460,26 +463,26 @@ fn chat_stream(
         while let Some(event) = upstream.next().await {
             let value: Value = serde_json::from_str(&event?.data).map_err(|_| bad_gateway())?;
             match value["type"].as_str().unwrap_or("") {
-                "response.created" => { response = value["response"].clone(); yield chat_event(chunk(&response, json!({"role":"assistant","content":""}), Value::Null)); },
-                "response.output_text.delta" => { yield chat_event(chunk(&response, json!({"content":value["delta"]}), Value::Null)); },
-                "response.refusal.delta" => { yield chat_event(chunk(&response, json!({"refusal":value["delta"]}), Value::Null)); },
+                "response.created" => { response = value["response"].clone(); yield chat_event(chunk(&response, json!({"role":"assistant","content":""}), Value::Null), include_usage); },
+                "response.output_text.delta" => { yield chat_event(chunk(&response, json!({"content":value["delta"]}), Value::Null), include_usage); },
+                "response.refusal.delta" => { yield chat_event(chunk(&response, json!({"refusal":value["delta"]}), Value::Null), include_usage); },
                 "response.output_item.added" if value["item"]["type"] == "function_call" => {
                     let index = calls.len();
                     calls.insert(value["output_index"].as_u64().ok_or_else(bad_gateway)?, index);
-                    yield chat_event(chunk(&response, json!({"tool_calls":[{"index":index,"id":value["item"]["call_id"],"type":"function","function":{"name":value["item"]["name"],"arguments":value["item"]["arguments"].as_str().unwrap_or("")}}]}), Value::Null));
+                    yield chat_event(chunk(&response, json!({"tool_calls":[{"index":index,"id":value["item"]["call_id"],"type":"function","function":{"name":value["item"]["name"],"arguments":value["item"]["arguments"].as_str().unwrap_or("")}}]}), Value::Null), include_usage);
                 },
                 "response.function_call_arguments.delta" => {
                     let index = calls.get(&value["output_index"].as_u64().ok_or_else(bad_gateway)?).ok_or_else(bad_gateway)?;
-                    yield chat_event(chunk(&response, json!({"tool_calls":[{"index":index,"function":{"arguments":value["delta"]}}]}), Value::Null));
+                    yield chat_event(chunk(&response, json!({"tool_calls":[{"index":index,"function":{"arguments":value["delta"]}}]}), Value::Null), include_usage);
                 },
                 "response.completed" => {
                     response = value["response"].clone();
-                    yield chat_event(chunk(&response, json!({}), json!(if calls.is_empty() {"stop"} else {"tool_calls"})));
+                    yield chat_event(chunk(&response, json!({}), json!(if calls.is_empty() {"stop"} else {"tool_calls"})), include_usage);
                     if include_usage {
                         let mut last = chunk(&response, json!({}), Value::Null);
                         last["choices"] = json!([]);
                         last["usage"] = chat_usage(&response);
-                        yield chat_event(last);
+                        yield chat_event(last, include_usage);
                     }
                     yield SseEvent {event:None,data:"[DONE]".into()};
                     return;
