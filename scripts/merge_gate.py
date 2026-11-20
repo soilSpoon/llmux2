@@ -61,6 +61,8 @@ def evaluate(data, required, policy):
         errors.append('Devin Review has not submitted a review on the head SHA.')
     latest = {}
     for review in sorted(reviews, key=lambda r: r['id']):
+        if review['state'] == 'COMMENTED' and not (review.get('body') or '').strip():
+            continue
         latest[reviewer_login(review)] = review
     for login, review in latest.items():
         if unavailable(review):

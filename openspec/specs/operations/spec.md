@@ -35,6 +35,7 @@ no blocking latest reviews, and a passing head-specific independent session atte
 Verification comments SHALL come from a policy-allowlisted account.
 Devin Review evidence SHALL contain a configured real-review body marker;
 author thread replies SHALL NOT satisfy that evidence.
+Empty-body COMMENTED reviews SHALL NOT supersede a reviewer's blocking review.
 Only the latest run of each head check name SHALL determine its outcome.
 Every latest head check SHALL be completed before merging.
 Required checks SHALL come from the checked-in ruleset and review markers from

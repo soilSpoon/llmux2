@@ -28,6 +28,20 @@ def marker(sha=SHA, verdict='pass', reviewer='independent'):
 
 
 class MergeGateTest(unittest.TestCase):
+    def test_empty_reply_review_does_not_clear_blocker(self):
+        for body in ('', '  \r\n', None):
+            with self.subTest(body=body):
+                data = fixture()
+                data['reviews'] += [
+                    {'id': 2, 'user': {'login': 'codesolarlght'}, 'state': 'COMMENTED',
+                     'body': 'Changes recommended'},
+                    {'id': 3, 'user': {'login': 'codesolarlght'}, 'state': 'COMMENTED', 'body': body}]
+                self.assertIn('Latest review by codesolarlght is blocking.',
+                              evaluate(data, ['check'], POLICY))
+        data['reviews'].append({'id': 4, 'user': {'login': 'codesolarlght'},
+                                'state': 'APPROVED', 'body': ''})
+        self.assertEqual(evaluate(data, ['check'], POLICY), [])
+
     def test_devin_review_requires_real_body_marker(self):
         for body in ('', 'Fixed in abc123', 'Devin Review', '<!-- unrelated -->'):
             with self.subTest(body=body):
