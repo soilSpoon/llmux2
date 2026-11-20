@@ -49,10 +49,13 @@ impl Admin {
     async fn call(&self, method: Method, path: &str, body: Value) -> Result<Value, String> {
         let parsed =
             url::Url::parse(&self.url).map_err(|err| format!("bad LLMUX_ADMIN_URL: {err}"))?;
-        let loopback = matches!(
-            parsed.host_str(),
-            Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
-        );
+        // 127.0.0.0/8 and ::1 are all loopback, not just 127.0.0.1.
+        let loopback = match parsed.host() {
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            Some(url::Host::Domain(domain)) => domain == "localhost",
+            None => false,
+        };
         if parsed.scheme() == "http" && !loopback && self.key.is_some() {
             return Err(
                 "refusing to send the admin key over plaintext http to a non-loopback host".into(),
@@ -201,5 +204,196 @@ async fn main() {
             writeln!(stdout, "{reply}").expect("stdout");
             stdout.flush().expect("stdout");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        extract::{Path, State},
+        http::StatusCode,
+        response::IntoResponse,
+        routing::{get, post},
+        Json, Router,
+    };
+    use llmux_testkit::TestServer;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    async fn admin() -> (Admin, TestServer, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let server = TestServer::start(
+            Router::new()
+                .route(
+                    "/admin/status",
+                    get(|| async { Json(json!({"uptime_ms": 1, "version": "test"})) }),
+                )
+                .route(
+                    "/admin/deployments",
+                    get(|| async { Json(json!({"deployments": []})) }),
+                )
+                .route(
+                    "/admin/credentials",
+                    get(|| async { Json(json!({"credentials": []})) }),
+                )
+                .route(
+                    "/admin/models",
+                    get(|| async { Json(json!({"models": []})) }),
+                )
+                .route(
+                    "/admin/credentials/{id}/disabled",
+                    post(
+                        |State(calls): State<Arc<AtomicUsize>>,
+                         Path(id): Path<String>,
+                         Json(body): Json<Value>| async move {
+                            calls.fetch_add(1, Ordering::Relaxed);
+                            assert_eq!(id, "a/b%c");
+                            Json(json!({"id": id, "disabled": body["disabled"]}))
+                        },
+                    ),
+                )
+                .route(
+                    "/admin/reload",
+                    post(|headers: http::HeaderMap| async move {
+                        if headers["authorization"] != "Bearer admin-key" {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({"error":{"message":"denied"}})),
+                            )
+                                .into_response();
+                        }
+                        Json(json!({"reloaded": true})).into_response()
+                    }),
+                )
+                .with_state(counted),
+        )
+        .await
+        .unwrap();
+        let admin = Admin {
+            url: server.url(),
+            key: Some("admin-key".into()),
+            client: Client::builder(TokioExecutor::new()).build(
+                HttpsConnectorBuilder::new()
+                    .with_webpki_roots()
+                    .https_or_http()
+                    .enable_http1()
+                    .build(),
+            ),
+        };
+        (admin, server, calls)
+    }
+
+    #[tokio::test]
+    async fn tools_forward_to_admin_routes() {
+        let (admin, _server, calls) = admin().await;
+        for tool in [
+            "llmux_status",
+            "llmux_deployments",
+            "llmux_credentials",
+            "llmux_models",
+            "llmux_reload",
+        ] {
+            let reply = handle(
+                &admin,
+                &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":{}}}),
+            )
+            .await
+            .unwrap();
+            assert!(reply["result"].get("isError").is_none(), "{tool}: {reply}");
+        }
+        let reply = handle(
+            &admin,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"llmux_set_disabled","arguments":{"id":"a/b%c","disabled":true}}}),
+        )
+        .await
+        .unwrap();
+        assert!(reply["result"].get("isError").is_none(), "{reply}");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn protocol_and_error_paths() {
+        let (admin, _server, _calls) = admin().await;
+        let reply = handle(
+            &admin,
+            &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["result"]["protocolVersion"], PROTOCOL);
+
+        let reply = handle(&admin, &json!({"jsonrpc":"2.0","id":1,"method":"ping"}))
+            .await
+            .unwrap();
+        assert_eq!(reply["result"], json!({}));
+
+        let reply = handle(
+            &admin,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["result"]["tools"].as_array().unwrap().len(), 6);
+
+        let reply = handle(
+            &admin,
+            &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        )
+        .await;
+        assert!(reply.is_none());
+        let reply = handle(&admin, &json!({"jsonrpc":"2.0","method":"ping"})).await;
+        assert!(reply.is_none());
+
+        let reply = handle(&admin, &json!({"jsonrpc":"2.0","id":1,"method":"no/such"}))
+            .await
+            .unwrap();
+        assert_eq!(reply["error"]["code"], -32601);
+
+        let reply = handle(
+            &admin,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bogus","arguments":{}}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["result"]["isError"], true);
+
+        // Auth failure on the admin side becomes isError, not a crash.
+        let denied = Admin {
+            url: admin.url.clone(),
+            key: Some("wrong".into()),
+            client: admin.client.clone(),
+        };
+        let reply = handle(
+            &denied,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"llmux_reload","arguments":{}}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["result"]["isError"], true);
+        assert!(reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("denied"));
+
+        // Plaintext http to a non-loopback host is refused before any request.
+        let remote = Admin {
+            url: "http://example.com".into(),
+            ..denied
+        };
+        let reply = handle(
+            &remote,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"llmux_status","arguments":{}}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["result"]["isError"], true);
+        assert!(reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("plaintext"));
     }
 }
