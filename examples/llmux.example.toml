@@ -25,6 +25,12 @@ kind = "api_key"
 provider = "openai_compat"
 key = "env:TOGETHER_API_KEY"
 
+[[credentials]]
+id = "anthropic-key"
+kind = "api_key"
+provider = "anthropic"
+key = "env:ANTHROPIC_API_KEY"
+
 [[models]]
 name = "llama-3.3-70b"
 aliases = ["llama-70b"]
@@ -47,3 +53,15 @@ upstream_model = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
 priority = 10
 billing = "pay_as_you_go"
 timeout_ms = 30000
+
+[[models]]
+name = "claude-sonnet"
+capabilities = { stream = true }
+
+[[models.deployments]]
+id = "anthropic-sonnet"
+credential = "anthropic-key"
+base_url = "https://api.anthropic.com/v1"
+upstream_model = "claude-sonnet-4-5"
+billing = "pay_as_you_go"
+timeout_ms = 60000

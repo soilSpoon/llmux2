@@ -46,11 +46,16 @@ pub struct CooldownConfig {
     pub max: Duration,
 }
 
+pub struct ApiKey {
+    pub provider: ProviderKind,
+    pub key: Arc<str>,
+}
+
 pub struct RuntimeConfig {
     pub server: ServerConfig,
     pub routing: RoutingConfig,
     pub cooldown: CooldownConfig,
-    pub api_keys: HashMap<Arc<str>, Arc<str>>,
+    pub api_keys: HashMap<Arc<str>, ApiKey>,
     pub model_names: HashMap<Arc<str>, usize>,
     pub models: Box<[CanonicalModel]>,
     pub deployments: Box<[Deployment]>,
@@ -227,8 +232,15 @@ impl RawConfig {
                 ));
             }
             let id: Arc<str> = id.into();
-            provider_kinds.insert(id.clone(), ProviderKind(provider.into()));
-            api_keys.insert(id, resolve_secret(&key)?);
+            let provider = ProviderKind(provider.into());
+            provider_kinds.insert(id.clone(), provider.clone());
+            api_keys.insert(
+                id,
+                ApiKey {
+                    provider,
+                    key: resolve_secret(&key)?,
+                },
+            );
         }
 
         if models.is_empty() {

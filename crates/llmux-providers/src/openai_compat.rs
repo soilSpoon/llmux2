@@ -2,7 +2,7 @@ use crate::sse;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use http::{
-    header::{self, HeaderMap, HeaderValue},
+    header::{self, HeaderMap, HeaderName, HeaderValue},
     Method, Request, Response, StatusCode, Uri,
 };
 use http_body_util::{BodyExt, Limited};
@@ -88,13 +88,14 @@ pub struct StaticKey(AuthMaterial);
 
 impl StaticKey {
     pub fn bearer(key: &str) -> Result<Self, BuildError> {
-        let mut value =
-            HeaderValue::from_str(&format!("Bearer {key}")).map_err(|_| BuildError::InvalidAuth)?;
+        Self::header(header::AUTHORIZATION, &format!("Bearer {key}"))
+    }
+
+    /// Sends `value` verbatim in `name`, e.g. Anthropic's `x-api-key`.
+    pub fn header(name: HeaderName, value: &str) -> Result<Self, BuildError> {
+        let mut value = HeaderValue::from_str(value).map_err(|_| BuildError::InvalidAuth)?;
         value.set_sensitive(true);
-        Ok(Self(AuthMaterial::Header {
-            name: header::AUTHORIZATION,
-            value,
-        }))
+        Ok(Self(AuthMaterial::Header { name, value }))
     }
 }
 
