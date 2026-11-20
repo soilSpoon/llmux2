@@ -29,6 +29,19 @@ def marker(sha=SHA, verdict='pass', reviewer='independent'):
 
 
 class MergeGateTest(unittest.TestCase):
+    def test_devin_status_context_is_case_insensitive(self):
+        for context in ('devin review', 'DEVIN REVIEW', 'DeViN ReViEw'):
+            for state in ('success', 'pending'):
+                with self.subTest(context=context, state=state):
+                    data = fixture()
+                    data['reviews'] = []
+                    data['statuses'] = [{'id': 1, 'context': context, 'state': state,
+                                         'creator': {'login': 'devin-ai-integration[bot]'}}]
+                    if state == 'success':
+                        self.assertEqual(evaluate(data, ['check'], POLICY), [])
+                    else:
+                        self.assertIn('Devin Review status is pending', evaluate(data, ['check'], POLICY))
+
     def test_untrusted_status_cannot_displace_devin_status(self):
         for state in ('pending', 'failure', 'error'):
             with self.subTest(state=state):

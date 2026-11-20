@@ -59,7 +59,7 @@ def evaluate(data, required, policy):
                and any(marker in (r.get('body') or '') for marker in policy['devin_review_markers'])
                and r.get('commit_id') == sha and not unavailable(r) for r in reviews)
     status = max((s for s in data['statuses']
-                  if s['context'] == policy['devin_review_status_context']
+                  if s['context'].casefold() == policy['devin_review_status_context'].casefold()
                   and reviewer_login({'user': s.get('creator')}) == 'devin-ai-integration'),
                  key=lambda s: (s['id'], s.get('created_at') or ''), default=None)
     status_passed = status is not None and status['state'] == 'success'
