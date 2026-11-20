@@ -48,18 +48,25 @@ pub(super) fn seed(
         let Some(source) = source(&provider, nodes) else {
             continue;
         };
-        if upstream::canonical_provider(source, nodes) != provider {
+        let canonical = upstream::canonical_provider(source, nodes) == provider;
+        if matches!(provider, ProviderIdentity::Builtin(_)) && !canonical {
             continue;
+        }
+        let mut prefixes = vec![provider.as_str()];
+        if canonical && provider.as_str() != source {
+            prefixes.push(source);
         }
         for route in routes(source) {
             if connections
                 .iter()
                 .any(|connection| matches(route, connection))
             {
-                let name = format!("{source}/{}", route.0);
-                direct
-                    .entry(name.clone())
-                    .or_insert_with(|| json!({"name":name,"models":[provider.step(route.0)]}));
+                for prefix in &prefixes {
+                    let name = format!("{prefix}/{}", route.0);
+                    direct
+                        .entry(name.clone())
+                        .or_insert_with(|| json!({"name":name,"models":[provider.step(route.0)]}));
+                }
             }
         }
     }

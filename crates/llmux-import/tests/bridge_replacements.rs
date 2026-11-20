@@ -88,7 +88,11 @@ fn bridge_replacements_preserve_leg_order_aliases_and_optional_fallback() {
             assert_eq!(deps[2].credential.as_ref(), "upstream-mistral-slow");
             assert!(!deps.iter().any(|d| d.fallback), "Codex ancestry: {name}");
         }
-        for name in ["deepai/mimo-2.6-flash", "bridge-alias"] {
+        for name in [
+            "deepai/mimo-2.6-flash",
+            "openai-compatible-deepai/mimo-2.6-flash",
+            "bridge-alias",
+        ] {
             let model = &config.models[*config
                 .model_names
                 .get(name)
@@ -149,6 +153,7 @@ fn bridge_replacements_are_opt_in_fail_closed_and_respect_source_reservations() 
     }
     let mut root = fixture();
     root["combos"].as_array_mut().unwrap().extend([
+        json!({"name":"openai-compatible-deepai/mimo-2.6-pro","models":["openai/collision-winner"]}),
         json!({"name":"disabled","models":[{"providerId":"duckduckgo-web","model":"mistral-small-2603","usable":false}]}),
         json!({"name":"malformed","models":[{"providerId":"deepai","model":"mimo-2.6-flash","allowedConnectionIds":"deepai"}]}),
     ]);
@@ -166,6 +171,16 @@ fn bridge_replacements_are_opt_in_fail_closed_and_respect_source_reservations() 
     )
     .unwrap();
     let config = RuntimeConfig::load(out).unwrap();
+    let winner = &config.models[*config
+        .model_names
+        .get("openai-compatible-deepai/mimo-2.6-pro")
+        .unwrap()];
+    assert_eq!(
+        config.deployments[winner.deployments[0].0 as usize]
+            .upstream_model
+            .as_ref(),
+        "collision-winner"
+    );
     for name in [
         "disabled",
         "malformed",

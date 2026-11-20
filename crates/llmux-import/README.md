@@ -361,6 +361,8 @@ Haiku effort suffixes, nested `ddgw/` wrappers and Gemma 31B are not inferred.
 Numes replacements require its exact official API URL and a keyed OpenAI-compatible
 connection; the other targets retain the reviewed official-endpoint checks.
 Workers AI still requires opt-in and its curated/snapshot model checks.
+Custom DeepAI nodes supply both node-ID and unambiguous prefix direct names;
+existing combos, aliases and mappings still win collisions.
 
 Bridge legs expand in place, preserving declared order and existing reviewed
 Morph ordering. Valid source bridge connection pins/allow-lists select no target
