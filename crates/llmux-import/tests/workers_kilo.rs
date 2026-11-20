@@ -36,6 +36,48 @@ fn success(output: &std::process::Output) -> String {
 }
 
 #[test]
+fn workers_registry_shorthands_use_canonical_connections() {
+    let mut root = fixture();
+    for (alias, provider) in [
+        ("cfpd", "cloudflare-direct"),
+        ("cfp", "cloudflare-playground"),
+    ] {
+        root["providerConnections"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":provider,"provider":provider,"authType":"none"}));
+        root["combos"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name":alias,"models":[format!("{alias}/openai/gpt-oss-20b")]}));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let account = dir.path().join("account");
+    let token = dir.path().join("token");
+    fs::write(&account, "0123456789abcdef0123456789abcdef").unwrap();
+    fs::write(&token, "synthetic-token").unwrap();
+    success(&run(
+        &root,
+        dir.path(),
+        &[
+            ("--cloudflare-account-id-file", &account),
+            ("--cloudflare-token-file", &token),
+        ],
+    ));
+    let config = RuntimeConfig::load(dir.path().join("out.toml")).unwrap();
+    for alias in ["cfpd", "cfp"] {
+        assert!(config.model_names.contains_key(alias), "missing {alias}");
+        let model = &config.models[config.model_names[alias]];
+        assert_eq!(
+            config.deployments[model.deployments[0].0 as usize]
+                .upstream_model
+                .as_ref(),
+            "@cf/openai/gpt-oss-20b"
+        );
+    }
+}
+
+#[test]
 fn workers_opt_in_maps_bridges_and_fails_closed_for_unknown_deprecated_and_paid_models() {
     let mut root = fixture();
     for (i, provider) in [

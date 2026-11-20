@@ -3,7 +3,12 @@ use http::Uri;
 use serde_json::{json, Value};
 use std::net::IpAddr;
 
-pub(super) const PROVIDER_ALIASES: &[(&str, &str)] = &[("ds", "deepseek"), ("kc", "kilocode")];
+pub(super) const PROVIDER_ALIASES: &[(&str, &str)] = &[
+    ("ds", "deepseek"),
+    ("kc", "kilocode"),
+    ("cfpd", "cloudflare-direct"),
+    ("cfp", "cloudflare-playground"),
+];
 
 pub(super) fn canonical_provider<'a>(provider: &'a str, nodes: &'a [Value]) -> &'a str {
     if let Some((_, canonical)) = PROVIDER_ALIASES
