@@ -164,6 +164,17 @@ OmniRoute's original order. Other combo names/models/endpoints are unchanged.
 No logprobs fields are stripped. An enabled OmniRoute fallback remains last.
 To roll back, remove the reviewed
 Morph endpoint exception and combo-order policy before regenerating config.
+
+Free XPLabs (Experiential Labs) routes go first in the reviewed combos
+`gpt-6-luna`, `deepseek-v4.1-flash`, `deepseek-v4.1-flash-fast`,
+`deepseek-v4.1-flash-1017`, `deepseek-v4.1-flash-1017-fast`,
+`deepseek-v4.1-flash-1017-ultrafast`, `claude-haiku-5.5` and `qwen3.8-27b`, using
+the active API-key connection of the custom `experlabs` node at
+`https://api.experientiallabs.ai/v1`. A declared leg for the same model moves
+instead of duplicating; in the Morph logprobs combos it follows Morph. Luna and
+DeepSeek V4.1 Flash are on XPLabs' standing Free tier (10 RPM, 1M tokens/day
+shared), so a 429 falls through to the next leg. Haiku 5.5 and Qwen3.8 27B are
+$0 promotions; remove them from the reviewed list when the promotion ends. Round-robin combos and other names are unchanged.
 Gemini uses Google's documented OpenAI-compatible endpoint
 `https://generativelanguage.googleapis.com/v1beta/openai`, not OmniRoute's native
 Gemini protocol endpoint. See https://ai.google.dev/gemini-api/docs/openai.

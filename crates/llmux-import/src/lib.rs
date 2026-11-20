@@ -12,6 +12,7 @@ mod policy;
 mod replacements;
 mod upstream;
 mod validation;
+mod xplabs;
 
 use llmux_types::provider::{
     ANTHROPIC as KIND_ANTHROPIC, OPENAI as KIND_OPENAI, OPENAI_COMPAT as KIND_OPENAI_COMPAT,
@@ -918,6 +919,35 @@ pub fn import_with_options(
         }
         .expand(&name, &mut Vec::new(), &mut deployments);
         morph::order(&name, &mut deployments, &connections, nodes, &mut warnings);
+        if let Some(step) = combos
+            .contains_key(&name)
+            .then(|| {
+                xplabs::step(
+                    &name,
+                    strategy,
+                    &deployments,
+                    &connections,
+                    &root,
+                    &mut warnings,
+                )
+            })
+            .flatten()
+        {
+            let mut free = Vec::new();
+            let combo = HashMap::from([(name.clone(), json!({"models":[step]}))]);
+            Expander {
+                context: &mut context,
+                combos: &combo,
+                connections: &connections,
+                nodes,
+                warnings: &mut warnings,
+                remaining_steps: 1,
+                exhausted: false,
+                policy: &policy,
+            }
+            .expand(&name, &mut Vec::new(), &mut free);
+            xplabs::place(&name, &mut deployments, free, &connections, &mut warnings);
+        }
         for deployment in &mut deployments {
             if let Some(fields) = deployment.as_object_mut() {
                 fields.remove("_bridge_replacement");
