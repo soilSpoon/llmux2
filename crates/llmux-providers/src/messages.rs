@@ -23,10 +23,10 @@ fn text_content(value: &Value) -> Result<String, BuildError> {
     }
     let mut result = String::new();
     for block in blocks(value)? {
-        if block["type"] != "text" {
-            return Err(BuildError::InvalidBody);
+        match text(&block["type"])? {
+            "text" => result.push_str(text(&block["text"])?),
+            _ => return Err(BuildError::UnsupportedConversion),
         }
-        result.push_str(text(&block["text"])?);
     }
     Ok(result)
 }
@@ -65,6 +65,9 @@ fn messages(value: &Value) -> Result<Vec<Value>, BuildError> {
                     result.push(json!({"role":"tool","tool_call_id":text(&block["tool_use_id"])?,
                         "content":if block["content"].is_null() { String::new() } else { text_content(&block["content"])? }
                     }));
+                }
+                Some(kind) if !matches!(kind, "image" | "tool_use" | "tool_result") => {
+                    return Err(BuildError::UnsupportedConversion);
                 }
                 _ => return Err(BuildError::InvalidBody),
             }

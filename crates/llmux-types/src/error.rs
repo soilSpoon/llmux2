@@ -60,6 +60,9 @@ impl UpstreamError {
 pub enum BuildError {
     #[error("unsupported inbound format")]
     UnsupportedFormat,
+    /// A converting adapter cannot represent this request upstream.
+    #[error("request cannot be converted for this deployment")]
+    UnsupportedConversion,
     #[error("invalid request body")]
     InvalidBody,
     #[error("invalid upstream URI or request headers")]

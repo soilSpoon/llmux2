@@ -42,6 +42,7 @@ enum Reply {
     Ok,
     Limit,
     Image,
+    Document,
     BrokenStream,
 }
 
@@ -81,6 +82,8 @@ async fn messages(State(up): State<Arc<Upstream>>, headers: HeaderMap, body: Byt
         let source = &request["messages"][0]["content"][0]["source"];
         assert_eq!(source["type"], "base64");
         assert_eq!(source["data"].as_str().unwrap().len(), 32_000);
+    } else if matches!(up.reply, Reply::Document) {
+        assert_eq!(request["messages"][0]["content"][0]["type"], "document");
     } else {
         assert_eq!(
             request["messages"],
@@ -179,6 +182,7 @@ credential = "openai-key"
 base_url = "{}/v1"
 upstream_model = "gpt-upstream"
 priority = {priority}
+quota = {{ rpm = 1 }}
 "#,
                     o.url()
                 )
@@ -189,6 +193,9 @@ priority = {priority}
 [server]
 client_keys = ["file:{base}/test-client"]
 request_timeout_ms = 4000
+
+[routing]
+max_attempts = 2
 
 [[credentials]]
 id = "claude-key"
@@ -418,6 +425,26 @@ async fn native_messages_emits_anthropic_broken_stream_error() {
     assert_eq!(error["error"]["type"], "api_error");
     assert!(!body.contains("event: message_stop"));
     assert_eq!(fixture.counts(), [1, 0]);
+}
+
+#[tokio::test]
+async fn native_messages_skips_conversion_that_cannot_handle_documents() {
+    let fixture = Fixture::start((Reply::Document, 10), (Reply::Ok, 0)).await;
+    for stream in [false, true] {
+        let (response, body) = fixture.send_to(
+            "/v1/messages", header::AUTHORIZATION, "Bearer test-client",
+            json!({"model":"assistant","max_tokens":4096,"system":"Be brief","stream":stream,
+                "messages":[{"role":"user","content":[{"type":"document",
+                    "source":{"type":"base64","media_type":"application/pdf","data":"JVBERg=="}}]}]
+            }),
+        ).await;
+        check_route(&response, "claude", "1");
+        assert!(body.contains("Hi from Claude"));
+    }
+    assert_eq!(fixture.counts(), [2, 0]);
+    let (response, _) = fixture.request(false).await;
+    check_route(&response, "gpt", "1");
+    assert_eq!(fixture.counts(), [2, 1]);
 }
 
 #[tokio::test]
