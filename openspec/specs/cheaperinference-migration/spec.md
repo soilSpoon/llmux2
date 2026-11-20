@@ -123,6 +123,23 @@ logprobs, reorder unrelated combos, or replace the optional final fallback.
 - **WHEN** the Morph model or combo name is not reviewed, or either leg is absent
 - **THEN** no reviewed logprobs-order policy is applied
 
+### Requirement: Gemini OpenAI endpoint parameter compatibility
+
+The importer SHALL add seed and user stripping to openai and openai_compat
+deployments whose parsed upstream host is exactly generativelanguage.googleapis.com,
+case-insensitively. It SHALL preserve other fields unless another reviewed rule
+already strips them, and SHALL NOT infer endpoint identity from model names.
+
+#### Scenario: Gemini endpoint on a custom node
+
+WHEN a compatible custom node uses the Google Gemini endpoint
+THEN its deployments load with seed and user stripped regardless of the node ID.
+
+#### Scenario: Another host or hostname lookalike
+
+WHEN a Gemini-named model uses another host or a hostname containing the Google host as a substring
+THEN no Gemini stripping is added.
+
 ### Requirement: Exact API compatibility
 
 The gateway SHALL match the request arguments and response shapes

@@ -1,4 +1,16 @@
 use super::*;
+
+#[test]
+fn timestamps_preserve_utc_offset_and_grouped_fractional_precision() {
+    for (nanos, suffix) in [
+        (0, "+00:00"),
+        (120_000_000, ".120+00:00"),
+        (123_400_000, ".123400+00:00"),
+        (123_456_789, ".123456789+00:00"),
+    ] {
+        assert_eq!(timestamp(0, nanos), format!("1970-01-01T00:00:00{suffix}"));
+    }
+}
 fn gateways() -> Vec<String> {
     vec!["omniroute".into(), "llmux".into()]
 }
