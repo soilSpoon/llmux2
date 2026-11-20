@@ -335,7 +335,7 @@ impl Executor {
                     continue;
                 }
                 let now = Instant::now();
-                if binding.limits.cooldown_until(now).is_some() {
+                if support != Support::Convert && binding.limits.cooldown_until(now).is_some() {
                     unavailable = true;
                     last_transient = None;
                     continue;
@@ -349,12 +349,6 @@ impl Executor {
                         break 'groups;
                     }
                     let permit = if support == Support::Convert {
-                        let now = Instant::now();
-                        if binding.limits.available_at(now, needed) > now {
-                            unavailable = true;
-                            last_transient = None;
-                            break;
-                        }
                         None
                     } else if let Some(permit) = binding.limits.admit(needed) {
                         Some(permit)
@@ -370,7 +364,13 @@ impl Executor {
                         incompatible.push(idx);
                         break;
                     }
-                    let Some(permit) = permit.or_else(|| binding.limits.admit(needed)) else {
+                    let Some(permit) = permit.or_else(|| {
+                        if binding.limits.cooldown_until(Instant::now()).is_some() {
+                            None
+                        } else {
+                            binding.limits.admit(needed)
+                        }
+                    }) else {
                         unavailable = true;
                         last_transient = None;
                         break;
