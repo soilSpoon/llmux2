@@ -29,6 +29,7 @@ use tokio::{
 #[derive(Clone)]
 enum Reply {
     Limit(u64),
+    Quota(Option<u64>),
     Complete,
     AbortStream,
     GatedStream(Arc<Semaphore>),
@@ -59,6 +60,13 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
         mock.next.clone()
     };
     match reply {
+        Reply::Quota(seconds) => {
+            let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": {"code": "insufficient_quota"}}))).into_response();
+            if let Some(seconds) = seconds {
+                response.headers_mut().insert(header::RETRY_AFTER, seconds.into());
+            }
+            response
+        }
         Reply::Limit(seconds) => (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, seconds.to_string())]).into_response(),
         Reply::Complete if request["stream"] == true => (
             [(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")],
@@ -145,7 +153,7 @@ impl Fixture {
         }
         let base = secrets.path().display();
         let fallback_on = if fallback_on_429 {
-            r#"["rate_limited"]"#
+            r#"["rate_limited", "quota_exhausted"]"#
         } else {
             "[]"
         };
@@ -285,6 +293,34 @@ async fn verify_failover(streaming: bool) {
     drop(body(after_cooldown).await);
     assert_eq!(fixture.counts(), [2, 2]);
     println!("stream={streaming}: d1 429 -> d2 200; d1 skipped during Retry-After: 5; d1 200 after cooldown");
+}
+
+#[tokio::test]
+async fn quota_exhaustion_cools_down_and_obeys_fallback_policy() {
+    for reset in [Some(5), None, Some(u64::MAX)] {
+        for fallback in [true, false] {
+            let fixture = Fixture::start_with_routing(
+                [Reply::Quota(reset), Reply::Complete],
+                [Reply::Complete, Reply::Complete],
+                "",
+                4,
+                fallback,
+            )
+            .await;
+            let response = fixture.request("test-client", "shared", false).await;
+            if fallback {
+                check_route(&response, "d2", "2");
+            } else {
+                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            }
+            drop(body(response).await);
+            assert_eq!(fixture.counts(), [1, usize::from(fallback)]);
+            let response = fixture.request("test-client", "shared", false).await;
+            check_route(&response, "d2", "1");
+            drop(body(response).await);
+            assert_eq!(fixture.counts(), [1, 1 + usize::from(fallback)]);
+        }
+    }
 }
 
 #[tokio::test]
