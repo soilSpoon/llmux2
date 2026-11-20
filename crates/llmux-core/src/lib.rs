@@ -62,7 +62,7 @@ pub enum GatewayError {
     #[error("all candidates are rate limited")]
     AllCandidatesExhausted {
         attempts: usize,
-        retry_after: Duration,
+        retry_after: Option<Duration>,
     },
     #[error(transparent)]
     Client(UpstreamError),
@@ -565,11 +565,10 @@ impl Executor {
                     && binding.adapter.supports(req.format) != Support::No
             })
             .map(|binding| binding.limits.available_at(now, needed))
-            .min()
-            .unwrap_or(now);
+            .min();
         Err(GatewayError::AllCandidatesExhausted {
             attempts,
-            retry_after: earliest.saturating_duration_since(Instant::now()),
+            retry_after: earliest.map(|ready| ready.saturating_duration_since(Instant::now())),
         })
     }
 

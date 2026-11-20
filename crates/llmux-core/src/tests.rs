@@ -520,7 +520,7 @@ async fn exhaustion_retry_hint_ignores_deployments_that_do_not_fit() {
     else {
         panic!("expected exhaustion")
     };
-    assert!(retry_after > Duration::from_secs(2));
+    assert!(retry_after.is_some_and(|wait| wait > Duration::from_secs(2)));
 }
 
 #[tokio::test]
@@ -791,7 +791,7 @@ async fn conversion_rejection_distinguishes_rate_limited_compatible_deployments(
         assert!(matches!(
             executor.execute(messages(b"image")).await,
             Err(GatewayError::AllCandidatesExhausted { attempts: 0, retry_after })
-                if !retry_after.is_zero()
+                if retry_after.is_some_and(|wait| !wait.is_zero())
         ));
     }
 }
