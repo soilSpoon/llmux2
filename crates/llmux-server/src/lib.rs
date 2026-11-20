@@ -30,8 +30,8 @@ use llmux_types::{
     ContextOverflow, CredentialSource, GatewayRequest, GatewayResponse, InboundFormat,
     ProviderRegistry, RequestId, UpstreamError,
 };
-use serde_json::{json, Value};
-use std::{convert::Infallible, error::Error, sync::Arc, time::Duration};
+use serde_json::{json, value::RawValue, Value};
+use std::{collections::BTreeMap, convert::Infallible, error::Error, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
@@ -230,6 +230,18 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
         );
     }
     let request_id = RequestId(Arc::from(uuid::Uuid::new_v4().to_string()));
+    let upstream_body = if metadata.has_gateway_routing_fields {
+        let Some(clean) = without_gateway_routing_fields(&body) else {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Invalid JSON body",
+            );
+        };
+        clean
+    } else {
+        body.clone()
+    };
     let request = |body: Bytes, prompt_bytes: u64| GatewayRequest {
         format,
         model: model.clone(),
@@ -245,7 +257,7 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
     let mut dropped = 0;
     let mut result = state
         .executor
-        .execute(request(body.clone(), metadata.prompt_bytes))
+        .execute(request(upstream_body.clone(), metadata.prompt_bytes))
         .await;
     if let Err(GatewayError::ContextLengthExceeded {
         limit,
@@ -254,7 +266,7 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
     }) = result
     {
         if let Some(truncated) = truncate_middle(
-            &body,
+            &upstream_body,
             metadata.prompt_bytes,
             metadata.max_output_tokens,
             limit,
@@ -324,6 +336,14 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
             .insert(ATTEMPTS_HEADER, HeaderValue::from(routed.attempts));
     }
     response
+}
+
+fn without_gateway_routing_fields(body: &[u8]) -> Option<Bytes> {
+    let mut fields: BTreeMap<String, &RawValue> = serde_json::from_slice(body).ok()?;
+    for field in ["min_discount_percent", "zdr", "ranking"] {
+        fields.remove(field);
+    }
+    serde_json::to_vec(&fields).ok().map(Bytes::from)
 }
 
 fn authorized(headers: &HeaderMap, keys: &[Arc<str>]) -> bool {
