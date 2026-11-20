@@ -198,7 +198,11 @@ async fn first_login_files_snippet_and_returning_login() {
         record["scopes"],
         json!(SCOPES.split_whitespace().collect::<Vec<_>>())
     );
-    assert!(chrono::DateTime::parse_from_rfc3339(record["saved_at"].as_str().unwrap()).is_ok());
+    assert!(time::OffsetDateTime::parse(
+        record["saved_at"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339
+    )
+    .is_ok());
     assert_eq!(
         fs::read_to_string(dir.path().join("refresh_token")).unwrap(),
         "refresh"
