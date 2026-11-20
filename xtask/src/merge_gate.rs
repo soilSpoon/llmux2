@@ -259,7 +259,11 @@ fn evaluate(data: &Value, required: &[String], policy: &Value) -> Result<Vec<Str
     }
     let mut latest = vec![];
     for review in reviews {
-        if review["state"] == "COMMENTED" && optional_text(&review["body"]).trim().is_empty() {
+        if review["state"] == "COMMENTED"
+            && optional_text(&review["body"])
+                .chars()
+                .all(|c| c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}'))
+        {
             continue;
         }
         latest_insert(&mut latest, reviewer_login(review)?, review);

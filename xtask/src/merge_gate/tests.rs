@@ -94,7 +94,12 @@ fn untrusted_or_unrelated_status_does_not_satisfy_review() {
 }
 #[test]
 fn empty_reply_review_does_not_clear_blocker() {
-    for body in [json!(""), json!("  \r\n"), Value::Null] {
+    for body in [
+        json!(""),
+        json!("  \r\n"),
+        Value::Null,
+        json!("\u{1c}\u{1d}\u{1e}\u{1f}"),
+    ] {
         let mut d = fixture();
         d["reviews"].as_array_mut().unwrap().extend([json!({"id":2,"user":{"login":"codesolarlght"},"state":"COMMENTED","body":"Changes recommended"}),json!({"id":3,"user":{"login":"codesolarlght"},"state":"COMMENTED","body":body})]);
         assert!(errors(&d).contains(&"Latest review by codesolarlght is blocking.".into()));
