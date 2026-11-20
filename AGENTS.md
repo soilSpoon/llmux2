@@ -25,7 +25,7 @@ Check the risks the change touches, not every row in every PR:
 
 Keep provider-specific behavior out of the routing core where the adapter contract suffices. Reuse shared fixtures and abstractions; avoid speculative dependencies, unbounded work, and unrelated cleanup.
 
-Run the applicable checks locally and require the GitHub Actions `check` job to pass on the PR head. The `pr-policy` job fails a PR whose template sections are empty, or whose `crates/*/src` changes come without a test change (a `crates/*/tests/` or `llmux-testkit` file, or an added `#[test]` or `assert!`); when no deterministic test applies, write `Test exemption: <reason>` in the Verification section. Address Devin Review findings before merging; explain any finding you do not act on.
+Run the applicable checks locally and require the GitHub Actions `check` job to pass on the PR head. The `pr-policy` job fails a PR whose template sections are empty, or whose `crates/*/src` changes come without a test change (a `crates/*/tests/` or `llmux-testkit` file, or an added `#[test]` or `assert!`); when no deterministic test applies, write `Test exemption: <reason>` in the Verification section. The `coverage` job fails when workspace line coverage drops below `.github/coverage-floor` or a PR lowers that number; raise it when coverage rises. Address Devin Review findings before merging; explain any finding you do not act on.
 
 ```sh
 cargo fmt --all -- --check
