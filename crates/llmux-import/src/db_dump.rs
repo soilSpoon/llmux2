@@ -73,11 +73,31 @@ fn rows(root: &Value, table: &str) -> Result<Vec<Value>, String> {
 }
 
 pub(super) fn normalize(root: &Value) -> Result<Value, String> {
+    let aliases = if let Some(rows) = root["key_value"].as_array() {
+        let mut aliases = Map::new();
+        for row in rows.iter().filter(|row| row["namespace"] == "modelAliases") {
+            if let Some(key) = row["key"].as_str() {
+                let value = row["value"]
+                    .as_str()
+                    .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                    .unwrap_or(Value::Null);
+                aliases.insert(key.into(), value);
+            }
+        }
+        Value::Object(aliases)
+    } else {
+        root["key_value"]
+            .get("modelAliases")
+            .cloned()
+            .unwrap_or(json!({}))
+    };
     Ok(json!({
         "_meta": {"version": "omniroute-v3-legacy-export"},
         "providerConnections": rows(root, "provider_connections")?,
         "providerNodes": rows(root, "provider_nodes")?,
         "apiKeys": rows(root, "api_keys")?,
         "combos": rows(root, "combos")?,
+        "modelAliases": aliases,
+        "modelComboMappings": rows(root, "model_combo_mappings")?,
     }))
 }
