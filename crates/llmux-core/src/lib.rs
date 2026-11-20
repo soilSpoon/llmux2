@@ -187,6 +187,11 @@ impl Executor {
                 })
             })
             .collect::<Result<Box<[_]>, _>>()?;
+        // A credential without deployments is still manageable: keep a
+        // flag for every configured credential, not only deployed ones.
+        for id in credentials.keys() {
+            disabled.entry(id.clone()).or_default();
+        }
 
         let orders = cfg
             .models
