@@ -60,14 +60,27 @@ impl Drop for Temporary {
     }
 }
 pub fn address_parts(listen: &str) -> Result<(IpAddr, i64)> {
+    let (address, _, port) = scoped_address_parts(listen)?;
+    Ok((address, port))
+}
+fn scoped_address_parts(listen: &str) -> Result<(IpAddr, Option<&str>, i64)> {
     let (host, port) = listen
         .rsplit_once(':')
         .ok_or("not enough values to unpack (expected 2, got 1)")?;
     let host = host.trim_matches(['[', ']']);
-    let address: IpAddr = host
+    let (ip, scope) = host
+        .split_once('%')
+        .map_or((host, None), |(ip, scope)| (ip, Some(scope)));
+    let address: IpAddr = ip
         .parse()
         .map_err(|_| format!("'{host}' does not appear to be an IPv4 or IPv6 address"))?;
-    let address = if address.is_unspecified() {
+    if scope.is_some_and(|scope| scope.is_empty() || scope.contains('%'))
+        || (scope.is_some() && address.is_ipv4())
+    {
+        return Err(format!("'{host}' does not appear to be an IPv4 or IPv6 address").into());
+    }
+    let unspecified = address.is_unspecified();
+    let address = if unspecified {
         if address.is_ipv4() {
             IpAddr::from([127, 0, 0, 1])
         } else {
@@ -80,7 +93,7 @@ pub fn address_parts(listen: &str) -> Result<(IpAddr, i64)> {
         .trim()
         .parse()
         .map_err(|_| format!("invalid literal for int() with base 10: '{port}'"))?;
-    Ok((address, port))
+    Ok((address, if unspecified { None } else { scope }, port))
 }
 pub struct Deployment<R> {
     pub root: PathBuf,

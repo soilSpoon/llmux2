@@ -488,6 +488,61 @@ fn address_and_unit_state_mapping() {
     }
     assert!(llmux2_ops::unit_active(1, "active").is_err());
 }
+
+#[test]
+fn scoped_ipv6_is_accepted_by_deploy_status_and_guard() {
+    for listen in ["[fe80::1%2]:8080", "[fe80::1%eth0]:8080", "[::%eth0]:8080"] {
+        assert!(llmux2_ops::address_parts(listen).is_ok(), "{listen}");
+        let mut f = Fixture::new();
+        f.ops.runtime.listens.extend([listen.into(), listen.into()]);
+        assert_eq!(f.deploy().unwrap(), "b");
+        assert_eq!(f.ops.status().unwrap()["recorded"]["listen"], listen);
+        f.ops.runtime.active.clear();
+        f.ops.runtime.healthy = false;
+        f.ops.guard().unwrap();
+        assert!(f.ops.runtime.active.contains("b"));
+    }
+    assert_eq!(
+        llmux2_ops::address_parts("[::%eth0]:8080").unwrap().0,
+        "::1".parse::<IpAddr>().unwrap()
+    );
+    for listen in [
+        "[fe80::1%]:8080",
+        "[fe80::1%eth%0]:8080",
+        "127.0.0.1%2:8080",
+    ] {
+        assert!(llmux2_ops::address_parts(listen).is_err());
+    }
+}
+#[test]
+fn scoped_ipv6_health_probe_connects_over_loopback() {
+    use std::io::{BufRead, BufReader};
+    let listener = TcpListener::bind("[::1]:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.0 200 OK\r\n\r\nok")
+                .unwrap();
+        }
+    });
+    for zone in ["1", "lo"] {
+        assert!(llmux2_ops::health(&format!("[::1%{zone}]:{port}")).unwrap());
+    }
+    server.join().unwrap();
+    assert!(!llmux2_ops::health("[fe80::1%llmux-no-interface]:8080").unwrap());
+}
 #[test]
 fn health_requires_http_200_and_ok_prefix() {
     use std::io::{BufRead, BufReader};

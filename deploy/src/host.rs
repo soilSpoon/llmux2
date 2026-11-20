@@ -1,8 +1,8 @@
-use crate::{address_parts, Result, Runtime};
+use crate::{scoped_address_parts, Result, Runtime};
 use serde_json::{json, Value};
 use std::{
     io::{self, BufRead, BufReader, Read, Write},
-    net::{SocketAddr, TcpStream},
+    net::{IpAddr, SocketAddr, SocketAddrV6, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::mpsc,
@@ -28,18 +28,15 @@ pub fn unit_active(code: i32, state: &str) -> Result<bool> {
     }
 }
 pub fn health(listen: &str) -> Result<bool> {
-    let (host, port) = address_parts(listen)?;
+    let (host, scope, port) = scoped_address_parts(listen)?;
     let port = u16::try_from(port).map_err(|_| "Port out of range 0-65535")?;
     let operation = || -> io::Result<bool> {
         let timeout = Duration::from_secs(2);
-        let mut stream = TcpStream::connect_timeout(&SocketAddr::new(host, port), timeout)?;
+        let address = socket_address(host, port, scope)?;
+        let mut stream = TcpStream::connect_timeout(&address, timeout)?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
-        write!(
-            stream,
-            "GET /healthz HTTP/1.0\r\nHost: {}\r\n\r\n",
-            SocketAddr::new(host, port)
-        )?;
+        write!(stream, "GET /healthz HTTP/1.0\r\nHost: {}\r\n\r\n", address)?;
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         Read::by_ref(&mut reader).take(65537).read_line(&mut line)?;
@@ -62,6 +59,31 @@ pub fn health(listen: &str) -> Result<bool> {
         Ok(false)
     };
     Ok(operation().unwrap_or(false))
+}
+fn socket_address(host: IpAddr, port: u16, scope: Option<&str>) -> io::Result<SocketAddr> {
+    let Some(scope) = scope else {
+        return Ok(SocketAddr::new(host, port));
+    };
+    let IpAddr::V6(ip) = host else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "IPv4 address cannot have a scope id",
+        ));
+    };
+    let scope_id = if scope.bytes().all(|b| b.is_ascii_digit()) {
+        scope
+            .parse::<u32>()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+    } else {
+        let name = std::ffi::CString::new(scope)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+        if index == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        index
+    };
+    Ok(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, scope_id)))
 }
 pub struct Host {
     root: PathBuf,
@@ -190,6 +212,25 @@ fn run_command(command: &mut Command, timeout: Duration) -> Result<Output> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scoped_health_socket_uses_numeric_and_named_interface_ids() {
+        let ip = "fe80::1".parse().unwrap();
+        let SocketAddr::V6(numeric) = socket_address(ip, 8080, Some("2")).unwrap() else {
+            panic!()
+        };
+        assert_eq!(numeric.scope_id(), 2);
+        assert_eq!(
+            numeric.ip(),
+            &"fe80::1".parse::<std::net::Ipv6Addr>().unwrap()
+        );
+        let SocketAddr::V6(named) = socket_address(ip, 8080, Some("lo")).unwrap() else {
+            panic!()
+        };
+        assert_ne!(named.scope_id(), 0);
+        assert!(socket_address(ip, 8080, Some("llmux-no-interface")).is_err());
+        assert!(socket_address(ip, 8080, Some("4294967296")).is_err());
+        assert!(socket_address(ip, 8080, Some("lo\0")).is_err());
+    }
     #[test]
     fn subprocess_deadline_kills_and_reaps_a_stuck_command() {
         let error = run_command(
