@@ -35,7 +35,6 @@ fn replacement(provider: &str) -> Option<&'static str> {
             "replace with a Cloudflare Workers AI account API token at https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1 and a free-eligible model",
         ),
         "duckduckgo-web" | "deepai" | "deepai-code" => Some("no official replacement; dropped"),
-        "hms" => Some("custom headers unsupported in llmux2"),
         _ => None,
     }
 }
@@ -66,6 +65,12 @@ pub(super) fn select_auth<'a>(
     }
     let auth = string(connection, "authType");
     if matches!(auth, "no-auth" | "none") {
+        if nodes
+            .iter()
+            .any(|node| string(node, "id") == string(connection, "provider"))
+        {
+            return Ok(SelectedAuth::None);
+        }
         if provider == "aihorde" && string(connection, "provider") == "aihorde" {
             return Ok(SelectedAuth::None);
         }

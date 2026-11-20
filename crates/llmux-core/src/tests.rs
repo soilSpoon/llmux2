@@ -180,6 +180,7 @@ async fn fixture_full(
     });
     let deployments = (0..3)
         .map(|i| Deployment {
+            headers: Default::default(),
             fallback: false,
             idx: DeploymentIdx(i),
             id: format!("dep{i}").into(),

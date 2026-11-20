@@ -453,6 +453,7 @@ impl ProviderAdapter for Anthropic {
         if req.format == InboundFormat::AnthropicMessages {
             request.headers_mut().extend(req.anthropic_headers.clone());
         }
+        request.headers_mut().extend(dep.headers.clone());
         apply_auth(
             request.headers_mut(),
             auth,
@@ -913,6 +914,7 @@ mod tests {
     fn auth_passthrough_and_support() {
         let a = Anthropic::new(provider::ANTHROPIC);
         let mut dep = Deployment {
+            headers: Default::default(),
             fallback: false,
             idx: DeploymentIdx(0),
             id: "a".into(),

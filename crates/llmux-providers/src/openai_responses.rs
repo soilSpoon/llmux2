@@ -56,6 +56,7 @@ impl ProviderAdapter for OpenAiResponses {
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT, "text/event-stream")
             .body(Bytes::from(body.to_string()))?;
+        request.headers_mut().extend(dep.headers.clone());
         apply_auth(
             request.headers_mut(),
             auth,
@@ -489,6 +490,7 @@ mod tests {
     fn wildcard_deployment_forwards_requested_model() {
         let adapter = OpenAiResponses::new();
         let mut dep = Deployment {
+            headers: Default::default(),
             fallback: false,
             idx: DeploymentIdx(0),
             id: "r".into(),

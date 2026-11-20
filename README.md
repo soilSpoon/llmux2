@@ -37,6 +37,18 @@ Credentials use `provider = "openai"` or `"openai_compat"` for OpenAI-compatible
 
 Use `POST /v1/messages` for Anthropic Messages JSON and SSE on Anthropic deployments. Authenticate with a gateway client key in `x-api-key` or `Authorization: Bearer`.
 
+Deployments may set `headers = { "X-Custom" = "literal value", "X-Secret" = "file:/private/header" }`.
+Values can be literal or `env:`/`file:` references resolved at configuration load
+time (terminal CR/LF from reference files is trimmed). Use references for secrets.
+Headers apply on every upstream attempt, are marked sensitive, and are not logged.
+Invalid names/values, duplicate case-insensitive names, hop-by-hop/framing headers
+(`Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`, `TE`,
+`Trailer`, `Upgrade`), and proxy authentication headers are rejected.
+`Authorization` and the adapter credential header (`x-api-key` for Anthropic)
+cannot be overridden on credentialed deployments. Explicit `auth = "none"`
+deployments may supply their own Authorization instead. Existing configs are
+unchanged; remove `headers` to roll back custom headers.
+
 Chat requests converted to Anthropic return one choice even when `n` asks for more. For converted Anthropic Chat streams, set `stream_options.include_usage` to `true` for a separate usage chunk just before `[DONE]`, or `false` to omit usage. Without this option, usage remains on the finish chunk. Reported cache reads appear in `usage.prompt_tokens_details.cached_tokens` and cache writes in `usage.cache_creation_input_tokens`.
 
 ## Health, shutdown and deployment

@@ -49,6 +49,24 @@ WHEN an OpenAI Chat deployment is configured to strip an unsupported field
 THEN only the configured field is dropped, including only the `effort` member
 for `reasoning.effort` unless the enclosing object becomes empty.
 
+### Requirement: Static deployment headers
+
+The gateway SHALL support optional per-deployment headers with literal or
+env/file-reference values resolved at load time, applied to every upstream
+attempt and protected from logging. It SHALL reject invalid, duplicate,
+hop-by-hop, framing, and proxy-authentication headers. Authorization and the
+adapter credential header SHALL be rejected unless the deployment uses auth none.
+
+#### Scenario: Static secret header
+
+WHEN an anonymous compatible deployment references a secret Authorization file
+THEN each attempt sends that header without an adapter-generated credential.
+
+#### Scenario: Unsafe header
+
+WHEN a deployment configures Host or overrides credentialed Authorization
+THEN configuration loading fails without exposing its value.
+
 ### Requirement: Native Anthropic protocol headers
 
 The gateway SHALL forward client `anthropic-version` and `anthropic-beta`

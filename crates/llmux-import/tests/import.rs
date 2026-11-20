@@ -6,6 +6,26 @@ const FIXTURE: &str = include_str!("fixtures/export.json");
 const DB_FIXTURE: &str = include_str!("fixtures/db-dump.json");
 
 #[test]
+fn raw_dump_custom_header_json_loads_as_private_references() {
+    let mut root: Value = serde_json::from_str(DB_FIXTURE).unwrap();
+    root["provider_nodes"][0]["custom_headers_json"] =
+        json!("{\"X-Node\":\"synthetic-header-secret\"}");
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("llmux.toml");
+    llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let config = RuntimeConfig::load(&output).unwrap();
+    let custom = config
+        .deployments
+        .iter()
+        .find(|dep| dep.credential.as_ref() == "upstream-custom")
+        .unwrap();
+    assert_eq!(custom.headers["x-node"], "synthetic-header-secret");
+    assert!(!fs::read_to_string(output)
+        .unwrap()
+        .contains("synthetic-header-secret"));
+}
+
+#[test]
 fn imports_raw_sqlite_dump_through_shared_mapping() {
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("llmux.toml");
