@@ -11,6 +11,67 @@ fn fixture() -> Value {
 }
 
 #[test]
+fn horde_overrides_map_native_roots_and_reject_nonofficial_urls() {
+    for auth in ["no-auth", "apikey"] {
+        for base_url in [
+            "https://aihorde.net/api/v2",
+            "https://aihorde.net/api/v2/",
+            "https://oai.aihorde.net/v1",
+            "https://oai.aihorde.net/v1/",
+        ] {
+            let mut root = fixture();
+            root["providerConnections"][0]["provider"] = json!("aihorde");
+            root["providerConnections"][0]["authType"] = json!(auth);
+            root["providerConnections"][0]["providerSpecificData"] = json!({"baseUrl":base_url});
+            root["combos"][0]["models"] = json!(["aihorde/koboldcpp/test"]);
+            let dir = tempfile::tempdir().unwrap();
+            let output = dir.path().join("out.toml");
+            llmux_import::import(&root.to_string(), &output, None).unwrap();
+            let config = RuntimeConfig::load(&output).unwrap();
+            assert_eq!(
+                config.deployments[0].base_url.to_string(),
+                "https://oai.aihorde.net/v1"
+            );
+            assert_eq!(
+                config.deployments[0].upstream_model.as_ref(),
+                "koboldcpp/test"
+            );
+        }
+    }
+    for (base_url, expected) in [
+        (
+            "https://unsupported.example/private-root",
+            "unsupported AI Horde base URL",
+        ),
+        (
+            "https://aihorde.net/api/v3",
+            "unsupported AI Horde base URL",
+        ),
+        (
+            "http://127.0.0.1:9999/api/v2",
+            "loopback/localhost upstream",
+        ),
+    ] {
+        let mut root = fixture();
+        root["providerConnections"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id":"horde", "provider":"aihorde", "authType":"no-auth",
+                "providerSpecificData":{"baseUrl":base_url}
+            }));
+        let dir = tempfile::tempdir().unwrap();
+        let report =
+            llmux_import::import(&root.to_string(), &dir.path().join("out.toml"), None).unwrap();
+        assert_eq!(report.credentials, 1);
+        let warnings = report.warnings.join("\n");
+        assert!(warnings.contains(expected));
+        assert!(!warnings.contains(base_url));
+        assert!(!dir.path().join("secrets/upstream-horde").exists());
+    }
+}
+
+#[test]
 fn imports_horde_anonymous_and_keyed_and_kilo_keyed() {
     let mut root = fixture();
     for (id, provider, auth, key, model) in [

@@ -87,6 +87,15 @@ fn gemini_base_url(url: &str) -> Result<&'static str, &'static str> {
     }
 }
 
+fn horde_base_url(url: &str) -> Result<&'static str, &'static str> {
+    match url {
+        "https://aihorde.net/api/v2" | "https://oai.aihorde.net/v1" => {
+            Ok("https://oai.aihorde.net/v1")
+        }
+        _ => Err("unsupported AI Horde base URL; use its official OpenAI-compatible endpoint"),
+    }
+}
+
 pub(super) fn resolve(
     connection: &Value,
     nodes: &[Value],
@@ -140,6 +149,8 @@ pub(super) fn resolve(
     let url = url.strip_suffix(suffix).unwrap_or(url);
     let url = if id == "gemini" {
         gemini_base_url(url)?
+    } else if id == "aihorde" {
+        horde_base_url(url)?
     } else {
         url
     };
