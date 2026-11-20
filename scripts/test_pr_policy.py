@@ -54,6 +54,21 @@ class SectionsTest(unittest.TestCase):
 
 
 class TestRequirementTest(unittest.TestCase):
+    def test_subheadings_belong_to_their_section(self):
+        body = FILLED.replace(
+            "Red: `cargo test -p llmux-core x` failed with 500; green: passes.",
+            "### Red\n\nfailed with 500\n\n### Green\n\npasses",
+        )
+        self.assertEqual(pr_policy.check(body, [], ""), [])
+
+    def test_section_with_only_empty_subheading_is_empty(self):
+        body = FILLED.replace(
+            "Red: `cargo test -p llmux-core x` failed with 500; green: passes.", "### Red"
+        )
+        errors = pr_policy.check(body, [], "")
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Verification", errors[0])
+
     def test_source_change_without_test_change_fails(self):
         errors = pr_policy.check(FILLED, SRC, SRC_DIFF)
         self.assertEqual(len(errors), 1)

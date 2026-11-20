@@ -12,7 +12,7 @@ SECTIONS = (
     "Workflow and learning",
 )
 COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
-HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
+HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$", re.MULTILINE)
 SOURCE = re.compile(r"^crates/[^/]+/src/.+\.rs$")
 TEST_FILE = re.compile(r"^(crates/[^/]+/tests/|crates/llmux-testkit/)")
 ADDED_TEST_LINE = re.compile(
@@ -23,11 +23,14 @@ EXEMPTION = re.compile(r"^[ \t]*[-*]?[ \t]*Test exemption:[ \t]*\S.*$", re.IGNOR
 
 def sections(body):
     text = COMMENT.sub("", body)
-    found = {}
     matches = list(HEADING.finditer(text))
+    found = {}
     for i, match in enumerate(matches):
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        found[match.group(1).strip().lower()] = text[match.end() : end].strip()
+        level = len(match.group(1))
+        end = next(
+            (m.start() for m in matches[i + 1 :] if len(m.group(1)) <= level), len(text)
+        )
+        found[match.group(2).strip().lower()] = HEADING.sub("", text[match.end() : end]).strip()
     return found
 
 
