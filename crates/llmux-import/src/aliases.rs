@@ -58,24 +58,11 @@ fn matches(pattern: &str, name: &str) -> bool {
 pub(super) fn prepare(
     root: &Value,
     combos: &mut HashMap<String, Value>,
+    combo_ids: &HashMap<String, String>,
     order: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) -> BTreeMap<String, String> {
     let mut aliases = alias_map(root, warnings);
-    let combo_ids: HashMap<_, _> = array(root, "combos")
-        .iter()
-        .filter_map(|row| {
-            let data = match row.get("data") {
-                Some(Value::String(data)) => serde_json::from_str(data).ok()?,
-                Some(data) => data.clone(),
-                None => row.clone(),
-            };
-            Some((
-                string(row, "id").to_owned(),
-                string(&data, "name").to_owned(),
-            ))
-        })
-        .collect();
     let mut mappings: Vec<_> = array(root, "modelComboMappings")
         .iter()
         .filter(|row| row["enabled"] == true || row["enabled"] == 1)

@@ -434,6 +434,7 @@ pub fn import(
     }
     connections.sort_by_key(|c| c.priority);
     let mut combos = HashMap::new();
+    let mut combo_ids = HashMap::new();
     let mut order = Vec::new();
     for (i, entry) in array(&root, "combos").iter().enumerate() {
         let combo = if let Some(data) = entry.get("data") {
@@ -464,9 +465,15 @@ pub fn import(
             continue;
         }
         order.push(name.clone());
+        let id = string(entry, "id");
+        if !id.is_empty() {
+            combo_ids
+                .entry(id.to_owned())
+                .or_insert_with(|| name.clone());
+        }
         combos.insert(name, combo);
     }
-    let aliases = aliases::prepare(&root, &mut combos, &mut order, &mut warnings);
+    let aliases = aliases::prepare(&root, &mut combos, &combo_ids, &mut order, &mut warnings);
     let mut models = Vec::new();
     let mut deployment_ids = HashSet::new();
     let mut deployment_count = 0;

@@ -139,3 +139,32 @@ fn unavailable_winning_mapping_blocks_lower_mappings_and_legacy_aliases() {
             .any(|w| w.contains("public-name: target unavailable")));
     }
 }
+
+#[test]
+fn mapping_to_skipped_duplicate_combo_never_binds_to_first_combo() {
+    for model in ["openai/test", "openai/different"] {
+        let mut root = fixture();
+        root["combos"].as_array_mut().unwrap().push(json!({
+            "id":"duplicate-id", "name":"canonical",
+            "data":{"name":"canonical","models":[model]}
+        }));
+        root["key_value"]["modelAliases"] = json!({"duplicate-alias":"openai/legacy"});
+        root["model_combo_mappings"] = json!([
+            {"pattern":"duplicate-alias","combo_id":"duplicate-id","enabled":1,"priority":10},
+            {"pattern":"duplicate-alias","combo_id":"combo-id","enabled":1,"priority":1},
+            {"pattern":"retained-alias","combo_id":"combo-id","enabled":1}
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out.toml");
+        let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+        let config = RuntimeConfig::load(output).unwrap();
+        assert!(!config.model_names.contains_key("duplicate-alias"));
+        assert_eq!(
+            config.model_names.get("retained-alias"),
+            config.model_names.get("canonical")
+        );
+        let warnings = report.warnings.join("\n");
+        assert!(warnings.contains("skipped empty/duplicate name"));
+        assert!(warnings.contains("duplicate-alias: target unavailable"));
+    }
+}
