@@ -9,6 +9,7 @@ mod fallback;
 mod morph;
 mod policy;
 mod replacements;
+mod secondary;
 mod upstream;
 mod validation;
 
@@ -896,6 +897,30 @@ pub fn import_with_options(
         }
         .expand(&name, &mut Vec::new(), &mut deployments);
         morph::order(&name, &mut deployments, &connections, nodes, &mut warnings);
+        if combos.contains_key(&name) {
+            let steps = secondary::steps(
+                &name,
+                strategy,
+                &deployments,
+                &connections,
+                &root,
+                &mut warnings,
+            );
+            if !steps.is_empty() {
+                let extra = HashMap::from([(name.clone(), json!({"models":steps}))]);
+                Expander {
+                    context: &mut context,
+                    combos: &extra,
+                    connections: &connections,
+                    nodes,
+                    warnings: &mut warnings,
+                    remaining_steps: 1024,
+                    exhausted: false,
+                    policy: &policy,
+                }
+                .expand(&name, &mut Vec::new(), &mut deployments);
+            }
+        }
         if deployments.is_empty() {
             warnings.push(format!("combo {name}: skipped: no deployments"));
             continue;

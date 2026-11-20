@@ -163,6 +163,27 @@ OmniRoute's original order. Other combo names/models/endpoints are unchanged.
 No logprobs fields are stripped. Earlier non-Mistral legs remain earlier, and
 an enabled OmniRoute fallback remains last. To roll back, remove the reviewed
 Morph endpoint exception and combo-order policy before regenerating config.
+
+The existing source combo `gpt-6-luna` also has a reviewed Respan secondary
+policy. After its surviving source legs (Experlabs stays first), the importer
+appends `gpt-6-luna`, `openai/gpt-6-luna`, and `perplexity/gpt-6-luna`, in that
+order, on one active API-key custom OpenAI-compatible connection with prefix
+`respan` and normalized base URL `https://api.respan.ai/api/v1`. OCI verified
+Responses JSON and SSE on this reviewed direct route. Azure OpenAI, Azure
+Foundry, and Bedrock variants are not included. Missing, inactive, OAuth,
+anonymous, Codex, wrong-protocol and wrong-endpoint connections are ineligible.
+The first eligible connection in existing connection-priority order is used;
+this does not rotate across keys. Each upstream ID already present on that
+endpoint is skipped. Existing legs retain their order, appended legs receive
+consecutive priorities, and optional OmniRoute fallback remains last.
+No primary is synthesized for an empty/missing combo. Round-robin combos are
+unchanged with a warning because equal priorities cannot express a secondary.
+Normal endpoint normalization applies (trailing slash and `/chat/completions`
+suffix removal), including connection-level base URL overrides. No live model
+discovery or credential values are included in the generated config/warnings.
+To roll back an individual route, remove its model ID from `secondary.rs`;
+remove the reviewed row to disable all three, then regenerate config.
+
 Gemini uses Google's documented OpenAI-compatible endpoint
 `https://generativelanguage.googleapis.com/v1beta/openai`, not OmniRoute's native
 Gemini protocol endpoint. See https://ai.google.dev/gemini-api/docs/openai.
