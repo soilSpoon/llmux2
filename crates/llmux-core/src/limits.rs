@@ -99,6 +99,10 @@ impl DeploymentLimits {
         self.baseline + Duration::from_nanos(offset_ns.max(previous))
     }
 
+    pub fn cool_down_until(&self, until: Instant) {
+        self.cool_down(until.saturating_duration_since(Instant::now()));
+    }
+
     pub fn available_at(&self, now: Instant, tokens: u64) -> Instant {
         let mut ready = self.cooldown_until(now).unwrap_or(now);
         for window in self.windows.iter() {
