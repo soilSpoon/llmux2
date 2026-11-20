@@ -2,8 +2,8 @@
 
 use http::Uri;
 use llmux_types::{
-    Billing, CanonicalModel, Capabilities, ContextOverflow, Deployment, DeploymentIdx, ErrorKind,
-    ProviderKind, QuotaSpec, Strategy,
+    provider, CanonicalModel, Capabilities, ContextOverflow, Deployment, DeploymentIdx, ErrorKind,
+    ProviderKind, QuotaSpec,
 };
 use serde::Deserialize;
 use std::{
@@ -63,6 +63,8 @@ pub struct RuntimeConfig {
     /// Quotas shared by every deployment that uses the credential.
     pub credential_quotas: HashMap<Arc<str>, QuotaSpec>,
     pub model_names: HashMap<Arc<str>, usize>,
+    pub catch_all: Option<usize>,
+    pub catch_all_exclude: Vec<String>,
     pub model_allowed_keys: HashMap<usize, Box<[Arc<str>]>>,
     pub models: Box<[CanonicalModel]>,
     pub deployments: Box<[Deployment]>,
@@ -136,18 +138,14 @@ impl Default for RawServer {
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RawRouting {
-    default_strategy: Strategy,
     max_attempts: usize,
-    retry_same_deployment: bool,
     fallback_on: Vec<ErrorKind>,
 }
 
 impl Default for RawRouting {
     fn default() -> Self {
         Self {
-            default_strategy: Strategy::Priority,
             max_attempts: 4,
-            retry_same_deployment: false,
             fallback_on: vec![ErrorKind::RateLimited, ErrorKind::QuotaExhausted],
         }
     }
@@ -199,10 +197,10 @@ enum RawCredential {
 #[serde(deny_unknown_fields)]
 struct RawModel {
     name: String,
+    exclude: Option<Vec<String>>,
     allowed_keys: Option<Vec<String>>,
     #[serde(default)]
     aliases: Vec<String>,
-    strategy: Option<Strategy>,
     #[serde(default)]
     capabilities: Capabilities,
     #[serde(default)]
@@ -221,9 +219,6 @@ struct RawDeployment {
     upstream_model: String,
     #[serde(default)]
     priority: i32,
-    weight: Option<u32>,
-    #[serde(default)]
-    billing: Billing,
     #[serde(default)]
     quota: QuotaSpec,
     timeout_ms: Option<u64>,
@@ -275,14 +270,14 @@ impl RawConfig {
         if routing.max_attempts == 0 {
             return Err(invalid("routing.max_attempts must be positive"));
         }
-        if routing.default_strategy != Strategy::Priority
-            || routing.retry_same_deployment
-            || routing
-                .fallback_on
-                .iter()
-                .any(|kind| !matches!(kind, ErrorKind::RateLimited | ErrorKind::QuotaExhausted))
+        if routing
+            .fallback_on
+            .iter()
+            .any(|kind| !matches!(kind, ErrorKind::RateLimited | ErrorKind::QuotaExhausted))
         {
-            return Err(invalid("MVP routing supports priority, no same-deployment retries, and rate_limited or quota_exhausted fallback only"));
+            return Err(invalid(
+                "routing.fallback_on supports rate_limited and quota_exhausted only",
+            ));
         }
         if cooldown.default_ms == 0
             || cooldown.max_ms < cooldown.default_ms
@@ -411,11 +406,34 @@ impl RawConfig {
             return Err(invalid("at least one model is required"));
         }
         let mut model_names = HashMap::new();
+        let mut catch_all = None;
+        let mut catch_all_exclude = Vec::new();
         let mut model_allowed_keys = HashMap::new();
         let mut canonical_models = Vec::new();
         let mut deployment_ids = HashSet::new();
         let mut deployments = Vec::new();
         for model in models {
+            let is_catch_all = model.name == "*";
+            if is_catch_all {
+                if catch_all.replace(canonical_models.len()).is_some()
+                    || !model.aliases.is_empty()
+                    || model.allowed_keys.is_some()
+                {
+                    return Err(invalid(
+                        "only one catch-all is allowed, without aliases or allowed_keys",
+                    ));
+                }
+                for pattern in model.exclude.unwrap_or_default() {
+                    if pattern.is_empty()
+                        || pattern.strip_suffix('*').unwrap_or(&pattern).contains('*')
+                    {
+                        return Err(invalid("exclude entries must be nonempty exact ids or prefixes with one trailing *"));
+                    }
+                    catch_all_exclude.push(pattern.to_ascii_lowercase());
+                }
+            } else if model.exclude.is_some() {
+                return Err(invalid("exclude is only valid on the catch-all model"));
+            }
             let allowed_keys = model
                 .allowed_keys
                 .as_ref()
@@ -436,20 +454,21 @@ impl RawConfig {
                 model_allowed_keys.insert(canonical_models.len(), keys);
             }
             let name: Arc<str> = model.name.into();
-            for alias in
-                std::iter::once(name.clone()).chain(model.aliases.into_iter().map(Arc::from))
+            for alias in std::iter::once(name.clone())
+                .chain(model.aliases.into_iter().map(Arc::from))
+                .filter(|_| !is_catch_all)
             {
-                if alias.is_empty() || model_names.insert(alias, canonical_models.len()).is_some() {
+                if alias.is_empty()
+                    || alias.as_ref() == "*"
+                    || model_names.insert(alias, canonical_models.len()).is_some()
+                {
                     return Err(invalid(
                         "model names and aliases must be nonempty and globally unique",
                     ));
                 }
             }
-            let strategy = model.strategy.unwrap_or(routing.default_strategy);
-            if strategy != Strategy::Priority || model.deployments.is_empty() {
-                return Err(invalid(
-                    "each model needs at least one deployment and must use priority routing",
-                ));
+            if model.deployments.is_empty() {
+                return Err(invalid("each model needs at least one deployment"));
             }
 
             if model.capabilities.max_context == Some(0) {
@@ -463,7 +482,7 @@ impl RawConfig {
                 }
                 let provider = match (&dep.auth, &dep.credential, &dep.provider) {
                     (Some(DeploymentAuth::None), None, Some(provider))
-                        if matches!(provider.as_str(), "openai" | "openai_compat") =>
+                        if matches!(provider.as_str(), provider::OPENAI | provider::OPENAI_COMPAT) =>
                     {
                         ProviderKind(provider.as_str().into())
                     }
@@ -473,7 +492,7 @@ impl RawConfig {
                         .ok_or_else(|| invalid("deployment references an unknown credential"))?,
                     _ => return Err(invalid("deployment requires a credential, or auth = 'none' with an OpenAI-compatible provider; do not combine them")),
                 };
-                if provider.0.as_ref() == "openai_responses"
+                if provider.0.as_ref() == provider::OPENAI_RESPONSES
                     && dep
                         .credential
                         .as_deref()
@@ -486,13 +505,16 @@ impl RawConfig {
                     .base_url
                     .as_deref()
                     .or_else(|| {
-                        (provider.0.as_ref() == "openai_responses")
+                        (provider.0.as_ref() == provider::OPENAI_RESPONSES)
                             .then_some("https://api.openai.com/v1")
                     })
                     .ok_or_else(|| invalid("deployment requires base_url"))?;
-                if dep.upstream_model.is_empty() || dep.weight == Some(0) {
+                if dep.upstream_model.is_empty() {
+                    return Err(invalid("upstream_model must not be empty"));
+                }
+                if (dep.upstream_model == "*") != is_catch_all {
                     return Err(invalid(
-                        "upstream_model must not be empty and weight must be positive",
+                        "upstream_model must be * exactly for catch-all deployments",
                     ));
                 }
                 if dep.max_context == Some(0) {
@@ -516,8 +538,6 @@ impl RawConfig {
                     base_url: upstream_uri(base_url)?,
                     upstream_model: dep.upstream_model.into(),
                     priority: dep.priority,
-                    weight: dep.weight.unwrap_or(1),
-                    billing: dep.billing,
                     quota: dep.quota,
                     timeout: timeout(dep.timeout_ms.unwrap_or(server.request_timeout_ms))?,
                     max_context: dep.max_context.or(model.capabilities.max_context),
@@ -527,7 +547,6 @@ impl RawConfig {
             candidates.sort_by_key(|idx| deployments[idx.0 as usize].priority);
             canonical_models.push(CanonicalModel {
                 name,
-                strategy,
                 capabilities: model.capabilities,
                 context_overflow: model.context_overflow,
                 deployments: candidates.into_boxed_slice(),
@@ -556,6 +575,8 @@ impl RawConfig {
             api_keys,
             oauth,
             model_names,
+            catch_all,
+            catch_all_exclude,
             model_allowed_keys,
             models: canonical_models.into_boxed_slice(),
             deployments: deployments.into_boxed_slice(),
@@ -589,14 +610,8 @@ fn timeout(ms: u64) -> Result<Duration, ConfigError> {
 
 fn upstream_uri(value: &str) -> Result<Uri, ConfigError> {
     if let Ok(uri) = value.parse::<Uri>() {
-        if let (Some(authority), Some(scheme)) = (uri.authority(), uri.scheme_str()) {
-            let loopback = authority
-                .host()
-                .trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-                || authority.host().eq_ignore_ascii_case("localhost");
-            if (scheme == "https" || (scheme == "http" && loopback))
+        if let (Some(authority), Some(_)) = (uri.authority(), uri.scheme_str()) {
+            if llmux_types::is_https_or_loopback_http(&uri)
                 && !authority.as_str().contains('@')
                 && uri.query().is_none()
                 && !value.contains('#')
@@ -678,6 +693,24 @@ mod tests {
     }
 
     #[test]
+    fn removed_routing_and_deployment_knobs_are_rejected() {
+        let base = config(REQUIRED);
+        for legacy in [
+            "[routing]\ndefault_strategy = \"priority\"\n",
+            "[routing]\nretry_same_deployment = true\n",
+            "[models]\nstrategy = \"priority\"\n[[models]",
+            "weight = 2\n",
+            "billing = \"free\"\n",
+        ] {
+            let input = base.replace("[[models]]", &format!("{legacy}[[models]]"));
+            assert!(
+                RuntimeConfig::parse(&input).is_err(),
+                "legacy key still accepted: {legacy}"
+            );
+        }
+    }
+
+    #[test]
     fn credential_quotas_are_shared_limits_that_must_be_positive() {
         RuntimeConfig::parse(&config(&format!(
             "{REQUIRED}\nquota = {{ rpm = 20, rpd = 50 }}"
@@ -720,6 +753,38 @@ upstream_model = "upstream"
     const REQUIRED: &str = r#"token_url = "https://example.com/token"
 client_id = "client"
 refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
+
+    #[test]
+    fn catch_all_config_validation() {
+        let base = config(REQUIRED);
+        let wildcard = base
+            .replace("name = \"model\"", "name = \"*\"")
+            .replace("upstream_model = \"upstream\"", "upstream_model = \"*\"");
+        assert!(RuntimeConfig::parse(&wildcard).is_ok());
+        let excluded = wildcard.replace(
+            "name = \"*\"",
+            "name = \"*\"\nexclude = [\"codex/*\", \"exact\"]",
+        );
+        assert!(RuntimeConfig::parse(&excluded).is_ok());
+        for input in [
+            wildcard.replace("name = \"*\"", "name = \"*\"\naliases = [\"alias\"]"),
+            wildcard.replace("name = \"*\"", "name = \"*\"\nallowed_keys = []"),
+            wildcard.replace("upstream_model = \"*\"", "upstream_model = \"fixed\""),
+            base.replace("upstream_model = \"upstream\"", "upstream_model = \"*\""),
+            base.replace("name = \"model\"", "name = \"model\"\nexclude = []"),
+            base.replace("name = \"model\"", "name = \"model\"\naliases = [\"*\"]"),
+            format!("{wildcard}\n[[models]]\nname = \"*\"\ndeployments = []"),
+        ] {
+            assert!(RuntimeConfig::parse(&input).is_err(), "accepted {input}");
+        }
+        for pattern in ["", "a*b", "a**", "*x"] {
+            let input = wildcard.replace(
+                "name = \"*\"",
+                &format!("name = \"*\"\nexclude = [{pattern:?}]"),
+            );
+            assert!(RuntimeConfig::parse(&input).is_err(), "accepted {pattern}");
+        }
+    }
 
     #[test]
     fn shutdown_timeout_validation() {

@@ -4,11 +4,15 @@ mod aliases;
 mod connection;
 mod db_dump;
 mod direct;
+mod fallback;
 mod policy;
 mod replacements;
 mod upstream;
 mod validation;
 
+use llmux_types::provider::{
+    ANTHROPIC as KIND_ANTHROPIC, OPENAI as KIND_OPENAI, OPENAI_COMPAT as KIND_OPENAI_COMPAT,
+};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -32,6 +36,13 @@ pub struct ImportOptions<'a> {
     pub kilo_free_models: Option<&'a Path>,
     pub kilo_key_file: Option<&'a Path>,
     pub openrouter_replacements: bool,
+    pub omniroute_fallback: Option<OmniRouteFallback<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct OmniRouteFallback<'a> {
+    pub base_url: &'a str,
+    pub key: &'a str,
 }
 
 struct Connection {
@@ -46,35 +57,43 @@ struct Connection {
 
 // OmniRoute registry/<id>/index.ts; Gemini uses Google's documented OpenAI compatibility API.
 pub const PROVIDERS: &[(&str, &str, &str)] = &[
-    ("openai", "openai", "https://api.openai.com/v1"),
-    ("anthropic", "anthropic", "https://api.anthropic.com/v1"),
+    ("openai", KIND_OPENAI, "https://api.openai.com/v1"),
+    ("anthropic", KIND_ANTHROPIC, "https://api.anthropic.com/v1"),
     (
         "openrouter",
-        "openai_compat",
+        KIND_OPENAI_COMPAT,
         "https://openrouter.ai/api/v1",
     ),
-    ("groq", "openai_compat", "https://api.groq.com/openai/v1"),
-    ("deepseek", "openai_compat", "https://api.deepseek.com"),
-    ("mistral", "openai_compat", "https://api.mistral.ai/v1"),
-    ("xai", "openai_compat", "https://api.x.ai/v1"),
-    ("together", "openai_compat", "https://api.together.xyz/v1"),
+    ("groq", KIND_OPENAI_COMPAT, "https://api.groq.com/openai/v1"),
+    ("deepseek", KIND_OPENAI_COMPAT, "https://api.deepseek.com"),
+    ("mistral", KIND_OPENAI_COMPAT, "https://api.mistral.ai/v1"),
+    ("xai", KIND_OPENAI_COMPAT, "https://api.x.ai/v1"),
+    (
+        "together",
+        KIND_OPENAI_COMPAT,
+        "https://api.together.xyz/v1",
+    ),
     (
         "fireworks",
-        "openai_compat",
+        KIND_OPENAI_COMPAT,
         "https://api.fireworks.ai/inference/v1",
     ),
-    ("cerebras", "openai_compat", "https://api.cerebras.ai/v1"),
+    ("cerebras", KIND_OPENAI_COMPAT, "https://api.cerebras.ai/v1"),
     (
         "gemini",
-        "openai_compat",
+        KIND_OPENAI_COMPAT,
         "https://generativelanguage.googleapis.com/v1beta/openai",
     ),
-    ("morph", "openai_compat", "https://api.morphllm.com/v1"),
-    ("aihorde", "openai_compat", "https://oai.aihorde.net/v1"),
-    ("kilo", "openai_compat", "https://ai-gateway.kilo.ai/api/v1"),
+    ("morph", KIND_OPENAI_COMPAT, "https://api.morphllm.com/v1"),
+    ("aihorde", KIND_OPENAI_COMPAT, "https://oai.aihorde.net/v1"),
+    (
+        "kilo",
+        KIND_OPENAI_COMPAT,
+        "https://ai-gateway.kilo.ai/api/v1",
+    ),
     (
         "kilocode",
-        "openai_compat",
+        KIND_OPENAI_COMPAT,
         "https://ai-gateway.kilo.ai/api/v1",
     ),
 ];
@@ -350,6 +369,23 @@ pub fn import(
     import_with_options(input, output, secrets_dir, &ImportOptions::default())
 }
 
+pub fn import_with_fallback(
+    input: &str,
+    output: &Path,
+    secrets_dir: Option<&Path>,
+    fallback: Option<OmniRouteFallback<'_>>,
+) -> Result<ImportReport, String> {
+    import_with_options(
+        input,
+        output,
+        secrets_dir,
+        &ImportOptions {
+            omniroute_fallback: fallback,
+            ..Default::default()
+        },
+    )
+}
+
 pub fn import_with_options(
     input: &str,
     output: &Path,
@@ -357,6 +393,17 @@ pub fn import_with_options(
     options: &ImportOptions<'_>,
 ) -> Result<ImportReport, String> {
     let policy = policy::Policy::load(options)?;
+    let fallback = options.omniroute_fallback;
+    if let Some(options) = &fallback {
+        if !["env:", "file:"].iter().any(|prefix| {
+            options
+                .key
+                .strip_prefix(prefix)
+                .is_some_and(|value| !value.is_empty())
+        }) {
+            return Err("--omniroute-key must be a nonempty env: or file: secret reference".into());
+        }
+    }
     let root: Value =
         serde_json::from_str(input).map_err(|_| "invalid OmniRoute JSON".to_owned())?;
     if !root.is_object() {
@@ -474,7 +521,7 @@ pub fn import_with_options(
                 Some(id)
             }
             connection::SelectedAuth::None => {
-                if kind != "openai_compat" {
+                if kind != KIND_OPENAI_COMPAT {
                     warnings.push(format!(
                         "{label}: skipped anonymous auth requires an OpenAI-compatible provider"
                     ));
@@ -731,11 +778,27 @@ pub fn import_with_options(
             dep["priority"] = if strategy == "round-robin" { 0 } else { i }.into();
         }
         deployment_count += deployments.len();
-        models.push(
-            json!({"name":name,"strategy":"priority","aliases":[],"deployments":deployments}),
-        );
+        models.push(json!({"name":name,"aliases":[],"deployments":deployments}));
     }
     aliases::attach(&mut models, aliases, &mut warnings);
+    if let Some(options) = fallback {
+        let exclusions = fallback::exclusions(&root, &combos, &combo_ids)?;
+        let credential = unique("omniroute-fallback", &mut ids);
+        credentials.push(
+            json!({"id":credential,"kind":"api_key","provider":"openai_compat","key":options.key}),
+        );
+        fallback::append(
+            &mut models,
+            &options,
+            &credential,
+            &mut deployment_ids,
+            exclusions,
+        )?;
+        deployment_count = models
+            .iter()
+            .map(|model| array(model, "deployments").len())
+            .sum();
+    }
     if models.is_empty() {
         return Err("no importable models; no configuration written".into());
     }

@@ -6,13 +6,13 @@ mod stats;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use http::StatusCode;
 use http_body_util::Full;
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{
-    client::legacy::{connect::HttpConnector, Client},
+    client::legacy::Client,
     rt::{TokioExecutor, TokioTimer},
 };
 use limits::{DeploymentLimits, Permit, Window};
@@ -77,7 +77,7 @@ pub struct RoutedResponse {
     pub response: GatewayResponse,
 }
 
-type HttpClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+type HttpClient = llmux_types::HttpClient;
 
 struct Binding {
     adapter: Arc<dyn ProviderAdapter>,
@@ -218,12 +218,7 @@ impl Executor {
             })
             .collect();
 
-        let connector = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .build();
+        let connector = llmux_types::https_connector();
         let mut builder = Client::builder(TokioExecutor::new());
         builder
             .pool_timer(TokioTimer::new())
@@ -264,10 +259,25 @@ impl Executor {
     }
 
     pub async fn execute(&self, req: GatewayRequest) -> Result<RoutedResponse, GatewayError> {
-        let &model_idx = self
+        let model_idx = self
             .cfg
             .model_names
             .get(req.model.as_ref())
+            .copied()
+            .or_else(|| {
+                let catch_all = self.cfg.catch_all?;
+                if req.model.as_ref() == "*" {
+                    return None;
+                }
+                let requested = req.model.to_ascii_lowercase();
+                let excluded = self.cfg.catch_all_exclude.iter().any(|pattern| {
+                    pattern.strip_suffix('*').map_or_else(
+                        || requested == *pattern,
+                        |prefix| requested.starts_with(prefix),
+                    )
+                });
+                (!excluded).then_some(catch_all)
+            })
             .ok_or(GatewayError::UnknownModel)?;
         let model = &self.cfg.models[model_idx];
         if req.stream && !model.capabilities.stream {

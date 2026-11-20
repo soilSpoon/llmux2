@@ -250,6 +250,33 @@ fn check_route(response: &Response, deployment: &str, attempts: &str) {
 }
 
 #[tokio::test]
+async fn chat_n_two_returns_one_choice_for_anthropic() {
+    let fixture = Fixture::start((Reply::Ok, 0), (Reply::Ok, 10)).await;
+    for stream in [false, true] {
+        let (response, body) = fixture.send(json!({
+            "model":"assistant","max_tokens":4096,"stream":stream,"n":2,
+            "messages":[{"role":"system","content":"Be brief"},{"role":"user","content":"Hello"}]
+        })).await;
+        check_route(&response, "claude", "1");
+        if stream {
+            assert!(body.ends_with("data: [DONE]\n\n"));
+            for chunk in body
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]")
+            {
+                let chunk: Value = serde_json::from_str(chunk).unwrap();
+                assert_eq!(chunk["choices"].as_array().unwrap().len(), 1);
+                assert_eq!(chunk["choices"][0]["index"], 0);
+            }
+        } else {
+            let completion: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(completion["choices"].as_array().unwrap().len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
 async fn anthropic_deployment_serves_openai_chat_json() {
     let fixture = Fixture::start((Reply::Ok, 0), (Reply::Ok, 10)).await;
     let (response, body) = fixture.request(false).await;
@@ -369,8 +396,8 @@ async fn unconvertible_request_is_a_client_error() {
     let fixture = Fixture::start((Reply::Ok, 0), (Reply::Ok, 10)).await;
     let (response, body) = fixture
         .send(json!({
-            "model": "assistant", "n": 2,
-            "messages": [{"role": "user", "content": "Hello"}],
+            "model": "assistant",
+            "messages": [{"role": "user", "content": [{"type":"audio"}]}],
         }))
         .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);

@@ -8,8 +8,8 @@ use futures_util::StreamExt;
 use http::{header, HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use llmux_types::{
-    AuthMaterial, BoxStream, BuildError, Deployment, GatewayRequest, GatewayResponse,
-    InboundFormat, LimitObservation, LimitScope, ProviderAdapter, ProviderKind, SseEvent, Support,
+    provider, AuthMaterial, BoxStream, BuildError, Deployment, GatewayRequest, GatewayResponse,
+    InboundFormat, LimitObservation, ProviderAdapter, ProviderKind, SseEvent, Support,
     UpstreamError, Usage,
 };
 use serde::Deserialize;
@@ -79,9 +79,6 @@ fn blocks(content: &Value) -> Result<Vec<Value>, BuildError> {
 
 fn convert_request(body: &[u8], model: &str) -> Result<Bytes, BuildError> {
     let input: Value = serde_json::from_slice(body).map_err(|_| BuildError::InvalidBody)?;
-    if input["n"].as_u64().is_some_and(|n| n > 1) {
-        return Err(BuildError::InvalidBody);
-    }
     let mut messages: Vec<Value> = Vec::new();
     let mut system = Vec::new();
     for message in input["messages"]
@@ -432,8 +429,8 @@ impl ProviderAdapter for Anthropic {
     ) -> Result<Request<Bytes>, BuildError> {
         let body = match self.supports(req.format) {
             Support::No => return Err(BuildError::UnsupportedFormat),
-            Support::Passthrough => rewrite_model(&req.body, &dep.upstream_model)?,
-            Support::Convert => convert_request(&req.body, &dep.upstream_model)?,
+            Support::Passthrough => rewrite_model(&req.body, crate::upstream_model(req, dep))?,
+            Support::Convert => convert_request(&req.body, crate::upstream_model(req, dep))?,
         };
         let mut parts = dep.base_url.clone().into_parts();
         parts.path_and_query =
@@ -455,7 +452,7 @@ impl ProviderAdapter for Anthropic {
             .body(body)?;
         let auth = match auth {
             AuthMaterial::Bearer(key) => Some((
-                http::HeaderName::from_static("x-api-key"),
+                http::HeaderName::from_static(provider::ANTHROPIC_KEY_HEADER),
                 HeaderValue::from_str(key).map_err(|_| BuildError::InvalidAuth)?,
             )),
             AuthMaterial::Header { name, value } => Some((name.clone(), value.clone())),
@@ -479,7 +476,6 @@ impl ProviderAdapter for Anthropic {
             StatusCode::TOO_MANY_REQUESTS => {
                 return Err(UpstreamError::RateLimited {
                     retry_after: retry_after(&parts.headers, SystemTime::now()),
-                    scope: LimitScope::Unknown,
                 })
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
@@ -491,18 +487,7 @@ impl ProviderAdapter for Anthropic {
             _ => {}
         }
         if req.stream {
-            if !parts
-                .headers
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|s| {
-                    s.split(';')
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .eq_ignore_ascii_case("text/event-stream")
-                })
-            {
+            if !sse::is_event_stream(&parts.headers) {
                 return Err(bad_gateway());
             }
             let events = sse::decode_until(body, true);
@@ -517,13 +502,8 @@ impl ProviderAdapter for Anthropic {
             }));
         }
         let mut body = collect(body).await?;
-        let parsed = serde_json::from_slice::<Value>(&body);
-        let usage = parsed
-            .as_ref()
-            .ok()
-            .and_then(|v| v.get("usage"))
-            .map(|v| MessageUsage::parse(v).tokens);
         if convert {
+            let parsed = serde_json::from_slice::<Value>(&body);
             body = Bytes::from(convert_response(&parsed.map_err(|_| bad_gateway())?).to_string());
             parts.headers.remove(header::CONTENT_LENGTH);
             parts.headers.insert(
@@ -535,7 +515,6 @@ impl ProviderAdapter for Anthropic {
             status: parts.status,
             headers: parts.headers,
             body,
-            usage,
         })
     }
     fn observe_limits(&self, headers: &HeaderMap) -> Option<LimitObservation> {
@@ -562,7 +541,7 @@ impl ProviderAdapter for Anthropic {
 mod tests {
     use super::*;
     use futures_util::FutureExt;
-    use llmux_types::{Billing, DeploymentIdx, QuotaSpec, RequestId};
+    use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
     use std::time::Duration;
 
     fn converted(v: Value) -> Value {
@@ -672,7 +651,6 @@ mod tests {
     fn invalid_requests_are_rejected() {
         for v in [
             json!({}),
-            json!({"messages":[],"n":2}),
             json!({"messages":[{"role":"user","content":[{"type":"audio"}]}]}),
             json!({"messages":[{"role":"assistant","tool_calls":[{"id":"t","function":{"name":"f","arguments":"{"}}]}]}),
             json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"file:///x"}}]}]}),
@@ -906,7 +884,7 @@ mod tests {
             panic!()
         };
         assert_eq!(raw, body);
-        let a = Anthropic::new("anthropic");
+        let a = Anthropic::new(provider::ANTHROPIC);
         assert!(a.observe_limits(&HeaderMap::new()).is_none());
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -924,8 +902,8 @@ mod tests {
 
     #[test]
     fn auth_passthrough_and_support() {
-        let a = Anthropic::new("anthropic");
-        let dep = Deployment {
+        let a = Anthropic::new(provider::ANTHROPIC);
+        let mut dep = Deployment {
             idx: DeploymentIdx(0),
             id: "a".into(),
             provider: a.kind().clone(),
@@ -933,8 +911,6 @@ mod tests {
             base_url: "https://example.com/v1/".parse().unwrap(),
             upstream_model: "claude".into(),
             priority: 0,
-            weight: 1,
-            billing: Billing::default(),
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(10),
             max_context: None,
@@ -944,7 +920,6 @@ mod tests {
             model: "alias".into(),
             stream: true,
             body: Bytes::from_static(br#"{ "model":"alias", "future":{"model":"untouched"} }"#),
-            parsed: Default::default(),
             est_input_tokens: 0,
             max_output_tokens: None,
             context_overflow: None,
@@ -992,5 +967,26 @@ mod tests {
                 .unwrap(),
             Err(BuildError::UnsupportedFormat)
         ));
+        dep.upstream_model = "*".into();
+        req.format = InboundFormat::AnthropicMessages;
+        let request = a
+            .build_request(&req, &dep, &AuthMaterial::None)
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            request.body().as_ref(),
+            br#"{ "model":"alias", "future":{"model":"untouched"} }"#
+        );
+        req.format = InboundFormat::OpenAiChat;
+        req.body =
+            Bytes::from_static(br#"{"model":"alias","messages":[{"role":"user","content":"hi"}]}"#);
+        let request = a
+            .build_request(&req, &dep, &AuthMaterial::None)
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        let body: Value = serde_json::from_slice(request.body()).unwrap();
+        assert_eq!(body["model"], "alias");
     }
 }

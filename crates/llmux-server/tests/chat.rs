@@ -32,6 +32,7 @@ enum Reply {
     Quota(Option<u64>),
     Complete,
     NegotiatedStream(Value),
+    WithoutGatewayControls,
     InlineUsageStream,
     ResponseStream { complete: bool },
     AbortStream,
@@ -99,6 +100,24 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
                     "data: [DONE]\n\n",
                 ),
             ).into_response()
+        }
+        Reply::WithoutGatewayControls => {
+            for field in ["min_discount_percent", "zdr", "ranking"] {
+                if request.get(field).is_some() {
+                    return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error":{"message":"unknown field"}}))).into_response();
+                }
+            }
+            if request.get("max_completion_tokens").is_none() {
+                assert_eq!(request["vendor_option"]["zdr"], true);
+                assert_eq!(request["vendor_option"]["ranking"], "nested");
+            }
+            if request["stream"] == true {
+                ([(header::CONTENT_TYPE, "text/event-stream")], "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").into_response()
+            } else {
+                Json(json!({
+                    "id":"c","choices":[{"index":0,"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}]
+                })).into_response()
+            }
         }
         Reply::InlineUsageStream => (
             [(header::CONTENT_TYPE, "text/event-stream")],
@@ -458,6 +477,40 @@ async fn openai_chat_preserves_documented_and_extension_parameters_and_usage() {
 }
 
 #[tokio::test]
+async fn cheaperinference_controls_are_not_sent_to_upstream() {
+    for (endpoint, fields) in [
+        (
+            "/v1/chat/completions",
+            json!({"messages":[{"role":"user","content":"Hello"}],
+                "vendor_option":{"model":"leave-me-alone","zdr":true,"ranking":"nested"}}),
+        ),
+        (
+            "/v1/responses",
+            json!({"input":"Hello","max_output_tokens":16}),
+        ),
+    ] {
+        let fixture = Fixture::start(
+            [Reply::WithoutGatewayControls, Reply::Complete],
+            [Reply::WithoutGatewayControls, Reply::Complete],
+            "",
+        )
+        .await;
+        for stream in [false, true] {
+            let mut request = fields.clone();
+            request["model"] = json!("alias");
+            request["stream"] = json!(stream);
+            request["min_discount_percent"] = json!(99.99);
+            request["zdr"] = json!(true);
+            request["ranking"] = Value::Null;
+            let payload = request.to_string().replace("\"zdr\":", r#""\u007adr":"#);
+            let response = fixture.post(endpoint, "test-client", payload).await;
+            check_route(&response, "d1", "1");
+            assert!(body(response).await.contains("Hi"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn openai_chat_enforces_explicit_stream_usage_options() {
     let fixture = Fixture::start(
         [Reply::InlineUsageStream, Reply::Complete],
@@ -555,7 +608,7 @@ async fn dashboard_reports_fallback_and_committed_stream_errors_without_exposing
     let mut bad = fixture.request("test-dashboard", "alias", false).await;
     assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
     bad = fixture.request("test-client", "unknown", false).await;
-    assert_eq!(bad.status(), StatusCode::NOT_FOUND);
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     check_route(
         &fixture.request("test-client", "alias", false).await,
         "d2",
@@ -946,6 +999,36 @@ async fn stream_closed_before_first_event_fails_over() {
 }
 
 #[tokio::test]
+async fn chat_reports_omniroute_errors_for_invalid_temperature_and_unknown_model() {
+    let fixture = Fixture::start(
+        [Reply::Complete, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    for stream in [false, true] {
+        for (model, temperature, message) in [
+            ("shared", json!(3), "temperature: must be between 0 and 2"),
+            ("shared", json!("hot"), "temperature: must be a number"),
+            ("unknown", json!(1), "Invalid model format"),
+        ] {
+            let request = json!({"model":model,"stream":stream,"temperature":temperature,
+                "messages":[{"role":"user","content":"Hello"}],"vendor_option":{"model":"leave-me-alone"}});
+            let response = fixture
+                .post("/v1/chat/completions", "test-client", request.to_string())
+                .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{message}");
+            let error: Value = serde_json::from_str(&body(response).await).unwrap();
+            assert_eq!(
+                error,
+                json!({"error":{"message":message,"type":"invalid_request_error","code":"bad_request"}})
+            );
+        }
+    }
+    assert_eq!(fixture.counts(), [0, 0]);
+}
+
+#[tokio::test]
 async fn invalid_client_key_unknown_model_and_upstream_400_do_not_fail_over() {
     let fixture = Fixture::start(
         [Reply::BadRequest, Reply::Complete],
@@ -956,7 +1039,7 @@ async fn invalid_client_key_unknown_model_and_upstream_400_do_not_fail_over() {
     let unauthorized = fixture.request("wrong", "shared", false).await;
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
     let missing = fixture.request("test-client", "missing", false).await;
-    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
     assert_eq!(fixture.counts(), [0, 0]);
     let bad_request = fixture.request("test-client", "shared", false).await;
     assert_eq!(bad_request.status(), StatusCode::BAD_REQUEST);

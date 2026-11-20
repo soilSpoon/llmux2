@@ -20,7 +20,7 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
 
 For Chat Completions on OpenAI-compatible upstreams, the gateway rewrites only the top-level request model. Other request fields and successful response payloads pass through.
 
-Use authenticated `GET /v1/models` to list the exact model IDs accepted by the gateway. The list contains configured model names and aliases, not upstream deployment names or the full CheaperInference catalog.
+Use authenticated `GET /v1/models` to list configured model names and aliases, not upstream deployment names or the full CheaperInference catalog. An optional catch-all accepts additional IDs but is not listed.
 
 ```sh
 curl -sS http://127.0.0.1:8080/v1/responses \
@@ -29,11 +29,13 @@ curl -sS http://127.0.0.1:8080/v1/responses \
   -d '{"model":"llama-70b","input":"Hello"}'
 ```
 
-The Responses route translates requests to Chat Completions on OpenAI-compatible upstreams and converts replies back. It accepts reasoning effort as either `reasoning.effort` or `reasoning_effort`; conflicting values are rejected. Stateful Responses conversations and built-in non-function tools are unsupported. For SSE on either route, add `"stream":true` and use `curl -N`.
+The Responses route translates requests to Chat Completions on OpenAI-compatible upstreams and converts replies back. It accepts reasoning effort as either `reasoning.effort` or `reasoning_effort`; when both are non-null, `reasoning_effort` takes precedence. Stateful Responses conversations and built-in non-function tools are unsupported. For SSE on either route, add `"stream":true` and use `curl -N`.
+
+llmux2 accepts and discards the CheaperInference routing fields `min_discount_percent`, `zdr`, and `ranking`. These fields do not impose a price ceiling, guarantee zero data retention, or change how llmux2 ranks deployments. Enforce any retention requirements in your provider configuration.
 
 Credentials use `provider = "openai"` or `"openai_compat"` for OpenAI-compatible upstreams, or `provider = "anthropic"` for the Anthropic Messages API. Anthropic deployments use a base URL such as `https://api.anthropic.com/v1` (the adapter appends `/messages`) and send the key as `x-api-key`. The gateway converts chat requests, JSON responses and SSE chunks between the OpenAI Chat and Anthropic formats, so a model can mix both kinds of deployments and fail over between them.
 
-For converted Anthropic Chat streams, set `stream_options.include_usage` to `true` for a separate usage chunk just before `[DONE]`, or `false` to omit usage. Without this option, usage remains on the finish chunk. Reported cache reads appear in `usage.prompt_tokens_details.cached_tokens` and cache writes in `usage.cache_creation_input_tokens`.
+Chat requests converted to Anthropic return one choice even when `n` asks for more. For converted Anthropic Chat streams, set `stream_options.include_usage` to `true` for a separate usage chunk just before `[DONE]`, or `false` to omit usage. Without this option, usage remains on the finish chunk. Reported cache reads appear in `usage.prompt_tokens_details.cached_tokens` and cache writes in `usage.cache_creation_input_tokens`.
 
 ## Health, shutdown and deployment
 
@@ -101,6 +103,35 @@ Rejecting is the default. To trim instead, set `context_overflow = "middle-out"`
 
 Before a response is committed, the gateway can fail over on upstream server, connection, and timeout errors within its attempt and time limits. Rate-limit and quota-exhaustion failover are controlled by `routing.fallback_on` and enabled by default. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local request and token quotas use per-deployment sliding windows (one minute for `rpm`/`tpm`, one day for `rpd`/`tpd`) only when configured. Token quotas count the same prompt-plus-output estimate used for context fitting, and a single request larger than a token quota is still admitted when that window is empty. A credential may also set `quota` (`rpm`, `rpd`, `tpm`, `tpd`) for providers that limit per key or project across models; those windows are shared by every deployment that uses the credential.
 
+### Catch-all route for cutover
+
+Add one `[[models]]` entry named `"*"` to forward otherwise unknown IDs, for
+example to a local OmniRoute instance:
+
+```toml
+[[models]]
+name = "*"
+exclude = ["codex/*", "cx/*", "some-exact-id"]
+
+[[models.deployments]]
+id = "omniroute"
+auth = "none"
+provider = "openai_compat"
+base_url = "http://127.0.0.1:20128/v1"
+upstream_model = "*"
+```
+
+The catch-all must have no aliases or `allowed_keys`, and all its deployments
+must use `upstream_model = "*"` to pass through the requested ID unchanged.
+Other models cannot use this upstream model value. `exclude` is valid only on
+the catch-all; entries are nonempty exact IDs or prefixes with one trailing `*`,
+matched ASCII case-insensitively. Excluded unknown IDs and the literal model
+`"*"` retain the existing unknown-model error. Known names and aliases always
+use their own route, including their key restrictions; exhaustion never spills
+them into the catch-all. Existing routing limits and retry rules still apply.
+No migration is needed for existing configs; remove the catch-all entry to
+roll back unknown-ID forwarding (older binaries do not support `exclude`).
+
 ## Credentials
 
 OpenAI-compatible deployments can explicitly opt into anonymous access with
@@ -145,6 +176,45 @@ require reauthorization after restart. `env:` references are memory-only. Option
 with ChatGPT, use `https://auth.openai.com/api/accounts/oauth/token` as `token_url`,
 the issued client ID, `resource = "https://api.openai.com/v1"`, and omit `scopes`.
 A refreshable authentication error can trigger one on-demand refresh and retry for the attempted deployment, still subject to request and admission limits. If refresh fails or authentication is rejected again, the gateway disables that credential for routing and can try another eligible deployment.
+
+## Import from OmniRoute
+
+Import an OmniRoute JSON export or SQLite table dump into a new configuration:
+
+```sh
+cargo run -p llmux-import -- \
+  --input /private/omniroute-export.json \
+  --output /private/llmux.toml \
+  --secrets-dir /private/llmux-secrets
+```
+
+For a staged cutover, optionally add both flags:
+
+```sh
+  --omniroute-fallback http://127.0.0.1:20128/v1 \
+  --omniroute-key file:/private/omniroute-client.key
+```
+
+The key must be an `env:VARIABLE` or `file:/path` reference, never a literal.
+The importer writes only that reference, not its value, to the TOML. Referenced
+secrets must be available during import because the generated config is checked
+with the gateway's config parser. URLs must use HTTPS, or HTTP on loopback, with
+no credentials, query, or fragment. Existing output and secret files are never
+overwritten.
+
+Each non-Codex, unrestricted imported model gets an OmniRoute deployment after
+all its native deployments, forwarding its llmux model name as the OmniRoute ID.
+The catch-all forwards otherwise unknown IDs unchanged. Its exclusions cover
+Codex provider IDs and node prefixes, Codex-reaching combos and alias chains,
+enabled mapping patterns, and names/aliases of models with `allowed_keys`.
+Codex-reaching models and models with `allowed_keys` get no fallback leg.
+Exclusions are conservative: even a lower-precedence mapping that can reach
+Codex is excluded. If such a pattern cannot be represented as an exact ID or a
+prefix with one trailing `*` (for example, `owner-?` or `owner-*-suffix`), import
+fails rather than opening a routing gap. Review the emitted `exclude` list
+before cutover. Omitting both flags preserves the existing import output;
+remove the generated fallback credential, deployments, and catch-all to roll
+back to native-only routing.
 
 ## Codex / Sign in with ChatGPT
 
@@ -204,6 +274,42 @@ references, explicit Responses system items, and unsupported hosted tools are
 rejected with 400. An incomplete, failed, or interrupted stream is not successful;
 after SSE commitment errors terminate the stream without replaying the request.
 Anthropic inbound is not supported by this adapter.
+
+## xAI OAuth (api.x.ai)
+
+Sign in with xAI uses the public Grok CLI OAuth client (authorization-code
+PKCE on `auth.x.ai`) and serves `api.x.ai` through `provider = "openai_compat"`,
+the same pattern OmniRoute uses for its `xai-oauth` provider.
+
+Run `cargo run -p llmux-login -- xai --dir ~/.config/llmux/xai` (the directory
+is optional). It opens the browser with a private sign-in URL, listens for the
+callback on `127.0.0.1:56121/callback` (falling back to a free port), validates
+the ES256 ID token against xAI's JWKS, requires the `api:access` scope, and
+writes `credentials.json` and `refresh_token` with owner-only permissions. Paste
+the printed credential block into `llmux.toml`, then point a deployment at it:
+
+```toml
+[[credentials]]
+id = "xai"
+kind = "oauth"
+provider = "openai_compat"
+token_url = "https://auth.x.ai/oauth2/token"
+client_id = "b1a00492-073a-47ea-816f-4c329264a828" # public Grok CLI client
+refresh_token = "file:/absolute/path/to/.config/llmux/xai/refresh_token"
+
+[[models]]
+name = "grok-4.7"
+
+[[models.deployments]]
+id = "xai-grok-4.7"
+credential = "xai"
+base_url = "https://api.x.ai/v1"
+upstream_model = "grok-4.7"
+```
+
+Do not run login concurrently with a gateway using the same rotating token file.
+Unlike Codex, an xAI credential needs no `allowed_keys` restriction unless
+your own policy wants one.
 
 ## Development
 

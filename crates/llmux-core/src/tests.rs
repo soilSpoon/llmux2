@@ -4,7 +4,7 @@ use http::{HeaderMap, Request, Response};
 use hyper::body::Incoming;
 use llmux_types::{
     AuthError, AuthMaterial, BuildError, CanonicalModel, Capabilities, ContextOverflow,
-    InboundFormat, LimitObservation, ProviderKind, RequestId, SseEvent, Strategy,
+    InboundFormat, LimitObservation, ProviderKind, RequestId, SseEvent,
 };
 use std::{collections::VecDeque, sync::Mutex};
 
@@ -93,7 +93,6 @@ impl ProviderAdapter for Adapter {
             status: StatusCode::OK,
             headers: HeaderMap::new(),
             body: Bytes::new(),
-            usage: None,
         })
     }
 }
@@ -184,8 +183,6 @@ async fn fixture_full(
             base_url: server.url().parse().unwrap(),
             upstream_model: "upstream".into(),
             priority: i as i32,
-            weight: 1,
-            billing: Default::default(),
             quota: if i < 2 {
                 shared_quota
             } else {
@@ -217,6 +214,8 @@ async fn fixture_full(
         api_keys: HashMap::new(),
         credential_quotas: HashMap::from([("second".into(), second_quota)]),
         oauth: HashMap::new(),
+        catch_all: None,
+        catch_all_exclude: Vec::new(),
         model_names: models
             .iter()
             .enumerate()
@@ -226,7 +225,6 @@ async fn fixture_full(
             .iter()
             .map(|(name, deployments)| CanonicalModel {
                 name: Arc::from(*name),
-                strategy: Strategy::Priority,
                 capabilities: Capabilities::default(),
                 context_overflow: ContextOverflow::default(),
                 deployments: deployments.iter().copied().map(DeploymentIdx).collect(),
@@ -263,7 +261,6 @@ fn request() -> GatewayRequest {
         model: "model".into(),
         stream: false,
         body: Bytes::new(),
-        parsed: Default::default(),
         est_input_tokens: 0,
         max_output_tokens: None,
         context_overflow: None,
@@ -491,7 +488,6 @@ async fn exhaustion_retry_hint_ignores_deployments_that_do_not_fit() {
     let (executor, _, _, _server) = fixture_with_context(
         vec![UpstreamError::RateLimited {
             retry_after: Some(Duration::from_secs(3)),
-            scope: llmux_types::LimitScope::Requests,
         }],
         false,
         [None, Some(10), Some(10)],
@@ -509,10 +505,7 @@ async fn exhaustion_retry_hint_ignores_deployments_that_do_not_fit() {
 
 #[tokio::test]
 async fn repeated_rate_limits_lengthen_cooldown_until_a_success() {
-    let limited = || UpstreamError::RateLimited {
-        retry_after: None,
-        scope: llmux_types::LimitScope::Unknown,
-    };
+    let limited = || UpstreamError::RateLimited { retry_after: None };
     let (executor, adapter, _, _server) = fixture(vec![limited()], false).await;
     let cooldown = |executor: &Executor| {
         let now = Instant::now();
@@ -559,7 +552,6 @@ async fn rate_limit_cools_down_every_model_sharing_the_upstream_route() {
     let (executor, adapter, _, _server) = fixture_with_models(
         vec![UpstreamError::RateLimited {
             retry_after: Some(Duration::from_secs(3)),
-            scope: llmux_types::LimitScope::Requests,
         }],
         false,
         [None; 3],
@@ -686,7 +678,6 @@ async fn limit_error_after_stream_start_cools_down_the_deployment() {
     for error in [
         UpstreamError::RateLimited {
             retry_after: Some(Duration::from_secs(3)),
-            scope: llmux_types::LimitScope::Unknown,
         },
         UpstreamError::QuotaExhausted {
             reset_at: Some(SystemTime::now() + Duration::from_secs(3)),
@@ -728,10 +719,7 @@ async fn repeated_limit_errors_after_stream_start_back_off() {
             .stream_errors
             .lock()
             .unwrap()
-            .push_back(UpstreamError::RateLimited {
-                retry_after: None,
-                scope: llmux_types::LimitScope::Unknown,
-            });
+            .push_back(UpstreamError::RateLimited { retry_after: None });
         let routed = executor.execute(streaming()).await.unwrap();
         assert_eq!(routed.deployment.as_ref(), "dep0");
         let GatewayResponse::Stream(events) = routed.response else {
@@ -787,7 +775,6 @@ async fn after_a_cooldown_other_requests_fall_back_while_a_probe_is_open() {
     let (executor, adapter, _, _server) = fixture(
         vec![UpstreamError::RateLimited {
             retry_after: Some(Duration::from_millis(50)),
-            scope: llmux_types::LimitScope::Unknown,
         }],
         false,
     )

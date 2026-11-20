@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use llmux_types::{
-    AuthMaterial, BoxStream, BuildError, Deployment, GatewayRequest, GatewayResponse,
+    provider, AuthMaterial, BoxStream, BuildError, Deployment, GatewayRequest, GatewayResponse,
     InboundFormat, LimitObservation, ProviderAdapter, ProviderKind, SseEvent, Support,
     UpstreamError, Usage,
 };
@@ -19,7 +19,7 @@ pub struct OpenAiResponses(ProviderKind);
 
 impl Default for OpenAiResponses {
     fn default() -> Self {
-        Self(ProviderKind("openai_responses".into()))
+        Self(ProviderKind(provider::OPENAI_RESPONSES.into()))
     }
 }
 
@@ -50,7 +50,7 @@ impl ProviderAdapter for OpenAiResponses {
         if self.supports(req.format) == Support::No {
             return Err(BuildError::UnsupportedFormat);
         }
-        let body = normalize(&req.body, &dep.upstream_model, req.format)?;
+        let body = normalize(&req.body, crate::upstream_model(req, dep), req.format)?;
         let mut parts = dep.base_url.clone().into_parts();
         parts.path_and_query =
             Some(format!("{}/responses", dep.base_url.path().trim_end_matches('/')).parse()?);
@@ -90,18 +90,7 @@ impl ProviderAdapter for OpenAiResponses {
                 SystemTime::now(),
             ));
         }
-        if !parts
-            .headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| {
-                v.split(';')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .eq_ignore_ascii_case("text/event-stream")
-            })
-        {
+        if !sse::is_event_stream(&parts.headers) {
             return Err(bad_gateway());
         }
         let stream = validated(sse::decode(body));
@@ -122,7 +111,6 @@ impl ProviderAdapter for OpenAiResponses {
             let value: Value = serde_json::from_str(&event?.data).map_err(|_| bad_gateway())?;
             if value["type"] == "response.completed" {
                 let response = &value["response"];
-                let usage = usage(response);
                 let response = if req.format == InboundFormat::OpenAiChat {
                     chat_complete(response)?
                 } else {
@@ -132,14 +120,13 @@ impl ProviderAdapter for OpenAiResponses {
                     status: StatusCode::OK,
                     headers: HeaderMap::new(),
                     body: Bytes::from(response.to_string()),
-                    usage,
                 });
             }
         }
         Err(bad_gateway())
     }
     fn observe_limits(&self, headers: &HeaderMap) -> Option<LimitObservation> {
-        OpenAiCompat::new("openai_responses").observe_limits(headers)
+        OpenAiCompat::new(provider::OPENAI_RESPONSES).observe_limits(headers)
     }
 }
 
@@ -497,6 +484,57 @@ fn chat_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt;
+    use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
+    use std::time::Duration;
+
+    #[test]
+    fn wildcard_deployment_forwards_requested_model() {
+        let adapter = OpenAiResponses::new();
+        let mut dep = Deployment {
+            idx: DeploymentIdx(0),
+            id: "r".into(),
+            provider: adapter.kind().clone(),
+            credential: "key".into(),
+            base_url: "https://example.com/v1".parse().unwrap(),
+            upstream_model: "fixed".into(),
+            priority: 0,
+            quota: QuotaSpec::default(),
+            timeout: Duration::from_secs(10),
+            max_context: None,
+        };
+        for (format, body) in [
+            (
+                InboundFormat::OpenAiResponses,
+                json!({"model":"vendor/New-ID","input":"hi"}),
+            ),
+            (
+                InboundFormat::OpenAiChat,
+                json!({"model":"vendor/New-ID","messages":[{"role":"user","content":"hi"}]}),
+            ),
+        ] {
+            let req = GatewayRequest {
+                format,
+                model: "vendor/New-ID".into(),
+                stream: false,
+                body: Bytes::from(body.to_string()),
+                est_input_tokens: 0,
+                max_output_tokens: None,
+                context_overflow: None,
+                request_id: RequestId("r".into()),
+            };
+            for (upstream, expected) in [("fixed", "fixed"), ("*", "vendor/New-ID")] {
+                dep.upstream_model = upstream.into();
+                let request = adapter
+                    .build_request(&req, &dep, &AuthMaterial::None)
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap();
+                let sent: Value = serde_json::from_slice(request.body()).unwrap();
+                assert_eq!(sent["model"], expected, "{format:?} {upstream}");
+            }
+        }
+    }
 
     #[test]
     fn chat_options_and_multipart_instructions_are_converted() {

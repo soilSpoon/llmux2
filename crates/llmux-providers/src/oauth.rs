@@ -5,16 +5,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::{header, HeaderValue, Request, Uri};
 use http_body_util::{BodyExt, Full, Limited};
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::{
-    client::legacy::{connect::HttpConnector, Client},
-    rt::TokioExecutor,
+use llmux_types::{
+    http_client, is_https_or_loopback_http, AuthError, AuthMaterial, CredentialSource, HttpClient,
 };
-use llmux_types::{AuthError, AuthMaterial, CredentialSource};
 use serde::Deserialize;
 use std::{
-    io::Write,
-    net::IpAddr,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -83,7 +78,7 @@ struct RefreshState {
 struct Inner {
     config: OAuthConfig,
     uri: Uri,
-    http: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    http: HttpClient,
     token: ArcSwapOption<Token>,
     generation: AtomicU64,
     state: Mutex<RefreshState>,
@@ -103,17 +98,9 @@ impl OAuthCredentialSource {
             .token_url
             .parse()
             .map_err(|_| AuthError::RefreshFailed)?;
-        let loopback = uri.host().is_some_and(|host| {
-            host.eq_ignore_ascii_case("localhost")
-                || host
-                    .trim_matches(['[', ']'])
-                    .parse::<IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        });
         if uri.authority().is_none()
             || uri.authority().is_some_and(|a| a.as_str().contains('@'))
-            || !(uri.scheme_str() == Some("https")
-                || (uri.scheme_str() == Some("http") && loopback))
+            || !is_https_or_loopback_http(&uri)
             || config.request_timeout.is_zero()
             || config.extra_params.iter().any(|(key, _)| {
                 matches!(
@@ -125,18 +112,10 @@ impl OAuthCredentialSource {
             return Err(AuthError::RefreshFailed);
         }
         let refresh_token = std::mem::take(&mut config.refresh_token);
-        let connector = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .build();
         let inner = Arc::new(Inner {
             config,
             uri,
-            http: Client::builder(TokioExecutor::new())
-                .retry_canceled_requests(false)
-                .build(connector),
+            http: http_client(),
             token: ArcSwapOption::empty(),
             generation: AtomicU64::new(0),
             changed: Notify::new(),
@@ -242,11 +221,9 @@ impl Inner {
                 .iter()
                 .map(|(key, value)| (key.as_str(), value.as_str())),
         );
-        let body = fields
-            .into_iter()
-            .map(|(k, v)| format!("{}={}", encode(k), encode(v)))
-            .collect::<Vec<_>>()
-            .join("&");
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(fields)
+            .finish();
         let request = Request::post(self.uri.clone())
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(Full::new(Bytes::from(body)))
@@ -309,23 +286,7 @@ impl Inner {
 }
 
 fn persist_token(path: &Path, token: &str) -> std::io::Result<()> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    file.write_all(token.as_bytes())?;
-    file.as_file().sync_all()?;
-    file.persist(path).map_err(|error| error.error)?;
-    #[cfg(unix)]
-    std::fs::File::open(parent)?.sync_all()?;
-    Ok(())
+    llmux_types::atomic_write(path, token.as_bytes())
 }
 
 async fn background(weak: Weak<Inner>) {
@@ -364,19 +325,6 @@ async fn background(weak: Weak<Inner>) {
             retry = Duration::from_secs(1);
         }
     }
-}
-
-fn encode(value: &str) -> String {
-    value
-        .bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => {
-                (b as char).to_string()
-            }
-            b' ' => "+".to_owned(),
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
 }
 
 #[cfg(test)]

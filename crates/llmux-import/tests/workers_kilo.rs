@@ -36,6 +36,51 @@ fn success(output: &std::process::Output) -> String {
 }
 
 #[test]
+fn workers_options_compose_with_explicit_omniroute_fallback() {
+    let mut root = fixture();
+    root["providerConnections"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"cloudflare","provider":"cfpd","authType":"none"}));
+    root["combos"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name":"workers","models":["cfpd/openai/gpt-oss-20b"]}));
+    let dir = tempfile::tempdir().unwrap();
+    let account = dir.path().join("account");
+    let token = dir.path().join("token");
+    let key = dir.path().join("fallback-key");
+    fs::write(&account, "0123456789abcdef0123456789abcdef").unwrap();
+    fs::write(&token, "synthetic-token").unwrap();
+    fs::write(&key, "synthetic-fallback-key").unwrap();
+    let key = format!("file:{}", key.display());
+    success(&run(
+        &root,
+        dir.path(),
+        &[
+            ("--cloudflare-account-id-file", &account),
+            ("--cloudflare-token-file", &token),
+            (
+                "--omniroute-fallback",
+                Path::new("http://127.0.0.1:20128/v1"),
+            ),
+            ("--omniroute-key", Path::new(&key)),
+        ],
+    ));
+    let config = RuntimeConfig::load(dir.path().join("out.toml")).unwrap();
+    let model = &config.models[config.model_names["workers"]];
+    assert_eq!(model.deployments.len(), 2);
+    let first = &config.deployments[model.deployments[0].0 as usize];
+    let last = &config.deployments[model.deployments[1].0 as usize];
+    assert_eq!(first.upstream_model.as_ref(), "@cf/openai/gpt-oss-20b");
+    assert_eq!(first.quota.rpm, Some(1));
+    assert_eq!(last.upstream_model.as_ref(), "workers");
+    assert_eq!(last.base_url.to_string(), "http://127.0.0.1:20128/v1");
+    assert!(last.priority > first.priority);
+    assert!(config.catch_all.is_some());
+}
+
+#[test]
 fn chained_mapping_availability_reaches_a_fixed_point_before_aliases() {
     let mut root = fixture();
     let names = [
