@@ -85,11 +85,8 @@ cargo test --locked -p llmux-server --test chat -- --nocapture
 
 ## Live gateway comparison
 
-`bench/compare_gateways.py` runs on Python 3.9+ using only the standard library.
-Run on the gateway host so credentials stay there. Supply the **reference first**
-(OmniRoute), then the candidate (llmux). URLs include the OpenAI API prefix.
-Keys must be `file:/absolute/path` or `env:VARIABLE`, never literal command-line
-arguments. Use existing authorized client keys; this tool never provisions keys.
+Run on the gateway host with Python 3.9+ (stdlib only), reference first, llmux second.
+Keep keys server-side: use `file:/absolute/path` or `env:VARIABLE`, never literal keys.
 
 ```sh
 python3 bench/compare_gateways.py \
@@ -99,68 +96,22 @@ python3 bench/compare_gateways.py \
   --timeout 45 --max-requests 80 --output /private/compare-run-001
 ```
 
-Alternatively use repeated `--model NAME` or `--models-file PATH` (a JSON string
-array or one name per line). Coverage/traffic JSON has `rows` containing `name`,
-`calls`, and optional `present` (whether imported). Selection takes the top N
-traffic rows **before** filtering out `present: false`. Traffic JSON without
-`present` selects all names, including direct-provider names that may not be
-canonical models. Keep the coverage snapshot fixed for comparable reruns.
-
-Each model gets one non-stream and one stream chat case with 16 output tokens.
-`--responses N` adds Responses cases for the first N selected models. Each case
-is serialized once and sent unchanged to both sides, sequentially, alternating
-A/B then B/A order. An over-budget plan fails before sending anything; it is
-not silently truncated. The default cap of 80 counts gateway HTTP requests,
-**not** internal upstream attempts. Gateway fallback can multiply those calls.
-No retries, redirects, parallel load, warmup, or config changes are performed.
-Normal inference can still update a gateway's usage logs and cooldown state.
-
-The new private output directory contains `results.json` and a self-contained
-`report.html`. A private `partial.json` checkpoint survives an interrupted run;
-reruns must use a new directory. Never copy credential files alongside reports.
-Only bounded, redacted error messages and allowlisted routing headers are saved,
-not prompt/response bodies. Review artifacts before sharing: redaction is a
-defense in depth, not a guarantee against arbitrarily encoded upstream secrets.
-
-Read the report as a functional snapshot, not a gateway speed ranking:
-
-- `match` means both requests succeeded, not identical generated text. Both
-  failures remain `both fail`; `same_error_class` distinguishes error parity.
-- `llmux-only fail` means only the second gateway failed; `omniroute-only fail`
-  means only the first failed. Model verdicts require all its cases to succeed.
-  Opposite failures across different cases yield `both fail` for that model.
-- HTTP status is preserved. Error classes are heuristics: known local rejection
-  codes and 401/403 are `gateway_reject`, 429 is `rate_limited`, other 4xx/5xx are
-  `upstream_4xx`/`upstream_5xx`. These names do not establish error provenance.
-  Transport or malformed-response failures are `connection`; deadline expiry
-  is `timeout`. HTTP 200 containing an error is not success.
-- TTFT is dispatch to the first **content** delta, not a role or keepalive event.
-  Streams must terminate with `[DONE]`; missing terminators fail even on HTTP
-  200. A valid empty-content stream can have no TTFT. Latency includes reading
-  the whole JSON response or through `[DONE]`. Total per-request deadlines cover
-  stream reads; OS DNS resolution may exceed them, so use IPs for local runs.
-- llmux `attempts > 1` proves multiple HTTP attempts. Missing attempts means
-  fallback is unknown, not false. OmniRoute routing/fallback headers are shown
-  as returned, not interpreted as a complete attempt trace.
-- All-result p50 includes errors. Success-only p50 and success TTFT p50 are
-  separate; they can compare different successful subsets. One observation per
-  case has no repeatability estimate or measured bottleneck. Do not infer a
-  speedup from it. For performance decisions, repeat matched successful work
-  across multiple trials and establish the noise floor and limiter first.
-
-Operational learnings: OmniRoute's API and dashboard ports may differ; validate
-the authenticated `/v1/models` endpoint before a run. Its stored client keys can
-be encrypted even though the inference API needs plaintext. Extract/decrypt only
-server-side, readonly, into a private file. Imported canonical names can exist
-while their upstream IDs still retain custom provider prefixes or inaccessible
-container-local addresses; a successful import is not proof of usable routing.
-
-Tests are separate from Rust-only CI (no CI changes):
-
-```sh
-python3 -m unittest bench.test_compare_gateways
-python3 -m py_compile bench/compare_gateways.py bench/test_compare_gateways.py
-```
+Or use repeated `--model NAME` / `--models-file PATH` (JSON array or one name per line).
+Coverage selects top-N traffic rows, then filters `present: false`; keep the snapshot fixed.
+Identical chat/stream bodies alternate A/B order; `--responses N` adds N Responses cases.
+The cap is checked before sending and counts HTTP requests, not internal fallback attempts.
+Read `results.json` / `report.html` in a new private output directory; review before sharing.
+- `match`: both succeed, not identical text; `llmux-only fail` / `omniroute-only fail`: only that side fails.
+- `both fail`: neither side succeeds in all cases; model verdicts require every case to succeed.
+- Single sample, not a speed ranking: all-result p50 includes errors; successful subsets can differ.
+- TTFT measures first content; streams require `[DONE]`. HTTP 200 with an error is not success.
+- Missing llmux attempts means fallback unknown ≠ false; attempts >1 proves multiple attempts.
+- Routing headers are evidence, not a complete trace; error classes do not prove error provenance.
+Learnings: API and dashboard ports differ—validate authenticated `/v1/models` first.
+Stored client keys may be encrypted; extract/decrypt readonly, server-side, into private files.
+Imported names can retain wrong upstream IDs or container-local URLs: import success ≠ usable routing.
+Tests (separate from Rust-only CI): `python3 -m unittest bench.test_compare_gateways` and
+`python3 -m py_compile bench/compare_gateways.py bench/test_compare_gateways.py`.
 
 ## Mock-upstream load benchmark
 

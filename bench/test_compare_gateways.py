@@ -7,10 +7,41 @@ import time
 import unittest
 from contextlib import redirect_stderr
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from html.parser import HTMLParser
 from pathlib import Path
 from unittest.mock import patch
 
 from bench import compare_gateways as compare
+
+
+class ReportTables(HTMLParser):
+    def __init__(self, source):
+        super().__init__()
+        self.tables = {}
+        self.rows = self.row = self.cell = None
+        self.feed(source)
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'table':
+            self.rows = []
+            self.tables[dict(attrs).get('aria-label')] = self.rows
+        elif tag == 'tr':
+            self.row = []
+        elif tag in ('td', 'th'):
+            self.cell = []
+
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.cell.append(data)
+
+    def handle_endtag(self, tag):
+        if tag in ('td', 'th'):
+            self.row.append(' '.join(' '.join(self.cell).split()))
+            self.cell = None
+        elif tag == 'tr':
+            self.rows.append(self.row)
+        elif tag == 'table':
+            self.rows = None
 
 
 def result(gateway, model="m", kind="chat", error_class="ok", latency_ms=10):
@@ -21,6 +52,57 @@ def result(gateway, model="m", kind="chat", error_class="ok", latency_ms=10):
 
 
 class ComparisonTest(unittest.TestCase):
+    def test_report_has_compact_summary_model_overview_and_run_list(self):
+        rows = [result('omniroute'), result('llmux'),
+                result('omniroute', kind='stream'),
+                result('llmux', kind='stream', error_class='rate_limited')]
+        data = compare.aggregate(rows, ['omniroute', 'llmux'])
+        data['run'] = {'completed_at': '2026-11-20T09:00:00Z', 'timeout_s': 45,
+                       'max_requests': 80, 'note': 'A single sample'}
+        source = compare.render_html(data)
+        tables = ReportTables(source).tables
+        self.assertEqual(tables['Summary'][0], ['Metric', 'omniroute', 'llmux'])
+        self.assertIn(['Successes / requests', '2 / 2', '1 / 2'], tables['Summary'])
+        self.assertIn(['Error classes', '—', 'rate_limited: 1'], tables['Summary'])
+        self.assertIn(['p50 all (ms)', '10', '10'], tables['Summary'])
+        self.assertIn(['p50 success (ms)', '10', '10'], tables['Summary'])
+        self.assertIn(['p50 TTFT (ms)', '—', '—'], tables['Summary'])
+        self.assertEqual(tables['Models'][0], ['Model', 'Chat', 'Stream', 'Responses', 'Verdict'])
+        overview = tables['Models'][1]
+        self.assertEqual(overview[0], 'm')
+        self.assertIn('200 / 200', overview[1])
+        self.assertIn('200 / 429', overview[2])
+        self.assertEqual(overview[3:], ['—', 'llmux-only fail'])
+        self.assertLess(source.index('aria-label="Models"'), source.index('aria-label="Request details"'))
+        self.assertIn('<dl', source)
+        self.assertIn('A single sample', source)
+        self.assertNotIn('&quot;completed_at&quot;', source)
+        self.assertIn('match: 1', source)
+        self.assertIn('llmux-only fail: 1', source)
+        self.assertIn('both fail: 0', source)
+
+    def test_case_cells_show_human_values_and_only_candidate_attempt_evidence(self):
+        rows = [result('omniroute'), result('llmux'),
+                result('omniroute', kind='stream'), result('llmux', kind='stream')]
+        rows[0]['attempts'] = 7
+        rows[1].update(attempts=1, fallback=False, deployment='winner')
+        rows[2].update(done=False)
+        rows[3].update(done=True, attempts=2, fallback=True, ttft_ms=5)
+        source = compare.render_html(compare.aggregate(rows, ['omniroute', 'llmux']))
+        cells = ReportTables(source).tables['Request details']
+        chat = next(r for r in cells if r[0] == 'chat')
+        stream = next(r for r in cells if r[0] == 'stream')
+        self.assertNotIn('DONE', ' '.join(chat))
+        self.assertNotIn('attempt', chat[1])
+        self.assertIn('1 attempt', chat[2])
+        self.assertNotIn('(fallback)', chat[2])
+        self.assertIn('winner', chat[2])
+        self.assertIn('DONE ✗', stream[1])
+        self.assertIn('DONE ✓', stream[2])
+        self.assertIn('2 attempts (fallback)', stream[2])
+        for literal in ('None', 'True', 'False'):
+            self.assertNotIn(literal, ' '.join(' '.join(r) for r in cells))
+
     def test_case_bytes_are_fixed_and_pairs_alternate_before_cap_check(self):
         cases = compare.generate_cases(["m", "m", "n"], responses=2)
         self.assertEqual([(c["model"], c["kind"]) for c in cases], [

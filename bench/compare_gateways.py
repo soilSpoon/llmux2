@@ -322,6 +322,18 @@ def aggregate(results, gateways):
 def render_html(report):
     escape = lambda s: html.escape(str(s))
     gateways = report["gateways"]
+
+    def display(value):
+        if value is None:
+            return '—'
+        if isinstance(value, float):
+            value = format(value, '.3f').rstrip('0').rstrip('.')
+        return escape(value)
+
+    def badge(verdict, count=None):
+        label = verdict if count is None else verdict+': '+str(count)
+        return '<span class="badge '+('ok' if verdict == 'match' else 'fail')+'">'+escape(label)+'</span>'
+
     pieces = ['<!doctype html><html lang="en"><meta charset="utf-8">',
               '<meta name="viewport" content="width=device-width,initial-scale=1">',
               '<title>Gateway comparison</title><style>',
@@ -329,32 +341,79 @@ def render_html(report):
               'table{border-collapse:collapse;width:100%;background:white;margin:1rem 0}',
               'th,td{border:1px solid #c9d1d9;padding:.65rem;text-align:left;vertical-align:top}',
               'small{display:block;overflow-wrap:anywhere}pre{white-space:pre-wrap}',
-              '.ok{color:#176734}.fail{color:#a32620}h1{margin-bottom:.4rem}</style>',
+              '.ok{color:#176734}.fail{color:#a32620}.badge{display:inline-block;padding:.15rem .45rem;border-radius:.3rem}',
+              '.badge.ok{background:#e0f2e5}.badge.fail{background:#fde7e5}.strip{display:flex;gap:1rem;flex-wrap:wrap}',
+              'dl{display:grid;grid-template-columns:max-content 1fr;gap:.35rem 1rem}dd{margin:0;overflow-wrap:anywhere}',
+              'h1{margin-bottom:.4rem}caption{text-align:left;color:#52606d;margin:.3rem 0}</style>',
               '<h1>Gateway comparison</h1><p>Single sequential snapshot, not a performance ranking. ',
               'Both gateways receive identical bytes; pair order alternates. No automatic retries. ',
               'Fast errors are not successful work. TTFT starts at request dispatch and ends at the first content delta.</p>',
               '<p>Verdicts use success across each pair; both failures are never a match, even with equal error classes. ',
               'Model verdict requires every case to succeed; failures on both sides across different cases count as both fail. ',
               '“llmux-only” means the second gateway; “omniroute-only” means the first.</p>',
-              '<h2>Summary</h2><pre>'+escape(json.dumps(report["summary"], indent=2))+'</pre>',
-              '<h2>Run details</h2><pre>'+escape(json.dumps(report.get("run", {}), indent=2))+'</pre>',
-              '<p>Fallback is true only when llmux reports attempts &gt; 1. Unknown is not false. ',
-              'Other routing headers are evidence, not a reconstructed attempt trace. Error classes are HTTP/payload heuristics, ',
-              'not proof of which component generated the error.</p>',
-              '<table><thead><tr><th>Model / case</th><th>'+escape(gateways[0])+'</th><th>'+escape(gateways[1])+'</th><th>Verdict</th></tr></thead><tbody>']
+              '<h2>Summary</h2><div class="strip" aria-label="Verdict counts">']
+    for verdict in ('match', 'llmux-only fail', 'omniroute-only fail', 'both fail'):
+        pieces.append(badge(verdict, report['summary']['verdicts'].get(verdict, 0)))
+    pieces.append('</div><table aria-label="Summary"><thead><tr><th>Metric</th>'+''.join(
+        '<th>'+escape(g)+'</th>' for g in gateways)+'</tr></thead><tbody>')
+    summaries = [report['summary']['gateways'][g] for g in gateways]
+    metrics = [('Successes / requests', [str(s['successes'])+' / '+str(s['requests']) for s in summaries]),
+               ('Error classes', [', '.join(k+': '+str(v) for k, v in sorted(s['errors'].items())) or '—' for s in summaries])]
+    metrics.extend((label, [s[key] for s in summaries]) for label, key in (
+        ('p50 all (ms)', 'p50_ms'), ('p50 success (ms)', 'success_p50_ms'),
+        ('p50 TTFT (ms)', 'success_ttft_p50_ms')))
+    for label, values in metrics:
+        pieces.append('<tr><th>'+label+'</th>'+''.join('<td>'+display(v)+'</td>' for v in values)+'</tr>')
+    pieces.append('</tbody></table><h2>Models</h2><table aria-label="Models"><caption>HTTP '+
+                  escape(' / '.join(gateways))+'; colors indicate success, including payload and stream validation.</caption>'+
+                  '<thead><tr><th>Model</th><th>Chat</th><th>Stream</th><th>Responses</th><th>Verdict</th></tr></thead><tbody>')
+    for model in report['models']:
+        pieces.append('<tr><th>'+escape(model['model'])+'</th>')
+        cases = {c['kind']: c for c in model['cases']}
+        for kind in ('chat', 'stream', 'responses'):
+            case = cases.get(kind)
+            if case is None:
+                pieces.append('<td>—</td>')
+            else:
+                pieces.append('<td class="'+('ok' if case['verdict'] == 'match' else 'fail')+'">'+
+                              ' / '.join(display(case['results'][g]['status']) for g in gateways)+'</td>')
+        pieces.append('<td>'+badge(model['verdict'])+'</td></tr>')
+    pieces.append('</tbody></table><h2>Run details</h2><dl>')
+    for key, label in (('completed_at', 'Completed (UTC)'), ('timeout_s', 'Timeout (seconds)'),
+                       ('total_http_requests_sent', 'HTTP requests sent'), ('compared_requests', 'Compared requests'),
+                       ('superseded_requests', 'Superseded requests'), ('max_requests', 'Request cap'),
+                       ('ordering', 'Order'), ('note', 'Note')):
+        if report.get('run', {}).get(key) is not None:
+            pieces.append('<dt>'+label+'</dt><dd>'+display(report['run'][key])+'</dd>')
+    pieces.extend(['</dl><p>p50 TTFT uses successful streams only. Fallback unknown ≠ false; routing headers are evidence, ',
+                   'not a reconstructed attempt trace. Error classes are heuristics, not proof of error provenance.</p>',
+                   '<h2>Request details</h2><table aria-label="Request details"><thead><tr><th>Model / case</th><th>'+escape(gateways[0])+ '</th><th>'+escape(gateways[1])+'</th><th>Verdict</th></tr></thead><tbody>'])
     for model in report["models"]:
         pieces.append('<tr><th colspan="3">'+escape(model["model"])+'</th><th>'+escape(model["verdict"])+'</th></tr>')
         for case in model["cases"]:
             pieces.append('<tr><td>'+escape(case["kind"])+"</td>")
             for gateway in gateways:
                 r = case["results"][gateway]
-                label = 'HTTP %s · %s · %s ms · TTFT %s ms · DONE %s · fallback %s' % (
-                    r["status"], r["error_class"], r["latency_ms"], r["ttft_ms"], r["done"], r["fallback"])
-                pieces.append('<td class="'+('ok' if r["error_class"] == 'ok' else 'fail')+'">'+escape(label)+
-                              '<small>deployment '+escape(r["deployment"])+', attempts '+escape(r["attempts"])+
-                              '</small><small>'+escape(r["error"] or '')+'</small><details><summary>Routing headers</summary><pre>'+
-                              escape(json.dumps(r["routing_headers"], indent=2))+'</pre></details></td>')
-            pieces.append('<td>'+escape(case["verdict"])+'<small>Same error class: '+escape(case["same_error_class"])+"</small></td></tr>")
+                fields = ['HTTP '+display(r['status']), display(r['error_class']), display(r['latency_ms'])+' ms']
+                if r['ttft_ms'] is not None:
+                    fields.append('TTFT '+display(r['ttft_ms'])+' ms')
+                if case['kind'] == 'stream':
+                    fields.append('DONE '+('✓' if r['done'] else '✗'))
+                if gateway == gateways[1] and r['attempts'] is not None:
+                    attempts = r['attempts']
+                    fields.append(str(attempts)+(' attempt' if attempts == 1 else ' attempts')+
+                                  (' (fallback)' if attempts > 1 else ''))
+                pieces.append('<td class="'+('ok' if r['error_class'] == 'ok' else 'fail')+'">'+' · '.join(fields))
+                if r['deployment']:
+                    pieces.append('<small>Deployment '+escape(r['deployment'])+'</small>')
+                if r['error']:
+                    pieces.append('<small>'+escape(r['error'])+'</small>')
+                if r['routing_headers']:
+                    pieces.append('<details><summary>Routing headers</summary><pre>'+
+                                  escape(json.dumps(r['routing_headers'], indent=2))+'</pre></details>')
+                pieces.append('</td>')
+            pieces.append('<td>'+badge(case['verdict'])+'<small>Same error class: '+
+                          ('yes' if case['same_error_class'] else 'no')+'</small></td></tr>')
     if not report["models"]:
         pieces.append('<tr><td colspan="4">No results</td></tr>')
     pieces.append('</tbody></table></html>')
