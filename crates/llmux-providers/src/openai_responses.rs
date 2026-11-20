@@ -28,6 +28,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chat_function_strictness_preserves_optional_arguments() {
+        for strict in [None, Some(false), Some(true)] {
+            let mut function = json!({"name":"test","parameters":{"type":"object","properties":{"optional":{"type":"string"}},"required":[]}});
+            if let Some(strict) = strict {
+                function["strict"] = json!(strict);
+            }
+            let value = chat_request(
+                &json!({"messages":[],"tools":[{"type":"function","function":function.clone()}]}),
+            )
+            .unwrap();
+            assert_eq!(value["tools"][0]["strict"], json!(strict.unwrap_or(false)));
+            assert_eq!(value["tools"][0]["parameters"], function["parameters"]);
+        }
+        assert_eq!(
+            chat_request(&json!({"messages":[],"tools":[]})).unwrap()["tools"],
+            json!([])
+        );
+    }
+
+    #[test]
     fn assistant_text_parts_use_valid_input_content() {
         let value = chat_request(&json!({"messages":[
             {"role":"assistant","content":"Hello"},
@@ -354,6 +374,7 @@ fn chat_request(chat: &Value) -> Result<Value, BuildError> {
                 .ok_or(BuildError::InvalidBody)?
                 .clone();
             function.insert("type".into(), json!("function"));
+            function.entry("strict").or_insert(json!(false));
             converted.push(Value::Object(function));
         }
         out.insert("tools".into(), json!(converted));
