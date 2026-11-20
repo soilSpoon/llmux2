@@ -62,7 +62,7 @@ pub(super) fn collect(
                 names.push(raw.to_owned());
             }
             for name in names {
-                direct.insert(name.clone(), json!({"name":name,"models":[{"kind":"model","model":format!("{provider}/{model}")}]}));
+                direct.insert(name.clone(), json!({"name":name,"models":[{"kind":"model","providerId":provider,"model":format!("{provider}/{model}")}]}));
             }
         }
     }

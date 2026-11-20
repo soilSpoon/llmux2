@@ -267,6 +267,45 @@ fn custom_node_ids_do_not_claim_another_providers_registry_alias() {
 }
 
 #[test]
+fn synthetic_direct_steps_preserve_resolved_provider_identity() {
+    for custom_connected in [false, true] {
+        let mut root = fixture();
+        root["providerNodes"][0]["prefix"] = json!("deepseek");
+        if !custom_connected {
+            root["providerConnections"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|connection| connection["provider"] != "node");
+        }
+        root["providerConnections"].as_array_mut().unwrap().push(json!({"id":"deep","provider":"deepseek","authType":"apikey","apiKey":"synthetic-deep"}));
+        root["combos"][0]["models"] =
+            json!(["ds/test", "ds/deepseek/vendor", {"providerId":"node","model":"vendor/custom"}]);
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out.toml");
+        llmux_import::import(&root.to_string(), &output, None).unwrap();
+        let config = RuntimeConfig::load(output).unwrap();
+        for (name, upstream) in [
+            ("ds/test", "test"),
+            ("deepseek/test", "test"),
+            ("ds/deepseek/vendor", "deepseek/vendor"),
+        ] {
+            let model = &config.models[*config
+                .model_names
+                .get(name)
+                .unwrap_or_else(|| panic!("missing {name}; custom_connected={custom_connected}"))];
+            assert_eq!(model.deployments.len(), 1, "{name}");
+            let deployment = &config.deployments[model.deployments[0].0 as usize];
+            assert_eq!(deployment.credential.as_ref(), "upstream-deep", "{name}");
+            assert_eq!(deployment.upstream_model.as_ref(), upstream, "{name}");
+        }
+        assert_eq!(
+            config.model_names.contains_key("node/vendor/custom"),
+            custom_connected
+        );
+    }
+}
+
+#[test]
 fn malformed_restrictions_and_nested_combo_names_are_not_model_sources() {
     let mut root = fixture();
     root["combos"]

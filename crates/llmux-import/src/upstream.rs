@@ -56,7 +56,11 @@ pub(super) fn model_target<'a>(step: &'a Value, nodes: &'a [Value]) -> Option<(&
     } else {
         (provider_id, raw)
     };
-    let canonical = canonical_provider(provider, nodes);
+    let canonical = if string(step, "providerId").is_empty() {
+        canonical_provider(provider, nodes)
+    } else {
+        provider_id
+    };
     let model =
         if !provider_id.is_empty() || nodes.iter().any(|node| string(node, "id") == canonical) {
             model_id(model, canonical, nodes)
