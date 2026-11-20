@@ -7,7 +7,14 @@ it, including quota-aware priority and cost policy.
 
 ## Requirements
 
-### Requirement: Canonical model names
+The gateway SHALL expose public canonical model names, each mapped to one or
+more provider deployments with provider-specific model IDs.
+
+#### Scenario: Two deployments behind one name
+
+WHEN canonical model `m` maps to deployments on two providers with different
+upstream model IDs
+THEN a client requesting `m` is served by whichever deployment routing selects.
 
 The gateway SHALL expose public canonical model names, each mapped to one or
 more provider deployments with provider-specific model IDs.
@@ -57,17 +64,36 @@ avoiding rate-limit and latency spikes, not a goal in itself.
 WHEN the top deployment approaches its request or concurrency limit
 THEN overflow requests go to the next-ranked eligible deployment.
 
-### Requirement: Quality floor
+The gateway SHALL deprioritize a deployment whose observed latency or error
+rate degrades, even for the same model.
+
+#### Scenario: Degraded deployment ranked lower
+
+WHEN two deployments serve the same model and one's error rate rises
+THEN the healthier deployment is preferred until the degraded one recovers.
 
 The gateway SHALL deprioritize a deployment whose observed latency or error
 rate degrades, even for the same model.
 
-### Requirement: Paid deployments last
+The gateway SHALL use paid deployments only when free and subscription quota
+is exhausted, and only within a configured cost cap.
+
+#### Scenario: Paid fallback at the end
+
+WHEN every free deployment is ineligible and a paid deployment remains
+THEN the request goes to the paid deployment only if the cost cap allows.
 
 The gateway SHALL use paid deployments only when free and subscription quota
 is exhausted, and only within a configured cost cap.
 
-### Requirement: Revenue-aware capacity
+For deployments that also serve CheaperInference, the gateway SHALL preserve
+quota for models that sell well instead of spending it on low-value traffic.
+
+#### Scenario: High-selling model keeps quota
+
+WHEN a deployment's quota is shared between a high-selling model and a
+low-value one
+THEN the low-value model is deprioritized first as quota runs low.
 
 For deployments that also serve CheaperInference, the gateway SHALL preserve
 quota for models that sell well instead of spending it on low-value traffic.

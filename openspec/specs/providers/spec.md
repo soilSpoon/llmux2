@@ -27,7 +27,13 @@ WHEN a provider only offers a free tier with a request cap
 THEN it is configured as a normal deployment and its limits are tracked like
 any other.
 
-### Requirement: Keyless deployments
+The gateway SHALL support explicit keyless upstreams via `auth = "none"` with
+no credential, for providers that allow anonymous access.
+
+#### Scenario: Anonymous provider
+
+WHEN a deployment is configured with `auth = "none"` and no credential
+THEN requests are sent upstream without an authorization header.
 
 The gateway SHALL support explicit keyless upstreams via `auth = "none"` with
 no credential, for providers that allow anonymous access.
