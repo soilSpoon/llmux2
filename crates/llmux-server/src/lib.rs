@@ -214,6 +214,15 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
             "Expected a JSON object with a nonempty string model and optional boolean stream",
         );
     };
+    if format == InboundFormat::OpenAiChat {
+        if let Some(temperature) = metadata.temperature {
+            match serde_json::from_str::<f64>(temperature.get()) {
+                Ok(value) if (0.0..=2.0).contains(&value) => {}
+                Ok(_) => return chat_bad_request("temperature: must be between 0 and 2"),
+                Err(_) => return chat_bad_request("temperature: must be a number"),
+            }
+        }
+    }
 
     let model: Arc<str> = Arc::from(metadata.model.as_ref());
     if state
@@ -280,6 +289,9 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
     }
     let routed = match result {
         Ok(routed) => routed,
+        Err(GatewayError::UnknownModel) if format == InboundFormat::OpenAiChat => {
+            return chat_bad_request("Invalid model format");
+        }
         Err(err) => return gateway_error(err),
     };
     let mut response = match routed.response {
@@ -471,6 +483,14 @@ fn upstream_client_error(status: StatusCode, body: Bytes) -> Response {
         .entry("code")
         .or_insert_with(|| json!("upstream_client_error"));
     json_body(status, Body::from(payload.to_string()))
+}
+
+fn chat_bad_request(message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error":{"message":message,"type":"invalid_request_error","code":"bad_request"}})),
+    )
+        .into_response()
 }
 
 fn error(status: StatusCode, code: &str, message: &str) -> Response {
