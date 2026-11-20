@@ -541,6 +541,18 @@ mod tests {
     use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
     use std::time::Duration;
 
+    #[test]
+    fn limit_header_names_match_the_upstream_contract() {
+        assert_eq!(
+            LIMIT_REMAINING_REQUESTS,
+            "anthropic-ratelimit-requests-remaining"
+        );
+        assert_eq!(
+            LIMIT_REMAINING_TOKENS,
+            "anthropic-ratelimit-tokens-remaining"
+        );
+    }
+
     fn converted(v: Value) -> Value {
         serde_json::from_slice(&convert_request(v.to_string().as_bytes(), "claude").unwrap())
             .unwrap()

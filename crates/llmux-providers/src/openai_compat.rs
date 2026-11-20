@@ -985,6 +985,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn limit_header_names_match_the_upstream_contract() {
+        assert_eq!(LIMIT_REMAINING_REQUESTS, "x-ratelimit-remaining-requests");
+        assert_eq!(LIMIT_REMAINING_TOKENS, "x-ratelimit-remaining-tokens");
+        assert_eq!(LIMIT_RESET_REQUESTS, "x-ratelimit-reset-requests");
+        assert_eq!(LIMIT_RESET_TOKENS, "x-ratelimit-reset-tokens");
+    }
+
     fn classify(status: u16, body: &str) -> UpstreamError {
         classify_error(
             StatusCode::from_u16(status).unwrap(),
