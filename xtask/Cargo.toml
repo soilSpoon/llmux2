@@ -3,7 +3,6 @@ name = "xtask"
 version.workspace = true
 edition.workspace = true
 publish = false
-license = "MIT"
 
 [dependencies]
 serde_json.workspace = true

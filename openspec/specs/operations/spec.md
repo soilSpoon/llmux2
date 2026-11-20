@@ -74,9 +74,9 @@ dropped.
 #### Scenario: Policy cache and test ownership
 
 WHEN PR policy and coverage build xtask
-THEN PR policy SHALL use its own small xtask-only Rust cache rather than restoring
-the workspace cache, and xtask tests SHALL run in the coverage job rather than
-again in check.
+THEN PR policy SHALL use a separate small dependency cache rather than restoring
+the coverage job's workspace artifacts, and coverage SHALL keep its default Rust
+cache. xtask tests SHALL run in the coverage job rather than again in check.
 
 ### Requirement: Simple and extensible
 

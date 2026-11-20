@@ -28,10 +28,6 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: policy-tools
-          cache-workspace-crates: true
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Run Rust unit and integration tests with coverage
         run: cargo llvm-cov --locked --workspace --json --summary-only --output-path coverage.json
       - name: Enforce coverage floor

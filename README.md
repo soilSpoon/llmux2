@@ -360,10 +360,10 @@ success and 1 on failure. `xtask` is not a default workspace member and depends
 only on `serde_json`, not the gateway crates. New tools belong in separate modules
 behind subcommands of this one binary.
 
-The policy and coverage jobs share the `policy-tools` Rust cache. Only coverage
-pushes on `main` save it, avoiding competing saves from PR jobs; the normal xtask
-build from the coverage-floor step is reusable by PR policy checks, alongside the
-separate instrumented coverage artifacts.
+PR policy uses its own small `xtask` Rust dependency cache with default save
+behavior, so later PR body edits can reuse it without restoring the gateway's
+workspace and instrumented coverage artifacts. Coverage keeps its default Rust
+cache. The xtask binary itself is cheap to rebuild from cached dependencies.
 
 ## Live gateway comparison
 

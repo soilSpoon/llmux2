@@ -23,9 +23,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: policy-tools
-          cache-workspace-crates: true
-          save-if: false
+          shared-key: xtask
       - name: Check PR template and test evidence
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
