@@ -12,6 +12,13 @@ use std::net::IpAddr;
 
 pub type HttpClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
+/// Whether a URI host is a loopback IP literal (no `localhost` name lookup).
+pub fn host_is_loopback_ip(host: &str) -> bool {
+    host.trim_matches(['[', ']'])
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Whether a URI host names the local machine: `localhost` or a loopback IP.
 pub fn host_is_loopback(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")

@@ -2,7 +2,7 @@ use crate::{Error, Result};
 use bytes::Bytes;
 use http::{header, Request, StatusCode};
 use http_body_util::{BodyExt, Full, Limited};
-use llmux_types::{host_is_loopback, HttpClient};
+use llmux_types::{host_is_loopback_ip, HttpClient};
 
 use serde::de::DeserializeOwned;
 use std::time::Duration;
@@ -76,7 +76,7 @@ impl Http {
 }
 
 pub(crate) fn validate_url(url: &Url) -> Result<()> {
-    let loopback = url.host_str().is_some_and(host_is_loopback);
+    let loopback = url.host_str().is_some_and(host_is_loopback_ip);
     if url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()

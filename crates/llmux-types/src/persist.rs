@@ -26,9 +26,11 @@ pub fn private_tempfile(path: &Path, bytes: &[u8]) -> io::Result<tempfile::Named
     Ok(file)
 }
 
-fn sync_dir(dir: &Path) -> io::Result<()> {
+/// fsync a directory after persisting files into it.
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
     let _ = dir;
     Ok(())
 }

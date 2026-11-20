@@ -46,10 +46,20 @@ pub(crate) fn prepare(dir: &Path) -> Result<(PathBuf, String, Option<Credentials
 
 pub(crate) fn save(dir: &Path, credentials: &Credentials) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(credentials).map_err(|_| Error::Storage)?;
-    llmux_types::atomic_write(
+    // Stage both files before replacing either destination: a partial pair
+    // (new refresh_token, old credentials.json) would corrupt the login state.
+    let refresh = llmux_types::private_tempfile(
         &dir.join("refresh_token"),
         credentials.refresh_token.as_bytes(),
     )
     .map_err(|_| Error::Storage)?;
-    llmux_types::atomic_write(&dir.join("credentials.json"), &bytes).map_err(|_| Error::Storage)
+    let record = llmux_types::private_tempfile(&dir.join("credentials.json"), &bytes)
+        .map_err(|_| Error::Storage)?;
+    refresh
+        .persist(&*dir.join("refresh_token"))
+        .map_err(|_| Error::Storage)?;
+    record
+        .persist(&*dir.join("credentials.json"))
+        .map_err(|_| Error::Storage)?;
+    llmux_types::sync_dir(dir).map_err(|_| Error::Storage)
 }
