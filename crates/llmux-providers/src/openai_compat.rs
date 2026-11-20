@@ -192,13 +192,7 @@ pub(crate) fn native_message_bytes(raw: &RawValue) -> serde_json::Result<u64> {
     };
     message.into_iter().try_fold(0, |sum, (key, value)| {
         let bytes = if key == "content" {
-            if let Ok(blocks) = serde_json::from_str::<Vec<&RawValue>>(value.get()) {
-                blocks
-                    .into_iter()
-                    .try_fold(0, |sum, block| native_block_bytes(block).map(|n| sum + n))?
-            } else {
-                text_bytes(value)?
-            }
+            native_content_bytes(value, true)?
         } else {
             text_bytes(value)?
         };
@@ -206,10 +200,29 @@ pub(crate) fn native_message_bytes(raw: &RawValue) -> serde_json::Result<u64> {
     })
 }
 
-fn native_block_bytes(raw: &RawValue) -> serde_json::Result<u64> {
+fn native_content_bytes(raw: &RawValue, allow_tool_result: bool) -> serde_json::Result<u64> {
+    let Ok(blocks) = serde_json::from_str::<Vec<&RawValue>>(raw.get()) else {
+        return text_bytes(raw);
+    };
+    blocks.into_iter().try_fold(0, |sum, block| {
+        native_block_bytes(block, allow_tool_result).map(|n| sum + n)
+    })
+}
+
+fn native_block_bytes(raw: &RawValue, allow_tool_result: bool) -> serde_json::Result<u64> {
     let Ok(block) = serde_json::from_str::<RawFields<'_>>(raw.get()) else {
         return text_bytes(raw);
     };
+    if allow_tool_result && field_is(&block, "type", "tool_result") {
+        return block.into_iter().try_fold(0, |sum, (key, value)| {
+            let bytes = if key == "content" {
+                native_content_bytes(value, false)?
+            } else {
+                text_bytes(value)?
+            };
+            Ok(sum + key.len() as u64 + bytes)
+        });
+    }
     if !(field_is(&block, "type", "image") || field_is(&block, "type", "document")) {
         return text_bytes(raw);
     }

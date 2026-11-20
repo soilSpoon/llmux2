@@ -78,7 +78,12 @@ async fn messages(State(up): State<Arc<Upstream>>, headers: HeaderMap, body: Byt
     assert_eq!(request["max_tokens"], 4096);
     assert_eq!(request["system"], "Be brief");
     if matches!(up.reply, Reply::Image) {
-        let source = &request["messages"][0]["content"][0]["source"];
+        let block = &request["messages"].as_array().unwrap().last().unwrap()["content"][0];
+        let source = if block["type"] == "tool_result" {
+            &block["content"][0]["source"]
+        } else {
+            &block["source"]
+        };
         assert_eq!(source["type"], "base64");
         assert_eq!(source["data"].as_str().unwrap().len(), 32_000);
     } else {
@@ -356,6 +361,29 @@ async fn native_messages_base64_image_does_not_use_prompt_text_budget() {
         json!({"model":"assistant","max_tokens":4096,"system":"Be brief",
             "messages":[{"role":"user","content":[{"type":"image",
                 "source":{"type":"base64","media_type":"image/png","data":"A".repeat(32_000)}}]}]
+        }),
+    ).await;
+    check_route(&response, "claude", "1");
+    assert_eq!(fixture.counts(), [1, 0]);
+}
+
+#[tokio::test]
+async fn native_messages_nested_base64_image_does_not_use_prompt_text_budget() {
+    let fixture = Fixture::with_context(
+        (Reply::Image, 0),
+        (Reply::Ok, 10),
+        "capabilities = { max_context = 4500 }",
+    )
+    .await;
+    let (response, _) = fixture.send_to(
+        "/v1/messages", header::AUTHORIZATION, "Bearer test-client",
+        json!({"model":"assistant","max_tokens":4096,"system":"Be brief",
+            "messages":[
+                {"role":"user","content":"Hello"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"lookup","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1",
+                    "content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"A".repeat(32_000)}}]}]}
+            ]
         }),
     ).await;
     check_route(&response, "claude", "1");
