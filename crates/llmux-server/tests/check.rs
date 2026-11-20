@@ -55,4 +55,21 @@ upstream_model = "test"
         String::from_utf8_lossy(&output.stdout).trim(),
         address.to_string()
     );
+    let config = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        config.replace("provider = \"openai\"", "provider = \"unknown\""),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_llmux-server"))
+        .arg("--check")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "--check must reject unsupported startup providers"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("no registered adapter for provider unknown"));
 }

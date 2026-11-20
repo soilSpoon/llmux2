@@ -46,13 +46,20 @@ struct AppState {
     dashboard: Option<dashboard::Dashboard>,
 }
 
-pub async fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Send + Sync>> {
+fn provider_registry() -> ProviderRegistry {
     let mut registry = ProviderRegistry::default();
     for kind in ["openai", "openai_compat"] {
         registry.register(Arc::new(OpenAiCompat::new(kind)));
     }
     registry.register(Arc::new(Anthropic::new(ANTHROPIC)));
-    let mut sources = std::mem::take(&mut config.api_keys)
+    registry
+}
+
+fn static_sources(
+    config: &mut RuntimeConfig,
+) -> Result<std::collections::HashMap<Arc<str>, Arc<dyn CredentialSource>>, llmux_types::BuildError>
+{
+    std::mem::take(&mut config.api_keys)
         .into_iter()
         .map(|(id, ApiKey { provider, key })| {
             let source = if &*provider.0 == ANTHROPIC {
@@ -62,7 +69,20 @@ pub async fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Se
             };
             Ok((id, Arc::new(source) as Arc<dyn CredentialSource>))
         })
-        .collect::<Result<std::collections::HashMap<_, _>, llmux_types::BuildError>>()?;
+        .collect()
+}
+
+pub fn validate_startup(mut config: RuntimeConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let registry = provider_registry();
+    let sources = static_sources(&mut config)?;
+    let credentials = sources.keys().chain(config.oauth.keys()).cloned().collect();
+    Executor::validate(&config, &registry, &credentials)?;
+    Ok(())
+}
+
+pub async fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Send + Sync>> {
+    let registry = provider_registry();
+    let mut sources = static_sources(&mut config)?;
     for (id, credential) in std::mem::take(&mut config.oauth) {
         let mut oauth = OAuthConfig::new(
             credential.token_url,

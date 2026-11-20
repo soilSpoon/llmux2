@@ -21,7 +21,9 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let config = RuntimeConfig::load(path)?;
     if check {
-        println!("{}", config.server.listen);
+        let address = config.server.listen;
+        llmux_server::validate_startup(config)?;
+        println!("{address}");
         return Ok(());
     }
     let address = config.server.listen;
