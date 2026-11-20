@@ -1,4 +1,4 @@
-//! Axum boundary for the OpenAI-compatible chat gateway.
+//! Axum boundary for the OpenAI-compatible gateway.
 
 use axum::{
     body::{self, Body},
@@ -52,10 +52,19 @@ pub fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Send + S
     let executor = Executor::new(config.clone(), &registry, &sources)?;
     Ok(Router::new()
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/responses", post(responses))
         .with_state(Arc::new(AppState { config, executor })))
 }
 
 async fn chat(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    execute(state, request, InboundFormat::OpenAiChat).await
+}
+
+async fn responses(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    execute(state, request, InboundFormat::OpenAiResponses).await
+}
+
+async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) -> Response {
     if !authorized(request.headers(), &state.config.server.client_keys) {
         let mut response = error(
             StatusCode::UNAUTHORIZED,
@@ -97,7 +106,7 @@ async fn chat(State(state): State<Arc<AppState>>, request: Request) -> Response 
     };
 
     let req = GatewayRequest {
-        format: InboundFormat::OpenAiChat,
+        format,
         model: Arc::from(metadata.model.as_ref()),
         stream: metadata.stream,
         est_input_tokens: body.len().div_ceil(4) as u32,
@@ -113,15 +122,31 @@ async fn chat(State(state): State<Arc<AppState>>, request: Request) -> Response 
     let mut response = match routed.response {
         GatewayResponse::Complete { status, body, .. } => json_body(status, Body::from(body)),
         GatewayResponse::Stream(events) => {
-            let stream = events.map(|event| {
+            let mut sequence_number = 0_u64;
+            let stream = events.map(move |event| {
                 let event = match event {
                     Ok(event) => {
+                        if format == InboundFormat::OpenAiResponses {
+                            sequence_number += 1;
+                        }
                         let out = Event::default().data(event.data);
                         if let Some(name) = event.event {
                             out.event(name)
                         } else {
                             out
                         }
+                    }
+                    Err(_) if format == InboundFormat::OpenAiResponses => {
+                        Event::default().event("error").data(
+                            json!({
+                                "type": "error",
+                                "message": "Upstream stream ended unexpectedly",
+                                "code": "stream_broken",
+                                "param": null,
+                                "sequence_number": sequence_number,
+                            })
+                            .to_string(),
+                        )
                     }
                     Err(_) => Event::default().data(
                         r#"{"error":{"message":"Upstream stream ended unexpectedly","type":"upstream_error","code":"stream_broken"}}"#,
@@ -174,6 +199,11 @@ fn gateway_error(err: GatewayError) -> Response {
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "Model does not support streaming",
+        ),
+        GatewayError::InvalidRequest => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Invalid or unsupported request body",
         ),
         GatewayError::AllCandidatesExhausted { retry_after, .. } => rate_limited(retry_after),
         GatewayError::Client(UpstreamError::RateLimited { retry_after, .. }) => {
