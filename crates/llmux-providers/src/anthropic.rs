@@ -903,7 +903,7 @@ mod tests {
     #[test]
     fn auth_passthrough_and_support() {
         let a = Anthropic::new("anthropic");
-        let dep = Deployment {
+        let mut dep = Deployment {
             idx: DeploymentIdx(0),
             id: "a".into(),
             provider: a.kind().clone(),
@@ -967,5 +967,26 @@ mod tests {
                 .unwrap(),
             Err(BuildError::UnsupportedFormat)
         ));
+        dep.upstream_model = "*".into();
+        req.format = InboundFormat::AnthropicMessages;
+        let request = a
+            .build_request(&req, &dep, &AuthMaterial::None)
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            request.body().as_ref(),
+            br#"{ "model":"alias", "future":{"model":"untouched"} }"#
+        );
+        req.format = InboundFormat::OpenAiChat;
+        req.body =
+            Bytes::from_static(br#"{"model":"alias","messages":[{"role":"user","content":"hi"}]}"#);
+        let request = a
+            .build_request(&req, &dep, &AuthMaterial::None)
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        let body: Value = serde_json::from_slice(request.body()).unwrap();
+        assert_eq!(body["model"], "alias");
     }
 }

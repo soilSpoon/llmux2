@@ -778,6 +778,7 @@ refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
             wildcard.replace("upstream_model = \"*\"", "upstream_model = \"fixed\""),
             base.replace("upstream_model = \"upstream\"", "upstream_model = \"*\""),
             base.replace("name = \"model\"", "name = \"model\"\nexclude = []"),
+            base.replace("name = \"model\"", "name = \"model\"\naliases = [\"*\"]"),
             format!("{wildcard}\n[[models]]\nname = \"*\"\ndeployments = []"),
         ] {
             assert!(RuntimeConfig::parse(&input).is_err(), "accepted {input}");
