@@ -344,6 +344,10 @@ impl Expander<'_> {
                     }
                 };
                 let mut deployment = json!({"base_url":c.base_url,"upstream_model":model});
+                if c.provider.is_builtin("deepseek") {
+                    deployment["strip_request_fields"] =
+                        json!(["seed", "user", "safety_identifier", "reasoning.effort"]);
+                }
                 if c.policy == policy::ModelPolicy::Workers {
                     deployment["quota"] = json!({"rpm":1});
                 }
