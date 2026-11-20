@@ -833,6 +833,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "llmux-mcp"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper-rustls",
+ "hyper-util",
+ "llmux-testkit",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "llmux-providers"
 version = "0.1.0"
 dependencies = [

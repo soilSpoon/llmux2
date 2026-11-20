@@ -111,6 +111,44 @@ starts collecting when opened; it polls every two seconds. The dashboard
 does not collect prompts, responses, upstream URLs or credential values
 in its stats. Omit `dashboard_key` to disable the routes and collection.
 
+## Operating the gateway: API, CLI and MCP
+
+With `dashboard_key` set, the same key also unlocks an HTTP admin API under
+`/admin`: `GET /admin/status`, `GET /admin/deployments`, `GET /admin/models`,
+`GET /admin/credentials`, `POST /admin/credentials/{id}/disabled`
+(`{"disabled": true}` stops routing through every deployment that draws on
+the credential; `false` resumes), and `POST /admin/reload`, which re-reads
+the config file and atomically swaps routing. A rejected reload keeps the
+running configuration; changes to `server.listen`, `server.shutdown_timeout`
+and `server.drain_grace` only apply on restart and are reported in the
+response's `warnings`. Rotating or removing `dashboard_key` revokes the old
+key immediately. No response ever contains secret material.
+
+The `llmux` CLI is a thin client of that API — one subcommand per endpoint:
+
+```sh
+export LLMUX_ADMIN_URL=http://127.0.0.1:8080
+export LLMUX_ADMIN_KEY=...   # the dashboard key
+llmux status                 # uptime, version, response counters
+llmux deployments            # deployments with live routing stats
+llmux models                 # canonical models and their deployment order
+llmux credentials            # kind, provider, disabled flag, quota
+llmux disable spare-key      # stop routing through a credential
+llmux enable spare-key       # resume it
+llmux reload                 # hot-reload the config file
+```
+
+`llmux-mcp` serves the same operations over stdio as MCP tools
+(`llmux_status`, `llmux_deployments`, `llmux_credentials`, `llmux_models`,
+`llmux_set_disabled`, `llmux_reload`) for agents and editors, reading the
+same two environment variables:
+
+```json
+{ "command": "llmux-mcp",
+  "env": { "LLMUX_ADMIN_URL": "http://127.0.0.1:8080",
+           "LLMUX_ADMIN_KEY": "..." } }
+```
+
 ## Routing
 
 Lower numeric priority wins, with round-robin ordering among equal priorities. On an upstream HTTP 429, the gateway tries the next deployment and skips the limited deployment until its `Retry-After` (seconds or HTTP date) expires. Missing values use the configured default, doubled for each consecutive 429 from that deployment until it serves a request again, and waits are capped by `cooldown.max_ms`. A 429 or quota error that arrives after a stream has started cannot be retried, but it still cools the deployment down for later requests. A response whose rate-limit headers report zero remaining requests or tokens also skips that deployment until the reported reset. After a 429 or quota cooldown ends, the deployment takes one request at a time until one succeeds, and other requests fall back meanwhile, so a still-limited provider is not hit by every queued request at once. If none can serve the request, the gateway returns 429 with the earliest known retry delay. Optional local per-deployment request (`quota.rpm`, `quota.rpd`), estimated-token (`quota.tpm`, `quota.tpd`) and concurrency limits also skip deployments without contacting them. Deployments under different models that share the same provider, credential, base URL, upstream model and quota share one cooldown and one set of local limits, so a 429 on one model's route is not immediately retried through another model.
