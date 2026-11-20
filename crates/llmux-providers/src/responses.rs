@@ -171,6 +171,17 @@ pub(crate) fn complete(body: &[u8]) -> Result<(Bytes, Option<Usage>), ()> {
     if let Some(text) = msg["content"].as_str() {
         output.push(message(&format!("msg_{id}"), text, "completed"));
     }
+    if let Some(refusal) = msg["refusal"].as_str() {
+        if output.is_empty() {
+            let mut item = message(&format!("msg_{id}"), "", "completed");
+            item["content"] = json!([]);
+            output.push(item);
+        }
+        output[0]["content"]
+            .as_array_mut()
+            .ok_or(())?
+            .push(json!({"type":"refusal","refusal":refusal}));
+    }
     if let Some(calls) = msg["tool_calls"].as_array() {
         for call in calls {
             output.push(json!({"id":format!("fc_{}", call["id"].as_str().ok_or(())?), "type":"function_call", "status":"completed", "call_id":call["id"], "name":call["function"]["name"], "arguments":call["function"]["arguments"]}));
@@ -193,7 +204,9 @@ struct Translator {
     sequence: u64,
     chat: Value,
     output: Vec<Value>,
+    message: Option<usize>,
     text: Option<usize>,
+    refusal: Option<usize>,
     calls: BTreeMap<u64, usize>,
     incomplete: bool,
     started: bool,
@@ -220,8 +233,23 @@ impl Translator {
                 self.output[index]["status"] = json!("completed");
                 let item = self.output[index].clone();
                 if item["type"] == "message" {
-                    events.push(self.event("response.output_text.done", json!({"item_id":item["id"],"output_index":index,"content_index":0,"text":item["content"][0]["text"]})));
-                    events.push(self.event("response.content_part.done", json!({"item_id":item["id"],"output_index":index,"content_index":0,"part":item["content"][0]})));
+                    for (content_index, part) in
+                        item["content"].as_array().ok_or(())?.iter().enumerate()
+                    {
+                        let refusal = part["type"] == "refusal";
+                        let mut data = json!({"item_id":item["id"],"output_index":index,"content_index":content_index});
+                        let field = if refusal { "refusal" } else { "text" };
+                        data[field] = part[field].clone();
+                        events.push(self.event(
+                            if refusal {
+                                "response.refusal.done"
+                            } else {
+                                "response.output_text.done"
+                            },
+                            data,
+                        ));
+                        events.push(self.event("response.content_part.done", json!({"item_id":item["id"],"output_index":index,"content_index":content_index,"part":part})));
+                    }
                 } else {
                     events.push(self.event("response.function_call_arguments.done", json!({"item_id":item["id"],"output_index":index,"arguments":item["arguments"]})));
                 }
@@ -260,8 +288,11 @@ impl Translator {
         };
         self.incomplete |= choice["finish_reason"] == "length";
         let delta = &choice["delta"];
-        if let Some(text) = delta["content"].as_str() {
-            let index = if let Some(index) = self.text {
+        for (field, is_refusal) in [("content", false), ("refusal", true)] {
+            let Some(text) = delta[field].as_str() else {
+                continue;
+            };
+            let index = if let Some(index) = self.message {
                 index
             } else {
                 let index = self.output.len();
@@ -272,20 +303,42 @@ impl Translator {
                     "response.output_item.added",
                     json!({"output_index":index,"item":item}),
                 ));
-                events.push(self.event("response.content_part.added", json!({"output_index":index,"item_id":id,"content_index":0,"part":text_part("")})));
-                self.output.push(message(&id, "", "in_progress"));
-                self.text = Some(index);
+                self.output.push(item);
+                self.message = Some(index);
                 index
             };
+            let content_index = if let Some(content_index) =
+                if is_refusal { self.refusal } else { self.text }
+            {
+                content_index
+            } else {
+                let part = if is_refusal {
+                    json!({"type":"refusal","refusal":""})
+                } else {
+                    text_part("")
+                };
+                let parts = self.output[index]["content"].as_array_mut().ok_or(())?;
+                let content_index = parts.len();
+                parts.push(part.clone());
+                let id = self.output[index]["id"].clone();
+                events.push(self.event("response.content_part.added", json!({"output_index":index,"item_id":id,"content_index":content_index,"part":part})));
+                if is_refusal {
+                    self.refusal = Some(content_index);
+                } else {
+                    self.text = Some(content_index);
+                }
+                content_index
+            };
             let item = &mut self.output[index];
-            let Value::String(accumulated) = &mut item["content"][0]["text"] else {
+            let part_field = if is_refusal { "refusal" } else { "text" };
+            let Value::String(accumulated) = &mut item["content"][content_index][part_field] else {
                 return Err(());
             };
             accumulated.push_str(text);
             let id = item["id"].clone();
             events.push(self.event(
-                "response.output_text.delta",
-                json!({"output_index":index,"item_id":id,"content_index":0,"delta":text}),
+                if is_refusal { "response.refusal.delta" } else { "response.output_text.delta" },
+                json!({"output_index":index,"item_id":id,"content_index":content_index,"delta":text}),
             ));
         }
         if let Some(calls) = delta["tool_calls"].as_array() {
@@ -455,6 +508,58 @@ mod tests {
 
     fn chunk(delta: Value) -> String {
         json!({"id":"chat1","created":42,"model":"m","choices":[{"index":0,"delta":delta,"finish_reason":null}]}).to_string()
+    }
+
+    #[test]
+    fn preserves_refusals() {
+        for content in [Value::Null, json!("preface")] {
+            let (body, _) = complete(&serde_json::to_vec(&json!({"id":"r","choices":[{"message":{"content":content,"refusal":"cannot help"},"finish_reason":"stop"}]})).unwrap()).unwrap();
+            let response: Value = serde_json::from_slice(&body).unwrap();
+            let parts = response["output"][0]["content"].as_array().unwrap();
+            assert_eq!(
+                parts.last().unwrap(),
+                &json!({"type":"refusal","refusal":"cannot help"})
+            );
+            assert_eq!(parts.len(), if content.is_null() { 1 } else { 2 });
+        }
+        for prefix in [None, Some("preface")] {
+            let mut translator = Translator::default();
+            if let Some(text) = prefix {
+                translator.push(&chunk(json!({"content":text}))).unwrap();
+            }
+            let mut events = translator
+                .push(&chunk(json!({"refusal":"cannot "})))
+                .unwrap();
+            events.extend(translator.push(&chunk(json!({"refusal":"help"}))).unwrap());
+            events.extend(translator.push("[DONE]").unwrap());
+            let data: Vec<Value> = events
+                .iter()
+                .map(|event| serde_json::from_str(&event.data).unwrap())
+                .collect();
+            let index = usize::from(prefix.is_some());
+            let added = data
+                .iter()
+                .find(|e| e["type"] == "response.content_part.added")
+                .unwrap();
+            assert_eq!(added["content_index"], index);
+            assert_eq!(added["part"], json!({"type":"refusal","refusal":""}));
+            let deltas: Vec<_> = data
+                .iter()
+                .filter(|e| e["type"] == "response.refusal.delta")
+                .map(|e| e["delta"].clone())
+                .collect();
+            assert_eq!(deltas, [json!("cannot "), json!("help")]);
+            let done = data
+                .iter()
+                .find(|e| e["type"] == "response.refusal.done")
+                .unwrap();
+            assert_eq!(done["refusal"], "cannot help");
+            assert_eq!(done["content_index"], index);
+            assert_eq!(
+                data.last().unwrap()["response"]["output"][0]["content"][index],
+                json!({"type":"refusal","refusal":"cannot help"})
+            );
+        }
     }
 
     #[test]
