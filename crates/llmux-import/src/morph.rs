@@ -68,7 +68,10 @@ pub(super) fn order(
                 index += 1;
             }
         }
-        let mut last_morph = deployments.iter().rposition(is_morph).unwrap();
+        let Some(mut last_morph) = deployments.iter().rposition(is_morph) else {
+            *deployments = original;
+            return;
+        };
         let mut bridges = Vec::new();
         let mut index = 0;
         while index < last_morph {
@@ -83,5 +86,30 @@ pub(super) fn order(
     }
     if *deployments != original {
         warnings.push(format!("combo {name}: reviewed Morph logprobs order places Morph ahead of Vibe/Mistral and bridge replacements; fast combos start with Morph, base combos retain declared Numes priority"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::order;
+    use serde_json::json;
+
+    #[test]
+    fn missing_morph_position_preserves_empty_and_nonempty_orders() {
+        for name in ["deepseek-v4.1-flash", "deepseek-v4.1-flash-fast"] {
+            for mut deployments in [
+                vec![],
+                vec![
+                    json!({"upstream_model":"deepseek/deepseek-v4.1-flash", "_bridge_replacement":true}),
+                    json!({"upstream_model":"deepseek-v4-1-flash-1017"}),
+                ],
+            ] {
+                let expected = deployments.clone();
+                let mut warnings = Vec::new();
+                order(name, &mut deployments, &[], &[], &mut warnings);
+                assert_eq!(deployments, expected);
+                assert!(warnings.is_empty());
+            }
+        }
     }
 }
