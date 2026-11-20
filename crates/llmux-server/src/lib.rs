@@ -190,6 +190,11 @@ fn gateway_error(err: GatewayError) -> Response {
                 )
             }
         }
+        GatewayError::Client(UpstreamError::ContextLength) => error(
+            StatusCode::BAD_REQUEST,
+            "context_length_exceeded",
+            "Request exceeds the upstream model's maximum context length",
+        ),
         GatewayError::Client(UpstreamError::Timeout) => error(
             StatusCode::GATEWAY_TIMEOUT,
             "upstream_timeout",
