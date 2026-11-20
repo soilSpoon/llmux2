@@ -33,8 +33,11 @@ conflict-free PR targeting the default branch, successful required head checks,
 no failed head checks or unresolved review threads, a head-specific Devin Review,
 no blocking latest reviews, and a passing head-specific independent session attestation.
 Verification comments SHALL come from a policy-allowlisted account.
-Devin Review evidence SHALL contain a configured real-review body marker;
-author thread replies SHALL NOT satisfy that evidence.
+Devin Review evidence SHALL be either a head-specific review from the Devin app
+containing a configured real-review body marker, or a successful latest head
+commit status for the configured context created by that app. A latest pending,
+failed, or errored status SHALL block even if a marked review exists.
+Author thread replies SHALL NOT satisfy that evidence.
 Empty-body COMMENTED reviews SHALL NOT supersede a reviewer's blocking review.
 Only the latest run of each head check name SHALL determine its outcome.
 Every latest head check SHALL be completed before merging.

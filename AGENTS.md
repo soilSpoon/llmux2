@@ -38,6 +38,7 @@ python3 -B -m unittest discover -s scripts -v
 
 ## Merge
 
+- Head-specific Devin Review evidence is either a marked review from `devin-ai-integration` or a successful latest `Devin Review` commit status created by that app. A pending, failed, or errored latest status blocks even with a marked review. The context and body markers are configured in `.github/merge-policy.json`.
 - Run the gate from a trusted, up-to-date `main` checkout so a PR cannot weaken its own policy. Bootstrap changes to the gate require independent review before using the updated gate.
 - Verification markers count only from accounts in `.github/merge-policy.json`'s `verifier_logins` allowlist (`devin-ai-integration` and `soilspoon`, case-insensitive with `[bot]` stripped).
 - The owner never merges. Devin bots merge as the `devin-ai-integration` app, only after `python3 scripts/merge_gate.py <n>` succeeds; then run `command gh pr merge <n> --squash --match-head-commit <sha>` using the exact SHA the gate passed. Until the ruleset is imported, this gate is the enforcement; do not bypass it.

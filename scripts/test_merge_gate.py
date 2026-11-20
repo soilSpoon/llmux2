@@ -6,6 +6,7 @@ from merge_gate import evaluate, fetch, main, pages
 
 SHA = 'a' * 40
 POLICY = {'blocking_markers': {'codesolarlght': ['Changes recommended']},
+          'devin_review_status_context': 'Devin Review',
           'devin_review_markers': ['<!-- devin-review-summary -->', '<!-- devin-review-session-triaged -->'],
           'verifier_logins': ['devin-ai-integration', 'soilspoon'],
           'unable_to_review_markers': {'copilot': ['quota exceeded']}}
@@ -17,7 +18,7 @@ def fixture():
             'default_branch': 'main',
             'checks': [{'name': 'check', 'status': 'completed', 'conclusion': 'success',
                         'head_sha': SHA}],
-            'threads': [{'isResolved': True}],
+            'threads': [{'isResolved': True}], 'statuses': [],
             'reviews': [{'id': 1, 'user': {'login': 'devin-ai-integration'},
                          'commit_id': SHA, 'state': 'COMMENTED', 'body': '<!-- devin-review-summary -->'}],
             'comments': [{'id': 1, 'user': {'login': 'devin-ai-integration[bot]'}, 'body': marker()}]}
@@ -28,6 +29,34 @@ def marker(sha=SHA, verdict='pass', reviewer='independent'):
 
 
 class MergeGateTest(unittest.TestCase):
+    def test_devin_status_success_without_review(self):
+        data = fixture()
+        data['reviews'] = []
+        data['statuses'] = [{'id': 1, 'context': 'Devin Review', 'state': 'success',
+                             'creator': {'login': 'devin-ai-integration[bot]'}}]
+        self.assertEqual(evaluate(data, ['check'], POLICY), [])
+
+    def test_latest_devin_status_overrides_review(self):
+        for state in ('pending', 'failure', 'error'):
+            with self.subTest(state=state):
+                data = fixture()
+                data['statuses'] = [
+                    {'id': 2, 'context': 'Devin Review', 'state': state,
+                     'creator': {'login': 'devin-ai-integration[bot]'}},
+                    {'id': 1, 'context': 'Devin Review', 'state': 'success',
+                     'creator': {'login': 'devin-ai-integration[bot]'}}]
+                self.assertIn(f'Devin Review status is {state}', evaluate(data, ['check'], POLICY))
+
+    def test_untrusted_or_unrelated_status_does_not_satisfy_review(self):
+        for context, login in [('Devin Review', 'someone-else'),
+                               ('Other Review', 'devin-ai-integration[bot]')]:
+            with self.subTest(context=context, login=login):
+                data = fixture()
+                data['reviews'] = []
+                data['statuses'] = [{'id': 1, 'context': context, 'state': 'success',
+                                     'creator': {'login': login}}]
+                self.assertTrue(evaluate(data, ['check'], POLICY))
+
     def test_empty_reply_review_does_not_clear_blocker(self):
         for body in ('', '  \r\n', None):
             with self.subTest(body=body):

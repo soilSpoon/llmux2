@@ -55,9 +55,17 @@ def evaluate(data, required, policy):
         return any(m.lower() in (review.get('body') or '').lower()
                    for m in policy['unable_to_review_markers'].get(login, []))
 
-    if not any(reviewer_login(r) == 'devin-ai-integration'
+    marked_review = any(reviewer_login(r) == 'devin-ai-integration'
                and any(marker in (r.get('body') or '') for marker in policy['devin_review_markers'])
-               and r.get('commit_id') == sha and not unavailable(r) for r in reviews):
+               and r.get('commit_id') == sha and not unavailable(r) for r in reviews)
+    status = max((s for s in data['statuses']
+                  if s['context'] == policy['devin_review_status_context']),
+                 key=lambda s: (s['id'], s.get('created_at') or ''), default=None)
+    status_passed = (status is not None and status['state'] == 'success'
+                     and reviewer_login({'user': status.get('creator')}) == 'devin-ai-integration')
+    if status is not None and status['state'] != 'success':
+        errors.append(f'Devin Review status is {status["state"]}')
+    elif not marked_review and not status_passed:
         errors.append('Devin Review has not submitted a review on the head SHA.')
     latest = {}
     for review in sorted(reviews, key=lambda r: r['id']):
@@ -139,6 +147,7 @@ def fetch(number):
     data = {'pr': pr, 'default_branch': repo['default_branch'], 'threads': threads,
             'checks': pages(f'{endpoint}/commits/{sha}/check-runs?filter=all', 'check_runs'),
             'reviews': pages(f'{endpoint}/pulls/{number}/reviews'),
+            'statuses': pages(f'{endpoint}/commits/{sha}/statuses'),
             'comments': pages(f'{endpoint}/issues/{number}/comments')}
     if gh(f'{endpoint}/pulls/{number}')['head']['sha'] != sha:
         raise ValueError('PR head changed while fetching; rerun the gate')
