@@ -537,6 +537,7 @@ impl Executor {
                             // A stream error here precedes the first downstream byte.
                             err @ (UpstreamError::Server { .. }
                             | UpstreamError::Timeout
+                            | UpstreamError::ModelNotFound { .. }
                             | UpstreamError::Connect
                             | UpstreamError::StreamBroken { .. }),
                         )) => last_transient = Some(err),

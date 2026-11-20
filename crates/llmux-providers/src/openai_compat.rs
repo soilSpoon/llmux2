@@ -708,6 +708,11 @@ fn error_details(body: &[u8]) -> serde_json::Value {
         .unwrap_or_default()
 }
 
+pub(crate) fn is_model_not_found(status: StatusCode, details: &serde_json::Value) -> bool {
+    matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND)
+        && details["code"].as_str() == Some("model_not_found")
+}
+
 pub(crate) fn classify_error(
     status: StatusCode,
     headers: &HeaderMap,
@@ -806,6 +811,7 @@ fn classify_error_details(
         {
             UpstreamError::ContextLength
         }
+        _ if is_model_not_found(status, details) => UpstreamError::ModelNotFound { status, body },
         500..=599 => UpstreamError::Server { status },
         400..=499 => UpstreamError::BadRequest { status, body },
         _ => bad_gateway(),

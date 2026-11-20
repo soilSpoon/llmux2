@@ -18,9 +18,17 @@ WHEN a deployment answers 429
 THEN the request is retried on the next eligible deployment without surfacing
 the error to the client.
 
+#### Scenario: An explicitly missing upstream model or an Anthropic HTTP 408 triggers failover
+
+WHEN a deployment returns HTTP 400 or 404 with the explicit upstream error
+code `model_not_found`, or the Anthropic adapter receives HTTP 408
+THEN the gateway SHALL try the next eligible deployment within the existing
+attempt and time budgets, before committing a response. An ordinary upstream
+400 or generic 404 SHALL remain terminal.
+
 ### Requirement: Stream commitment
 
-Once a content-bearing SSE event has been sent to the client, the gateway
+Once a streaming response has been committed, the gateway
 SHALL NOT retry that request on another deployment.
 
 #### Scenario: Mid-stream failure surfaces

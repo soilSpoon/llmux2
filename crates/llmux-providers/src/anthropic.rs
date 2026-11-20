@@ -259,6 +259,9 @@ fn convert_response(v: &Value) -> Value {
 
 fn client_error(status: StatusCode, body: Bytes, convert: bool) -> UpstreamError {
     let value = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    if crate::openai_compat::is_model_not_found(status, &value["error"]) {
+        return UpstreamError::ModelNotFound { status, body };
+    }
     if matches!(status.as_u16(), 400 | 413)
         && value["error"]["message"]
             .as_str()
@@ -479,6 +482,7 @@ impl ProviderAdapter for Anthropic {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 return Err(UpstreamError::Auth { refreshable: false })
             }
+            StatusCode::REQUEST_TIMEOUT => return Err(UpstreamError::Timeout),
             s if s.is_client_error() => return Err(client_error(s, collect(body).await?, convert)),
             s if s.is_server_error() => return Err(UpstreamError::Server { status: s }),
             s if !s.is_success() => return Err(bad_gateway()),

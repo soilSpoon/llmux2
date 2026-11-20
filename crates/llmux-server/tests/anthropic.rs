@@ -41,6 +41,7 @@ const ANTHROPIC_SSE: &str = concat!(
 enum Reply {
     Ok,
     Limit,
+    Timeout,
     Image,
     Document,
     BrokenStream,
@@ -66,8 +67,13 @@ impl Upstream {
 
     fn limited(&self) -> Option<Response> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        matches!(self.reply, Reply::Limit)
-            .then(|| (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "30")]).into_response())
+        match self.reply {
+            Reply::Limit => {
+                Some((StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "30")]).into_response())
+            }
+            Reply::Timeout => Some(StatusCode::REQUEST_TIMEOUT.into_response()),
+            _ => None,
+        }
     }
 }
 
@@ -416,6 +422,15 @@ async fn native_messages_forwards_anthropic_protocol_headers() {
         .await;
     check_route(&response, "gpt", "1");
     assert_eq!(fixture.counts(), [0, 1]);
+}
+
+#[tokio::test]
+async fn anthropic_http_408_fails_over() {
+    let fixture = Fixture::start((Reply::Timeout, 0), (Reply::Ok, 10)).await;
+    let (response, text) = fixture.request(false).await;
+    check_route(&response, "gpt", "2");
+    assert!(text.contains("Hi from OpenAI"));
+    assert_eq!(fixture.counts(), [1, 1]);
 }
 
 #[tokio::test]
