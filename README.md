@@ -35,8 +35,10 @@ Credentials use `provider = "openai"` or `"openai_compat"` for OpenAI-compatible
 
 `GET /healthz` is unauthenticated and returns `200 ok`; it is excluded from
 dashboard statistics. On SIGTERM or SIGINT, the server marks itself draining,
-refuses new work (503 on connections still reaching it), closes its listener,
-and waits for in-flight requests and SSE streams. After
+returns 503 only for health probes, closes its listener,
+and waits for in-flight requests and SSE streams. Real requests reaching an
+existing connection during the handoff are still served; Hyper closes
+keep-alive connections after the current response. After
 `server.shutdown_timeout_ms` (default 60000, valid range 1–86400000 ms), it exits
 successfully even if work remains; those unfinished connections are closed.
 Clients should allow streams to finish within that budget.

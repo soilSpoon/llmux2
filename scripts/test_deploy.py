@@ -29,13 +29,19 @@ class DeploymentTests(unittest.TestCase):
         self.healthy = True
         self.fail_start = False
         self.fail_check = False
+        self.unit_states = []
+        self.waits = []
         self.ops = ops.Deployment(self.root, self.systemctl, self.check,
-                                  lambda _: self.healthy)
+                                  lambda _: self.healthy, self.waits.append)
 
     def systemctl(self, action, slot):
         self.calls.append((action, slot))
         if action == "is-active":
             return slot in self.active
+        if action == "show":
+            if self.unit_states:
+                return self.unit_states.pop(0)
+            return {"ActiveState": "active", "NRestarts": "0", "MainPID": "1234"}
         if action == "start":
             if self.fail_start:
                 raise RuntimeError("start failed")
@@ -81,6 +87,60 @@ class DeploymentTests(unittest.TestCase):
             self.ops.deploy(self.binary, self.config)
         self.assertEqual(self.active, {"a"})
         self.assertIn(("stop", "b"), self.calls)
+
+    def test_old_health_does_not_mask_new_slot_failure(self):
+        for state in (
+                {},
+                {"ActiveState": "failed", "NRestarts": "0", "MainPID": "0"},
+                {"ActiveState": "active", "NRestarts": "1", "MainPID": "1234"},
+                {"ActiveState": "active", "NRestarts": "0", "MainPID": "0"}):
+            with self.subTest(state=state):
+                self.active = {"a"}
+                self.calls.clear()
+                self.unit_states = [state]
+                with self.assertRaisesRegex(RuntimeError, "new slot"):
+                    self.ops.deploy(self.binary, self.config)
+                self.assertEqual(self.active, {"a"})
+                self.assertNotIn(("stop", "a"), self.calls)
+                self.assertIn(("stop", "b"), self.calls)
+
+    def test_new_slot_must_stay_stable_for_settle_window(self):
+        stable = {"ActiveState": "active", "NRestarts": "0", "MainPID": "1234"}
+        self.unit_states = [stable, stable, dict(stable, MainPID="5678")]
+        with self.assertRaisesRegex(RuntimeError, "new slot"):
+            self.ops.deploy(self.binary, self.config)
+        self.assertEqual(self.active, {"a"})
+        self.assertNotIn(("stop", "a"), self.calls)
+
+    def test_healthy_slot_is_observed_for_three_seconds(self):
+        self.ops.deploy(self.binary, self.config)
+        self.assertGreaterEqual(sum(self.waits), 3)
+        self.assertGreaterEqual(self.calls.count(("show", "b")), 2)
+
+    def test_cli_checks_new_unit_properties(self):
+        commands = []
+        def run(command, **kwargs):
+            commands.append(command)
+            if "--check" in command:
+                return subprocess.CompletedProcess(command, 0, "127.0.0.1:8080\n", "")
+            if command[2] == "show":
+                return subprocess.CompletedProcess(command, 0, "MainPID=4321\nNRestarts=0\nActiveState=active\n", "")
+            if command[2] == "is-active":
+                active = command[-1] == "llmux2@a.service"
+                return subprocess.CompletedProcess(command, 0 if active else 3,
+                                                   "active\n" if active else "inactive\n", "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+        with patch.object(ops.Path, "home", return_value=self.root), \
+                patch.object(ops.subprocess, "run", side_effect=run), \
+                patch.object(ops, "health", return_value=True), \
+                patch.object(ops.time, "sleep"), \
+                patch.object(ops.sys, "argv", ["llmux2-deploy", "deploy", "--binary", str(self.binary), "--config", str(self.config)]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ops.main(), 0)
+        probes = [command for command in commands if "show" in command]
+        self.assertGreaterEqual(len(probes), 2)
+        self.assertTrue(all(command == ["systemctl", "--user", "show", "-p",
+                                       "ActiveState,NRestarts,MainPID", "llmux2@b.service"] for command in probes))
 
     def test_invalid_config_does_not_touch_units(self):
         self.fail_check = True

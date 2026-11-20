@@ -48,9 +48,13 @@ systemctl --user enable --now llmux2-guard.timer
 
 Without arguments, sources are `$HOME/llmux2/bin/llmux-server` and
 `$HOME/llmux2/llmux.toml`. The tool validates and atomically copies sources to the
-idle slot, validates the installed copies, waits for systemd READY and HTTP
-health, then stops/drains the old slot and records/enables the new one for boot.
-Use the same listen address across deployments. A failed start or health check
+idle slot, validates the installed copies, waits for systemd READY, then observes
+the new unit's ActiveState, NRestarts and MainPID for three seconds. It must
+remain active with zero restarts and the same nonzero PID. A port health probe
+must also succeed, but cannot identify the new slot under SO_REUSEPORT: the old
+slot might answer it. Only after both checks does deployment stop/drain the old
+slot and record/enable the new one for boot.
+Use the same listen address across deployments. A failed start, stability or health check
 stops the new slot without stopping the old one. Both slots active is an
 ambiguous interrupted handoff: inspect logs and stop the unwanted slot before
 retrying. Failures at/after old-slot stop leave the new slot running and require

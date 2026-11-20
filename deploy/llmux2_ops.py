@@ -79,6 +79,18 @@ class Deployment:
         stopping_old = False
         try:
             self.systemctl("start", idle)
+            pid = None
+            for sample in range(7):
+                if sample:
+                    self.sleep(0.5)
+                state = self.systemctl("show", idle)
+                current_pid = state.get("MainPID", "")
+                if (state.get("ActiveState") != "active"
+                        or state.get("NRestarts") != "0"
+                        or not current_pid.isdigit() or int(current_pid) == 0
+                        or (pid is not None and current_pid != pid)):
+                    raise RuntimeError("new slot did not remain active without restarts during settle window")
+                pid = current_pid
             for _ in range(60):
                 if self.health(listen):
                     break
@@ -142,7 +154,11 @@ def main(guard=False):
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     def systemctl(action, slot):
-        result = subprocess.run(["systemctl", "--user", action, "llmux2@" + slot + ".service"],
+        command = ["systemctl", "--user", action]
+        if action == "show":
+            command += ["-p", "ActiveState,NRestarts,MainPID"]
+        command.append("llmux2@" + slot + ".service")
+        result = subprocess.run(command,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                 timeout=130)
         if action == "is-active" and result.returncode in (0, 3):
@@ -154,6 +170,8 @@ def main(guard=False):
             raise RuntimeError("unexpected unit state: " + state)
         if result.returncode:
             raise RuntimeError("systemctl {} {} failed: {}".format(action, slot, result.stderr.strip()))
+        if action == "show":
+            return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
         return True
 
     def check(binary, config):
