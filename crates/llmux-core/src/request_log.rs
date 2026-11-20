@@ -53,11 +53,14 @@ impl RequestLog {
         let Ok(mut file) = self.file.lock() else {
             return;
         };
-        // A full log line must be its own write so readers never see a torn record.
-        if serde_json::to_writer(&mut *file, record).is_ok() {
-            let _ = file.write_all(b"\n");
-            let _ = file.flush();
-        }
+        // Serialize first so every record is a single write: a hot reload
+        // leaves an older executor sharing this path without its mutex.
+        let Ok(mut line) = serde_json::to_vec(record) else {
+            return;
+        };
+        line.push(b'\n');
+        let _ = file.write_all(&line);
+        let _ = file.flush();
     }
 }
 
