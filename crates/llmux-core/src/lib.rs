@@ -9,7 +9,7 @@ use http_body_util::Full;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
-    rt::TokioExecutor,
+    rt::{TokioExecutor, TokioTimer},
 };
 use limits::{DeploymentLimits, Permit};
 use llmux_config::RuntimeConfig;
@@ -138,7 +138,10 @@ impl Executor {
             .enable_http2()
             .build();
         let mut builder = Client::builder(TokioExecutor::new());
-        builder.retry_canceled_requests(false);
+        builder
+            .pool_timer(TokioTimer::new())
+            .pool_idle_timeout(Duration::from_secs(30))
+            .retry_canceled_requests(false);
         Ok(Self {
             cfg,
             bindings,
