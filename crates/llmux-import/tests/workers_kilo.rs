@@ -36,6 +36,34 @@ fn success(output: &std::process::Output) -> String {
 }
 
 #[test]
+fn replaced_openrouter_combos_preserve_nested_and_alias_references() {
+    let mut root = fixture();
+    let name = "openrouter/anthropic/claude-fable-5.2";
+    root["providerConnections"].as_array_mut().unwrap().push(json!({"id":"anthropic","provider":"anthropic","authType":"apikey","apiKey":"synthetic-anthropic-key"}));
+    root["combos"].as_array_mut().unwrap().extend([
+        json!({"id":"original","name":name,"models":["openai/unverified"]}),
+        json!({"name":"nested","models":[{"kind":"combo-ref","comboName":name}]}),
+    ]);
+    root["modelAliases"] = json!({"prefixed":format!("combo/{name}"),"dependent":"mapped"});
+    root["modelComboMappings"] = json!([{"pattern":"mapped","comboId":"original","enabled":true}]);
+    let dir = tempfile::tempdir().unwrap();
+    success(&run(
+        &root,
+        dir.path(),
+        &[("--openrouter-replacements", dir.path())],
+    ));
+    let config = RuntimeConfig::load(dir.path().join("out.toml")).unwrap();
+    for name in [name, "nested", "prefixed", "mapped", "dependent"] {
+        assert!(config.model_names.contains_key(name), "missing {name}");
+        let model = &config.models[config.model_names[name]];
+        assert_eq!(model.deployments.len(), 1);
+        let dep = &config.deployments[model.deployments[0].0 as usize];
+        assert_eq!(dep.upstream_model.as_ref(), "claude-fable-5-2");
+        assert_eq!(dep.base_url.to_string(), "https://api.anthropic.com/v1");
+    }
+}
+
+#[test]
 fn workers_registry_shorthands_use_canonical_connections() {
     let mut root = fixture();
     for (alias, provider) in [

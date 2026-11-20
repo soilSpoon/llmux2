@@ -552,7 +552,7 @@ pub fn import_with_options(
     let mut combo_ids = HashMap::new();
     let mut order = Vec::new();
     for (i, entry) in array(&root, "combos").iter().enumerate() {
-        let combo = if let Some(data) = entry.get("data") {
+        let mut combo = if let Some(data) = entry.get("data") {
             if let Some(data) = data.as_str() {
                 match serde_json::from_str(data) {
                     Ok(combo) => combo,
@@ -568,12 +568,6 @@ pub fn import_with_options(
             entry.clone()
         };
         let name = string(&combo, "name").to_owned();
-        if policy.openrouter_replacements && name.starts_with("openrouter/") {
-            warnings.push(format!(
-                "combo {name}: source combo replaced by reviewed official-only policy"
-            ));
-            continue;
-        }
         if name.is_empty() || combos.contains_key(&name) {
             warnings.push(format!("combo {i}: skipped empty/duplicate name"));
             continue;
@@ -591,6 +585,15 @@ pub fn import_with_options(
             combo_ids
                 .entry(id.to_owned())
                 .or_insert_with(|| name.clone());
+        }
+        if policy.openrouter_replacements {
+            if let Some(model) = name.strip_prefix("openrouter/") {
+                combo["models"] =
+                    json!([{"kind":"model","_resolvedProviderId":"openrouter","model":model}]);
+                warnings.push(format!(
+                    "combo {name}: source combo replaced by reviewed official-only policy"
+                ));
+            }
         }
         combos.insert(name, combo);
     }
