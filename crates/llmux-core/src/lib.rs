@@ -356,9 +356,11 @@ impl Executor {
                             }
                         }
                         Err(GatewayError::Client(
+                            // A stream error here precedes the first downstream byte.
                             err @ (UpstreamError::Server { .. }
                             | UpstreamError::Timeout
-                            | UpstreamError::Connect),
+                            | UpstreamError::Connect
+                            | UpstreamError::StreamBroken { .. }),
                         )) => last_transient = Some(err),
                         Err(err) => return Err(err),
                     }
