@@ -36,6 +36,51 @@ fn success(output: &std::process::Output) -> String {
 }
 
 #[test]
+fn workers_shorthand_only_connections_match_canonical_and_alias_legs() {
+    for (alias, canonical) in [
+        ("cfpd", "cloudflare-direct"),
+        ("cfp", "cloudflare-playground"),
+    ] {
+        let mut root = fixture();
+        root["providerConnections"] = json!([{"id":"only","provider":alias,"authType":"none"}]);
+        root["combos"] = json!([
+            {"name":"canonical","models":[format!("{canonical}/openai/gpt-oss-20b")]},
+            {"name":"alias","models":[format!("{alias}/openai/gpt-oss-20b")]}
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let account = dir.path().join("account");
+        let token = dir.path().join("token");
+        fs::write(&account, "0123456789abcdef0123456789abcdef").unwrap();
+        fs::write(&token, "synthetic-token").unwrap();
+        success(&run(
+            &root,
+            dir.path(),
+            &[
+                ("--cloudflare-account-id-file", &account),
+                ("--cloudflare-token-file", &token),
+            ],
+        ));
+        let config = RuntimeConfig::load(dir.path().join("out.toml")).unwrap();
+        for name in [
+            "canonical",
+            "alias",
+            &format!("{canonical}/openai/gpt-oss-20b"),
+            &format!("{alias}/openai/gpt-oss-20b"),
+        ] {
+            assert!(config.model_names.contains_key(name), "missing {name}");
+            let model = &config.models[config.model_names[name]];
+            assert_eq!(model.deployments.len(), 1);
+            assert_eq!(
+                config.deployments[model.deployments[0].0 as usize]
+                    .upstream_model
+                    .as_ref(),
+                "@cf/openai/gpt-oss-20b"
+            );
+        }
+    }
+}
+
+#[test]
 fn replacement_restrictions_exclude_legs_and_mistral_uses_mapped_model() {
     let mut root = fixture();
     root["providerNodes"] = json!([{"id":"mistral","prefix":"vibe","type":"openai-compatible","baseUrl":"https://api.mistral.ai/v1"}]);
