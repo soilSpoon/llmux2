@@ -151,8 +151,15 @@ impl CredentialSource for OAuthCredentialSource {
 }
 
 impl Inner {
-    async fn refresh(&self) -> Result<(), AuthError> {
+    async fn refresh(self: &Arc<Self>) -> Result<(), AuthError> {
         let generation = self.generation.load(Ordering::Acquire);
+        let inner = self.clone();
+        tokio::spawn(async move { inner.refresh_generation(generation).await })
+            .await
+            .map_err(|_| AuthError::RefreshFailed)?
+    }
+
+    async fn refresh_generation(&self, generation: u64) -> Result<(), AuthError> {
         let mut state = self.state.lock().await;
         if self.generation.load(Ordering::Acquire) != generation {
             return if state.succeeded {
@@ -328,6 +335,7 @@ mod tests {
         fail: AtomicBool,
         lifetime: AtomicU64,
         mode: AtomicU64,
+        release: Notify,
     }
 
     async fn endpoint(
@@ -340,6 +348,7 @@ mod tests {
             "application/x-www-form-urlencoded"
         );
         state.bodies.lock().await.push(body);
+        let mode = state.mode.load(Ordering::Relaxed);
         tokio::time::sleep(Duration::from_millis(30)).await;
         if state.fail.load(Ordering::Relaxed) {
             return (
@@ -347,10 +356,14 @@ mod tests {
                 r#"{"error":"invalid_grant","error_description":"secret"}"#.into(),
             );
         }
-        let body = match state.mode.load(Ordering::Relaxed) {
+        let body = match mode {
             1 => "x".repeat(65537),
             2 => "{}".into(),
             3 => r#"{"access_token":"access","token_type":"Bearer"}"#.into(),
+            4 => {
+                state.release.notified().await;
+                r#"{"access_token":"access","token_type":"Bearer","refresh_token":"cancel-rotated"}"#.into()
+            }
             _ => serde_json::json!({"access_token":"access", "token_type":"Bearer", "expires_in":state.lifetime.load(Ordering::Relaxed), "refresh_token":"rotated"}).to_string(),
         };
         (http::StatusCode::OK, body)
@@ -402,6 +415,37 @@ mod tests {
         let bodies = endpoint.bodies.lock().await;
         assert_eq!(bodies.len(), 2);
         assert!(bodies[1].contains("refresh_token=rotated"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_preserves_rotated_refresh_token() {
+        let (_server, endpoint, config) = fixture(3600).await;
+        let source = Arc::new(OAuthCredentialSource::start(config).await.unwrap());
+        endpoint.mode.store(4, Ordering::Relaxed);
+        let caller_source = source.clone();
+        let caller = tokio::spawn(async move { caller_source.refresh().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while endpoint.bodies.lock().await.len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        endpoint.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while source.inner.generation.load(Ordering::Acquire) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        endpoint.mode.store(0, Ordering::Relaxed);
+        source.refresh().await.unwrap();
+        let bodies = endpoint.bodies.lock().await;
+        assert_eq!(bodies.len(), 3);
+        assert!(bodies[2].contains("refresh_token=cancel-rotated"));
     }
 
     #[tokio::test]
