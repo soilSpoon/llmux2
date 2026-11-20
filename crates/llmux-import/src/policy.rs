@@ -184,9 +184,10 @@ pub(super) fn workers_model(raw: &str) -> Option<&'static str> {
         model = "meta/llama-3.3-70b-instruct-fp8-fast";
     }
     // https://developers.cloudflare.com/workers-ai/changelog/#2026-05-08
-    // https://developers.cloudflare.com/workers-ai/models/llama-3.3-70b-instruct-fp8-fast/
+    // https://developers.cloudflare.com/workers-ai/models/granite-4.0-h-micro/
+    // https://developers.cloudflare.com/workers-ai/platform/pricing/
     if model == "meta/llama-3.1-8b-instruct" {
-        model = "meta/llama-3.3-70b-instruct-fp8-fast";
+        model = "ibm-granite/granite-4.0-h-micro";
     }
     WORKERS
         .iter()

@@ -36,7 +36,7 @@ fn success(output: &std::process::Output) -> String {
 }
 
 #[test]
-fn retired_workers_bridge_models_use_current_llama_for_free_cloudflare() {
+fn retired_workers_bridge_models_use_small_current_instruct_for_free_cloudflare() {
     let mut root = fixture();
     root["providerConnections"]
         .as_array_mut()
@@ -66,7 +66,7 @@ fn retired_workers_bridge_models_use_current_llama_for_free_cloudflare() {
         config.deployments[model.deployments[0].0 as usize]
             .upstream_model
             .as_ref(),
-        "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+        "@cf/ibm-granite/granite-4.0-h-micro"
     );
     assert!(!config.model_names.contains_key("retired-small"));
     for deployment in &config.deployments {
@@ -80,7 +80,7 @@ fn workers_snapshot_filters_mapped_targets_and_never_expands_the_allowlist() {
     for rows in [
         json!([]),
         json!([
-            {"name":"@cf/meta/llama-3.3-70b-instruct-fp8-fast"},
+            {"name":"@cf/ibm-granite/granite-4.0-h-micro"},
             {"name":"@cf/meta/llama-3.1-8b-instruct"},
             {"name":"@cf/meta/llama-3.2-1b-instruct"}
         ]),

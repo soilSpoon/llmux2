@@ -112,7 +112,7 @@ not account-wide neuron accounting or a guarantee against paid overage.
 #### Scenario: Retired Llama bridge target
 
 WHEN an opted-in Cloudflare bridge leg targets `meta/llama-3.1-8b-instruct`
-THEN it uses the reviewed current `@cf/meta/llama-3.3-70b-instruct-fp8-fast`
+THEN it uses the reviewed current 3B `@cf/ibm-granite/granite-4.0-h-micro`
 instead of sending the retired upstream ID. Documentation SHALL disclose the
 checkpoint and size change. Other excluded deprecated models remain excluded.
 

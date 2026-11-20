@@ -137,14 +137,31 @@ eligibility can change; review this allowlist before deployment.
 #### Retired models and an optional current catalog
 
 Legacy bridge `meta/llama-3.1-8b-instruct` legs (including `free-cloudflare`)
-now use `@cf/meta/llama-3.3-70b-instruct-fp8-fast`. This is an explicit model
-substitution, not the same 8B checkpoint: quality, latency, context, and neuron
+now use `@cf/ibm-granite/granite-4.0-h-micro`. This is an explicit model
+substitution to a 3B instruct model, not the same 8B checkpoint: quality, latency, context, and neuron
 usage can differ. The retired ID is never sent upstream. Cloudflare's
 [May 8 deprecation notice](https://developers.cloudflare.com/workers-ai/changelog/#2026-05-08)
 retired the original on May 30, 2026. The 8B FP8 page lists November 20, 2026
 deprecation, and the FP8-fast page currently says unavailable, so neither is a
-replacement. The [3.3 fast model](https://developers.cloudflare.com/workers-ai/models/llama-3.3-70b-instruct-fp8-fast/)
-is current and eligible for the daily free allocation, not unlimited free usage.
+replacement. This unavailability refers specifically to **Llama 3.1 8B FP8-fast**,
+not Llama 3.3 70B FP8-fast, whose model page remains available. Llama 3.2 3B is
+also deprecated November 20, 2026. Instead, the current
+[Granite model](https://developers.cloudflare.com/workers-ai/models/granite-4.0-h-micro/)
+has no deprecation notice, supports text generation and function calling, and is
+eligible for the daily free allocation, not unlimited free usage.
+[IBM documents its 3B size](https://www.ibm.com/granite/docs/models/granite4-0).
+Cloudflare's [neuron pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/)
+lists the following per **million** tokens (input / output):
+
+| Model | Input neurons | Output neurons |
+| --- | ---: | ---: |
+| Retired Llama 3.1 8B instruct | 25,608 | 75,147 |
+| Current Granite 4.0 H Micro (3B) | 1,542 | 10,158 |
+| Llama 3.3 70B FP8-fast (not chosen) | 26,668 | 204,805 |
+
+Granite uses about 94.0% fewer input neurons and 86.5% fewer output neurons
+than the retired 8B. The free 10,000-neuron daily account allowance and
+per-deployment RPM limitations below still apply.
 On November 20, 2026, all nine allowlisted model pages linked in `src/policy.rs`
 and the official changelog were rechecked; none of those targets had an announced
 deprecation date. Pricing tables alone are not availability evidence.
