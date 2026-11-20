@@ -328,6 +328,16 @@ fn classify_error(
     now: SystemTime,
 ) -> UpstreamError {
     let details = error_details(&body);
+    classify_error_details(status, headers, body, now, &details)
+}
+
+fn classify_error_details(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: Bytes,
+    now: SystemTime,
+    details: &serde_json::Value,
+) -> UpstreamError {
     let code = details
         .get("code")
         .and_then(serde_json::Value::as_str)
@@ -434,7 +444,7 @@ fn embedded_error(body: &Bytes, headers: &HeaderMap, now: SystemTime) -> Option<
         return None;
     }
     let bounded = body.slice(..body.len().min(MAX_ERROR_BYTES));
-    let details = error_details(&bounded);
+    let details = error_details(body);
     let status = ["status", "status_code", "code"]
         .iter()
         .find_map(|key| {
@@ -468,7 +478,9 @@ fn embedded_error(body: &Bytes, headers: &HeaderMap, now: SystemTime) -> Option<
                 StatusCode::BAD_REQUEST
             }
         });
-    Some(classify_error(status, headers, bounded, now))
+    Some(classify_error_details(
+        status, headers, bounded, now, &details,
+    ))
 }
 
 fn bad_gateway() -> UpstreamError {
@@ -696,6 +708,38 @@ mod tests {
                 reset_tokens: Some(Duration::from_millis(20))
             })
         );
+    }
+
+    #[test]
+    fn large_embedded_errors_keep_details_but_bound_passthrough_bytes() {
+        let headers = HeaderMap::new();
+        let now = SystemTime::UNIX_EPOCH;
+        for (details, expected) in [
+            (
+                r#""status":429,"code":"rate_limit_exceeded""#,
+                llmux_types::ErrorKind::RateLimited,
+            ),
+            (
+                r#""type":"insufficient_quota""#,
+                llmux_types::ErrorKind::QuotaExhausted,
+            ),
+            (
+                r#""code":"context_length_exceeded""#,
+                llmux_types::ErrorKind::ContextLength,
+            ),
+            (r#""status":400""#, llmux_types::ErrorKind::BadRequest),
+        ] {
+            let body = Bytes::from(format!(
+                r#"{{"error":{{"padding":"{}",{details}}}}}"#,
+                "x".repeat(MAX_ERROR_BYTES)
+            ));
+            let error = embedded_error(&body, &headers, now).unwrap();
+            assert_eq!(error.kind(), expected);
+            if let UpstreamError::BadRequest { body: stored, .. } = error {
+                assert_eq!(stored.len(), MAX_ERROR_BYTES);
+                assert_eq!(stored, body.slice(..MAX_ERROR_BYTES));
+            }
+        }
     }
 
     #[test]
