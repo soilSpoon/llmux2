@@ -755,3 +755,39 @@ async fn token_quota_skips_a_deployment_without_calling_it() {
         "60 + 60 tokens exceed tpm = 100 on dep0"
     );
 }
+
+#[tokio::test]
+async fn after_a_cooldown_other_requests_fall_back_while_a_probe_is_open() {
+    let (executor, adapter, _, _server) = fixture(
+        vec![UpstreamError::RateLimited {
+            retry_after: Some(Duration::from_millis(50)),
+            scope: llmux_types::LimitScope::Unknown,
+        }],
+        false,
+    )
+    .await;
+    assert_eq!(
+        executor
+            .execute(request())
+            .await
+            .unwrap()
+            .deployment
+            .as_ref(),
+        "dep2"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let streaming = GatewayRequest {
+        stream: true,
+        ..request()
+    };
+    let probe = executor.execute(streaming).await.unwrap();
+    assert_eq!(probe.deployment.as_ref(), "dep0");
+    let held_back = executor.execute(request()).await.unwrap();
+    assert_eq!(
+        held_back.deployment.as_ref(),
+        "dep2",
+        "dep0 has a probe open"
+    );
+    drop(probe);
+    assert_eq!(adapter.calls.lock().unwrap().len(), 4);
+}

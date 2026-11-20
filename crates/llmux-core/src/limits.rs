@@ -2,7 +2,7 @@ use llmux_types::{LimitObservation, QuotaSpec};
 use std::{
     collections::VecDeque,
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -20,6 +20,8 @@ pub(super) struct DeploymentLimits {
     inflight: AtomicU32,
     windows: Box<[Window]>,
     limit_strikes: AtomicU32,
+    /// After a limit, one request at a time probes the deployment until one succeeds.
+    probe: AtomicBool,
 }
 
 impl DeploymentLimits {
@@ -51,6 +53,7 @@ impl DeploymentLimits {
             })
             .collect(),
             limit_strikes: AtomicU32::new(0),
+            probe: AtomicBool::new(false),
         }
     }
 
@@ -113,6 +116,8 @@ impl DeploymentLimits {
         if self
             .concurrent
             .is_some_and(|max| self.inflight.load(Ordering::Relaxed) >= max)
+            || (self.limit_strikes.load(Ordering::Relaxed) > 0
+                && self.probe.load(Ordering::Relaxed))
         {
             ready = ready.max(now + CONCURRENCY_RETRY);
         }
@@ -120,7 +125,18 @@ impl DeploymentLimits {
     }
 
     pub fn admit(self: &Arc<Self>, tokens: u64) -> Option<Permit> {
-        let permit = if let Some(max) = self.concurrent {
+        let mut probe = Permit(None, None);
+        if self.limit_strikes.load(Ordering::Relaxed) > 0 {
+            if self
+                .probe
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+            {
+                return None;
+            }
+            probe.1 = Some(self.clone());
+        }
+        let mut permit = if let Some(max) = self.concurrent {
             let mut inflight = self.inflight.load(Ordering::Relaxed);
             loop {
                 if inflight >= max {
@@ -136,9 +152,9 @@ impl DeploymentLimits {
                     Err(actual) => inflight = actual,
                 }
             }
-            Permit(Some(self.clone()))
+            Permit(Some(self.clone()), None)
         } else {
-            Permit(None)
+            Permit(None, None)
         };
         let now = Instant::now();
         let mut windows: Vec<_> = self
@@ -159,6 +175,7 @@ impl DeploymentLimits {
                 used.total += cost;
             }
         }
+        permit.1 = probe.1.take();
         Some(permit)
     }
 }
@@ -222,12 +239,15 @@ impl Usage {
     }
 }
 
-pub(super) struct Permit(Option<Arc<DeploymentLimits>>);
+pub(super) struct Permit(Option<Arc<DeploymentLimits>>, Option<Arc<DeploymentLimits>>);
 
 impl Drop for Permit {
     fn drop(&mut self) {
         if let Some(limits) = &self.0 {
             limits.inflight.fetch_sub(1, Ordering::Relaxed);
+        }
+        if let Some(limits) = &self.1 {
+            limits.probe.store(false, Ordering::Relaxed);
         }
     }
 }
@@ -369,5 +389,23 @@ mod tests {
             assert!(limits.admit(0).is_some());
         }
         assert!(limits.windows[0].lock(Instant::now()).entries.is_empty());
+    }
+
+    #[test]
+    fn after_a_limit_only_one_probe_is_in_flight_until_a_success() {
+        let limits = Arc::new(DeploymentLimits::new(QuotaSpec::default()));
+        limits.limited(None, Duration::from_millis(1), Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(5));
+        let probe = limits.admit(0).expect("one probe after the cooldown");
+        assert!(limits.admit(0).is_none(), "others wait for the probe");
+        drop(probe);
+        let probe = limits.admit(0).expect("a new probe once the last one ends");
+        limits.succeeded();
+        drop(probe);
+        let (a, b) = (limits.admit(0), limits.admit(0));
+        assert!(
+            a.is_some() && b.is_some(),
+            "a success restores full traffic"
+        );
     }
 }
