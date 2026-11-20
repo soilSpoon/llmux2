@@ -22,4 +22,4 @@ uuid.workspace = true
 hyper-util.workspace = true
 llmux-testkit.workspace = true
 tempfile = "3"
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "test-util"] }
