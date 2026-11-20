@@ -58,6 +58,7 @@ pub struct RuntimeConfig {
     pub api_keys: HashMap<Arc<str>, ApiKey>,
     pub oauth: HashMap<Arc<str>, OAuthCredential>,
     pub model_names: HashMap<Arc<str>, usize>,
+    pub model_allowed_keys: HashMap<usize, Box<[Arc<str>]>>,
     pub models: Box<[CanonicalModel]>,
     pub deployments: Box<[Deployment]>,
 }
@@ -182,6 +183,7 @@ enum RawCredential {
 #[serde(deny_unknown_fields)]
 struct RawModel {
     name: String,
+    allowed_keys: Option<Vec<String>>,
     #[serde(default)]
     aliases: Vec<String>,
     strategy: Option<Strategy>,
@@ -197,7 +199,7 @@ struct RawModel {
 struct RawDeployment {
     id: String,
     credential: String,
-    base_url: String,
+    base_url: Option<String>,
     upstream_model: String,
     #[serde(default)]
     priority: i32,
@@ -348,10 +350,30 @@ impl RawConfig {
             return Err(invalid("at least one model is required"));
         }
         let mut model_names = HashMap::new();
+        let mut model_allowed_keys = HashMap::new();
         let mut canonical_models = Vec::new();
         let mut deployment_ids = HashSet::new();
         let mut deployments = Vec::new();
         for model in models {
+            let allowed_keys = model
+                .allowed_keys
+                .as_ref()
+                .map(|refs| {
+                    let keys = refs
+                        .iter()
+                        .map(|key| resolve_secret(key))
+                        .collect::<Result<Box<[_]>, _>>()?;
+                    if keys.is_empty() || keys.iter().any(|key| !client_keys.contains(key)) {
+                        return Err(invalid(
+                            "allowed_keys must be a nonempty subset of server.client_keys",
+                        ));
+                    }
+                    Ok(keys)
+                })
+                .transpose()?;
+            if let Some(keys) = allowed_keys {
+                model_allowed_keys.insert(canonical_models.len(), keys);
+            }
             let name: Arc<str> = model.name.into();
             for alias in
                 std::iter::once(name.clone()).chain(model.aliases.into_iter().map(Arc::from))
@@ -382,6 +404,20 @@ impl RawConfig {
                     .get(dep.credential.as_str())
                     .cloned()
                     .ok_or_else(|| invalid("deployment references an unknown credential"))?;
+                if provider.0.as_ref() == "openai_responses"
+                    && oauth.contains_key(dep.credential.as_str())
+                    && !model_allowed_keys.contains_key(&canonical_models.len())
+                {
+                    return Err(invalid("OAuth openai_responses models require allowed_keys for the owner's gateway keys"));
+                }
+                let base_url = dep
+                    .base_url
+                    .as_deref()
+                    .or_else(|| {
+                        (provider.0.as_ref() == "openai_responses")
+                            .then_some("https://api.openai.com/v1")
+                    })
+                    .ok_or_else(|| invalid("deployment requires base_url"))?;
                 if dep.upstream_model.is_empty() || dep.weight == Some(0) {
                     return Err(invalid(
                         "upstream_model must not be empty and weight must be positive",
@@ -406,7 +442,7 @@ impl RawConfig {
                     id,
                     provider,
                     credential: dep.credential.into(),
-                    base_url: upstream_uri(&dep.base_url)?,
+                    base_url: upstream_uri(base_url)?,
                     upstream_model: dep.upstream_model.into(),
                     priority: dep.priority,
                     weight: dep.weight.unwrap_or(1),
@@ -445,6 +481,7 @@ impl RawConfig {
             api_keys,
             oauth,
             model_names,
+            model_allowed_keys,
             models: canonical_models.into_boxed_slice(),
             deployments: deployments.into_boxed_slice(),
         })

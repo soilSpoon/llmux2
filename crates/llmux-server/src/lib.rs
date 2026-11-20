@@ -17,7 +17,9 @@ use http_body_util::LengthLimitError;
 use llmux_config::{ApiKey, RuntimeConfig};
 use llmux_core::{Executor, GatewayError};
 use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
-use llmux_providers::{truncate_middle, Anthropic, OpenAiCompat, RequestMetadata, StaticKey};
+use llmux_providers::{
+    truncate_middle, Anthropic, OpenAiCompat, OpenAiResponses, RequestMetadata, StaticKey,
+};
 use llmux_types::{
     ContextOverflow, CredentialSource, GatewayRequest, GatewayResponse, InboundFormat,
     ProviderRegistry, RequestId, UpstreamError,
@@ -45,6 +47,7 @@ pub async fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Se
         registry.register(Arc::new(OpenAiCompat::new(kind)));
     }
     registry.register(Arc::new(Anthropic::new(ANTHROPIC)));
+    registry.register(Arc::new(OpenAiResponses::new()));
     let mut sources = std::mem::take(&mut config.api_keys)
         .into_iter()
         .map(|(id, ApiKey { provider, key })| {
@@ -114,7 +117,8 @@ async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) 
             }
         },
     };
-    let body = match body::to_bytes(request.into_body(), MAX_REQUEST_BYTES).await {
+    let (parts, body) = request.into_parts();
+    let body = match body::to_bytes(body, MAX_REQUEST_BYTES).await {
         Ok(body) => body,
         Err(err)
             if err
@@ -144,6 +148,19 @@ async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) 
     };
 
     let model: Arc<str> = Arc::from(metadata.model.as_ref());
+    if state
+        .config
+        .model_names
+        .get(model.as_ref())
+        .and_then(|idx| state.config.model_allowed_keys.get(idx))
+        .is_some_and(|keys| !authorized(&parts.headers, keys))
+    {
+        return error(
+            StatusCode::FORBIDDEN,
+            "model_not_allowed",
+            "Gateway key is not allowed to use this model",
+        );
+    }
     let request_id = RequestId(Arc::from(uuid::Uuid::new_v4().to_string()));
     let request = |body: Bytes, prompt_bytes: u64| GatewayRequest {
         format,
