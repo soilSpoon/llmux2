@@ -510,9 +510,10 @@ fn gateway_error(err: GatewayError) -> Response {
         GatewayError::Client(UpstreamError::RateLimited { retry_after, .. }) => {
             rate_limited(retry_after.unwrap_or_default())
         }
-        GatewayError::Client(UpstreamError::BadRequest { status, body }) => {
-            upstream_client_error(status, body)
-        }
+        GatewayError::Client(
+            UpstreamError::BadRequest { status, body }
+            | UpstreamError::ModelNotFound { status, body },
+        ) => upstream_client_error(status, body),
         GatewayError::Client(UpstreamError::ContextLength) => error(
             StatusCode::BAD_REQUEST,
             "context_length_exceeded",

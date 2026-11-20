@@ -533,6 +533,10 @@ impl Executor {
                                 break 'groups;
                             }
                         }
+                        Err(GatewayError::Client(err @ UpstreamError::ModelNotFound { .. })) => {
+                            incompatible.push(idx);
+                            last_transient = Some(err);
+                        }
                         Err(GatewayError::Client(
                             // A stream error here precedes the first downstream byte.
                             err @ (UpstreamError::Server { .. }

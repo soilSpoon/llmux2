@@ -40,6 +40,8 @@ enum Reply {
     EmptyStream,
     GatedStream(Arc<Semaphore>),
     BadRequest,
+    NotFound(&'static str),
+    EmbeddedModelNotFound,
     StructuredBadRequest(Value),
     ContextLength,
     HtmlPayloadTooLarge,
@@ -162,6 +164,10 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
         Reply::BadRequest => (
             StatusCode::BAD_REQUEST, Json(json!({"error": {"message": "bad input"}})),
         ).into_response(),
+        Reply::NotFound(code) => (
+            StatusCode::NOT_FOUND, Json(json!({"error":{"message":"not found","code":code}})),
+        ).into_response(),
+        Reply::EmbeddedModelNotFound => Json(json!({"error":{"code":"model_not_found"}})).into_response(),
         Reply::StructuredBadRequest(payload) => (StatusCode::BAD_REQUEST, Json(payload)).into_response(),
         Reply::HtmlPayloadTooLarge => (
             StatusCode::PAYLOAD_TOO_LARGE, axum::response::Html("<h1>Proxy error</h1>"),
@@ -1162,6 +1168,46 @@ async fn never_retries_after_stream_event() {
     assert!(output.contains("\"code\":\"stream_broken\""));
     assert!(!output.contains("[DONE]"));
     assert_eq!(fixture.counts(), [1, 0]);
+}
+
+#[tokio::test]
+async fn only_explicit_upstream_model_not_found_fails_over() {
+    for stream in [false, true] {
+        for (reply, status) in [
+            (Reply::BadRequest, StatusCode::BAD_REQUEST),
+            (Reply::NotFound("not_found"), StatusCode::NOT_FOUND),
+            (Reply::NotFound("model_not_found"), StatusCode::OK),
+        ] {
+            let fixture = Fixture::start(
+                [reply, Reply::Complete],
+                [Reply::Complete, Reply::Complete],
+                "",
+            )
+            .await;
+            let response = fixture.request("test-client", "shared", stream).await;
+            assert_eq!(response.status(), status);
+            if status == StatusCode::OK {
+                check_route(&response, "d2", "2");
+            }
+            drop(body(response).await);
+            assert_eq!(fixture.counts(), [1, usize::from(status == StatusCode::OK)]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn embedded_upstream_model_not_found_fails_over() {
+    let fixture = Fixture::start(
+        [Reply::EmbeddedModelNotFound, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture.request("test-client", "shared", false).await;
+    check_route(&response, "d2", "2");
+    let payload: Value = serde_json::from_str(&body(response).await).unwrap();
+    assert_eq!(payload["id"], "vendor-secondary");
+    assert_eq!(fixture.counts(), [1, 1]);
 }
 
 #[tokio::test]
