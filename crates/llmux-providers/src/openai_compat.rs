@@ -45,7 +45,8 @@ pub struct RequestMetadata<'a> {
     pub stream: bool,
     /// Bytes of strings and object keys in prompt fields, excluding `data:` URLs.
     pub prompt_bytes: u64,
-    /// `max_completion_tokens`, else `max_tokens`, else `max_output_tokens`.
+    /// The output limit the inbound format forwards: Responses `max_output_tokens`,
+    /// Chat `max_completion_tokens` else `max_tokens`, Anthropic `max_tokens`.
     pub max_output_tokens: Option<u32>,
 }
 
@@ -74,7 +75,7 @@ struct RawRequestMetadata<'a> {
 }
 
 impl<'a> RequestMetadata<'a> {
-    pub fn parse(body: &'a [u8]) -> Result<Self, BuildError> {
+    pub fn parse(body: &'a [u8], format: InboundFormat) -> Result<Self, BuildError> {
         if body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
             return Err(BuildError::InvalidBody);
         }
@@ -100,11 +101,21 @@ impl<'a> RequestMetadata<'a> {
             .iter()
             .map(|text| text.0)
             .sum(),
-            max_output_tokens: tokens(raw.max_completion_tokens)
-                .or_else(|| tokens(raw.max_tokens))
-                .or_else(|| tokens(raw.max_output_tokens)),
+            max_output_tokens: match format {
+                InboundFormat::OpenAiResponses => tokens(raw.max_output_tokens),
+                InboundFormat::OpenAiChat => {
+                    tokens(raw.max_completion_tokens).or_else(|| tokens(raw.max_tokens))
+                }
+                InboundFormat::AnthropicMessages => tokens(raw.max_tokens),
+            },
         })
     }
+}
+
+fn is_base64_data_url(text: &str) -> bool {
+    text.strip_prefix("data:")
+        .and_then(|rest| rest.split_once(',').map(|(media, _)| media))
+        .is_some_and(|media| media.len() < 256 && media.ends_with(";base64"))
 }
 
 /// Sums string and key lengths of any JSON value without allocating.
@@ -123,7 +134,7 @@ impl<'de> Deserialize<'de> for TextBytes {
             }
 
             fn visit_str<E>(self, v: &str) -> Result<TextBytes, E> {
-                Ok(TextBytes(if v.starts_with("data:") {
+                Ok(TextBytes(if is_base64_data_url(v) {
                     0
                 } else {
                     v.len() as u64
@@ -1027,7 +1038,7 @@ mod tests {
     #[test]
     fn request_metadata_counts_prompt_text_and_output_tokens() {
         let body = br#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"h\u00e9llo"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}],"tools":[{"type":"function"}],"metadata":{"ignored":"text"},"max_tokens":7,"temperature":0.5}"#;
-        let meta = RequestMetadata::parse(body).unwrap();
+        let meta = RequestMetadata::parse(body, InboundFormat::OpenAiChat).unwrap();
         assert_eq!(meta.model, "m");
         assert!(!meta.stream);
         let counted = [
@@ -1045,18 +1056,35 @@ mod tests {
         .sum::<u64>();
         assert_eq!(meta.prompt_bytes, counted);
         assert_eq!(meta.max_output_tokens, Some(7));
-        for (fields, expected) in [
-            (r#""max_tokens":7,"max_completion_tokens":9"#, Some(9)),
-            (r#""max_output_tokens":5,"input":"abcd""#, Some(5)),
-            (r#""max_tokens":null,"max_output_tokens":5"#, Some(5)),
-            (r#""max_tokens":-1"#, None),
-            (r#""max_tokens":1.5"#, None),
-            (r#""max_tokens":"7""#, None),
-            (r#""max_tokens":99999999999"#, None),
+        let chat = InboundFormat::OpenAiChat;
+        let responses = InboundFormat::OpenAiResponses;
+        for (format, fields, expected) in [
+            (chat, r#""max_tokens":7,"max_completion_tokens":9"#, Some(9)),
+            (
+                chat,
+                r#""max_tokens":7,"max_completion_tokens":null"#,
+                Some(7),
+            ),
+            (chat, r#""max_output_tokens":5"#, None),
+            (
+                responses,
+                r#""max_output_tokens":5,"max_tokens":7"#,
+                Some(5),
+            ),
+            (responses, r#""max_completion_tokens":9"#, None),
+            (
+                InboundFormat::AnthropicMessages,
+                r#""max_tokens":7"#,
+                Some(7),
+            ),
+            (chat, r#""max_tokens":-1"#, None),
+            (chat, r#""max_tokens":1.5"#, None),
+            (chat, r#""max_tokens":"7""#, None),
+            (chat, r#""max_tokens":99999999999"#, None),
         ] {
             let body = format!(r#"{{"model":"m",{fields}}}"#);
             assert_eq!(
-                RequestMetadata::parse(body.as_bytes())
+                RequestMetadata::parse(body.as_bytes(), format)
                     .unwrap()
                     .max_output_tokens,
                 expected,
@@ -1065,9 +1093,21 @@ mod tests {
         }
         let meta = RequestMetadata::parse(
             br#"{"model":"m","input":"abcd","instructions":"ef","system":null}"#,
+            responses,
         )
         .unwrap();
         assert_eq!(meta.prompt_bytes, 6);
+        for (text, counted) in [
+            ("data: 1,2,3", true),
+            ("data:text/plain,hello", true),
+            ("data:image/png;base64,AAAA", false),
+            ("data:;base64,AAAA", false),
+        ] {
+            let body = serde_json::json!({"model": "m", "input": text}).to_string();
+            let meta = RequestMetadata::parse(body.as_bytes(), responses).unwrap();
+            let expected = if counted { text.len() as u64 } else { 0 };
+            assert_eq!(meta.prompt_bytes, expected, "{text}");
+        }
     }
 
     #[test]
@@ -1092,7 +1132,7 @@ mod tests {
                 "{invalid}"
             );
             assert!(
-                RequestMetadata::parse(invalid.as_bytes()).is_err(),
+                RequestMetadata::parse(invalid.as_bytes(), InboundFormat::OpenAiChat).is_err(),
                 "{invalid}"
             );
         }

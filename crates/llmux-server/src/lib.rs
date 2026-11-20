@@ -110,7 +110,7 @@ async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) 
             )
         }
     };
-    let Ok(metadata) = RequestMetadata::parse(&body) else {
+    let Ok(metadata) = RequestMetadata::parse(&body, format) else {
         return error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
