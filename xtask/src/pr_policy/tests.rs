@@ -39,6 +39,28 @@ fn empty_body_reports_every_section() {
     assert_eq!(check("", &[], "").len(), 4);
 }
 #[test]
+fn section_with_only_hashes_whitespace_or_headings_is_empty() {
+    for content in [
+        "##",
+        "##   ",
+        "  ####  ",
+        "#######",
+        " \t\n ",
+        "### Nested",
+        "### Nested\n##\n### Other",
+    ] {
+        let errors = check(&FILLED.replace("Adds X.", content), &[], "");
+        assert_eq!(errors.len(), 1, "{content:?}: {errors:?}");
+        assert!(errors[0].contains("Summary"), "{content:?}: {errors:?}");
+    }
+    for content in ["##", "### \n\t"] {
+        let errors = check(&FILLED.replace("Repo-native fallback.", content), &[], "");
+        assert_eq!(errors.len(), 1, "{content:?}: {errors:?}");
+        assert!(errors[0].contains("Workflow and learning"));
+    }
+    assert!(check(&FILLED.replace("Adds X.", "##not a heading"), &[], "").is_empty());
+}
+#[test]
 fn heading_level_and_case_are_flexible() {
     assert!(check(
         &FILLED.replace("## Verification", "### verification"),
