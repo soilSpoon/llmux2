@@ -156,6 +156,16 @@ pub(super) fn exclusions(
     Ok(excluded)
 }
 
+fn is_excluded(excluded: &BTreeSet<String>, name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    excluded.iter().any(|pattern| {
+        let pattern = pattern.to_ascii_lowercase();
+        pattern
+            .strip_suffix('*')
+            .map_or(name == pattern, |prefix| name.starts_with(prefix))
+    })
+}
+
 pub(super) fn append(
     models: &mut Vec<Value>,
     options: &OmniRouteFallback<'_>,
@@ -165,7 +175,7 @@ pub(super) fn append(
 ) -> Result<(), String> {
     for model in models.iter_mut() {
         let name = string(model, "name").to_owned();
-        if model.get("allowed_keys").is_some() || excluded.contains(&name) {
+        if model.get("allowed_keys").is_some() || is_excluded(&excluded, &name) {
             insert(&mut excluded, &name)?;
             for alias in array(model, "aliases").iter().filter_map(Value::as_str) {
                 insert(&mut excluded, alias)?;
@@ -211,6 +221,21 @@ mod tests {
         .unwrap();
         assert_eq!(models[0], original);
         assert_eq!(models[1]["exclude"], json!(["owner", "owner-alias"]));
+    }
+
+    #[test]
+    fn models_matching_an_exclusion_prefix_get_no_fallback_leg() {
+        let original = json!({"name":"OpenAI/GPT","deployments":[{"id":"primary","priority":0}]});
+        let mut models = vec![original.clone()];
+        append(
+            &mut models,
+            &OPTIONS,
+            "fallback",
+            &mut HashSet::new(),
+            BTreeSet::from(["openai/*".to_owned()]),
+        )
+        .unwrap();
+        assert_eq!(models[0], original);
     }
 
     #[test]
