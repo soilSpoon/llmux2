@@ -116,9 +116,8 @@ impl Executor {
                     .get(&dep.provider)
                     .ok_or_else(|| InitError::UnknownProvider(dep.provider.0.clone()))?
                     .clone();
-                let auth = dep
-                    .credential
-                    .as_ref()
+                let credential = (!dep.credential.is_empty()).then_some(&dep.credential);
+                let auth = credential
                     .map(|id| {
                         credentials
                             .get(id)
@@ -126,7 +125,7 @@ impl Executor {
                             .ok_or(InitError::MissingCredential)
                     })
                     .transpose()?;
-                let disabled = dep.credential.as_ref().map_or_else(
+                let disabled = credential.map_or_else(
                     || Arc::new(AtomicBool::new(false)),
                     |id| disabled.entry(id.clone()).or_default().clone(),
                 );

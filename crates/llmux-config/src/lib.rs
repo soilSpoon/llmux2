@@ -438,7 +438,7 @@ impl RawConfig {
                     idx,
                     id,
                     provider,
-                    credential: dep.credential.map(Arc::from),
+                    credential: dep.credential.unwrap_or_default().into(),
                     base_url: upstream_uri(&dep.base_url)?,
                     upstream_model: dep.upstream_model.into(),
                     priority: dep.priority,

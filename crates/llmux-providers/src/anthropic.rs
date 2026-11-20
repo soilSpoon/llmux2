@@ -855,7 +855,7 @@ mod tests {
             idx: DeploymentIdx(0),
             id: "a".into(),
             provider: a.kind().clone(),
-            credential: Some("key".into()),
+            credential: "key".into(),
             base_url: "https://example.com/v1/".parse().unwrap(),
             upstream_model: "claude".into(),
             priority: 0,

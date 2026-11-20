@@ -110,7 +110,8 @@ page only exposes account-specific limits, no number is invented.
 - **H4** [Official chat front OpenAPI schema](https://oai.aihorde.net/openapi.json),
   discovered from the Swagger UI at [the official root](https://oai.aihorde.net):
   `AIHordeApiKey` description: “An AI Horde API key. Omit it to use the anonymous key `0000000000`.”
-  Therefore the importer chooses true keyless access, not a stored anonymous key.
+  Therefore true keyless access is supported, without a stored anonymous key.
+  Importer mapping of anonymous connections is handled separately in PR #28.
 - **O1** [OpenRouter limits](https://openrouter.ai/docs/api-reference/limits.md):
   “Making additional accounts or API keys will not affect your rate limits, as we govern capacity globally.”
   Free usage table headings: “Credits purchased (all time) | Requests per minute | Requests per day”;

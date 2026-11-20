@@ -63,7 +63,8 @@ pub struct Deployment {
     pub idx: DeploymentIdx,
     pub id: Arc<str>,
     pub provider: ProviderKind,
-    pub credential: Option<Arc<str>>,
+    /// Empty for explicitly anonymous deployments.
+    pub credential: Arc<str>,
     pub base_url: http::Uri,
     pub upstream_model: Arc<str>,
     pub priority: i32,

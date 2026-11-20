@@ -39,18 +39,7 @@ Move the secrets and update references together when relocating the config.
 On failure, newly created secret files may remain; review/remove them before
 retrying. Non-Unix secure file creation is not supported.
 
-Active API-key connections become credentials. Explicit `no-auth`/`none`
-connections at the documented Kilo (`https://ai-gateway.kilo.ai/api/v1`) and
-AI Horde (`https://oai.aihorde.net/v1`) chat endpoints become `auth = "none"`
-deployments without secret files. Built-in IDs include `kilo`, `kilo-free`, and
-`aihorde`; compatible custom nodes at these exact URLs also qualify. Other
-anonymous endpoints remain skipped until their official API access is established.
-AI Horde's official OpenAPI description says “Omit it to use the anonymous key
-`0000000000`”, so no synthetic Bearer credential is necessary. See
-https://oai.aihorde.net/openapi.json. Anonymous and keyed connections can coexist
-in one combo. Local bridges remain skipped regardless of auth type.
-
-Each nonempty combo becomes a
+Active API-key connections become credentials. Each nonempty combo becomes a
 canonical model; connection priorities sort ascending within each step. Pinned
 connections and allowed-connection lists restrict selection. Nested combos expand
 inline (cycle/depth/deployment limits and a 1024-step work budget per top-level

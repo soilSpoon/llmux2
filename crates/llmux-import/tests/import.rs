@@ -26,7 +26,7 @@ fn imports_raw_sqlite_dump_through_shared_mapping() {
         .map(|index| {
             let deployment = &config.deployments[index.0 as usize];
             (
-                deployment.credential.as_ref().unwrap().to_string(),
+                deployment.credential.to_string(),
                 deployment.upstream_model.to_string(),
                 deployment.priority,
             )
@@ -44,8 +44,6 @@ fn imports_raw_sqlite_dump_through_shared_mapping() {
     assert_eq!(
         config.deployments[pinned[0].0 as usize]
             .credential
-            .as_ref()
-            .unwrap()
             .to_string(),
         "upstream-slow"
     );
@@ -148,7 +146,7 @@ fn imports_and_validates_real_config() {
             .map(|idx| {
                 let d = &config.deployments[idx.0 as usize];
                 (
-                    d.credential.as_ref().unwrap().to_string(),
+                    d.credential.to_string(),
                     d.upstream_model.to_string(),
                     d.priority,
                 )
