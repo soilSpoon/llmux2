@@ -26,6 +26,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let address = config.server.listen;
     let shutdown_timeout = config.server.shutdown_timeout;
+    let drain_grace = config.server.drain_grace;
     let app = llmux_server::app(config).await?;
     let listener = llmux_server::bind(address).await?;
     eprintln!("llmux-server listening on {}", listener.local_addr()?);
@@ -40,6 +41,6 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         #[cfg(not(unix))]
         let _ = tokio::signal::ctrl_c().await;
     };
-    llmux_server::serve(listener, app, shutdown, shutdown_timeout).await?;
+    llmux_server::serve(listener, app, shutdown, shutdown_timeout, drain_grace).await?;
     Ok(())
 }

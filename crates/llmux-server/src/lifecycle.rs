@@ -40,7 +40,8 @@ fn with_shutdown(
         let state = state.clone();
         let mut cancel = cancel.clone();
         async move {
-            if request.uri().path() == "/healthz" && state.load(Ordering::Acquire) {
+            let http1 = matches!(request.version(), http::Version::HTTP_10 | http::Version::HTTP_11);
+            let mut response = if request.uri().path() == "/healthz" && state.load(Ordering::Acquire) {
                 (http::StatusCode::SERVICE_UNAVAILABLE, "draining").into_response()
             } else {
                 let response = tokio::select! {
@@ -50,7 +51,11 @@ fn with_shutdown(
                 let (parts, body) = response.into_parts();
                 let stream = body.into_data_stream().take_until(async move { let _ = cancel.changed().await; });
                 axum::response::Response::from_parts(parts, axum::body::Body::from_stream(stream))
+            };
+            if http1 && state.load(Ordering::Acquire) {
+                response.headers_mut().insert(http::header::CONNECTION, http::HeaderValue::from_static("close"));
             }
+            response
         }
     }))
 }
@@ -60,6 +65,7 @@ pub async fn serve(
     app: Router,
     shutdown: impl Future<Output = ()> + Send + 'static,
     shutdown_timeout: Duration,
+    drain_grace: Duration,
 ) -> io::Result<()> {
     #[cfg(unix)]
     let notify_socket = std::env::var_os("NOTIFY_SOCKET").map(std::path::PathBuf::from);
@@ -101,6 +107,9 @@ pub async fn serve(
             if let Some(socket) = notify_socket {
                 let _ = crate::notify::send(&socket, "STOPPING=1");
             }
+        }
+        if !drain_grace.is_zero() {
+            tokio::time::sleep(drain_grace).await;
         }
         let _ = began.send(());
     })
@@ -179,6 +188,8 @@ mod tests {
             request(&mut connection, "/work").await.contains("200"),
             "authorized work must survive drain admission"
         );
+        let address = server.url().trim_start_matches("http://").to_owned();
+        let mut connection = BufReader::new(tokio::net::TcpStream::connect(address).await.unwrap());
         let status = request(&mut connection, "/healthz").await;
         assert!(status.contains(StatusCode::SERVICE_UNAVAILABLE.as_str()));
     }

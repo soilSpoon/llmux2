@@ -38,20 +38,23 @@ For converted Anthropic Chat streams, set `stream_options.include_usage` to `tru
 ## Health, shutdown and deployment
 
 `GET /healthz` is unauthenticated and returns `200 ok`; it is excluded from
-dashboard statistics. On SIGTERM or SIGINT, the server marks itself draining,
-returns 503 only for health probes, closes its listener,
-and waits for in-flight requests and SSE streams. Real requests reaching an
-existing connection during the handoff are still served; Hyper closes
-keep-alive connections after the current response. After
-`server.shutdown_timeout_ms` (default 60000, valid range 1–86400000 ms), it exits
-successfully even if work remains; those unfinished connections are closed.
+dashboard statistics. On SIGTERM or SIGINT, the server marks itself draining
+and returns 503 only for health probes. For `server.drain_grace_ms` (default
+2000, valid range 0–86400000 ms), it keeps accepting connections and serving
+real requests, adding `Connection: close` to HTTP/1 responses so keep-alive
+clients reconnect to the new slot. Zero disables this lame-duck interval.
+After that interval, it closes the listener and lets in-flight requests and
+SSE streams finish. The subsequent drain is bounded by
+`server.shutdown_timeout_ms` (default 60000, valid range 1–86400000 ms). It exits
+successfully when that timeout expires even if work remains; those unfinished
+connections are closed.
 Clients should allow streams to finish within that budget.
 
 `llmux-server --check CONFIG` loads and validates configuration without binding
 or contacting upstreams, prints the configured listen address, and exits 0
 (invalid config: exit 1). Existing configs need no changes. Older binaries do
-not recognize `shutdown_timeout_ms`; remove that field when rolling back to an
-older version.
+not recognize `shutdown_timeout_ms` or `drain_grace_ms`; remove unsupported fields
+when rolling back to an older version.
 
 Unix listeners use SO_REUSEADDR and SO_REUSEPORT for overlapping slot handoffs.
 Under systemd, NOTIFY_SOCKET receives READY=1 after application/listener setup

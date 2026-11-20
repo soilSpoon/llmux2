@@ -85,6 +85,7 @@ mod tests {
                 let _ = shutdown.await;
             },
             Duration::from_secs(1),
+            Duration::ZERO,
         ));
         let mut buffer = [0; 64];
         let count = timeout(Duration::from_millis(100), receiver.recv(&mut buffer))

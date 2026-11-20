@@ -64,7 +64,14 @@ The guard starts the recorded slot only if neither slot is active (including
 restarting/stopping) and health fails. Restart=always and the HTTP-gated
 watchdog handle crashes and wedged processes. Slot logs are
 `$HOME/llmux2/server-a.log` and `server-b.log`; arrange log rotation externally.
-Keep `server.shutdown_timeout_ms` below the service's 90-second stop timeout.
+On SIGTERM the old slot immediately sends STOPPING=1 and reports healthz 503,
+but keeps accepting/serving for `server.drain_grace_ms` (default 2000 ms,
+range 0–86400000; 0 disables the grace). Its HTTP/1 responses carry
+`Connection: close`, giving keep-alive clients time to migrate before the old
+listener closes. Only then does the bounded in-flight/SSE drain start.
+Keep `server.drain_grace_ms + server.shutdown_timeout_ms` below the service's
+90-second stop timeout. The grace mitigates the close/send race; it does not
+guarantee error-free handoffs for clients stalled beyond the grace interval.
 
 ## Rollback and deliberate stop
 

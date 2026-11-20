@@ -34,6 +34,7 @@ pub struct ServerConfig {
     pub client_keys: Box<[Arc<str>]>,
     pub request_timeout: Duration,
     pub shutdown_timeout: Duration,
+    pub drain_grace: Duration,
     pub expose_routing_headers: bool,
     pub dashboard_key: Option<Arc<str>>,
 }
@@ -110,6 +111,7 @@ struct RawServer {
     client_keys: Vec<String>,
     request_timeout_ms: u64,
     shutdown_timeout_ms: u64,
+    drain_grace_ms: u64,
     expose_routing_headers: bool,
     dashboard_key: Option<String>,
 }
@@ -121,6 +123,7 @@ impl Default for RawServer {
             client_keys: Vec::new(),
             request_timeout_ms: DEFAULT_TIMEOUT_MS,
             shutdown_timeout_ms: 60_000,
+            drain_grace_ms: 2_000,
             expose_routing_headers: true,
             dashboard_key: None,
         }
@@ -235,6 +238,11 @@ impl RawConfig {
             models,
         } = self;
         let request_timeout = timeout(server.request_timeout_ms)?;
+        if server.drain_grace_ms > MAX_TIMEOUT_MS {
+            return Err(invalid(
+                "server.drain_grace_ms must be between 0 and 86400000",
+            ));
+        }
         if server.client_keys.is_empty() {
             return Err(invalid(
                 "server.client_keys must contain at least one secret reference",
@@ -469,6 +477,7 @@ impl RawConfig {
                 client_keys,
                 request_timeout,
                 shutdown_timeout: timeout(server.shutdown_timeout_ms)?,
+                drain_grace: Duration::from_millis(server.drain_grace_ms),
                 expose_routing_headers: server.expose_routing_headers,
                 dashboard_key,
             },
@@ -641,6 +650,28 @@ refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
             &base.replace("[server]", "[server]\nshutdown_timeout_ms = 1234")
         )
         .is_ok());
+    }
+
+    #[test]
+    fn drain_grace_validation() {
+        let base = config(REQUIRED);
+        assert_eq!(
+            RuntimeConfig::parse(&base).unwrap().server.drain_grace,
+            Duration::from_millis(2000)
+        );
+        for value in [0, 1, 2000, 86_400_000] {
+            let input = base.replace("[server]", &format!("[server]\ndrain_grace_ms = {value}"));
+            assert_eq!(
+                RuntimeConfig::parse(&input).unwrap().server.drain_grace,
+                Duration::from_millis(value)
+            );
+        }
+        let input = base.replace("[server]", "[server]\ndrain_grace_ms = 86400001");
+        assert!(RuntimeConfig::parse(&input)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("drain_grace_ms"));
     }
 
     fn error(fields: &str) -> String {
