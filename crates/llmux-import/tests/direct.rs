@@ -209,6 +209,43 @@ fn unavailable_mapping_winners_reserve_direct_names() {
 }
 
 #[test]
+fn wildcard_mappings_resolve_direct_only_names_without_legacy_aliases() {
+    for (target, available) in [("mapped-id", true), ("missing-id", false)] {
+        let mut root = fixture();
+        root["modelAliases"] = json!({});
+        root["combos"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":"mapped-id","name":"mapping-winner","models":["anthropic/winner"]}));
+        root["modelComboMappings"] =
+            json!([{"pattern":"gateway/*","comboId":target,"enabled":true}]);
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out.toml");
+        let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+        let config = RuntimeConfig::load(output).unwrap();
+        if available {
+            assert_eq!(
+                config.model_names.get("gateway/deepseek/text"),
+                config.model_names.get("mapping-winner")
+            );
+            let winner = &config.models[config.model_names["gateway/deepseek/text"]];
+            assert_eq!(
+                config.deployments[winner.deployments[0].0 as usize]
+                    .upstream_model
+                    .as_ref(),
+                "winner"
+            );
+        } else {
+            assert!(!config.model_names.contains_key("gateway/deepseek/text"));
+            assert!(report.warnings.iter().any(|warning| warning
+                .contains("alias gateway/deepseek/text: target unavailable (winning mapping)")));
+        }
+        assert!(config.model_names.contains_key("node/deepseek/text"));
+        assert!(!config.model_names.contains_key("gateway/not-observed"));
+    }
+}
+
+#[test]
 fn repeated_custom_routing_segments_preserve_vendor_ids_and_observed_names() {
     let mut root = fixture();
     root["combos"][0]["models"].as_array_mut().unwrap().extend([
