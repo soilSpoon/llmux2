@@ -11,6 +11,25 @@ Use OmniRoute's operator-only `GET /api/settings/export-json` export
 it contains plaintext credentials. Unknown fields are tolerated. Unversioned
 legacy JSON is accepted with a warning, including combos stored as `data` JSON.
 
+Raw SQLite table dumps are also auto-detected by the `provider_connections`
+root; use the same CLI command without converting the file first. Supported
+tables are `provider_connections`, `provider_nodes`, `combos`, and optional
+`api_keys`. Snake_case columns and boolean or 0/1 `is_active` values are
+normalized into the same import path. Combo `data` may be an object or JSON
+string; steps retain their camelCase fields such as `connectionId`.
+JSON columns (`custom_headers_json`, `provider_specific_data`, and
+`rate_limit_overrides_json`) accept objects, encoded objects, or null;
+malformed values fail without printing their contents. Connections and steps
+marked `usable: false` are skipped with warnings in either input format.
+Other dump roots (including `key_value`, model mappings, and overrides) are
+ignored with one summary warning. Provider-specific base URL overrides are
+not applied. No table-dump contents are required as repository fixtures.
+
+Redacted credential placeholders with printable non-whitespace ASCII are
+treated as opaque credentials and written only to secret files, never TOML or
+logs. This permits offline validation, not working upstream authentication;
+replace placeholders securely before use.
+
 The output directory must already exist. The default secret directory is
 `secrets/` beside the output. On Unix, the directory is secured to 0700 and each
 secret is exclusively created at 0600; existing output/secret files are never
