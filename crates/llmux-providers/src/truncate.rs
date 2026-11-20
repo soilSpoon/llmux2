@@ -21,27 +21,71 @@ struct Conversation<'a> {
 }
 
 #[derive(Default, Deserialize)]
-struct ItemKind {
+struct Item {
     #[serde(default)]
     role: Option<String>,
     #[serde(default, rename = "type")]
     kind: Option<String>,
     #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<IdPart>>,
+    #[serde(default)]
     content: Option<serde_json::Value>,
 }
 
-impl ItemKind {
-    /// Tool results must stay with the call before them: Chat `tool` messages,
-    /// Responses `function_call_output` items, Anthropic `tool_result` blocks.
+#[derive(Deserialize)]
+struct IdPart {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+impl Item {
+    /// Call ids this item makes or answers: Chat `tool_calls`/`tool_call_id`,
+    /// Responses `call_id`, Anthropic `tool_use`/`tool_result` blocks.
+    fn call_ids(&self) -> Vec<&str> {
+        let mut ids: Vec<&str> = self
+            .call_id
+            .iter()
+            .chain(&self.tool_call_id)
+            .map(String::as_str)
+            .collect();
+        ids.extend(
+            self.tool_calls
+                .iter()
+                .flatten()
+                .filter_map(|call| call.id.as_deref()),
+        );
+        if let Some(parts) = self.content.as_ref().and_then(|content| content.as_array()) {
+            ids.extend(parts.iter().filter_map(|part| match part["type"].as_str() {
+                Some("tool_use") => part["id"].as_str(),
+                Some("tool_result") => part["tool_use_id"].as_str(),
+                _ => None,
+            }));
+        }
+        ids
+    }
+
+    /// A result that follows its call; without a matching id it stays with the item before it.
     fn is_tool_result(&self) -> bool {
-        self.role.as_deref() == Some("tool")
+        matches!(self.role.as_deref(), Some("tool" | "function"))
             || self.kind.as_deref() == Some("function_call_output")
             || self
                 .content
                 .as_ref()
-                .and_then(|c| c.as_array())
+                .and_then(|content| content.as_array())
                 .is_some_and(|parts| parts.iter().any(|part| part["type"] == "tool_result"))
     }
+}
+
+fn root(parent: &mut [usize], mut i: usize) -> usize {
+    while parent[i] != i {
+        parent[i] = parent[parent[i]];
+        i = parent[i];
+    }
+    i
 }
 
 struct Unit {
@@ -66,24 +110,58 @@ pub fn truncate_middle(
         bytes.div_ceil(4) + u64::from(max_output_tokens.unwrap_or(0)) <= u64::from(limit)
     };
 
-    let mut units: Vec<Unit> = Vec::new();
-    for (i, item) in items.iter().enumerate() {
-        let kind: ItemKind = serde_json::from_str(item.get()).unwrap_or_default();
-        let bytes = serde_json::from_str::<TextBytes>(item.get()).ok()?.0;
-        match kind.role.as_deref() {
-            Some("system" | "developer") => {}
-            _ if kind.is_tool_result() && !units.is_empty() => {
-                let unit = units.last_mut()?;
-                unit.items.push(i);
-                unit.bytes += bytes;
-            }
-            _ => units.push(Unit {
-                items: vec![i],
-                bytes,
-            }),
+    // Items sharing a call id (a call and its results) are dropped together.
+    let mut parent: Vec<usize> = (0..items.len()).collect();
+    let mut bytes_of = vec![0; items.len()];
+    let mut conversation = Vec::new();
+    let mut seen = std::collections::HashMap::new();
+    for (i, raw) in items.iter().enumerate() {
+        let item: Item = serde_json::from_str(raw.get()).unwrap_or_default();
+        bytes_of[i] = serde_json::from_str::<TextBytes>(raw.get()).ok()?.0;
+        if matches!(item.role.as_deref(), Some("system" | "developer")) {
+            continue;
         }
+        let ids = item.call_ids();
+        let mut matched = false;
+        for id in ids {
+            match seen.get(id) {
+                Some(&j) => {
+                    let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                    parent[a.max(b)] = a.min(b);
+                    matched = true;
+                }
+                None => {
+                    seen.insert(id.to_owned(), i);
+                }
+            }
+        }
+        if !matched && item.is_tool_result() {
+            if let Some(&previous) = conversation.last() {
+                let (a, b) = (root(&mut parent, i), root(&mut parent, previous));
+                parent[a.max(b)] = a.min(b);
+            }
+        }
+        conversation.push(i);
     }
-    let droppable = units.len().checked_sub(1)?;
+    let latest = root(&mut parent, *conversation.last()?);
+    let mut units: Vec<Unit> = Vec::new();
+    let mut unit_of = std::collections::HashMap::new();
+    for &i in &conversation {
+        let r = root(&mut parent, i);
+        if r == latest {
+            continue;
+        }
+        let unit = *unit_of.entry(r).or_insert_with(|| {
+            units.push(Unit {
+                items: Vec::new(),
+                bytes: 0,
+            });
+            units.len() - 1
+        });
+        units[unit].items.push(i);
+        units[unit].bytes += bytes_of[i];
+    }
+    let droppable = units.len();
     let center = droppable / 2;
     let (mut start, mut end) = (center, center);
     let mut bytes = prompt_bytes;
@@ -217,6 +295,78 @@ mod tests {
         assert_eq!(
             contents(&out.body, "messages"),
             [format!("u1{filler}"), "latest".into()]
+        );
+    }
+
+    #[test]
+    fn keeps_parallel_calls_and_legacy_function_results_with_their_calls() {
+        let filler = "w".repeat(400);
+        let body = Bytes::from(
+            json!({
+                "model": "m",
+                "input": [
+                    {"role": "user", "content": format!("u1{filler}")},
+                    {"type": "function_call", "call_id": "a", "arguments": filler},
+                    {"type": "function_call", "call_id": "b", "arguments": filler},
+                    {"type": "function_call_output", "call_id": "a", "output": "oa"},
+                    {"type": "function_call_output", "call_id": "b", "output": "ob"},
+                    {"role": "user", "content": "latest"},
+                ],
+            })
+            .to_string(),
+        );
+        let bytes = prompt_bytes(&body);
+        let out = truncate_middle(&body, bytes, None, (bytes.div_ceil(4) - 50) as u32).unwrap();
+        let kept = contents(&out.body, "input");
+        assert_eq!(out.dropped, 2, "{kept:?}");
+        assert_eq!(
+            kept,
+            [
+                format!("u1{filler}"),
+                String::new(),
+                "ob".into(),
+                "latest".into()
+            ]
+        );
+
+        let body = Bytes::from(
+            json!({
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": format!("u1{filler}")},
+                    {"role": "assistant", "content": null, "function_call": {"name": "f", "arguments": filler}},
+                    {"role": "function", "name": "f", "content": "result"},
+                    {"role": "user", "content": "latest"},
+                ],
+            })
+            .to_string(),
+        );
+        let bytes = prompt_bytes(&body);
+        let out = truncate_middle(&body, bytes, None, (bytes.div_ceil(4) - 50) as u32).unwrap();
+        assert_eq!(out.dropped, 2);
+        assert_eq!(
+            contents(&out.body, "messages"),
+            [format!("u1{filler}"), "latest".into()]
+        );
+
+        let body = Bytes::from(
+            json!({
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": format!("u1{filler}")},
+                    {"role": "assistant", "content": "", "tool_calls": [{"id": "c"}]},
+                    {"role": "user", "content": format!("u2{filler}")},
+                    {"role": "tool", "tool_call_id": "c", "content": "latest"},
+                ],
+            })
+            .to_string(),
+        );
+        let bytes = prompt_bytes(&body);
+        let out = truncate_middle(&body, bytes, None, (bytes.div_ceil(4) - 50) as u32).unwrap();
+        assert_eq!(out.dropped, 1);
+        assert_eq!(
+            contents(&out.body, "messages"),
+            [format!("u1{filler}"), String::new(), "latest".into()]
         );
     }
 
