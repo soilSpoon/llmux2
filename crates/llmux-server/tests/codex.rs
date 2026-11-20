@@ -1,4 +1,4 @@
-use axum::{body::Bytes, routing::post, Json, Router};
+use axum::{body::Bytes, response::IntoResponse, routing::post, Json, Router};
 use http::{header, HeaderMap, Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
@@ -88,6 +88,7 @@ fn oauth_codex_requires_owner_keys() {
 
 async fn fixture(
     events: String,
+    omit_content_type: bool,
 ) -> (
     tempfile::TempDir,
     TestServer,
@@ -112,7 +113,14 @@ async fn fixture(
                     async move {
                         assert_eq!(headers[header::AUTHORIZATION], "Bearer access");
                         seen.lock().unwrap().push(body);
-                        ([(header::CONTENT_TYPE, "text/event-stream")], events)
+                        if omit_content_type {
+                            http::Response::builder()
+                                .body(events)
+                                .unwrap()
+                                .into_response()
+                        } else {
+                            ([(header::CONTENT_TYPE, "text/event-stream")], events).into_response()
+                        }
                     }
                 }),
             ),
@@ -140,7 +148,7 @@ fn events() -> String {
 
 #[tokio::test]
 async fn responses_normalization_aggregation_and_relay() {
-    let (_dir, _upstream, gateway, calls) = fixture(events()).await;
+    let (_dir, _upstream, gateway, calls) = fixture(events(), false).await;
     for stream in [false, true] {
         let body = json!({"model":"codex","input":"Hi","instructions":"Be brief","stream":stream,"store":true,"temperature":1,"top_p":1,"max_output_tokens":20,"metadata":{},"background":true,"user":"someone","moderation":{},"multi_agent":{},"prompt":{},"prompt_cache_retention":"24h","safety_identifier":"x","top_logprobs":2,"truncation":"auto","max_tool_calls":3});
         let (status, body) = send(&gateway.url(), "responses", "owner-key", body).await;
@@ -163,8 +171,24 @@ async fn responses_normalization_aggregation_and_relay() {
 }
 
 #[tokio::test]
+async fn missing_upstream_content_type_is_accepted() {
+    // The real Codex upstream (api.openai.com/v1/responses) returns its SSE
+    // stream without a Content-Type header.
+    let (_dir, _upstream, gateway, _) = fixture(events(), true).await;
+    let (status, body) = send(
+        &gateway.url(),
+        "responses",
+        "owner-key",
+        json!({"model":"codex","input":"Hi"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), completed());
+}
+
+#[tokio::test]
 async fn rejects_unsupported_inputs_and_owner_mismatch_without_upstream() {
-    let (_dir, _upstream, gateway, calls) = fixture(events()).await;
+    let (_dir, _upstream, gateway, calls) = fixture(events(), false).await;
     for model in ["codex", "alias"] {
         let (status, _) = send(
             &gateway.url(),
@@ -195,7 +219,7 @@ async fn rejects_unsupported_inputs_and_owner_mismatch_without_upstream() {
 
 #[tokio::test]
 async fn chat_roundtrip_and_images_tools() {
-    let (_dir, _upstream, gateway, calls) = fixture(events()).await;
+    let (_dir, _upstream, gateway, calls) = fixture(events(), false).await;
     for stream in [false, true] {
         let (status, body) = send(&gateway.url(), "chat/completions", "owner-key", json!({"model":"codex","stream":stream,"messages":[{"role":"system","content":"Be brief"},{"role":"user","content":[{"type":"text","text":"Hi"},{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]},{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"test","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c1","content":"ok"}],"tools":[{"type":"function","function":{"name":"test","parameters":{"type":"object"}}}]})).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -224,7 +248,7 @@ async fn chat_roundtrip_and_images_tools() {
 #[tokio::test]
 async fn interrupted_and_failed_streams_are_not_success() {
     for events in [String::new(), "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"subscription_sharing_usage_limit_exceeded\"}}}\n\n".into()] {
-        let (_dir, _upstream, gateway, _) = fixture(events).await;
+        let (_dir, _upstream, gateway, _) = fixture(events, false).await;
         assert_ne!(send(&gateway.url(), "responses", "owner-key", json!({"model":"codex","input":[]})).await.0, StatusCode::OK);
     }
 }
@@ -421,7 +445,7 @@ async fn function_output_converts_to_chat_json_and_sse() {
         json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":"{}"}),
         json!({"type":"response.completed","response":response})
     );
-    let (_dir, _upstream, gateway, _) = fixture(events).await;
+    let (_dir, _upstream, gateway, _) = fixture(events, false).await;
     for stream in [false, true] {
         let (status, body) = send(
             &gateway.url(),
@@ -547,7 +571,7 @@ async fn chat_usage_is_opt_in_and_separate_from_finish() {
         json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"c1","name":"test","arguments":""}}),
         json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":"{}"}),
     ].iter().map(|value| format!("data: {value}\n\n")).collect::<String>();
-    let (_dir, _upstream, gateway, _) = fixture(format!("{prefix}{}", events())).await;
+    let (_dir, _upstream, gateway, _) = fixture(format!("{prefix}{}", events()), false).await;
     for include in [None, Some(false), Some(true)] {
         let mut request = json!({"model":"codex","stream":true,"messages":[]});
         if let Some(include) = include {
