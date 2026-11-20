@@ -62,7 +62,12 @@ pub(super) fn prepare(
     direct: &BTreeMap<String, Value>,
     order: &mut Vec<String>,
     warnings: &mut Vec<String>,
-) -> (BTreeMap<String, String>, HashMap<String, Value>) {
+    official_replacements: bool,
+) -> (
+    BTreeMap<String, String>,
+    HashMap<String, Value>,
+    HashSet<String>,
+) {
     let mut aliases = alias_map(root, warnings);
     let mut mappings: Vec<_> = array(root, "modelComboMappings")
         .iter()
@@ -104,6 +109,16 @@ pub(super) fn prepare(
                     .is_some_and(|combo| combo["isActive"] != false)
             });
             if let Some(target) = target {
+                if official_replacements && name.starts_with("openrouter/") {
+                    aliases.remove(&name);
+                    if super::replacements::find(&name["openrouter/".len()..]).is_none() {
+                        unavailable.insert(name.clone());
+                    }
+                    warnings.push(format!(
+                        "alias {name}: source mapping replaced by reviewed official-only policy"
+                    ));
+                    continue;
+                }
                 aliases.insert(name, target.clone());
             } else {
                 warnings.push(format!(
@@ -112,6 +127,11 @@ pub(super) fn prepare(
                 aliases.remove(&name);
                 unavailable.insert(name);
             }
+        } else if official_replacements && name.starts_with("openrouter/") {
+            aliases.remove(&name);
+            warnings.push(format!(
+                "alias {name}: source alias replaced by reviewed official-only policy"
+            ));
         }
     }
     let mut resolved = BTreeMap::new();
@@ -171,7 +191,7 @@ pub(super) fn prepare(
         );
         order.push(terminal);
     }
-    (resolved, synthetic)
+    (resolved, synthetic, unavailable)
 }
 
 pub(super) fn attach(

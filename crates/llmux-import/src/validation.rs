@@ -40,9 +40,27 @@ impl Drop for ValidationMarker {
     }
 }
 
-pub(super) fn validate(config: &Value, fallback: bool, dir: &Path) -> Result<(), String> {
+pub(super) fn validate(
+    config: &Value,
+    fallback: bool,
+    dir: &Path,
+    external: &[&str],
+) -> Result<(), String> {
     let mut config = config.clone();
     let mut temporary = None;
+    if !external.is_empty() {
+        let marker = ValidationMarker::create(dir)?;
+        let reference = format!("file:{}", marker.0.display());
+        for credential in config["credentials"].as_array_mut().into_iter().flatten() {
+            if credential["key"]
+                .as_str()
+                .is_some_and(|key| external.contains(&key))
+            {
+                credential["key"] = reference.clone().into();
+            }
+        }
+        temporary = Some(marker);
+    }
     if fallback {
         let reference = if let Some(reference) = config["credentials"][0]["key"].as_str() {
             reference.to_owned()
@@ -75,7 +93,7 @@ mod tests {
     fn failed_validation_removes_the_public_marker() {
         let dir = tempfile::tempdir().unwrap();
         let config = json!({"server":{"listen":"invalid"},"credentials":[],"models":[]});
-        assert!(validate(&config, true, dir.path()).is_err());
+        assert!(validate(&config, true, dir.path(), &[]).is_err());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }
