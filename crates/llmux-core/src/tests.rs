@@ -196,6 +196,37 @@ async fn refresh_once_then_success() {
 }
 
 #[tokio::test]
+async fn refreshed_retry_obeys_rpm_limit() {
+    let (mut executor, adapter, credential, _server) =
+        fixture(vec![UpstreamError::Auth { refreshable: true }], false).await;
+    executor.bindings[0].limits = Arc::new(DeploymentLimits::new(llmux_types::QuotaSpec {
+        rpm: Some(1),
+        ..Default::default()
+    }));
+    let response = executor.execute(request()).await.unwrap();
+    assert_eq!(response.deployment.as_ref(), "dep1");
+    assert_eq!(response.attempts, 2);
+    assert_eq!(credential.refreshes.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        *adapter.calls.lock().unwrap(),
+        vec![("dep0".into(), "0".into()), ("dep1".into(), "1".into())]
+    );
+}
+
+#[tokio::test]
+async fn refreshed_retry_releases_previous_concurrency_permit() {
+    let (mut executor, _, _, _server) =
+        fixture(vec![UpstreamError::Auth { refreshable: true }], false).await;
+    executor.bindings[0].limits = Arc::new(DeploymentLimits::new(llmux_types::QuotaSpec {
+        concurrent: Some(1),
+        ..Default::default()
+    }));
+    let response = executor.execute(request()).await.unwrap();
+    assert_eq!(response.deployment.as_ref(), "dep0");
+    assert_eq!(response.attempts, 2);
+}
+
+#[tokio::test]
 async fn failed_auth_disables_shared_credential_and_falls_back() {
     for refreshable in [true, false] {
         let (executor, adapter, credential, _server) = fixture(

@@ -198,16 +198,15 @@ impl Executor {
                 if now >= deadline {
                     return Err(GatewayError::Client(UpstreamError::Timeout));
                 }
-                let Some(permit) = binding.limits.admit() else {
-                    last_transient = None;
-                    continue;
-                };
-
                 let mut refreshed = false;
                 loop {
                     if attempts == self.cfg.routing.max_attempts {
                         break 'groups;
                     }
+                    let Some(permit) = binding.limits.admit() else {
+                        last_transient = None;
+                        break;
+                    };
                     attempts += 1;
                     let attempt_deadline = deadline.min(Instant::now() + dep.timeout);
                     let result = timeout_at(attempt_deadline, self.attempt(&req, dep, binding))
