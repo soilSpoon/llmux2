@@ -15,6 +15,22 @@ fn fixture() -> Value {
 }
 
 #[test]
+fn deepseek_models_on_anthropic_nodes_import_without_stripping() {
+    let mut root = fixture();
+    root["providerNodes"][0]["type"] = json!("anthropic-compatible");
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let config = RuntimeConfig::load(output).unwrap();
+    assert!(!config.deployments.is_empty());
+    for dep in &config.deployments {
+        assert_eq!(dep.upstream_model.as_ref(), "deepseek/test");
+        assert_eq!(dep.provider.0.as_ref(), "anthropic");
+        assert!(dep.strip_request_fields.is_empty());
+    }
+}
+
+#[test]
 fn custom_headers_are_secret_files_and_connection_overrides_replace_node_headers() {
     for override_headers in [
         None,

@@ -914,10 +914,20 @@ pub fn import_with_options(
             .map(|model| array(model, "deployments").len())
             .sum();
     }
+    let credential_providers: HashMap<_, _> = credentials
+        .iter()
+        .map(|credential| (string(credential, "id"), string(credential, "provider")))
+        .collect();
     for model in &mut models {
         if let Some(deployments) = model["deployments"].as_array_mut() {
             for deployment in deployments {
-                if deepseek_model(string(deployment, "upstream_model")) {
+                let provider = credential_providers
+                    .get(string(deployment, "credential"))
+                    .copied()
+                    .unwrap_or_else(|| string(deployment, "provider"));
+                if matches!(provider, KIND_OPENAI | KIND_OPENAI_COMPAT)
+                    && deepseek_model(string(deployment, "upstream_model"))
+                {
                     deployment["strip_request_fields"] =
                         json!(["seed", "user", "safety_identifier", "reasoning.effort"]);
                 }
