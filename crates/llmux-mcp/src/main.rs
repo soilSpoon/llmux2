@@ -47,6 +47,17 @@ impl Admin {
     }
 
     async fn call(&self, method: Method, path: &str, body: Value) -> Result<Value, String> {
+        let parsed =
+            url::Url::parse(&self.url).map_err(|err| format!("bad LLMUX_ADMIN_URL: {err}"))?;
+        let loopback = matches!(
+            parsed.host_str(),
+            Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+        );
+        if parsed.scheme() == "http" && !loopback && self.key.is_some() {
+            return Err(
+                "refusing to send the admin key over plaintext http to a non-loopback host".into(),
+            );
+        }
         let mut request = Request::builder()
             .method(method)
             .uri(format!("{}{}", self.url.trim_end_matches('/'), path))
@@ -54,15 +65,17 @@ impl Admin {
         if let Some(key) = &self.key {
             request = request.header(header::AUTHORIZATION, format!("Bearer {key}"));
         }
-        let response = self
-            .client
-            .request(
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.client.request(
                 request
                     .body(Full::new(Bytes::from(body.to_string())))
                     .map_err(|err| err.to_string())?,
-            )
-            .await
-            .map_err(|err| format!("request failed: {err}"))?;
+            ),
+        )
+        .await
+        .map_err(|_| "request timed out after 30s".to_string())?
+        .map_err(|err| format!("request failed: {err}"))?;
         let status = response.status();
         let body = response
             .into_body()
@@ -70,15 +83,14 @@ impl Admin {
             .await
             .map_err(|err| format!("reading response failed: {err}"))?
             .to_bytes();
-        let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         if status != StatusCode::OK {
-            let detail = parsed["error"]["message"]
-                .as_str()
-                .map(str::to_owned)
+            let detail = serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|body| body["error"]["message"].as_str().map(str::to_owned))
                 .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
             return Err(format!("{status}: {detail}"));
         }
-        Ok(parsed)
+        serde_json::from_slice(&body).map_err(|err| format!("invalid JSON response: {err}"))
     }
 }
 
@@ -99,6 +111,17 @@ async fn call_tool(admin: &Admin, name: &str, args: &Value) -> Result<Value, Str
         "llmux_reload" => admin.call(Method::POST, "/admin/reload", json!({})).await,
         "llmux_set_disabled" => {
             let id = args["id"].as_str().ok_or("missing string argument `id`")?;
+            // Percent-encode: config ids may contain `/`, `%` etc. and the
+            // admin handler decodes the segment before lookup.
+            let mut encoded = String::new();
+            for byte in id.bytes() {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                    encoded.push(byte as char);
+                } else {
+                    encoded.push_str(&format!("%{byte:02X}"));
+                }
+            }
+            let id = encoded;
             let disabled = args["disabled"]
                 .as_bool()
                 .ok_or("missing boolean argument `disabled`")?;
