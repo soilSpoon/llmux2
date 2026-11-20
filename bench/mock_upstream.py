@@ -24,7 +24,7 @@ CLIENT_KEY = "mock-gateway"
 UPSTREAM_KEY = "mock-backend"
 TARGET_RPS = 1000
 OVERHEAD_LIMIT_MS = 1.0
-DEFAULT_FIXED_RATE_ROUNDS = 6
+DEFAULT_FIXED_RATE_ROUNDS = 9
 
 
 def build():
@@ -129,8 +129,8 @@ class Chat:
                                f"{response.getheader('Content-Type')}")
         return response
 
-    def request(self, connection, scheduled=None):
-        start = time.perf_counter() if scheduled is None else scheduled
+    def request(self, connection, scheduled=None, *, timed=True):
+        start = time.perf_counter() if timed and scheduled is None else scheduled
         first = None
         with self.start(connection) as response:
             if self.streaming:
@@ -143,13 +143,13 @@ class Chat:
                         done = True
                     elif has_content(data):
                         tokens += 1
-                        if first is None:
+                        if timed and first is None:
                             first = received - start
                 if not done or tokens != TOKENS:
                     raise RuntimeError(f"incomplete stream: {tokens} tokens, [DONE]={done}")
             elif json.load(response)["choices"][0]["message"]["content"] != "x" * TOKENS:
                 raise RuntimeError("unexpected mock completion")
-        return time.perf_counter() - start, first
+        return (time.perf_counter() - start if timed else None), first
 
     def open_stream(self, connection):
         response = self.start(connection)
@@ -192,7 +192,7 @@ def arrivals(requests, rate):
         yield scheduled
 
 
-def fixed_rate(pool, chat, connections, requests, rate):
+def fixed_rate(pool, chat, connections, requests, rate, *, timed):
     available = queue.SimpleQueue()
     for connection in connections:
         available.put(connection)
@@ -200,16 +200,20 @@ def fixed_rate(pool, chat, connections, requests, rate):
     def request(scheduled):
         connection = available.get()
         try:
-            latency, _ = chat.request(connection, scheduled=scheduled)
+            latency, _ = chat.request(connection, scheduled=scheduled, timed=timed)
             return latency
         finally:
             available.put(connection)
 
     pending = [pool.submit(request, scheduled) for scheduled in arrivals(requests, rate)]
+    if not timed:
+        for future in pending:
+            future.result()
+        return None
     return p99([future.result() for future in pending]) * 1000
 
 
-def load(address, model, key, streaming, concurrency, requests, rate=None):
+def load(address, model, key, streaming, concurrency, requests, rate=None, *, timed=True):
     chat = Chat(model, key, streaming)
     with ExitStack() as stack:
         with concurrent.futures.ThreadPoolExecutor(concurrency) as pool:
@@ -220,11 +224,11 @@ def load(address, model, key, streaming, concurrency, requests, rate=None):
 
             def warm(connection):
                 for _ in range(4):
-                    chat.request(connection)
+                    chat.request(connection, timed=False)
 
             list(pool.map(warm, connections))
             if rate is not None:
-                return fixed_rate(pool, chat, connections, requests, rate)
+                return fixed_rate(pool, chat, connections, requests, rate, timed=timed)
             start = None
 
             def start_timer():
@@ -279,9 +283,14 @@ def round_order(index):
 
 
 def paired_rounds(rounds, measure):
+    for via_gateway in round_order(0):
+        measure(via_gateway, timed=False)
+
     pairs = []
     for index in range(rounds):
-        results = {via_gateway: measure(via_gateway) for via_gateway in round_order(index)}
+        results = {
+            via_gateway: measure(via_gateway, timed=True) for via_gateway in round_order(index)
+        }
         pairs.append((results[False], results[True]))
     return pairs
 
@@ -302,6 +311,9 @@ def report_fixed_rate(pairs):
         deltas.append(delta)
         print(f"| {index + 1} | {order} | {direct:.3f} | {gateway:.3f} | {delta:+.3f} |")
     median, result = overhead_verdict(deltas)
+    direct_p99s, gateway_p99s = zip(*pairs)
+    print(f"\nMedian direct p99: **{statistics.median(direct_p99s):.3f} ms**; "
+          f"median via-gateway p99: **{statistics.median(gateway_p99s):.3f} ms**.")
     print(f"\nJSON gateway p99 overhead target: **{result}** "
           f"(median paired delta {median:+.3f} ms; "
           f"range {min(deltas):+.3f} to {max(deltas):+.3f} ms; "
@@ -330,19 +342,21 @@ def compare(args):
             measurements.append(memory_per_stream(address, model, key, pids, args.concurrency))
         rows.append(measurements)
 
-    def measure_fixed_rate(via_gateway):
+    def measure_fixed_rate(via_gateway, *, timed):
         label = "via gateway" if via_gateway else "direct"
-        print(f"Benchmarking {label} ({TARGET_RPS:,} RPS JSON)…", file=sys.stderr)
+        phase = "Benchmarking" if timed else "Warming up"
+        print(f"{phase} {label} ({TARGET_RPS:,} RPS JSON)…", file=sys.stderr)
         with target(binaries, via_gateway, False, args.workers, args.upstream_delay_ms) as (
             address, model, key, _
         ):
-            return load(address, model, key, False, args.concurrency, args.requests, rate=TARGET_RPS)
+            return load(address, model, key, False, args.concurrency, args.requests,
+                        rate=TARGET_RPS, timed=timed)
 
     pairs = paired_rounds(args.fixed_rate_rounds, measure_fixed_rate)
     print(f"{args.requests} requests per route and mode, {args.concurrency} workers/held "
           f"streams, {args.workers} Tokio workers per server process, "
           f"{args.upstream_delay_ms} ms configured upstream delay, "
-          f"{args.fixed_rate_rounds} fixed-rate rounds.\n")
+          f"{args.fixed_rate_rounds} timed fixed-rate rounds after one untimed warm-up pair.\n")
     print("| Metric | Direct | Via gateway | Gateway − direct |")
     print("| --- | ---: | ---: | ---: |")
     labels = (

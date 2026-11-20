@@ -66,13 +66,16 @@ workers per server process.
 - **1,000 RPS JSON target:** An independent arrival schedule offers one request
   per millisecond, without waiting for previous responses. Latency is measured
   from each scheduled arrival through completion, so client queueing is
-  included when workers lag. The default six paired rounds alternate the
-  direct/gateway run order and take about 49 seconds for the fixed-rate
-  measurements alone. Use `--fixed-rate-rounds` to change the number (at least
-  two). The report shows each round's gateway-minus-direct p99 and its range.
-  The median of those paired differences, not a single run or the difference
-  of route medians, is compared to the design's **< 1 ms** target. The verdict
-  is advisory, not a CI gate; a wide range signals noisy measurements.
+  included when workers lag. One untimed direct/gateway warm-up pair is
+  discarded before nine timed pairs alternate the run order. With default
+  settings the fixed-rate workload takes about 82 seconds to schedule. Use
+  `--fixed-rate-rounds` to change the number of timed pairs (at least two;
+  odd counts select an observed pair as the median). The report shows each
+  round's gateway-minus-direct p99, the range of those differences, and
+  separate direct and gateway p99 medians. The median of the paired
+  differences, not the difference of the route medians, is compared to the
+  design's **< 1 ms** target. The verdict is advisory, not a CI gate; a wide
+  range signals noisy measurements.
 - **Memory:** In fresh processes primed with one JSON request, capture idle
   proportional set size (PSS), open the configured number of streams, and hold
   them after their first content event. Report the median of five PSS samples
