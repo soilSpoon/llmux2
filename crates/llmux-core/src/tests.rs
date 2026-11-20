@@ -425,6 +425,41 @@ async fn exhaustion_after_transient_then_quota_returns_limits() {
 }
 
 #[tokio::test]
+async fn retry_after_excludes_a_deployment_that_does_not_have_the_model() {
+    let (executor, adapter, _, _server) = fixture_full(
+        vec![UpstreamError::ModelNotFound {
+            status: StatusCode::NOT_FOUND,
+            body: Bytes::new(),
+        }],
+        false,
+        [None; 3],
+        &[("model", &[0, 2])],
+        Default::default(),
+        llmux_types::QuotaSpec {
+            rpm: Some(1),
+            ..Default::default()
+        },
+        false,
+    )
+    .await;
+    drop(executor.bindings[2].limits.admit(1).unwrap());
+
+    let Err(GatewayError::AllCandidatesExhausted {
+        attempts,
+        retry_after,
+    }) = executor.execute(request()).await
+    else {
+        panic!("expected the backup's quota to block routing");
+    };
+    assert_eq!(attempts, 1);
+    assert_eq!(adapter.calls.lock().unwrap()[0].0.as_ref(), "dep0");
+    assert!(
+        retry_after > Duration::ZERO,
+        "retry_after = {retry_after:?}"
+    );
+}
+
+#[tokio::test]
 async fn client_error_does_not_fall_back() {
     let (executor, adapter, _, _server) = fixture(
         vec![UpstreamError::BadRequest {
