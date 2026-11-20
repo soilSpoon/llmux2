@@ -35,6 +35,37 @@ Credentials use `provider = "openai"` or `"openai_compat"` for OpenAI-compatible
 
 For converted Anthropic Chat streams, set `stream_options.include_usage` to `true` for a separate usage chunk just before `[DONE]`, or `false` to omit usage. Without this option, usage remains on the finish chunk. Reported cache reads appear in `usage.prompt_tokens_details.cached_tokens` and cache writes in `usage.cache_creation_input_tokens`.
 
+## Health, shutdown and deployment
+
+`GET /healthz` is unauthenticated and returns `200 ok`; it is excluded from
+dashboard statistics. On SIGTERM or SIGINT, the server marks itself draining
+and returns 503 only for health probes. For `server.drain_grace_ms` (default
+2000, valid range 0–10000 ms), it keeps accepting connections and serving
+real requests, adding `Connection: close` to HTTP/1 responses so keep-alive
+clients reconnect to the new slot. Zero disables this lame-duck interval.
+The 10-second cap stays below the unit's 30-second watchdog: a healthy new
+slot's shared-port probe can temporarily reach the draining old slot's 503.
+After that interval, it closes the listener and lets in-flight requests and
+SSE streams finish. The subsequent drain is bounded by
+`server.shutdown_timeout_ms` (default 60000, valid range 1–86400000 ms). It exits
+successfully when that timeout expires even if work remains; those unfinished
+connections are closed.
+Clients should allow streams to finish within that budget.
+
+`llmux-server --check CONFIG` loads and validates configuration without binding
+or contacting upstreams, prints the configured listen address, and exits 0
+(invalid config: exit 1). Existing configs need no changes. Older binaries do
+not recognize `shutdown_timeout_ms` or `drain_grace_ms`; remove unsupported fields
+when rolling back to an older version.
+
+Unix listeners use SO_REUSEADDR and SO_REUSEPORT for overlapping slot handoffs.
+Under systemd, NOTIFY_SOCKET receives READY=1 after application/listener setup
+and STOPPING=1 at drain start. WATCHDOG_USEC enables a periodic TCP HTTP health
+probe; only a successful HTTP 200 sends WATCHDOG=1. See the
+[user-systemd deployment guide](deploy/README.md) for install, recovery,
+migration and rollback instructions, including the host's TCP queue migration
+sysctl.
+
 ## Live dashboard
 
 Add `dashboard_key = "env:LLMUX_DASHBOARD_KEY"` to `[server]`, set that

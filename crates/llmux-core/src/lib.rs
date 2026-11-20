@@ -25,7 +25,7 @@ use llmux_types::{
 use stats::AttemptStats;
 pub use stats::DeploymentStats;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::Range,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -102,6 +102,22 @@ pub struct Executor {
 }
 
 impl Executor {
+    pub fn validate(
+        cfg: &RuntimeConfig,
+        registry: &ProviderRegistry,
+        credentials: &HashSet<Arc<str>>,
+    ) -> Result<(), InitError> {
+        for dep in &cfg.deployments {
+            if registry.get(&dep.provider).is_none() {
+                return Err(InitError::UnknownProvider(dep.provider.0.clone()));
+            }
+            if !dep.credential.is_empty() && !credentials.contains(&dep.credential) {
+                return Err(InitError::MissingCredential);
+            }
+        }
+        Ok(())
+    }
+
     fn shared_limits<'a>(
         shared: &mut Vec<(&'a Deployment, Arc<DeploymentLimits>)>,
         dep: &'a Deployment,
@@ -126,6 +142,7 @@ impl Executor {
         registry: &ProviderRegistry,
         credentials: &HashMap<Arc<str>, Arc<dyn CredentialSource>>,
     ) -> Result<Self, InitError> {
+        Self::validate(&cfg, registry, &credentials.keys().cloned().collect())?;
         let mut disabled = HashMap::<Arc<str>, Arc<AtomicBool>>::new();
         // Deployments that reach the same upstream route draw on one provider limit.
         let mut shared_limits = Vec::<(&Deployment, Arc<DeploymentLimits>)>::new();
