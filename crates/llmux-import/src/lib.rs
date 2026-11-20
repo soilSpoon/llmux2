@@ -496,12 +496,18 @@ pub fn import(
         }
         combos.insert(name, combo);
     }
-    let aliases = aliases::prepare(&root, &mut combos, &combo_ids, &mut order, &mut warnings);
+    let (aliases, synthetic) =
+        aliases::prepare(&root, &combos, &combo_ids, &mut order, &mut warnings);
     let mut models = Vec::new();
     let mut deployment_ids = HashSet::new();
     let mut deployment_count = 0;
     for name in order {
-        let combo = &combos[&name];
+        let lookup = if synthetic.contains_key(&name) {
+            &synthetic
+        } else {
+            &combos
+        };
+        let combo = &lookup[&name];
         let strategy = string(combo, "strategy");
         if !matches!(strategy, "" | "priority" | "fallback" | "round-robin") {
             warnings.push(format!(
@@ -513,7 +519,7 @@ pub fn import(
         }
         let mut deployments = Vec::new();
         Expander {
-            combos: &combos,
+            combos: lookup,
             connections: &connections,
             nodes: array(&root, "providerNodes"),
             warnings: &mut warnings,
