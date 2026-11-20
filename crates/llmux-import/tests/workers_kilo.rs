@@ -36,6 +36,35 @@ fn success(output: &std::process::Output) -> String {
 }
 
 #[test]
+fn replacement_restrictions_exclude_legs_and_mistral_uses_mapped_model() {
+    let mut root = fixture();
+    root["providerNodes"] = json!([{"id":"mistral","prefix":"vibe","type":"openai-compatible","baseUrl":"https://api.mistral.ai/v1"}]);
+    root["providerConnections"].as_array_mut().unwrap().push(json!({"id":"mistral","provider":"mistral","authType":"apikey","apiKey":"synthetic-mistral-key"}));
+    let model = "openrouter/mistralai/mistral-large-4-0";
+    root["combos"].as_array_mut().unwrap().extend([
+        json!({"name":"mapped-mistral","models":[model]}),
+        json!({"name":"pinned","models":[{"model":model,"connectionId":"mistral"}]}),
+        json!({"name":"allowed","models":[{"model":model,"allowedConnectionIds":["mistral"]}]}),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let warnings = success(&run(
+        &root,
+        dir.path(),
+        &[("--openrouter-replacements", dir.path())],
+    ));
+    let config = RuntimeConfig::load(dir.path().join("out.toml")).unwrap();
+    for name in ["pinned", "allowed"] {
+        assert!(!config.model_names.contains_key(name), "unexpected {name}");
+    }
+    let model = &config.models[config.model_names["mapped-mistral"]];
+    assert_eq!(model.deployments.len(), 1);
+    let dep = &config.deployments[model.deployments[0].0 as usize];
+    assert_eq!(dep.upstream_model.as_ref(), "mistral-large-4");
+    assert_eq!(dep.base_url.to_string(), "https://api.mistral.ai/v1");
+    assert!(warnings.contains("source connection restriction"));
+}
+
+#[test]
 fn empty_winning_mapping_blocks_seeded_replacement_and_dependents() {
     for models in [
         json!([]),
