@@ -485,7 +485,7 @@ fn chat_stream(
 mod tests {
     use super::*;
     use futures_util::FutureExt;
-    use llmux_types::{Billing, DeploymentIdx, QuotaSpec, RequestId};
+    use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
     use std::time::Duration;
 
     #[test]
@@ -499,8 +499,6 @@ mod tests {
             base_url: "https://example.com/v1".parse().unwrap(),
             upstream_model: "fixed".into(),
             priority: 0,
-            weight: 1,
-            billing: Billing::default(),
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(10),
             max_context: None,
@@ -520,7 +518,6 @@ mod tests {
                 model: "vendor/New-ID".into(),
                 stream: false,
                 body: Bytes::from(body.to_string()),
-                parsed: Default::default(),
                 est_input_tokens: 0,
                 max_output_tokens: None,
                 context_overflow: None,
