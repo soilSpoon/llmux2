@@ -345,6 +345,17 @@ fn stopped_slots_deploy_to_the_unrecorded_slot() {
     }
 }
 #[test]
+fn invalid_record_does_not_block_redeploy() {
+    let mut f = Fixture::new();
+    f.ops.runtime.active.clear();
+    fs::write(f.temp.0.join("active.json"), "{").unwrap();
+    assert_eq!(f.deploy().unwrap(), "a");
+    assert_eq!(f.ops.runtime.active, BTreeSet::from(["a".into()]));
+    let record: Value =
+        serde_json::from_slice(&fs::read(f.temp.0.join("active.json")).unwrap()).unwrap();
+    assert_eq!(record["slot"], "a");
+}
+#[test]
 fn invalid_config_does_not_touch_units() {
     let mut f = Fixture::new();
     f.ops.runtime.fail_check = true;

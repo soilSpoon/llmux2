@@ -175,8 +175,10 @@ impl<R: Runtime> Deployment<R> {
             Some(_) => "a",
             // With nothing running, stage over the slot the record does not
             // name so a failed deploy leaves a working recovery build.
-            None => match self.record()? {
-                Some(record) if record["slot"] == "a" => "b",
+            None => match self.record() {
+                Ok(Some(record)) if record["slot"] == "a" => "b",
+                // An unreadable record cannot identify a recovery build; a
+                // successful deploy rewrites it, so do not block on it.
                 _ => "a",
             },
         };
