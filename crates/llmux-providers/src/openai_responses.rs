@@ -23,87 +23,6 @@ impl Default for OpenAiResponses {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn chat_function_strictness_preserves_optional_arguments() {
-        for strict in [None, Some(false), Some(true)] {
-            let mut function = json!({"name":"test","parameters":{"type":"object","properties":{"optional":{"type":"string"}},"required":[]}});
-            if let Some(strict) = strict {
-                function["strict"] = json!(strict);
-            }
-            let value = chat_request(
-                &json!({"messages":[],"tools":[{"type":"function","function":function.clone()}]}),
-            )
-            .unwrap();
-            assert_eq!(value["tools"][0]["strict"], json!(strict.unwrap_or(false)));
-            assert_eq!(value["tools"][0]["parameters"], function["parameters"]);
-        }
-        assert_eq!(
-            chat_request(&json!({"messages":[],"tools":[]})).unwrap()["tools"],
-            json!([])
-        );
-    }
-
-    #[test]
-    fn assistant_text_parts_use_valid_input_content() {
-        let value = chat_request(&json!({"messages":[
-            {"role":"assistant","content":"Hello"},
-            {"role":"assistant","content":[{"type":"text","text":"Hello"}]},
-            {"role":"assistant","content":[]},
-        ]}))
-        .unwrap();
-        assert_eq!(
-            value["input"][0],
-            json!({"role":"assistant","content":"Hello"})
-        );
-        assert_eq!(
-            value["input"][1],
-            json!({"role":"assistant","content":[{"type":"input_text","text":"Hello"}]})
-        );
-        assert_eq!(value["input"][2], json!({"role":"assistant","content":[]}));
-        assert!(chat_request(
-            &json!({"messages":[{"role":"assistant","content":[{"type":"text","text":5}]}]})
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn assistant_refusals_survive_chat_history_conversion() {
-        for message in [
-            json!({"role":"assistant","content":null,"refusal":"No"}),
-            json!({"role":"assistant","content":[{"type":"refusal","refusal":"No"}]}),
-            json!({"role":"assistant","content":"Sorry","refusal":"No"}),
-            json!({"role":"assistant","content":[{"type":"text","text":"Sorry"},{"type":"refusal","refusal":"No"}]}),
-            json!({"role":"assistant","content":null,"refusal":""}),
-        ] {
-            let result = chat_request(&json!({"messages":[message.clone()]})).unwrap();
-            assert_eq!(result["input"].as_array().unwrap().len(), 1);
-            let item = &result["input"][0];
-            assert_eq!(item["type"], "message");
-            assert_eq!(item["role"], "assistant");
-            assert_eq!(item["status"], "completed");
-            assert!(item["id"].as_str().unwrap().starts_with("msg_"));
-            let parts = item["content"].as_array().unwrap();
-            let refusal = parts.last().unwrap();
-            assert_eq!(refusal["type"], "refusal");
-            assert_eq!(
-                refusal["refusal"],
-                if message["refusal"] == "" { "" } else { "No" }
-            );
-            if parts.len() == 2 {
-                assert_eq!(
-                    parts[0],
-                    json!({"type":"output_text","text":"Sorry","annotations":[]})
-                );
-            }
-        }
-        assert!(chat_request(&json!({"messages":[{"role":"assistant","refusal":42}]})).is_err());
-    }
-}
-
 impl OpenAiResponses {
     pub fn new() -> Self {
         Self::default()
@@ -570,4 +489,85 @@ fn chat_stream(
         }
         Err(bad_gateway())?;
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_function_strictness_preserves_optional_arguments() {
+        for strict in [None, Some(false), Some(true)] {
+            let mut function = json!({"name":"test","parameters":{"type":"object","properties":{"optional":{"type":"string"}},"required":[]}});
+            if let Some(strict) = strict {
+                function["strict"] = json!(strict);
+            }
+            let value = chat_request(
+                &json!({"messages":[],"tools":[{"type":"function","function":function.clone()}]}),
+            )
+            .unwrap();
+            assert_eq!(value["tools"][0]["strict"], json!(strict.unwrap_or(false)));
+            assert_eq!(value["tools"][0]["parameters"], function["parameters"]);
+        }
+        assert_eq!(
+            chat_request(&json!({"messages":[],"tools":[]})).unwrap()["tools"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn assistant_text_parts_use_valid_input_content() {
+        let value = chat_request(&json!({"messages":[
+            {"role":"assistant","content":"Hello"},
+            {"role":"assistant","content":[{"type":"text","text":"Hello"}]},
+            {"role":"assistant","content":[]},
+        ]}))
+        .unwrap();
+        assert_eq!(
+            value["input"][0],
+            json!({"role":"assistant","content":"Hello"})
+        );
+        assert_eq!(
+            value["input"][1],
+            json!({"role":"assistant","content":[{"type":"input_text","text":"Hello"}]})
+        );
+        assert_eq!(value["input"][2], json!({"role":"assistant","content":[]}));
+        assert!(chat_request(
+            &json!({"messages":[{"role":"assistant","content":[{"type":"text","text":5}]}]})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn assistant_refusals_survive_chat_history_conversion() {
+        for message in [
+            json!({"role":"assistant","content":null,"refusal":"No"}),
+            json!({"role":"assistant","content":[{"type":"refusal","refusal":"No"}]}),
+            json!({"role":"assistant","content":"Sorry","refusal":"No"}),
+            json!({"role":"assistant","content":[{"type":"text","text":"Sorry"},{"type":"refusal","refusal":"No"}]}),
+            json!({"role":"assistant","content":null,"refusal":""}),
+        ] {
+            let result = chat_request(&json!({"messages":[message.clone()]})).unwrap();
+            assert_eq!(result["input"].as_array().unwrap().len(), 1);
+            let item = &result["input"][0];
+            assert_eq!(item["type"], "message");
+            assert_eq!(item["role"], "assistant");
+            assert_eq!(item["status"], "completed");
+            assert!(item["id"].as_str().unwrap().starts_with("msg_"));
+            let parts = item["content"].as_array().unwrap();
+            let refusal = parts.last().unwrap();
+            assert_eq!(refusal["type"], "refusal");
+            assert_eq!(
+                refusal["refusal"],
+                if message["refusal"] == "" { "" } else { "No" }
+            );
+            if parts.len() == 2 {
+                assert_eq!(
+                    parts[0],
+                    json!({"type":"output_text","text":"Sorry","annotations":[]})
+                );
+            }
+        }
+        assert!(chat_request(&json!({"messages":[{"role":"assistant","refusal":42}]})).is_err());
+    }
 }
