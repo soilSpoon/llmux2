@@ -11,6 +11,81 @@ fn fixture() -> Value {
 }
 
 #[test]
+fn anonymous_only_import_needs_no_credentials_or_secret_files() {
+    static ENV: std::sync::Once = std::sync::Once::new();
+    ENV.call_once(|| std::env::set_var("LLMUX_CLIENT_KEY", "synthetic-client-key"));
+    for provider in ["aihorde", "kilo", "kilocode", "custom-kilo"] {
+        for auth in ["no-auth", "none"] {
+            let mut root = fixture();
+            root["apiKeys"] = json!([]);
+            root["providerConnections"][0] =
+                json!({"id":"anon","provider":provider,"authType":auth});
+            root["combos"] = json!([{"name":"anonymous","models":[{"providerId":provider,"model":"vendor/free"}]}]);
+            if provider == "custom-kilo" {
+                root["providerNodes"] = json!([{"id":"custom-kilo","prefix":"kilo","type":"openai-compatible","baseUrl":"https://ai-gateway.kilo.ai/api/v1"}]);
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let output = dir.path().join("out.toml");
+            let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+            assert_eq!(
+                (report.models, report.deployments, report.credentials),
+                (1, 1, 0)
+            );
+            let config = RuntimeConfig::load(&output).unwrap();
+            assert!(config.api_keys.is_empty());
+            assert!(config.oauth.is_empty());
+            assert!(config.deployments[0].credential.is_empty());
+            assert_eq!(fs::read_dir(dir.path().join("secrets")).unwrap().count(), 0);
+            let raw: toml::Value = toml::from_str(&fs::read_to_string(output).unwrap()).unwrap();
+            let dep = &raw["models"][0]["deployments"][0];
+            assert_eq!(dep["auth"].as_str(), Some("none"));
+            assert_eq!(dep["provider"].as_str(), Some("openai_compat"));
+            assert!(dep.get("credential").is_none());
+        }
+    }
+}
+
+#[test]
+fn one_model_can_mix_anonymous_and_keyed_kilo_deployments() {
+    let mut root = fixture();
+    root["providerConnections"] = json!([
+        {"id":"anonymous","provider":"kilo","authType":"none","priority":0},
+        {"id":"keyed","provider":"kilo","authType":"apikey","apiKey":"synthetic-kilo-key","priority":10}
+    ]);
+    root["combos"] = json!([{"name":"mixed","models":["kilo/vendor/free"]}]);
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+    assert_eq!(
+        (report.models, report.deployments, report.credentials),
+        (1, 2, 1)
+    );
+    let config = RuntimeConfig::load(output).unwrap();
+    assert!(config.deployments[0].credential.is_empty());
+    assert_eq!(config.deployments[1].credential.as_ref(), "upstream-keyed");
+    assert!(!dir.path().join("secrets/upstream-anonymous").exists());
+}
+
+#[test]
+fn anonymous_kilo_rejects_nonofficial_urls_before_writing_secrets() {
+    for (provider, prefix) in [("kilo", ""), ("kilocode", ""), ("custom-kilo", "kilo")] {
+        let mut root = fixture();
+        root["providerConnections"].as_array_mut().unwrap().push(json!({"id":"bad","provider":provider,"authType":"none","providerSpecificData":{"baseUrl":"https://unsupported.example/private"}}));
+        root["providerNodes"] = json!([{"id":"custom-kilo","prefix":prefix,"type":"openai-compatible","baseUrl":"https://ai-gateway.kilo.ai/api/v1"}]);
+        let dir = tempfile::tempdir().unwrap();
+        let report =
+            llmux_import::import(&root.to_string(), &dir.path().join("out.toml"), None).unwrap();
+        assert_eq!(report.credentials, 1);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.contains("Kilo requires its public official")));
+        assert!(!report.warnings.join("\n").contains("unsupported.example"));
+        assert!(!dir.path().join("secrets/upstream-bad").exists());
+    }
+}
+
+#[test]
 fn horde_overrides_map_native_roots_and_reject_nonofficial_urls() {
     for auth in ["no-auth", "apikey"] {
         for base_url in [
@@ -98,6 +173,8 @@ fn imports_horde_anonymous_and_keyed_and_kilo_keyed() {
             "test-kilocode-key",
             "openrouter/free",
         ),
+        ("kilo-anon", "kilo", "no-auth", "", "vendor/free"),
+        ("kilocode-anon", "kilocode", "none", "", "openrouter/free"),
     ] {
         root["providerConnections"]
             .as_array_mut()
@@ -114,7 +191,7 @@ fn imports_horde_anonymous_and_keyed_and_kilo_keyed() {
     let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
     assert_eq!(
         (report.models, report.deployments, report.credentials),
-        (6, 6, 6)
+        (8, 8, 4)
     );
     let config = RuntimeConfig::load(&output).unwrap();
     for (name, expected_model, expected_url) in [
@@ -141,10 +218,13 @@ fn imports_horde_anonymous_and_keyed_and_kilo_keyed() {
         assert_eq!(deployment.upstream_model.as_ref(), expected_model);
         assert_eq!(deployment.base_url.to_string(), expected_url);
     }
-    assert_eq!(
-        fs::read_to_string(dir.path().join("secrets/upstream-horde-anon")).unwrap(),
-        "0000000000"
-    );
+    for name in ["horde-anon", "horde-none", "kilo-anon", "kilocode-anon"] {
+        let model = &config.models[config.model_names[name]];
+        let deployment = &config.deployments[model.deployments[0].0 as usize];
+        assert!(deployment.credential.is_empty());
+        assert_eq!(deployment.provider.0.as_ref(), "openai_compat");
+        assert!(!dir.path().join(format!("secrets/upstream-{name}")).exists());
+    }
     assert_eq!(
         fs::read_to_string(dir.path().join("secrets/upstream-horde-keyed")).unwrap(),
         "test-horde-key"
@@ -171,9 +251,29 @@ fn imports_horde_anonymous_and_keyed_and_kilo_keyed() {
 #[test]
 fn skip_precedence_is_explicit_and_replacement_warnings_are_static() {
     for (provider, auth, key, prefix, expected) in [
-        ("kilo", "none", "", "", "add a Kilo API key"),
-        ("kilocode", "no-auth", "", "", "add a Kilo API key"),
-        ("custom-kilo", "none", "", "kilo", "add a Kilo API key"),
+        ("kilo", "none", "", "", "loopback/localhost upstream"),
+        ("kilocode", "no-auth", "", "", "loopback/localhost upstream"),
+        (
+            "kilo",
+            "apikey",
+            "",
+            "",
+            "missing, encrypted or invalid API key",
+        ),
+        (
+            "kilocode",
+            "apikey",
+            "",
+            "",
+            "missing, encrypted or invalid API key",
+        ),
+        (
+            "custom-kilo",
+            "none",
+            "",
+            "kilo",
+            "unknown/non-compatible provider",
+        ),
         (
             "cloudflare-playground",
             "no-auth",

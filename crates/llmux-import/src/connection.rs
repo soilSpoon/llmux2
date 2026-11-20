@@ -1,12 +1,12 @@
 use crate::{string, valid_secret};
 use serde_json::Value;
 
-pub(super) struct SelectedKey<'a> {
-    pub value: &'a str,
-    pub anonymous: bool,
+pub(super) enum SelectedAuth<'a> {
+    Key(&'a str),
+    None,
 }
 
-fn identity<'a>(connection: &'a Value, nodes: &'a [Value]) -> &'a str {
+pub(super) fn identity<'a>(connection: &'a Value, nodes: &'a [Value]) -> &'a str {
     let provider = string(connection, "provider");
     nodes
         .iter()
@@ -26,10 +26,10 @@ fn replacement(provider: &str) -> Option<&'static str> {
     }
 }
 
-pub(super) fn select_key<'a>(
+pub(super) fn select_auth<'a>(
     connection: &'a Value,
     nodes: &[Value],
-) -> Result<SelectedKey<'a>, &'static str> {
+) -> Result<SelectedAuth<'a>, &'static str> {
     if connection["usable"] == false {
         return Err("usable: false");
     }
@@ -43,13 +43,10 @@ pub(super) fn select_key<'a>(
     let auth = string(connection, "authType");
     if matches!(auth, "no-auth" | "none") {
         if provider == "aihorde" && string(connection, "provider") == "aihorde" {
-            return Ok(SelectedKey {
-                value: "0000000000",
-                anonymous: true,
-            });
+            return Ok(SelectedAuth::None);
         }
         if matches!(provider, "kilo" | "kilocode") {
-            return Err("anonymous access needs requests with no auth header, which llmux2 can't configure; add a Kilo API key");
+            return Ok(SelectedAuth::None);
         }
     }
     if !matches!(auth, "apikey" | "api_key" | "api-key") {
@@ -59,8 +56,5 @@ pub(super) fn select_key<'a>(
     if !valid_secret(value) {
         return Err("missing, encrypted or invalid API key");
     }
-    Ok(SelectedKey {
-        value,
-        anonymous: false,
-    })
+    Ok(SelectedAuth::Key(value))
 }

@@ -52,7 +52,8 @@ are sanitized and deduplicated. If there are no client keys, set
 `LLMUX_CLIENT_KEY` before starting the server.
 
 Built-ins: openai, anthropic, openrouter, groq, deepseek (`ds` step alias),
-mistral, xai, together, fireworks, cerebras, gemini, morph. The URL/protocol table comes from
+mistral, xai, together, fireworks, cerebras, gemini, morph, aihorde, kilo, kilocode.
+The URL/protocol table comes from
 OmniRoute `open-sse/config/providers/registry/<provider>/index.ts`.
 Custom `openai-compatible` chat and `anthropic-compatible` nodes use `baseUrl`;
 custom prefix aliases are resolved. llmux appends `/chat/completions` or
@@ -74,12 +75,17 @@ to `/v1beta/openai`; overrides at other roots are skipped with a warning.
 
 AI Horde (`aihorde`) uses the official OpenAI-compatible
 `https://oai.aihorde.net/v1` endpoint, not its native asynchronous API. Active
-`no-auth`/`none` Horde connections use the documented anonymous key in a secret
-file; anonymous use may be restricted under load. API-key connections keep
+`no-auth`/`none` Horde connections use deployment `auth = "none"` with
+`provider = "openai_compat"` and no credential or upstream secret file;
+anonymous use may be restricted under load. API-key connections keep
 their own key; a missing API key is not silently replaced. Vendor/model IDs
 are preserved. Kilo (`kilo`, also OmniRoute's `kilocode` provider ID) uses
-`https://ai-gateway.kilo.ai/api/v1` with an API key. Anonymous Kilo is skipped:
-llmux2 cannot configure requests without an Authorization header.
+`https://ai-gateway.kilo.ai/api/v1` with an API key or the same explicit anonymous
+auth mechanism. Anonymous requests send no Authorization header; Kilo's anonymous
+limits apply per IP. Keyed Horde/Kilo connections with missing keys are skipped,
+never downgraded to anonymous. Kilo custom nodes identified by prefix use the same
+rules and must resolve to the official gateway URL. Native Horde `/api/v2` roots
+are normalized to its official chat facade; other Horde roots are rejected.
 
 Skip precedence is: unusable/inactive, replacement policy, auth/key validation,
 then provider/URL validation (including loopback). Cloudflare direct/playground
@@ -87,7 +93,10 @@ connections remain skipped with an official Workers AI replacement hint;
 DuckDuckGo/DeepAI bridges are dropped without an official replacement; HMS is
 skipped because custom headers are unsupported. Hints identify custom nodes
 by their provider prefix and contain only fixed documentation URLs, never
-connection-supplied URLs. Horde anonymous credentials still pass URL validation.
+connection-supplied URLs. Anonymous connections still pass provider/URL validation.
+When an anonymous-only import has no client keys, loader validation uses a
+temporary public marker file which is removed before return; generated config
+still requires `LLMUX_CLIENT_KEY` and retains no upstream credentials.
 
 ### Public model aliases
 
