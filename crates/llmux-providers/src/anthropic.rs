@@ -17,11 +17,59 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const LIMIT_REMAINING_REQUESTS: &str = "anthropic-ratelimit-requests-remaining";
 const LIMIT_REMAINING_TOKENS: &str = "anthropic-ratelimit-tokens-remaining";
+const REQUEST_LIMIT: (&str, &str) = (
+    LIMIT_REMAINING_REQUESTS,
+    "anthropic-ratelimit-requests-reset",
+);
+const TOKEN_LIMITS: [(&str, &str); 3] = [
+    (LIMIT_REMAINING_TOKENS, "anthropic-ratelimit-tokens-reset"),
+    (
+        "anthropic-ratelimit-input-tokens-remaining",
+        "anthropic-ratelimit-input-tokens-reset",
+    ),
+    (
+        "anthropic-ratelimit-output-tokens-remaining",
+        "anthropic-ratelimit-output-tokens-reset",
+    ),
+];
+
+fn limit_window(
+    headers: &HeaderMap,
+    (remaining, reset): (&str, &str),
+    now: SystemTime,
+) -> (Option<u32>, Option<Duration>) {
+    let remaining = headers
+        .get(remaining)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok());
+    let reset = headers
+        .get(reset)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| OffsetDateTime::parse(v, &Rfc3339).ok())
+        .and_then(|date| Duration::try_from(date - OffsetDateTime::from(now)).ok())
+        .filter(|wait| !wait.is_zero());
+    (remaining, reset)
+}
+
+fn anthropic_retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+    retry_after(headers, now)
+        .filter(|wait| !wait.is_zero())
+        .or_else(|| {
+            [REQUEST_LIMIT]
+                .into_iter()
+                .chain(TOKEN_LIMITS)
+                .map(|window| limit_window(headers, window, now))
+                .filter(|(remaining, _)| remaining.is_none_or(|remaining| remaining == 0))
+                .filter_map(|(_, reset)| reset)
+                .max()
+        })
+}
 
 pub struct Anthropic(ProviderKind);
 
@@ -487,7 +535,7 @@ impl ProviderAdapter for Anthropic {
         match parts.status {
             StatusCode::TOO_MANY_REQUESTS => {
                 return Err(UpstreamError::RateLimited {
-                    retry_after: retry_after(&parts.headers, SystemTime::now()),
+                    retry_after: anthropic_retry_after(&parts.headers, SystemTime::now()),
                 })
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
@@ -531,21 +579,23 @@ impl ProviderAdapter for Anthropic {
         })
     }
     fn observe_limits(&self, headers: &HeaderMap) -> Option<LimitObservation> {
-        let count = |name| {
-            headers
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u32>().ok())
-        };
-        let remaining_requests = count(LIMIT_REMAINING_REQUESTS);
-        let remaining_tokens = count(LIMIT_REMAINING_TOKENS);
+        let now = SystemTime::now();
+        let (remaining_requests, reset_requests) = limit_window(headers, REQUEST_LIMIT, now);
+        let tokens = TOKEN_LIMITS.map(|window| limit_window(headers, window, now));
+        let remaining_tokens = tokens.iter().filter_map(|(remaining, _)| *remaining).min();
+        let reset_tokens = tokens
+            .into_iter()
+            .filter(|(remaining, _)| *remaining == Some(0))
+            .filter_map(|(_, reset)| reset)
+            .max();
         if remaining_requests.is_none() && remaining_tokens.is_none() {
             return None;
         }
         Some(LimitObservation {
             remaining_requests,
             remaining_tokens,
-            ..LimitObservation::default()
+            reset_requests,
+            reset_tokens,
         })
     }
 }
@@ -555,7 +605,83 @@ mod tests {
     use super::*;
     use futures_util::FutureExt;
     use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
+
+    #[test]
+    fn anthropic_retry_after_prefers_the_header_then_valid_reset_windows() {
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let headers = HeaderMap::from_iter([
+            (header::RETRY_AFTER, HeaderValue::from_static("7")),
+            (
+                http::HeaderName::from_static(REQUEST_LIMIT.1),
+                HeaderValue::from_static("1970-01-01T00:00:25Z"),
+            ),
+            (
+                http::HeaderName::from_static(TOKEN_LIMITS[0].1),
+                HeaderValue::from_static("invalid"),
+            ),
+            (
+                http::HeaderName::from_static(TOKEN_LIMITS[1].1),
+                HeaderValue::from_static("1970-01-01T01:00:33.5+01:00"),
+            ),
+            (
+                http::HeaderName::from_static(TOKEN_LIMITS[2].0),
+                HeaderValue::from_static("5"),
+            ),
+            (
+                http::HeaderName::from_static(TOKEN_LIMITS[2].1),
+                HeaderValue::from_static("1970-01-01T00:01:00Z"),
+            ),
+        ]);
+        assert_eq!(
+            anthropic_retry_after(&headers, now),
+            Some(Duration::from_secs(7))
+        );
+        let mut headers = headers;
+        headers.insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_static("Thu, 01 Jan 1970 00:00:20 GMT"),
+        );
+        assert_eq!(
+            anthropic_retry_after(&headers, now),
+            Some(Duration::from_millis(3500))
+        );
+        headers.remove(TOKEN_LIMITS[1].1);
+        assert_eq!(anthropic_retry_after(&headers, now), None);
+    }
     use std::time::Duration;
+
+    #[test]
+    fn exhausted_token_windows_observe_the_latest_applicable_reset() {
+        let adapter = Anthropic::new(provider::ANTHROPIC);
+        for (remaining, expected_seconds) in [
+            (["9", "0", "9"], 30),
+            (["9", "9", "0"], 20),
+            (["0", "0", "0"], 30),
+        ] {
+            let now = OffsetDateTime::now_utc();
+            let mut headers = HeaderMap::new();
+            for (((count_header, reset_header), count), seconds) in
+                TOKEN_LIMITS.into_iter().zip(remaining).zip([10, 30, 20])
+            {
+                headers.insert(count_header, HeaderValue::from_static(count));
+                let reset = now + Duration::from_secs(seconds);
+                headers.insert(
+                    reset_header,
+                    reset.format(&Rfc3339).unwrap().parse().unwrap(),
+                );
+            }
+            let before = OffsetDateTime::now_utc();
+            let observation = adapter.observe_limits(&headers).unwrap();
+            let after = OffsetDateTime::now_utc();
+            let selected = now + Duration::from_secs(expected_seconds);
+            assert_eq!(observation.remaining_tokens, Some(0), "{remaining:?}");
+            let actual = observation.reset_tokens.unwrap();
+            assert!(
+                before + actual <= selected && after + actual >= selected,
+                "unexpected reset duration {actual:?} for {remaining:?}"
+            );
+        }
+    }
 
     #[test]
     fn limit_header_names_match_the_upstream_contract() {
