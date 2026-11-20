@@ -1,4 +1,5 @@
 mod coverage_ratchet;
+mod merge_gate;
 mod pr_policy;
 
 use std::{
@@ -28,7 +29,11 @@ fn main() -> ExitCode {
     let result = match args.as_slice() {
         [cmd] if cmd == "pr-policy" => pr_policy::run(),
         [cmd, path] if cmd == "coverage-ratchet" => coverage_ratchet::run(path),
-        _ => Err("usage: cargo xtask pr-policy | coverage-ratchet <coverage.json>".into()),
+        [cmd, number] if cmd == "merge-gate" => merge_gate::run(number),
+        _ => Err(
+            "usage: cargo xtask pr-policy | coverage-ratchet <coverage.json> | merge-gate <n>"
+                .into(),
+        ),
     };
     match result {
         Ok(true) => ExitCode::SUCCESS,

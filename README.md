@@ -397,6 +397,14 @@ success and 1 on failure. `xtask` is not a default workspace member and depends
 only on `serde_json`, not the gateway crates. New tools belong in separate modules
 behind subcommands of this one binary.
 
+Run `cargo xtask merge-gate <n>` from a trusted, up-to-date main checkout for the
+read-only autonomous merge preflight. It uses the authenticated `gh api` CLI and
+the checked-in ruleset and merge policy; API errors, unknown mergeability,
+unfinished latest checks, and missing fresh independent evidence fail closed.
+Only a passing gate prints `Merge gate passed for PR #N at <sha>.` and exits 0.
+This command does not merge; follow AGENTS.md and pass that exact SHA to the merge
+command. Bootstrap changes to the gate require independent review before use.
+
 PR policy uses its own small `xtask` Rust dependency cache with default save
 behavior, so later PR body edits can reuse it without restoring the gateway's
 workspace and instrumented coverage artifacts. Coverage keeps its default Rust
