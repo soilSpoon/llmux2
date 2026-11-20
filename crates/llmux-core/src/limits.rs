@@ -28,6 +28,10 @@ impl DeploymentLimits {
             .map(|_| self.inflight.load(Ordering::Relaxed))
     }
 
+    pub fn with_shared(spec: QuotaSpec, _shared: &[Arc<Window>]) -> Self {
+        Self::new(spec)
+    }
+
     pub fn new(spec: QuotaSpec) -> Self {
         Self {
             baseline: Instant::now(),
@@ -179,7 +183,7 @@ impl Unit {
 }
 
 /// Sliding window of admitted requests or estimated tokens.
-struct Window {
+pub(super) struct Window {
     max: u64,
     span: Duration,
     unit: Unit,
@@ -193,6 +197,10 @@ struct Usage {
 }
 
 impl Window {
+    pub fn for_quota(_spec: QuotaSpec) -> Vec<Arc<Self>> {
+        Vec::new()
+    }
+
     fn lock(&self, now: Instant) -> std::sync::MutexGuard<'_, Usage> {
         let mut used = self.used.lock().unwrap_or_else(|err| err.into_inner());
         while let Some(&(at, cost)) = used.entries.front() {
@@ -369,5 +377,29 @@ mod tests {
             assert!(limits.admit(0).is_some());
         }
         assert!(limits.windows[0].lock(Instant::now()).entries.is_empty());
+    }
+
+    #[test]
+    fn deployments_sharing_a_key_quota_draw_on_one_window() {
+        let key = Window::for_quota(QuotaSpec {
+            rpm: Some(1),
+            tpd: Some(1_000),
+            ..QuotaSpec::default()
+        });
+        let a = Arc::new(DeploymentLimits::with_shared(QuotaSpec::default(), &key));
+        let b = Arc::new(DeploymentLimits::with_shared(
+            QuotaSpec {
+                rpm: Some(10),
+                ..QuotaSpec::default()
+            },
+            &key,
+        ));
+        let now = Instant::now();
+        assert!(a.admit(10).is_some());
+        assert!(
+            b.admit(10).is_none(),
+            "the key's rpm is shared across its deployments"
+        );
+        assert!(b.available_at(now, 1) >= now + Duration::from_secs(59));
     }
 }
