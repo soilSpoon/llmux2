@@ -12,6 +12,7 @@ use llmux_types::{
     InboundFormat, LimitObservation, LimitScope, ProviderAdapter, ProviderKind, SseEvent, Support,
     UpstreamError, Usage,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -183,17 +184,45 @@ fn convert_request(body: &[u8], model: &str) -> Result<Bytes, BuildError> {
     Ok(Bytes::from(out.to_string()))
 }
 
-fn usage(v: &Value) -> Usage {
-    let count = |k: &str| v[k].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32;
-    Usage {
-        input_tokens: count("input_tokens")
-            .saturating_add(count("cache_creation_input_tokens"))
-            .saturating_add(count("cache_read_input_tokens")),
-        output_tokens: count("output_tokens"),
-    }
+#[derive(Default)]
+struct MessageUsage {
+    tokens: Usage,
+    cached_tokens: Option<u32>,
+    cache_creation_input_tokens: Option<u32>,
 }
-fn usage_json(u: Usage) -> Value {
-    json!({"prompt_tokens":u.input_tokens,"completion_tokens":u.output_tokens,"total_tokens":u64::from(u.input_tokens)+u64::from(u.output_tokens)})
+
+impl MessageUsage {
+    fn parse(value: &Value) -> Self {
+        let count = |key: &str| value[key].as_u64().map(|n| n.min(u32::MAX as u64) as u32);
+        let cached_tokens = count("cache_read_input_tokens");
+        let cache_creation_input_tokens = count("cache_creation_input_tokens");
+        Self {
+            tokens: Usage {
+                input_tokens: count("input_tokens")
+                    .unwrap_or_default()
+                    .saturating_add(cached_tokens.unwrap_or_default())
+                    .saturating_add(cache_creation_input_tokens.unwrap_or_default()),
+                output_tokens: count("output_tokens").unwrap_or_default(),
+            },
+            cached_tokens,
+            cache_creation_input_tokens,
+        }
+    }
+
+    fn chat_json(&self) -> Value {
+        let Usage {
+            input_tokens,
+            output_tokens,
+        } = self.tokens;
+        let mut usage = json!({"prompt_tokens":input_tokens,"completion_tokens":output_tokens,"total_tokens":u64::from(input_tokens)+u64::from(output_tokens)});
+        if let Some(cached) = self.cached_tokens {
+            usage["prompt_tokens_details"] = json!({"cached_tokens":cached});
+        }
+        if let Some(created) = self.cache_creation_input_tokens {
+            usage["cache_creation_input_tokens"] = json!(created);
+        }
+        usage
+    }
 }
 fn finish(v: &Value) -> &'static str {
     match v.as_str() {
@@ -225,7 +254,7 @@ fn convert_response(v: &Value) -> Value {
     if !tools.is_empty() {
         message["tool_calls"] = json!(tools);
     }
-    json!({"id":v["id"],"object":"chat.completion","created":now(),"model":v["model"],"choices":[{"index":0,"message":message,"finish_reason":finish(&v["stop_reason"])}],"usage":usage_json(usage(&v["usage"]))})
+    json!({"id":v["id"],"object":"chat.completion","created":now(),"model":v["model"],"choices":[{"index":0,"message":message,"finish_reason":finish(&v["stop_reason"])}],"usage":MessageUsage::parse(&v["usage"]).chat_json()})
 }
 
 fn client_error(status: StatusCode, body: Bytes, convert: bool) -> UpstreamError {
@@ -251,15 +280,30 @@ struct StreamTool {
     has_arguments: bool,
 }
 
+#[derive(Deserialize)]
+struct ChatStreamOptions {
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Deserialize)]
+struct StreamOptions {
+    include_usage: Option<bool>,
+}
+
 #[derive(Default)]
 struct StreamState {
     id: Value,
     model: Value,
     created: u64,
     tools: HashMap<u64, StreamTool>,
-    usage: Usage,
+    usage: MessageUsage,
+    include_usage: Option<bool>,
 }
 impl StreamState {
+    fn chunk(&self, choices: Value) -> Value {
+        json!({"id":self.id,"object":"chat.completion.chunk","created":self.created,"model":self.model,"choices":choices})
+    }
+
     fn map(&mut self, event: SseEvent) -> Result<Option<SseEvent>, UpstreamError> {
         let v: Value = serde_json::from_str(&event.data).map_err(|_| bad_gateway())?;
         let kind = event.event.as_deref().or_else(|| v["type"].as_str());
@@ -268,7 +312,7 @@ impl StreamState {
                 self.id = v["message"]["id"].clone();
                 self.model = v["message"]["model"].clone();
                 self.created = now();
-                self.usage = usage(&v["message"]["usage"]);
+                self.usage = MessageUsage::parse(&v["message"]["usage"]);
                 (json!({"role":"assistant","content":""}), Value::Null)
             }
             Some("content_block_start") if v["content_block"]["type"] == "tool_use" => {
@@ -318,7 +362,8 @@ impl StreamState {
                 )
             }
             Some("message_delta") => {
-                self.usage.output_tokens = usage(&v["usage"]).output_tokens;
+                self.usage.tokens.output_tokens =
+                    MessageUsage::parse(&v["usage"]).tokens.output_tokens;
                 (json!({}), json!(finish(&v["delta"]["stop_reason"])))
             }
             Some("message_stop") => {
@@ -330,9 +375,11 @@ impl StreamState {
             Some("error") => return Err(bad_gateway()),
             _ => return Ok(None),
         };
-        let mut chunk = json!({"id":self.id,"object":"chat.completion.chunk","created":self.created,"model":self.model,"choices":[{"index":0,"delta":delta,"finish_reason":reason}]});
-        if kind == Some("message_delta") {
-            chunk["usage"] = usage_json(self.usage);
+        let mut chunk = self.chunk(json!([{"index":0,"delta":delta,"finish_reason":reason}]));
+        if self.include_usage == Some(true) {
+            chunk["usage"] = Value::Null;
+        } else if self.include_usage.is_none() && kind == Some("message_delta") {
+            chunk["usage"] = self.usage.chat_json();
         }
         Ok(Some(SseEvent {
             event: None,
@@ -343,12 +390,21 @@ impl StreamState {
 
 fn convert_stream(
     mut events: BoxStream<'static, Result<SseEvent, UpstreamError>>,
+    include_usage: Option<bool>,
 ) -> BoxStream<'static, Result<SseEvent, UpstreamError>> {
     Box::pin(async_stream::try_stream! {
-        let mut state = StreamState::default();
+        let mut state = StreamState {
+            include_usage,
+            ..StreamState::default()
+        };
         while let Some(event) = events.next().await {
             if let Some(event) = state.map(event?)? {
                 let done = event.data == "[DONE]";
+                if done && include_usage == Some(true) {
+                    let mut chunk = state.chunk(json!([]));
+                    chunk["usage"] = state.usage.chat_json();
+                    yield SseEvent { event: None, data: chunk.to_string() };
+                }
                 yield event;
                 if done { return; }
             }
@@ -451,14 +507,22 @@ impl ProviderAdapter for Anthropic {
             }
             let events = sse::decode_until(body, true);
             return Ok(GatewayResponse::Stream(if convert {
-                convert_stream(events)
+                let usage = serde_json::from_slice::<ChatStreamOptions>(&req.body)
+                    .ok()
+                    .and_then(|chat| chat.stream_options)
+                    .and_then(|options| options.include_usage);
+                convert_stream(events, usage)
             } else {
                 events
             }));
         }
         let mut body = collect(body).await?;
         let parsed = serde_json::from_slice::<Value>(&body);
-        let usage = parsed.as_ref().ok().and_then(|v| v.get("usage")).map(usage);
+        let usage = parsed
+            .as_ref()
+            .ok()
+            .and_then(|v| v.get("usage"))
+            .map(|v| MessageUsage::parse(v).tokens);
         if convert {
             body = Bytes::from(convert_response(&parsed.map_err(|_| bad_gateway())?).to_string());
             parts.headers.remove(header::CONTENT_LENGTH);
@@ -632,7 +696,10 @@ mod tests {
         );
         assert_eq!(
             out["usage"],
-            json!({"prompt_tokens":15,"completion_tokens":4,"total_tokens":19})
+            json!({
+                "prompt_tokens":15,"completion_tokens":4,"total_tokens":19,
+                "prompt_tokens_details":{"cached_tokens":2},"cache_creation_input_tokens":3
+            })
         );
         for (reason, expected) in [
             ("end_turn", "stop"),
@@ -690,9 +757,12 @@ mod tests {
             json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}),
             json!({"type":"message_stop"}),
         ];
-        let result = convert_stream(Box::pin(futures_util::stream::iter(
-            source.into_iter().map(|v| Ok(event(v))),
-        )))
+        let result = convert_stream(
+            Box::pin(futures_util::stream::iter(
+                source.into_iter().map(|v| Ok(event(v))),
+            )),
+            None,
+        )
         .collect::<Vec<_>>()
         .now_or_never()
         .unwrap();
@@ -726,6 +796,10 @@ mod tests {
         );
         assert_eq!(chunks[5]["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(chunks[5]["usage"]["total_tokens"], 17);
+        assert_eq!(
+            chunks[5]["usage"]["prompt_tokens_details"]["cached_tokens"],
+            2
+        );
         let mut state = StreamState::default();
         assert!(matches!(
             state.map(event(

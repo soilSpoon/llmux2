@@ -7,6 +7,9 @@ capacity, production suitability, permission to resell, or identical models to a
 OmniRoute bridge. **Unverified** means do not budget capacity or enable that offer
 on the strength of this document.
 
+The compatibility/config sections now include explicit keyless deployment support.
+AI Horde's current official OpenAPI schema was rechecked for anonymous auth.
+
 Only official API keys or explicitly documented anonymous access qualify. Do not
 use playground internals, TLS impersonation, MITM, or consumer OAuth tokens in a
 third-party client. Browser login to obtain an official API key is different from
@@ -27,8 +30,8 @@ leg. These are not counts of legs that can be restored unchanged.
 | `duckduckgo-web` (same group) | No official third-party Duck.ai inference API verified [D2] | Drop bridge. Substitute Kilo/OpenRouter/Workers AI/AI Studio; these are model-access substitutes, not DuckDuckGo search or privacy-equivalent services. |
 | `antigravity` (34-leg OAuth group) | Google AI Studio/Gemini API key [G1–3] | Official free eligible models, project quotas, data-use caveats. `openai_compat`; do not migrate consumer OAuth. Five existing keys are not five independent project quotas. |
 | `xai-oauth` / grok-cli (same group) | xAI API key at `https://api.x.ai/v1` [X1–2] | Official keyed access, but no current free credit grant verified. Do not count as a free replacement. Current quickstart demonstrates Responses; llmux2 has no native upstream `responses` kind. Chat compatibility/model eligibility must be checked separately. |
-| `kilo` (7-leg no-auth group) | Same official gateway with Kilo API key; anonymous free access is also explicitly documented [K1–3] | Keyed `openai_compat` works as-is. Anonymous is 200 requests/hour/IP but cannot be configured truly keyless in current llmux2. |
-| `aihorde` (same group) | Official OpenAI-compatible `https://oai.aihorde.net/v1`, Horde key or documented anonymous `0000000000` [H1–3] | Works with `openai_compat`; native `https://aihorde.net/api/v2` is asynchronous and is not compatible. Queue/worker capacity, no fixed free token budget verified. |
+| `kilo`, `kilo-free` (7-leg no-auth group) | Same official gateway with Kilo API key; anonymous free access is also explicitly documented [K1–3] | Both keyed and explicit `auth = "none"` deployments work. Anonymous is 200 requests/hour/IP. |
+| `aihorde` (same group) | Official OpenAI-compatible `https://oai.aihorde.net/v1`, Horde key or anonymous access [H1–4] | Omit Authorization: the service selects anonymous key `0000000000`. Works with `openai_compat`; native `https://aihorde.net/api/v2` is asynchronous and is not compatible. Queue/worker capacity, no fixed free token budget verified. |
 | `hms` (1 custom-header leg) | Unknown operator/protocol; require the original operator's API/auth documentation | No connection named `hms` was present in the supplied connection list. Custom headers are not configurable. Do not infer legitimacy from a working bridge or import arbitrary headers. |
 
 ## Ranked provider shortlist
@@ -43,7 +46,7 @@ or live catalog, not a guarantee that they remain free or available.
 | Rank / provider | Base URL; auth | Verified free allowance; notable models | Eligibility, data/ToS caveats; as-is? |
 | --- | --- | --- | --- |
 | 1 Cloudflare Workers AI | `https://api.cloudflare.com/client/v4/accounts/ACCOUNT_ID/ai/v1`; account API token | 10,000 neurons/day [CF1]; `@cf/meta/llama-3.1-8b-instruct` [CF2] | Keep Workers Free to avoid paid overage; several frontier models require paid billing. Training, resale and multi-account clauses **unverified**. Yes, Chat. |
-| 2 Kilo Gateway | `https://ai-gateway.kilo.ai/api/v1`; Kilo API key, or official anonymous | Anonymous 200 requests/hour/IP [K2]; `kilo-auto/free`, examples `minimax/minimax-m2.1:free`, `z-ai/glm-5:free` [K2–3]. Keyed numeric limit **unverified** | Free routes can log/train; NVIDIA routes trial-only, no confidential data [K3]. Keyed yes; genuinely anonymous no. Do not assume anonymous quota also applies to keyed requests. |
+| 2 Kilo Gateway | `https://ai-gateway.kilo.ai/api/v1`; Kilo API key, or official anonymous | Anonymous 200 requests/hour/IP [K2]; `kilo-auto/free`, examples `minimax/minimax-m2.1:free`, `z-ai/glm-5:free` [K2–3]. Keyed numeric limit **unverified** | Free routes can log/train; NVIDIA routes trial-only, no confidential data [K3]. Both keyed and anonymous supported. Do not assume anonymous quota also applies to keyed requests. |
 | 3 OpenRouter | `https://openrouter.ai/api/v1`; API key | 20 RPM, 50 RPD without qualifying credit purchase; 1,000 RPD after threshold [O1]. `openrouter/free` or catalog-listed `:free` variants [O2] | Separate training controls for free routes [O3]. Paid fallback models cost money. Additional accounts/keys do not increase limits [O1]. Resale permission **unverified**. Yes. |
 | 4 Google AI Studio (already being mapped) | `https://generativelanguage.googleapis.com/v1beta/openai`; Gemini API key | Free tokens on eligible models [G1]; exact current RPM/TPM/RPD account-dependent, not verified. Compatibility example `gemini-4-hydrogen` is **not evidence of free eligibility** [G3] | Unpaid prompts/responses used for product/model improvement, regional exceptions in terms [G4]. Quotas per project [G2]; do not rotate keys to bypass them. Yes, Chat. |
 | 5 AI Horde | `https://oai.aihorde.net/v1`; Horde key or public anonymous key | Free queue-based access [H1]; live example `koboldcpp/Artemis-31B-v1.2` [H3]; numerical quota **unverified** | Anonymous lowest priority, may be restricted at high load. Volunteer workers see requests; do not send secrets. Kudos cannot be bought/sold [H1]. Yes via official chat front, not native v2 API. |
@@ -104,6 +107,11 @@ page only exposes account-specific limits, no number is invented.
 - **H3** [Official live model catalog](https://oai.aihorde.net/v1/models): returned
   `"id":"koboldcpp/Artemis-31B-v1.2"` and other worker-dependent IDs. This is a
   catalog check, not a successful generation/latency test.
+- **H4** [Official chat front OpenAPI schema](https://oai.aihorde.net/openapi.json),
+  discovered from the Swagger UI at [the official root](https://oai.aihorde.net):
+  `AIHordeApiKey` description: “An AI Horde API key. Omit it to use the anonymous key `0000000000`.”
+  Therefore true keyless access is supported, without a stored anonymous key.
+  Importer mapping of anonymous connections is handled separately in PR #28.
 - **O1** [OpenRouter limits](https://openrouter.ai/docs/api-reference/limits.md):
   “Making additional accounts or API keys will not affect your rate limits, as we govern capacity globally.”
   Free usage table headings: “Credits purchased (all time) | Requests per minute | Requests per day”;
@@ -209,14 +217,15 @@ page only exposes account-specific limits, no number is invented.
 
 ## What current llmux2 can configure
 
-- **No truly keyless deployment:** `crates/llmux-config/src/lib.rs` requires
-  `RawDeployment.credential` and resolves it against `RawCredential` (only
-  `api_key` or `oauth`). `resolve_secret` rejects missing/empty secrets and inline
-  values. `crates/llmux-server/src/lib.rs::app` creates Bearer `StaticKey` sources
-  for OpenAI-compatible keys and `x-api-key` for Anthropic. The adapter can accept
-  `AuthMaterial::None` internally, but TOML/server assembly cannot select it.
-  Do not use fake keys to pretend this is supported. Horde's officially specified
-  anonymous key is different: supply `0000000000` through an env reference.
+- **Explicit keyless deployments:** set `auth = "none"` and
+  `provider = "openai_compat"` (or `"openai"`) on a deployment, with no
+  `credential`. The executor supplies `AuthMaterial::None`, and the adapter sends
+  no Authorization header. A missing credential without opt-in is still a load
+  error, as are ambiguous credential/auth/provider combinations. Keyless is
+  currently restricted to OpenAI-compatible adapters; keyed config is unchanged.
+  Keyless and keyed deployments share model routing and fallback but retain
+  separate RPM/concurrency limits, cooldowns and anonymous auth-failure state.
+  Their upstream account/IP policies still apply across gateway instances.
 - **No arbitrary upstream header configuration:** `RawDeployment` has no header
   field and uses `deny_unknown_fields`; so does the credential schema. The
   adapter's internal `AuthMaterial::Header` and `StaticKey::header` do not expose
@@ -343,28 +352,62 @@ upstream_model = "FREE_MODEL_FROM_YOUR_PROJECT"
 billing = "free"
 ```
 
-### AI Horde (official anonymous key or registered API key)
+### Kilo Gateway (mixed anonymous and keyed)
 
-For anonymous mode: `export AIHORDE_API_KEY=0000000000`. This is the public
-anonymous credential documented by Horde, not an invented dummy Bearer token.
-Refresh the live model catalog before use; expect queues and worker turnover.
+One public model uses anonymous access first, then its official API key after a
+429 or another eligible failure. Only the keyed deployment needs an upstream
+secret. No fake Bearer token is sent for anonymous requests. Hourly IP limits and
+keyed account quotas remain upstream policies; this is not permission to evade
+them. `billing = "free"` cannot prevent charges if you choose a paid model.
+
+```toml
+[server]
+client_keys = ["env:LLMUX_CLIENT_KEY"]
+
+[[credentials]]
+id = "kilo-key"
+kind = "api_key"
+provider = "openai_compat"
+key = "env:KILO_API_KEY"
+
+[[models]]
+name = "free-kilo-mixed"
+[[models.deployments]]
+id = "kilo-anonymous"
+auth = "none"
+provider = "openai_compat"
+base_url = "https://ai-gateway.kilo.ai/api/v1"
+upstream_model = "kilo-auto/free"
+priority = 0
+billing = "free"
+
+[[models.deployments]]
+id = "kilo-keyed"
+credential = "kilo-key"
+base_url = "https://ai-gateway.kilo.ai/api/v1"
+upstream_model = "kilo-auto/free"
+priority = 10
+billing = "free"
+```
+
+### AI Horde (official anonymous access)
+
+No upstream key is needed: the official chat front selects the anonymous key
+when Authorization is omitted [H4]. For registered access instead, use an
+`api_key` credential through an env/file reference. Refresh the live model
+catalog before use; expect queues and worker turnover.
 
 ```toml
 [server]
 client_keys = ["env:LLMUX_CLIENT_KEY"]
 request_timeout_ms = 300000
 
-[[credentials]]
-id = "horde-key"
-kind = "api_key"
-provider = "openai_compat"
-key = "env:AIHORDE_API_KEY"
-
 [[models]]
 name = "free-horde"
 [[models.deployments]]
 id = "horde"
-credential = "horde-key"
+auth = "none"
+provider = "openai_compat"
 base_url = "https://oai.aihorde.net/v1"
 upstream_model = "koboldcpp/Artemis-31B-v1.2"
 billing = "free"
@@ -430,31 +473,32 @@ or otherwise not established as free.
 
 ## Validation performed
 
-All seven TOML blocks were extracted verbatim into separate temporary config
+All eight TOML blocks were extracted verbatim into separate temporary config
 files outside the repository. A small external Rust harness depending on this
 checkout's `llmux-config` called `RuntimeConfig::load` for every file, supplying
 non-secret printable placeholder environment values and asserting one model,
-one deployment, and `openai_compat`. No production credentials or upstream
+the expected deployments, and `openai_compat`. No production credentials or upstream
 inference calls were used. Output:
 
 ```text
-PASS free-cloudflare: 1 model, 1 deployment, openai_compat
-PASS free-kilo: 1 model, 1 deployment, openai_compat
-PASS free-openrouter: 1 model, 1 deployment, openai_compat
-PASS free-gemini: 1 model, 1 deployment, openai_compat
-PASS free-horde: 1 model, 1 deployment, openai_compat
-PASS free-samba-eval: 1 model, 1 deployment, openai_compat
-PASS free-cohere-eval: 1 model, 1 deployment, openai_compat
-Validated 7 documentation snippets with RuntimeConfig::load (placeholder env secrets; no upstream calls).
+PASS free-cloudflare: 1 model, 1 deployment(s), openai_compat
+PASS free-kilo: 1 model, 1 deployment(s), openai_compat
+PASS free-openrouter: 1 model, 1 deployment(s), openai_compat
+PASS free-gemini: 1 model, 1 deployment(s), openai_compat
+PASS free-kilo-mixed: 1 model, 2 deployment(s), openai_compat
+PASS free-horde: 1 model, 1 deployment(s), openai_compat
+PASS free-samba-eval: 1 model, 1 deployment(s), openai_compat
+PASS free-cohere-eval: 1 model, 1 deployment(s), openai_compat
+Validated 8 documentation snippets with RuntimeConfig::load (placeholder env secrets; no upstream calls).
 ```
 
-Existing parser tests: `cargo test --locked -p llmux-config`:
+Parser tests within `cargo test --locked --workspace`:
 
 ```text
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
 
-No repository Rust files changed, so the conditional Rust formatting check was
-not needed. This validates config loading only: placeholders, actual account
-entitlements, live generations, upstream payload edge cases and UI rendering
-were not tested.
+This validates config loading only: placeholders, actual account entitlements,
+live generations, upstream payload edge cases and UI rendering were not tested.
+The keyless implementation also has loopback tests asserting absent upstream
+Authorization and mixed-auth fallback with independent cooldown/RPM limits.

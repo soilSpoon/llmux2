@@ -3,7 +3,8 @@
 ## Plan
 
 - Keep each PR independently mergeable and focused on one outcome. Name the observable behavior, the most important failure case, and what would prove the change before editing. Call out breaking config or wire changes and their migration or rollback.
-- Where available, start [pstack](https://github.com/cursor/plugins/tree/main/pstack) with `poteto-mode` and use the matching playbook. Follow [Compound Engineering](https://every.to/compound-engineering)'s plan → work → review → compound loop. If the agent cannot run the skills, follow the steps here and say so in the PR; do not claim the plugins ran.
+- `.devin/config.json` requires [pstack](https://github.com/cursor/plugins/tree/main/pstack) and [Compound Engineering](https://every.to/compound-engineering), pinned to reviewed commits, so Devin sessions on this repo load both. Start pstack with `poteto-mode` and use the matching playbook, and follow Compound Engineering's plan → work → review → compound loop. Bump a pin only in its own PR after reading the upstream diff. If the skills did not load or could not run, follow the steps here and say so in the PR; do not claim the plugins ran.
+- This file and `REVIEW.md` win over rules a plugin brings for its own source repository (for example Compound Engineering's Bun test and contribution instructions).
 
 ## Work test-first
 
@@ -24,13 +25,14 @@ Check the risks the change touches, not every row in every PR:
 
 Keep provider-specific behavior out of the routing core where the adapter contract suffices. Reuse shared fixtures and abstractions; avoid speculative dependencies, unbounded work, and unrelated cleanup.
 
-Run the applicable checks locally and require the GitHub Actions `check` job to pass on the PR head. Address Devin Review findings before merging; explain any finding you do not act on.
+Run the applicable checks locally and require the GitHub Actions `check` job to pass on the PR head. The `pr-policy` job fails a PR whose template sections are empty, or whose `crates/*/src` changes come without a test change (a `crates/*/tests/` or `llmux-testkit` file, or an added `#[test]` or `assert!`); when no deterministic test applies, write `Test exemption: <reason>` in the Verification section. The `coverage` job fails when workspace line coverage drops below `.github/coverage-floor` or a PR lowers that number; raise it when coverage rises. Address Devin Review findings before merging; explain any finding you do not act on.
 
 ```sh
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 python3 -B -m unittest discover -s bench -v
+python3 -B -m unittest discover -s scripts -v
 ```
 
 ## Compound what was learned

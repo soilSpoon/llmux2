@@ -300,6 +300,48 @@ async fn anthropic_deployment_streams_openai_chat_chunks() {
 }
 
 #[tokio::test]
+async fn anthropic_chat_stream_sends_requested_usage_in_its_own_final_chunk() {
+    let fixture = Fixture::start((Reply::Ok, 0), (Reply::Ok, 10)).await;
+    for include_usage in [true, false] {
+        let (response, body) = fixture
+            .send(json!({
+                "model":"assistant",
+                "messages":[{"role":"system","content":"Be brief"},{"role":"user","content":"Hello"}],
+                "stream":true,"stream_options":{"include_usage":include_usage}
+            }))
+            .await;
+        check_route(&response, "claude", "1");
+        let events: Vec<_> = body
+            .split("\n\n")
+            .filter_map(|event| event.strip_prefix("data: "))
+            .collect();
+        assert_eq!(events.last(), Some(&"[DONE]"));
+        let mut chunks: Vec<Value> = events[..events.len() - 1]
+            .iter()
+            .map(|event| serde_json::from_str(event).unwrap())
+            .collect();
+        if include_usage {
+            let usage = chunks.pop().unwrap();
+            assert_eq!(usage["choices"], json!([]));
+            assert_eq!(
+                usage["usage"],
+                json!({"prompt_tokens":3,"completion_tokens":4,"total_tokens":7})
+            );
+            assert!(chunks
+                .iter()
+                .all(|chunk| chunk.get("usage") == Some(&Value::Null)));
+        } else {
+            assert!(chunks.iter().all(|chunk| chunk.get("usage").is_none()));
+        }
+        assert_eq!(
+            chunks.last().unwrap()["choices"][0]["finish_reason"],
+            "stop"
+        );
+    }
+    assert_eq!(fixture.counts(), [2, 0]);
+}
+
+#[tokio::test]
 async fn rate_limited_anthropic_fails_over_to_openai() {
     let fixture = Fixture::start((Reply::Limit, 0), (Reply::Ok, 10)).await;
     let (response, body) = fixture.request(false).await;
