@@ -193,6 +193,31 @@ impl Chat {
         }
         Ok(response.into_body())
     }
+    async fn hold(&self) -> Result<Incoming> {
+        tokio::time::timeout(
+            Duration::from_millis(if cfg!(test) { 100 } else { 15000 }),
+            async {
+                let mut body = self.start().await?;
+                let mut parser = Completion::default();
+                while let Some(frame) = body.frame().await {
+                    if let Some(bytes) = frame?.data_ref() {
+                        parser.feed(bytes, None, None)?;
+                        if parser.tokens > 0 {
+                            return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(body);
+                        }
+                    }
+                }
+                Err("held stream ended before its first token".into())
+            },
+        )
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "held stream setup timed out waiting for headers or first token",
+            )
+        })?
+    }
     async fn request(&self, scheduled: Option<Instant>, timed: bool) -> Result<Timing> {
         tokio::time::timeout(
             Duration::from_secs(15),
@@ -431,19 +456,7 @@ async fn memory(target: &Target, concurrency: usize) -> Result<f64> {
     for _ in 0..concurrency {
         let mut chat = target.chat.clone();
         chat.streaming = true;
-        tasks.spawn(async move {
-            let mut body = chat.start().await?;
-            let mut parser = Completion::default();
-            while let Some(frame) = body.frame().await {
-                if let Some(bytes) = frame?.data_ref() {
-                    parser.feed(bytes, None, None)?;
-                    if parser.tokens > 0 {
-                        return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(body);
-                    }
-                }
-            }
-            Err("held stream ended before its first token".into())
-        });
+        tasks.spawn(async move { chat.hold().await });
     }
     let mut bodies = Vec::new();
     while let Some(result) = tasks.join_next().await {
@@ -636,6 +649,42 @@ mod tests {
             model: "backend-model".into(),
             key: "mock-backend".into(),
             streaming,
+        }
+    }
+    #[tokio::test]
+    async fn held_stream_setup_times_out_on_missing_headers_or_first_token() {
+        use futures_util::StreamExt;
+        for missing_headers in [false, true] {
+            let server = llmux_testkit::TestServer::start(axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(move || async move {
+                    if missing_headers {
+                        std::future::pending::<axum::response::Response>().await
+                    } else {
+                        let role = futures_util::stream::once(async {
+                            Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                                b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+                            ))
+                        });
+                        axum::response::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from_stream(
+                                role.chain(futures_util::stream::pending()),
+                            ))
+                            .unwrap()
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+            let result =
+                tokio::time::timeout(Duration::from_millis(500), chat(&server, true).hold()).await;
+            assert!(
+                result.is_ok(),
+                "held-stream setup hung (missing_headers={missing_headers})"
+            );
+            let error = result.unwrap().unwrap_err().to_string();
+            assert!(error.contains("timed out"), "{error}");
         }
     }
     #[tokio::test]
