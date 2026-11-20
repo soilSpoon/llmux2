@@ -66,6 +66,16 @@ Before a response is committed, the gateway can fail over on upstream server, co
 
 ## Credentials
 
+OpenAI-compatible deployments can explicitly opt into anonymous access with
+`auth = "none"` and `provider = "openai_compat"`, omitting `credential`. They
+send no upstream Authorization header. Omitting a credential without this opt-in,
+or combining it with `auth = "none"`, is a configuration error. Keyed deployments
+keep their existing `credential = "id"` spelling. A model can mix both forms,
+with independent deployment limits and cooldowns; see the
+[mixed Kilo example](docs/free-providers.md#kilo-gateway-mixed-anonymous-and-keyed).
+Use anonymous access only when the upstream officially documents it. Multiple
+anonymous deployments do not multiply a provider's per-IP quota.
+
 Credentials support `kind = "api_key"` (with a `key` secret reference) and
 `kind = "oauth"` (OAuth 2.0 refresh-token grant). Deployments select either by
 credential `id`. Both use `provider = "openai"` or `"openai_compat"` in the server.
