@@ -36,6 +36,48 @@ fn success(output: &std::process::Output) -> String {
 }
 
 #[test]
+fn chained_mapping_availability_reaches_a_fixed_point_before_aliases() {
+    let mut root = fixture();
+    let names = [
+        "openrouter/anthropic/claude-fable-5.2",
+        "openrouter/anthropic/claude-fable-5.1:batch",
+        "openrouter/anthropic/claude-fable-5:batch",
+    ];
+    root["providerConnections"].as_array_mut().unwrap().push(json!({"id":"anthropic","provider":"anthropic","authType":"apikey","apiKey":"synthetic-anthropic-key"}));
+    for (i, name) in names.iter().enumerate() {
+        root["combos"].as_array_mut().unwrap().extend([
+            json!({"id":format!("original-{i}"),"name":name,"models":["openai/unverified"]}),
+            json!({"id":format!("nested-{i}"),"name":format!("nested-{i}"),"models":[{"kind":"combo-ref","comboName":name}]}),
+        ]);
+    }
+    root["modelComboMappings"] = json!([
+        {"pattern":names[0],"comboId":"missing","enabled":true},
+        {"pattern":names[1],"comboId":"nested-0","enabled":true},
+        {"pattern":names[2],"comboId":"nested-1","enabled":true}
+    ]);
+    root["modelAliases"] =
+        json!({"dependent":names[2],"chain":"dependent", "prefixed":format!("combo/{}", names[2])});
+    let dir = tempfile::tempdir().unwrap();
+    let warnings = success(&run(
+        &root,
+        dir.path(),
+        &[("--openrouter-replacements", dir.path())],
+    ));
+    let config = RuntimeConfig::load(dir.path().join("out.toml")).unwrap();
+    for name in names.into_iter().chain([
+        "nested-0",
+        "nested-1",
+        "nested-2",
+        "dependent",
+        "chain",
+        "prefixed",
+    ]) {
+        assert!(!config.model_names.contains_key(name), "unexpected {name}");
+    }
+    assert!(warnings.contains("target unavailable (winning mapping)"));
+}
+
+#[test]
 fn custom_node_id_ds_keeps_its_identity_without_opt_ins() {
     let mut root = fixture();
     root["providerNodes"] = json!([{"id":"ds","prefix":"gateway","type":"openai-compatible","baseUrl":"https://custom.example/v1"}]);

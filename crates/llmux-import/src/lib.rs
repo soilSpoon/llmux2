@@ -609,24 +609,55 @@ pub fn import_with_options(
     }
     let mut unavailable_combos = HashSet::new();
     if policy.openrouter_replacements {
-        let targets: HashSet<_> = array(&root, "modelComboMappings")
+        let mappings = aliases::sorted_mappings(&root);
+        let targets: HashSet<_> = mappings
             .iter()
             .filter_map(|row| combo_ids.get(string(row, "comboId")))
             .collect();
-        for target in targets {
-            let mut deployments = Vec::new();
-            Expander {
-                combos: &combos,
-                connections: &connections,
-                nodes,
-                warnings: &mut Vec::new(),
-                remaining_steps: 1024,
-                exhausted: false,
-                policy: &policy,
+        loop {
+            unavailable_combos.clear();
+            for target in &targets {
+                let mut deployments = Vec::new();
+                Expander {
+                    combos: &combos,
+                    connections: &connections,
+                    nodes,
+                    warnings: &mut Vec::new(),
+                    remaining_steps: 1024,
+                    exhausted: false,
+                    policy: &policy,
+                }
+                .expand(target, &mut Vec::new(), &mut deployments);
+                if deployments.is_empty() {
+                    unavailable_combos.insert((*target).clone());
+                }
             }
-            .expand(target, &mut Vec::new(), &mut deployments);
-            if deployments.is_empty() {
-                unavailable_combos.insert(target.clone());
+            let blocked: Vec<_> = combos
+                .iter()
+                .filter(|(name, combo)| {
+                    name.starts_with("openrouter/") && !array(combo, "models").is_empty()
+                })
+                .filter(|(name, _)| {
+                    mappings
+                        .iter()
+                        .find(|row| aliases::matches(string(row, "pattern"), name))
+                        .is_some_and(|mapping| {
+                            aliases::mapping_target(
+                                mapping,
+                                &combos,
+                                &combo_ids,
+                                Some(&unavailable_combos),
+                            )
+                            .is_none()
+                        })
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+            if blocked.is_empty() {
+                break;
+            }
+            for name in blocked {
+                combos.get_mut(&name).unwrap()["models"] = json!([]);
             }
         }
     }
@@ -641,11 +672,6 @@ pub fn import_with_options(
             .openrouter_replacements
             .then_some(&unavailable_combos),
     );
-    for name in &unavailable_aliases {
-        if let Some(combo) = combos.get_mut(name) {
-            combo["models"] = json!([]);
-        }
-    }
     direct.extend(direct::collect(&synthetic, nodes, &connections));
     for (name, model) in direct {
         let official = policy.openrouter_replacements

@@ -55,6 +55,35 @@ pub(super) fn matches(pattern: &str, name: &str) -> bool {
     pattern[p..].iter().all(|c| *c == '*')
 }
 
+pub(super) fn sorted_mappings(root: &Value) -> Vec<&Value> {
+    let mut mappings: Vec<_> = array(root, "modelComboMappings")
+        .iter()
+        .filter(|row| row["enabled"] == true || row["enabled"] == 1)
+        .collect();
+    mappings.sort_by(|a, b| {
+        b["priority"]
+            .as_i64()
+            .unwrap_or(0)
+            .cmp(&a["priority"].as_i64().unwrap_or(0))
+            .then_with(|| string(a, "createdAt").cmp(string(b, "createdAt")))
+    });
+    mappings
+}
+
+pub(super) fn mapping_target<'a>(
+    mapping: &Value,
+    combos: &HashMap<String, Value>,
+    combo_ids: &'a HashMap<String, String>,
+    unavailable_combos: Option<&HashSet<String>>,
+) -> Option<&'a String> {
+    combo_ids.get(string(mapping, "comboId")).filter(|name| {
+        combos
+            .get(*name)
+            .is_some_and(|combo| combo["isActive"] != false)
+            && !unavailable_combos.is_some_and(|unavailable| unavailable.contains(*name))
+    })
+}
+
 pub(super) fn prepare(
     root: &Value,
     combos: &HashMap<String, Value>,
@@ -70,17 +99,7 @@ pub(super) fn prepare(
 ) {
     let official_replacements = unavailable_combos.is_some();
     let mut aliases = alias_map(root, warnings);
-    let mut mappings: Vec<_> = array(root, "modelComboMappings")
-        .iter()
-        .filter(|row| row["enabled"] == true || row["enabled"] == 1)
-        .collect();
-    mappings.sort_by(|a, b| {
-        b["priority"]
-            .as_i64()
-            .unwrap_or(0)
-            .cmp(&a["priority"].as_i64().unwrap_or(0))
-            .then_with(|| string(a, "createdAt").cmp(string(b, "createdAt")))
-    });
+    let mappings = sorted_mappings(root);
     let mut names: BTreeSet<_> = aliases.keys().cloned().collect();
     names.extend(direct.keys().cloned());
     if official_replacements {
@@ -106,14 +125,8 @@ pub(super) fn prepare(
         let mapping = mappings
             .iter()
             .find(|row| matches(string(row, "pattern"), &name));
-        let target = mapping.and_then(|mapping| {
-            combo_ids.get(string(mapping, "comboId")).filter(|name| {
-                combos
-                    .get(*name)
-                    .is_some_and(|combo| combo["isActive"] != false)
-                    && !unavailable_combos.is_some_and(|unavailable| unavailable.contains(*name))
-            })
-        });
+        let target = mapping
+            .and_then(|mapping| mapping_target(mapping, combos, combo_ids, unavailable_combos));
         if official_replacements
             && name.starts_with("openrouter/")
             && mapping.is_some()

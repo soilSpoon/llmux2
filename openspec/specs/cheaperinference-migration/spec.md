@@ -116,6 +116,12 @@ deployment-empty combo
 THEN its name and dependent aliases remain unavailable, even if a seeded
 official replacement or lower-precedence mapping exists.
 
+#### Scenario: Transitive mapping availability
+
+WHEN clearing an unavailable winning mapping empties nested mapping targets
+THEN replacement and combo availability is recomputed to a fixed point before
+alias and mapping preparation, so dependent replacement names stay unavailable.
+
 #### Scenario: Source connection restrictions
 
 WHEN an OpenRouter leg has `connectionId` or nonempty `allowedConnectionIds`
