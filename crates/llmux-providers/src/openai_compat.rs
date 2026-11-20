@@ -537,6 +537,7 @@ impl ProviderAdapter for OpenAiCompat {
             )
             .body(strip_request_fields(body, &dep.strip_request_fields)?)?;
 
+        request.headers_mut().extend(dep.headers.clone());
         apply_auth(
             request.headers_mut(),
             auth,
@@ -935,6 +936,7 @@ mod tests {
             Support::Convert
         );
         let deployment = Deployment {
+            headers: Default::default(),
             idx: DeploymentIdx(0),
             id: "d".into(),
             provider: adapter.kind().clone(),

@@ -162,7 +162,7 @@ fn local_host(url: &str) -> bool {
     }
 }
 
-fn metadata(connection: &Value) -> Result<Value, &'static str> {
+pub(super) fn metadata(connection: &Value) -> Result<Value, &'static str> {
     match connection.get("providerSpecificData") {
         None | Some(Value::Null) => Ok(json!({})),
         Some(Value::Object(_)) => Ok(connection["providerSpecificData"].clone()),
@@ -220,11 +220,7 @@ pub(super) fn resolve(
             "anthropic-compatible" => KIND_ANTHROPIC,
             _ => return Err("unknown/non-compatible provider or custom protocol settings"),
         };
-        if !string(node, "chatPath").is_empty()
-            || node["customHeaders"]
-                .as_object()
-                .is_some_and(|headers| !headers.is_empty())
-        {
+        if !string(node, "chatPath").is_empty() {
             return Err("unknown/non-compatible provider or custom protocol settings");
         }
         (kind, string(node, "baseUrl"))

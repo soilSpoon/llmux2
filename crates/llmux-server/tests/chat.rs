@@ -386,6 +386,61 @@ async fn body(response: Response) -> String {
 }
 
 #[tokio::test]
+async fn deployment_custom_headers_reach_upstream_on_every_request() {
+    let upstream = TestServer::start(Router::new().route(
+        "/v1/chat/completions",
+        post(|headers: HeaderMap| async move {
+            assert_eq!(headers["x-static"], "literal value");
+            assert_eq!(headers["authorization"], "custom-secret");
+            Json(json!({"choices":[{"message":{"role":"assistant","content":"ok"}}]}))
+        }),
+    ))
+    .await
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("header"), "custom-secret\n").unwrap();
+    let config = format!(
+        r#"
+[server]
+client_keys = ["file:{}/header"]
+[[models]]
+name = "custom"
+[[models.deployments]]
+id = "custom"
+auth = "none"
+provider = "openai_compat"
+base_url = "{}/v1"
+upstream_model = "custom"
+headers = {{ x-static = "literal value", Authorization = "file:{}/header" }}
+"#,
+        dir.path().display(),
+        upstream.url(),
+        dir.path().display()
+    );
+    let gateway = TestServer::start(
+        llmux_server::app(RuntimeConfig::parse(&config).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+    for _ in 0..2 {
+        let request = Request::post(format!("{}/v1/chat/completions", gateway.url()))
+            .header(header::AUTHORIZATION, "Bearer custom-secret")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from_static(
+                br#"{"model":"custom","messages":[{"role":"user","content":"Hello"}]}"#,
+            )))
+            .unwrap();
+        assert_eq!(
+            client.request(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+}
+
+#[tokio::test]
 async fn healthz_is_public() {
     let fixture = Fixture::start_with_options(
         [Reply::Complete, Reply::Complete],

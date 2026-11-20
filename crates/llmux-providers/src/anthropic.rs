@@ -453,6 +453,7 @@ impl ProviderAdapter for Anthropic {
         if req.format == InboundFormat::AnthropicMessages {
             request.headers_mut().extend(req.anthropic_headers.clone());
         }
+        request.headers_mut().extend(dep.headers.clone());
         apply_auth(
             request.headers_mut(),
             auth,
@@ -913,6 +914,7 @@ mod tests {
     fn auth_passthrough_and_support() {
         let a = Anthropic::new(provider::ANTHROPIC);
         let mut dep = Deployment {
+            headers: Default::default(),
             fallback: false,
             idx: DeploymentIdx(0),
             id: "a".into(),
@@ -937,6 +939,8 @@ mod tests {
             context_overflow: None,
             request_id: RequestId("r".into()),
         };
+        dep.headers
+            .insert("x-deployment", HeaderValue::from_static("static-value"));
         for auth in [
             AuthMaterial::Bearer("secret".into()),
             AuthMaterial::Header {
@@ -951,6 +955,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(request.uri(), "https://example.com/v1/messages");
+            assert_eq!(request.headers()["x-deployment"], "static-value");
             assert_eq!(request.method(), Method::POST);
             assert_eq!(request.headers()["anthropic-version"], "2023-06-01");
             assert_eq!(request.headers()[header::ACCEPT], "text/event-stream");

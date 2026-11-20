@@ -50,6 +50,7 @@ pub enum ChatRequestField {
 
 #[derive(Debug)]
 pub struct Deployment {
+    pub headers: http::HeaderMap,
     pub fallback: bool,
     pub idx: DeploymentIdx,
     pub id: Arc<str>,

@@ -37,6 +37,18 @@ Credentials use `provider = "openai"` or `"openai_compat"` for OpenAI-compatible
 
 Use `POST /v1/messages` for Anthropic Messages JSON and SSE on Anthropic deployments. Authenticate with a gateway client key in `x-api-key` or `Authorization: Bearer`.
 
+Deployments may set `headers = { "X-Custom" = "literal value", "X-Secret" = "file:/private/header" }`.
+Values can be literal or `env:`/`file:` references resolved at configuration load
+time (terminal CR/LF from reference files is trimmed). Use references for secrets.
+Headers apply on every upstream attempt, are marked sensitive, and are not logged.
+Invalid names/values, duplicate case-insensitive names, hop-by-hop/framing headers
+(`Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`, `TE`,
+`Trailer`, `Upgrade`, `Proxy-Connection`, `HTTP2-Settings`), and proxy authentication headers are rejected.
+`Authorization` and the adapter credential header (`x-api-key` for Anthropic)
+cannot be overridden on credentialed deployments. Explicit `auth = "none"`
+deployments may supply their own Authorization instead. Existing configs are
+unchanged; remove `headers` to roll back custom headers.
+
 Chat requests converted to Anthropic return one choice even when `n` asks for more. For converted Anthropic Chat streams, set `stream_options.include_usage` to `true` for a separate usage chunk just before `[DONE]`, or `false` to omit usage. Without this option, usage remains on the finish chunk. Reported cache reads appear in `usage.prompt_tokens_details.cached_tokens` and cache writes in `usage.cache_creation_input_tokens`.
 
 ## Health, shutdown and deployment
@@ -69,6 +81,12 @@ probe; only a successful HTTP 200 sends WATCHDOG=1. See the
 [user-systemd deployment guide](deploy/README.md) for install, recovery,
 migration and rollback instructions, including the host's TCP queue migration
 sysctl.
+
+Deployment uses standalone `llmux2-deploy` and `llmux2-guard` binaries from the
+non-default `llmux2-ops` workspace package. Build them with
+`cargo build --locked --release -p llmux-server -p llmux2-ops`; production hosts
+need neither Python nor Cargo. Installed binary paths and systemd units are
+unchanged; see the guide above for installation commands.
 
 ## Live dashboard
 
@@ -110,6 +128,44 @@ Metrics stay in memory on each instance and reset on restart. The chart
 starts collecting when opened; it polls every two seconds. The dashboard
 does not collect prompts, responses, upstream URLs or credential values
 in its stats. Omit `dashboard_key` to disable the routes and collection.
+
+## Operating the gateway: API, CLI and MCP
+
+With `dashboard_key` set, the same key also unlocks an HTTP admin API under
+`/admin`: `GET /admin/status`, `GET /admin/deployments`, `GET /admin/models`,
+`GET /admin/credentials`, `POST /admin/credentials/{id}/disabled`
+(`{"disabled": true}` stops routing through every deployment that draws on
+the credential; `false` resumes), and `POST /admin/reload`, which re-reads
+the config file and atomically swaps routing. A rejected reload keeps the
+running configuration; changes to `server.listen`, `server.shutdown_timeout`
+and `server.drain_grace` only apply on restart and are reported in the
+response's `warnings`. Rotating or removing `dashboard_key` revokes the old
+key immediately. No response ever contains secret material.
+
+The `llmux` CLI is a thin client of that API — one subcommand per endpoint:
+
+```sh
+export LLMUX_ADMIN_URL=http://127.0.0.1:8080
+export LLMUX_ADMIN_KEY=...   # the dashboard key
+llmux status                 # uptime, version, response counters
+llmux deployments            # deployments with live routing stats
+llmux models                 # canonical models and their deployment order
+llmux credentials            # kind, provider, disabled flag, quota
+llmux disable spare-key      # stop routing through a credential
+llmux enable spare-key       # resume it
+llmux reload                 # hot-reload the config file
+```
+
+`llmux-mcp` serves the same operations over stdio as MCP tools
+(`llmux_status`, `llmux_deployments`, `llmux_credentials`, `llmux_models`,
+`llmux_set_disabled`, `llmux_reload`) for agents and editors, reading the
+same two environment variables:
+
+```json
+{ "command": "llmux-mcp",
+  "env": { "LLMUX_ADMIN_URL": "http://127.0.0.1:8080",
+           "LLMUX_ADMIN_KEY": "..." } }
+```
 
 ## Routing
 
@@ -383,8 +439,9 @@ node --test crates/llmux-server/tests/dashboard.cjs
 ```
 
 In CI, `coverage` runs the Rust unit and integration tests once with coverage
-instrumentation, while `check` runs Rust doctests, lint, and the dashboard and
-deployment tooling tests. The `xtask` workspace member contains CI policy tools
+instrumentation, including `llmux2-ops` deployment tests, while `check` runs Rust
+doctests, lint, dashboard tests, and the remaining Python repository tooling tests
+(including the merge gate). The `xtask` workspace member contains CI policy tools
 and repository-file checks; its tests run in `coverage`, not again in `check`.
 Use `cargo test --locked --workspace` to run all Rust
 tests locally without instrumentation.
@@ -395,7 +452,10 @@ on an LLVM coverage JSON report to enforce `.github/coverage-floor`; optional
 `BASE_SHA` also prevents lowering the committed floor. Both commands exit 0 on
 success and 1 on failure. `xtask` is not a default workspace member and depends
 only on `serde_json`, not the gateway crates. New tools belong in separate modules
-behind subcommands of this one binary.
+behind subcommands of this one binary. Benchmarks live in the separate,
+non-default `llmux-bench` member; `cargo xtask bench` delegates to
+`cargo run --release --locked -p llmux-bench --` without adding gateway or
+benchmark dependencies to xtask.
 
 Run `cargo xtask merge-gate <n>` from a trusted, up-to-date main checkout for the
 read-only autonomous merge preflight. It uses the authenticated `gh api` CLI and
@@ -412,11 +472,11 @@ cache. The xtask binary itself is cheap to rebuild from cached dependencies.
 
 ## Live gateway comparison
 
-Run on the gateway host with Python 3.9+ (stdlib only), reference first, llmux second.
+Run on the gateway host with Cargo, reference first, llmux second.
 Keep keys server-side: use `file:/absolute/path` or `env:VARIABLE`, never literal keys.
 
 ```sh
-python3 bench/compare_gateways.py \
+cargo xtask bench compare-gateways \
   --gateway omniroute http://127.0.0.1:20128/v1 file:/private/omniroute-client.key \
   --gateway llmux http://127.0.0.1:8090/v1 file:/private/llmux-client.key \
   --coverage /private/coverage.json --top 25 --responses 2 \
@@ -437,15 +497,27 @@ Read `results.json` / `report.html` in a new private output directory; review be
 Learnings: API and dashboard ports differ—validate authenticated `/v1/models` first.
 Stored client keys may be encrypted; extract/decrypt readonly, server-side, into private files.
 Imported names can retain wrong upstream IDs or container-local URLs: import success ≠ usable routing.
-Run just the comparison harness tests with `python3 -m unittest bench.test_compare_gateways`.
-Check Python syntax with `python3 -m py_compile bench/compare_gateways.py bench/test_compare_gateways.py`.
+Run the comparison harness tests with `cargo test --locked -p llmux-bench compare_gateways`.
+
+## Live reliability scenarios
+
+Run `cargo xtask bench live-reliability --offline` against local fake providers,
+or pass `--config /private/llmux.toml` to exercise its real API-key providers.
+The release gateway must already be built (`cargo build --release --locked -p llmux-server`);
+`--binary PATH` selects another binary. Optional `--primary HOST`, `--fallback HOST`,
+and `--bad-key-hosts all|none|HOST,HOST` select targets. Each scenario starts a fresh
+gateway and injects faults through a loopback proxy. Keys stay in the source
+secret files; reports redact known secrets and bearer tokens. `--out DIRECTORY`
+(default `live-reliability`) writes `report.json` and `report.md`; failures or
+fewer than two healthy targets produce a nonzero exit status. Tests use only
+offline providers.
 
 ## Mock-upstream load benchmark
 
-On Linux with Python 3.10+, Cargo, and readable `/proc/<pid>/smaps_rollup`, run:
+On Linux with Cargo and readable `/proc/<pid>/smaps_rollup`, run:
 
 ```sh
-python3 bench/mock_upstream.py
+cargo xtask bench mock-upstream
 ```
 
 The command builds the release gateway and the `llmux-testkit` Axum mock, starts and stops them

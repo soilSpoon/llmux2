@@ -47,6 +47,7 @@ pub struct OmniRouteFallback<'a> {
 }
 
 struct Connection {
+    headers: Value,
     source_id: String,
     provider: upstream::ProviderIdentity,
     credential: Option<String>,
@@ -126,6 +127,46 @@ fn unique(raw: &str, used: &mut HashSet<String>) -> String {
         n += 1;
     }
     name
+}
+
+fn connection_headers(
+    connection: &Value,
+    nodes: &[Value],
+    anonymous: bool,
+    kind: &str,
+) -> Result<HashMap<String, String>, &'static str> {
+    let metadata = upstream::metadata(connection)?;
+    let node = nodes
+        .iter()
+        .find(|node| string(node, "id") == string(connection, "provider"));
+    let raw = metadata
+        .get("customHeaders")
+        .filter(|v| !v.is_null())
+        .or_else(|| node.and_then(|node| node.get("customHeaders")));
+    let Some(raw) = raw.filter(|v| !v.is_null()) else {
+        return Ok(HashMap::new());
+    };
+    let parsed;
+    let raw = if let Some(text) = raw.as_str() {
+        parsed = serde_json::from_str::<Value>(text).map_err(|_| "invalid custom headers")?;
+        &parsed
+    } else {
+        raw
+    };
+    let raw = raw.as_object().ok_or("invalid custom headers")?;
+    let mut headers = HashMap::new();
+    for (name, value) in raw {
+        let value = value.as_str().ok_or("invalid custom headers")?;
+        llmux_config::validate_deployment_header(name, value, anonymous, kind)
+            .map_err(|_| "unsupported or forbidden custom headers")?;
+        if headers
+            .insert(name.to_ascii_lowercase(), value.to_owned())
+            .is_some()
+        {
+            return Err("duplicate custom headers");
+        }
+    }
+    Ok(headers)
 }
 
 fn valid_secret(secret: &str) -> bool {
@@ -344,6 +385,16 @@ impl Expander<'_> {
                     }
                 };
                 let mut deployment = json!({"base_url":c.base_url,"upstream_model":model});
+                if c.headers
+                    .as_object()
+                    .is_some_and(|headers| !headers.is_empty())
+                {
+                    deployment["headers"] = c.headers.clone();
+                }
+                if c.provider.is_builtin("deepseek") {
+                    deployment["strip_request_fields"] =
+                        json!(["seed", "user", "safety_identifier", "reasoning.effort"]);
+                }
                 if c.policy == policy::ModelPolicy::Workers {
                     deployment["quota"] = json!({"rpm":1});
                 }
@@ -465,7 +516,7 @@ pub fn import_with_options(
         let id = unique("workers-ai", &mut ids);
         credentials.push(json!({"id":id,"kind":"api_key","provider":"openai_compat","key":workers.reference}));
         warnings.push("Workers AI uses rpm=1 per deployment, NOT an account-wide neuron/daily spending cap; enforce free-only billing at Cloudflare".into());
-        connections.push(Connection {source_id:"workers-ai-opt-in".into(),provider:upstream::ProviderIdentity::Builtin("workers-ai".into()),credential:Some(id.clone()),kind:"openai_compat".into(),base_url:workers.base_url.clone(),priority:i64::MAX,policy:policy::ModelPolicy::Workers});
+        connections.push(Connection {headers:json!({}),source_id:"workers-ai-opt-in".into(),provider:upstream::ProviderIdentity::Builtin("workers-ai".into()),credential:Some(id.clone()),kind:"openai_compat".into(),base_url:workers.base_url.clone(),priority:i64::MAX,policy:policy::ModelPolicy::Workers});
         id
     });
     for (index, c) in array(&root, "providerConnections").iter().enumerate() {
@@ -502,6 +553,23 @@ pub fn import_with_options(
                 continue;
             }
         };
+        let headers = match connection_headers(
+            c,
+            array(&root, "providerNodes"),
+            matches!(auth, connection::SelectedAuth::None),
+            &kind,
+        ) {
+            Ok(headers) => headers,
+            Err(reason) => {
+                warnings.push(format!("{label}: skipped {reason}"));
+                continue;
+            }
+        };
+        let mut header_refs = serde_json::Map::new();
+        for (name, value) in headers {
+            let id = unique("upstream-header", &mut ids);
+            header_refs.insert(name, write_secret(&dir, &id, &value)?.into());
+        }
         let source_id = string(c, "id");
         if source_id.is_empty() || !source_ids.insert(source_id.to_owned()) {
             warnings.push(format!("{label}: skipped missing/duplicate connection id"));
@@ -538,6 +606,7 @@ pub fn import_with_options(
             }
         };
         connections.push(Connection {
+            headers: Value::Object(header_refs),
             source_id: source_id.into(),
             provider: upstream::ProviderIdentity::connection(
                 string(c, "provider"),
@@ -589,6 +658,7 @@ pub fn import_with_options(
                 .collect();
             for provider in providers {
                 connections.push(Connection {
+                    headers: json!({}),
                     source_id: unique(&format!("kilo-external-{provider}"), &mut external_ids),
                     provider,
                     credential: Some(id.clone()),

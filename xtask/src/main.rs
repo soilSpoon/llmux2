@@ -26,6 +26,19 @@ fn print_errors(errors: &[String]) {
 
 fn main() -> ExitCode {
     let args: Vec<_> = env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "bench") {
+        return match Command::new("cargo")
+            .args(["run", "--release", "--locked", "-p", "llmux-bench", "--"])
+            .args(&args[1..])
+            .status()
+        {
+            Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let result = match args.as_slice() {
         [cmd] if cmd == "pr-policy" => pr_policy::run(),
         [cmd, path] if cmd == "coverage-ratchet" => coverage_ratchet::run(path),

@@ -56,6 +56,7 @@ impl ProviderAdapter for OpenAiResponses {
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT, "text/event-stream")
             .body(Bytes::from(body.to_string()))?;
+        request.headers_mut().extend(dep.headers.clone());
         apply_auth(
             request.headers_mut(),
             auth,
@@ -489,6 +490,7 @@ mod tests {
     fn wildcard_deployment_forwards_requested_model() {
         let adapter = OpenAiResponses::new();
         let mut dep = Deployment {
+            headers: Default::default(),
             fallback: false,
             idx: DeploymentIdx(0),
             id: "r".into(),
@@ -502,6 +504,10 @@ mod tests {
             timeout: Duration::from_secs(10),
             max_context: None,
         };
+        dep.headers.insert(
+            "x-deployment",
+            http::HeaderValue::from_static("static-value"),
+        );
         for (format, body) in [
             (
                 InboundFormat::OpenAiResponses,
@@ -531,6 +537,7 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 let sent: Value = serde_json::from_slice(request.body()).unwrap();
+                assert_eq!(request.headers()["x-deployment"], "static-value");
                 assert_eq!(sent["model"], expected, "{format:?} {upstream}");
             }
         }

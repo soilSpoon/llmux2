@@ -6,6 +6,39 @@ Operability and the engineering standards the project holds itself to.
 
 ## Requirements
 
+### Requirement: Standalone slot deployment tools
+
+The non-default `llmux2-ops` workspace package SHALL build standalone
+`llmux2-deploy` and `llmux2-guard` binaries installed under `$HOME/llmux2/bin`.
+Production hosts SHALL NOT require Python or Cargo for deployment or recovery.
+The tools SHALL serialize through the same deployment lock, use private atomic
+file replacement, preserve the source and installed configuration checks,
+observe seven stable unit samples at half-second intervals, and try health up
+to sixty times before stopping the old slot. The health probe SHALL use a
+two-second TCP connect/read timeout and accept only HTTP 200 whose first up-to-three
+decoded body bytes equal exactly `ok`, respecting Content-Length and chunked
+framing. systemctl and configuration checks SHALL have 130- and 120-second
+deadlines respectively.
+
+#### Scenario: Failed handoff before old-slot stop
+
+WHEN the new slot fails to start, remain stable, or become healthy
+THEN deployment SHALL stop the new slot and leave the old slot unchanged,
+reporting cleanup failures separately.
+
+#### Scenario: Recovery and late handoff errors
+
+WHEN neither slot is active and the recorded listen address is unhealthy
+THEN the guard SHALL start the recorded slot.
+WHEN deployment reaches old-slot stop and a subsequent operation fails
+THEN it SHALL leave the new slot running and report that handoff stage.
+
+#### Scenario: Deployment test ownership
+
+WHEN CI runs deployment tests
+THEN it SHALL run the Rust tests once in the coverage job, using fake waits,
+while the check job SHALL retain the remaining Python merge-gate tests.
+
 ### Requirement: Bounded fallback traffic visibility
 The gateway SHALL expose reporting-only deployment `fallback` flags, defaulting
 to false and always true for catch-all deployments. The importer SHALL mark
@@ -154,6 +187,25 @@ WHEN PR policy and coverage build xtask
 THEN PR policy SHALL use a separate small dependency cache rather than restoring
 the coverage job's workspace artifacts, and coverage SHALL keep its default Rust
 cache. xtask tests SHALL run in the coverage job rather than again in check.
+
+### Requirement: Rust benchmark tools
+
+The non-default `llmux-bench` workspace member SHALL provide `mock-upstream`,
+`compare-gateways`, and `live-reliability` subcommands. `cargo xtask bench` SHALL
+delegate to the release benchmark binary without depending on benchmark or
+gateway crates. Benchmark tests SHALL use local fake upstreams, not providers.
+
+#### Scenario: Comparable fixed-rate measurements
+
+WHEN measuring 1,000 RPS gateway overhead
+THEN the harness SHALL discard one direct/gateway warm-up pair, alternate timed
+route order, and compare the median paired p99 delta to the strict 1 ms target.
+
+#### Scenario: Safe comparison and reliability reports
+
+WHEN comparing two gateways or injecting reliability faults
+THEN the Rust tools SHALL preserve request caps, secret-reference inputs,
+redaction, offline mode, and JSON/HTML/Markdown report contracts.
 
 ### Requirement: Simple and extensible
 

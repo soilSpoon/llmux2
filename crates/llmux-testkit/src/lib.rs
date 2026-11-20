@@ -1,5 +1,7 @@
 //! Loopback fixtures for tests exercising the real gateway over HTTP.
 
+pub mod mock_load_upstream;
+
 use axum::Router;
 use std::{io, net::SocketAddr};
 use tokio::{net::TcpListener, task::JoinHandle};
