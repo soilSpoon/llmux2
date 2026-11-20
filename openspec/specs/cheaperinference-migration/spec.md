@@ -6,6 +6,18 @@ Moving CheaperInference traffic from OmniRoute onto llmux2.
 
 ## Requirements
 
+### Requirement: DeepSeek parameter compatibility
+
+The importer SHALL configure built-in DeepSeek deployments to strip seed, user,
+safety_identifier, and reasoning.effort through the core strip_request_fields
+option. It SHALL preserve logprobs and top_logprobs, and leave other providers
+and custom nodes unchanged.
+
+#### Scenario: DeepSeek combo or direct route
+
+WHEN a route expands onto a built-in DeepSeek connection
+THEN the generated deployment loads with exactly those four stripped fields.
+
 ### Requirement: Exact API compatibility
 
 The gateway SHALL match the request arguments and response shapes
@@ -108,6 +120,23 @@ the omission, including for `@cf/meta/llama-3.2-1b-instruct`.
 WHEN a Workers AI deployment is emitted
 THEN it has `rpm = 1`, and documentation warns that this is per deployment,
 not account-wide neuron accounting or a guarantee against paid overage.
+
+#### Scenario: Retired Llama bridge target
+
+WHEN an opted-in Cloudflare bridge leg targets `meta/llama-3.1-8b-instruct`
+THEN it uses the reviewed current 3B `@cf/ibm-granite/granite-4.0-h-micro`
+instead of sending the retired upstream ID. Documentation SHALL disclose the
+checkpoint and size change. Other excluded deprecated models remain excluded.
+
+#### Scenario: Optional Workers AI snapshot
+
+WHEN `--workers-ai-models` or its API equivalent supplies a successful
+Cloudflare model-search response
+THEN every Workers AI deployment SHALL require its mapped upstream name to
+appear in the snapshot as well as the static allowlist; absent names SHALL be
+skipped with warnings. An empty result permits no Workers AI deployments.
+Unreadable, malformed, or failed API responses SHALL abort import without
+echoing their contents. Without a snapshot the static policy remains in effect.
 
 ### Requirement: Free-only keyed Kilo import
 

@@ -53,6 +53,11 @@ are sanitized and deduplicated. If there are no client keys, set
 
 Built-ins: openai, anthropic, openrouter, groq, deepseek (`ds` step alias),
 mistral, xai, together, fireworks, cerebras, gemini, morph, aihorde, kilo, kilocode.
+Official DeepSeek deployments set
+`strip_request_fields = ["seed", "user", "safety_identifier", "reasoning.effort"]`
+using the core per-deployment option. `logprobs` and `top_logprobs` are preserved.
+Other providers and custom nodes serving DeepSeek-named models are unchanged.
+Remove that deployment field to roll back stripping.
 The URL/protocol table comes from
 OmniRoute `open-sse/config/providers/registry/<provider>/index.ts`.
 Custom `openai-compatible` chat and `anthropic-compatible` nodes use `baseUrl`;
@@ -133,6 +138,81 @@ small source-linked allowlist in `src/policy.rs`, emitting exact `@cf/...` IDs.
 Unknown, deprecated, and explicitly paid-plan-only models are warned and skipped;
 in particular `@cf/meta/llama-3.2-1b-instruct` is never emitted. Catalog and billing
 eligibility can change; review this allowlist before deployment.
+
+#### Retired models and an optional current catalog
+
+Legacy bridge `meta/llama-3.1-8b-instruct` legs (including `free-cloudflare`)
+now use `@cf/ibm-granite/granite-4.0-h-micro`. This is an explicit model
+substitution to a 3B instruct model, not the same 8B checkpoint: quality, latency, context, and neuron
+usage can differ. The retired ID is never sent upstream. Cloudflare's
+[May 8 deprecation notice](https://developers.cloudflare.com/workers-ai/changelog/#2026-05-08)
+retired the original on May 30, 2026. The 8B FP8 page lists November 20, 2026
+deprecation, and the FP8-fast page currently says unavailable, so neither is a
+replacement. This unavailability refers specifically to **Llama 3.1 8B FP8-fast**,
+not Llama 3.3 70B FP8-fast, whose model page remains available. Llama 3.2 3B is
+also deprecated November 20, 2026. Instead, the current
+[Granite model](https://developers.cloudflare.com/workers-ai/models/granite-4.0-h-micro/)
+has no deprecation notice, supports text generation and function calling, and is
+eligible for the daily free allocation, not unlimited free usage.
+[IBM documents its 3B size](https://www.ibm.com/granite/docs/models/granite4-0).
+Cloudflare's [neuron pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/)
+lists the following per **million** tokens (input / output):
+
+| Model | Input neurons | Output neurons |
+| --- | ---: | ---: |
+| Retired Llama 3.1 8B instruct | 25,608 | 75,147 |
+| Current Granite 4.0 H Micro (3B) | 1,542 | 10,158 |
+| Llama 3.3 70B FP8-fast (not chosen) | 26,668 | 204,805 |
+
+Granite uses about 94.0% fewer input neurons and 86.5% fewer output neurons
+than the retired 8B. The free 10,000-neuron daily account allowance and
+per-deployment RPM limitations below still apply.
+On November 20, 2026, all nine allowlisted model pages linked in `src/policy.rs`
+and the official changelog were rechecked; none of those targets had an announced
+deprecation date. Pricing tables alone are not availability evidence.
+
+Supply `--workers-ai-models /private/workers-ai-models.json` (API field
+`workers_ai_models`) to intersect mapped upstream IDs with a saved successful
+Cloudflare `GET /accounts/{account_id}/ai/models/search` response. The file must
+contain `{"success":true,"result":[{"name":"@cf/..."},...]}`. An empty result
+permits no Workers AI deployments; absent mapped targets are skipped with a
+warning, including replacements. Malformed, unreadable, or failed API responses
+abort import without echoing their contents. This filter never expands the
+reviewed allowlist. Without it, the static policy remains in effect. Refresh
+before import; a snapshot is not a runtime availability check.
+
+OCI example (Bash, curl and jq), fetching every page without including deprecated
+models. Do not enable shell tracing; the token is passed through stdin, not curl's
+command-line arguments. Use a fresh snapshot filename:
+
+```sh
+set -eu
+umask 077
+SECRETS=/home/opc/llmux2/secrets
+SNAPSHOT="$SECRETS/workers-ai-models.json"
+test ! -e "$SNAPSHOT"
+PAGES=$(mktemp -d "$SECRETS/workers-ai-pages.XXXXXX")
+ACCOUNT=$(tr -d '\r\n' < "$SECRETS/cloudflare-account-id")
+PAGE=1
+while :; do
+  { printf 'Authorization: Bearer '; tr -d '\r\n' < "$SECRETS/cloudflare-workers-ai.token"; printf '\n'; } |
+    curl --fail --silent --show-error --header @- --get \
+      "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT/ai/models/search" \
+      --data-urlencode include_deprecated=false --data-urlencode per_page=100 \
+      --data-urlencode "page=$PAGE" --output "$PAGES/$PAGE.json"
+  jq -e '.success == true and (.result | type == "array")' "$PAGES/$PAGE.json" >/dev/null
+  test "$(jq '.result | length' "$PAGES/$PAGE.json")" -ge 100 || break
+  PAGE=$((PAGE + 1))
+done
+jq -s '{success:true,result:[.[].result[]]}' "$PAGES/"*.json > "$SNAPSHOT"
+chmod 600 "$SNAPSHOT"
+```
+
+Add `--workers-ai-models "$SNAPSHOT"` to the existing opt-in import command.
+An older generated TOML is not rewritten automatically; regenerate the config
+and restart the runtime. Rollback by using the prior config only if its upstream
+models still work; removing the snapshot flag restores static filtering, not
+retired upstream IDs.
 
 **There is no Workers AI neuron or account-wide spending budget.** Core supports
 `rpm`, `rpd`, `tpm`, `tpd`, and concurrency limits, but request/token counts cannot

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "deploy",
+    "bench",
     "xtask",
     "crates/llmux-login",
     "crates/llmux-import",
@@ -11,6 +12,8 @@ members = [
     "crates/llmux-providers",
     "crates/llmux-server",
     "crates/llmux-testkit",
+    "crates/llmux-cli",
+    "crates/llmux-mcp",
 ]
 default-members = ["crates/llmux-server"]
 

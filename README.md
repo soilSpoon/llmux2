@@ -117,6 +117,44 @@ starts collecting when opened; it polls every two seconds. The dashboard
 does not collect prompts, responses, upstream URLs or credential values
 in its stats. Omit `dashboard_key` to disable the routes and collection.
 
+## Operating the gateway: API, CLI and MCP
+
+With `dashboard_key` set, the same key also unlocks an HTTP admin API under
+`/admin`: `GET /admin/status`, `GET /admin/deployments`, `GET /admin/models`,
+`GET /admin/credentials`, `POST /admin/credentials/{id}/disabled`
+(`{"disabled": true}` stops routing through every deployment that draws on
+the credential; `false` resumes), and `POST /admin/reload`, which re-reads
+the config file and atomically swaps routing. A rejected reload keeps the
+running configuration; changes to `server.listen`, `server.shutdown_timeout`
+and `server.drain_grace` only apply on restart and are reported in the
+response's `warnings`. Rotating or removing `dashboard_key` revokes the old
+key immediately. No response ever contains secret material.
+
+The `llmux` CLI is a thin client of that API — one subcommand per endpoint:
+
+```sh
+export LLMUX_ADMIN_URL=http://127.0.0.1:8080
+export LLMUX_ADMIN_KEY=...   # the dashboard key
+llmux status                 # uptime, version, response counters
+llmux deployments            # deployments with live routing stats
+llmux models                 # canonical models and their deployment order
+llmux credentials            # kind, provider, disabled flag, quota
+llmux disable spare-key      # stop routing through a credential
+llmux enable spare-key       # resume it
+llmux reload                 # hot-reload the config file
+```
+
+`llmux-mcp` serves the same operations over stdio as MCP tools
+(`llmux_status`, `llmux_deployments`, `llmux_credentials`, `llmux_models`,
+`llmux_set_disabled`, `llmux_reload`) for agents and editors, reading the
+same two environment variables:
+
+```json
+{ "command": "llmux-mcp",
+  "env": { "LLMUX_ADMIN_URL": "http://127.0.0.1:8080",
+           "LLMUX_ADMIN_KEY": "..." } }
+```
+
 ## Routing
 
 Lower numeric priority wins, with round-robin ordering among equal priorities. On an upstream HTTP 429, the gateway tries the next deployment and skips the limited deployment until its `Retry-After` (seconds or HTTP date) expires. Missing values use the configured default, doubled for each consecutive 429 from that deployment until it serves a request again, and waits are capped by `cooldown.max_ms`. A 429 or quota error that arrives after a stream has started cannot be retried, but it still cools the deployment down for later requests. A response whose rate-limit headers report zero remaining requests or tokens also skips that deployment until the reported reset. After a 429 or quota cooldown ends, the deployment takes one request at a time until one succeeds, and other requests fall back meanwhile, so a still-limited provider is not hit by every queued request at once. If none can serve the request, the gateway returns 429 with the earliest known retry delay. Optional local per-deployment request (`quota.rpm`, `quota.rpd`), estimated-token (`quota.tpm`, `quota.tpd`) and concurrency limits also skip deployments without contacting them. Deployments under different models that share the same provider, credential, base URL, upstream model and quota share one cooldown and one set of local limits, so a 429 on one model's route is not immediately retried through another model.
@@ -128,6 +166,23 @@ Rejecting is the default. To trim instead, set `context_overflow = "middle-out"`
 `x-llmux-deployment` and `x-llmux-attempts` identify the winning deployment and number of HTTP attempts (not skipped deployments). Set `server.expose_routing_headers = false` to hide them. A stream commits on its first complete SSE event; after that, failures end the stream with an error payload rather than replaying the request.
 
 Before a response is committed, the gateway can fail over on upstream server, connection, and timeout errors within its attempt and time limits. Rate-limit and quota-exhaustion failover are controlled by `routing.fallback_on` and enabled by default. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local request and token quotas use per-deployment sliding windows (one minute for `rpm`/`tpm`, one day for `rpd`/`tpd`) only when configured. Token quotas count the same prompt-plus-output estimate used for context fitting, and a single request larger than a token quota is still admitted when that window is empty. A credential may also set `quota` (`rpm`, `rpd`, `tpm`, `tpd`) for providers that limit per key or project across models; those windows are shared by every deployment that uses the credential.
+
+### Strict OpenAI-compatible upstreams
+
+Some deployments reject optional Chat Completions fields. Set
+`strip_request_fields` on the affected `openai` or `openai_compat` deployment,
+listing only the fields that upstream rejects. For example, on the strict
+DeepSeek route:
+
+```toml
+strip_request_fields = ["seed", "user", "safety_identifier", "reasoning.effort", "logprobs", "top_logprobs"]
+```
+
+The gateway omits these fields from the upstream request in both JSON and SSE
+mode; it does not emulate their behavior. `reasoning.effort` removes only that
+member and drops the enclosing `reasoning` object if it becomes empty. It does
+not remove the separate top-level `reasoning_effort`. Other deployments are
+unchanged. Remove the setting to restore passthrough.
 
 ### Catch-all route for cutover
 
@@ -385,7 +440,10 @@ on an LLVM coverage JSON report to enforce `.github/coverage-floor`; optional
 `BASE_SHA` also prevents lowering the committed floor. Both commands exit 0 on
 success and 1 on failure. `xtask` is not a default workspace member and depends
 only on `serde_json`, not the gateway crates. New tools belong in separate modules
-behind subcommands of this one binary.
+behind subcommands of this one binary. Benchmarks live in the separate,
+non-default `llmux-bench` member; `cargo xtask bench` delegates to
+`cargo run --release --locked -p llmux-bench --` without adding gateway or
+benchmark dependencies to xtask.
 
 PR policy uses its own small `xtask` Rust dependency cache with default save
 behavior, so later PR body edits can reuse it without restoring the gateway's
@@ -394,11 +452,11 @@ cache. The xtask binary itself is cheap to rebuild from cached dependencies.
 
 ## Live gateway comparison
 
-Run on the gateway host with Python 3.9+ (stdlib only), reference first, llmux second.
+Run on the gateway host with Cargo, reference first, llmux second.
 Keep keys server-side: use `file:/absolute/path` or `env:VARIABLE`, never literal keys.
 
 ```sh
-python3 bench/compare_gateways.py \
+cargo xtask bench compare-gateways \
   --gateway omniroute http://127.0.0.1:20128/v1 file:/private/omniroute-client.key \
   --gateway llmux http://127.0.0.1:8090/v1 file:/private/llmux-client.key \
   --coverage /private/coverage.json --top 25 --responses 2 \
@@ -419,15 +477,27 @@ Read `results.json` / `report.html` in a new private output directory; review be
 Learnings: API and dashboard ports differ—validate authenticated `/v1/models` first.
 Stored client keys may be encrypted; extract/decrypt readonly, server-side, into private files.
 Imported names can retain wrong upstream IDs or container-local URLs: import success ≠ usable routing.
-Run just the comparison harness tests with `python3 -m unittest bench.test_compare_gateways`.
-Check Python syntax with `python3 -m py_compile bench/compare_gateways.py bench/test_compare_gateways.py`.
+Run the comparison harness tests with `cargo test --locked -p llmux-bench compare_gateways`.
+
+## Live reliability scenarios
+
+Run `cargo xtask bench live-reliability --offline` against local fake providers,
+or pass `--config /private/llmux.toml` to exercise its real API-key providers.
+The release gateway must already be built (`cargo build --release --locked -p llmux-server`);
+`--binary PATH` selects another binary. Optional `--primary HOST`, `--fallback HOST`,
+and `--bad-key-hosts all|none|HOST,HOST` select targets. Each scenario starts a fresh
+gateway and injects faults through a loopback proxy. Keys stay in the source
+secret files; reports redact known secrets and bearer tokens. `--out DIRECTORY`
+(default `live-reliability`) writes `report.json` and `report.md`; failures or
+fewer than two healthy targets produce a nonzero exit status. Tests use only
+offline providers.
 
 ## Mock-upstream load benchmark
 
-On Linux with Python 3.10+, Cargo, and readable `/proc/<pid>/smaps_rollup`, run:
+On Linux with Cargo and readable `/proc/<pid>/smaps_rollup`, run:
 
 ```sh
-python3 bench/mock_upstream.py
+cargo xtask bench mock-upstream
 ```
 
 The command builds the release gateway and the `llmux-testkit` Axum mock, starts and stops them

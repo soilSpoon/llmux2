@@ -35,7 +35,7 @@ cargo test --locked --workspace
 cargo test --locked -p llmux2-ops # standalone deployment and guard tools; no real sleeps
 cargo xtask pr-policy # PR_BODY, BASE_SHA, HEAD_SHA
 cargo xtask coverage-ratchet coverage.json # optional BASE_SHA
-python3 -B -m unittest discover -s bench -v
+cargo test --locked -p llmux-bench
 python3 -B -m unittest discover -s scripts -v
 ```
 

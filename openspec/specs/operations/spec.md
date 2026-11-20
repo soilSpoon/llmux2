@@ -113,6 +113,54 @@ existing environment inputs and success/failure exit codes.
 AND the non-default `xtask` workspace member SHALL expose one binary with a
 module per tool, independent of gateway crates.
 
+||||||| parent of d4d160c (Add authenticated /admin management API with hot config reload)
+=======
+### Requirement: Management over one shared core
+
+Operators SHALL be able to inspect and control the running gateway through an
+authenticated HTTP admin API, a CLI, and an MCP server. The CLI and MCP server
+SHALL be thin clients of the same admin API and contain no routing or config
+logic of their own. Admin endpoints SHALL exist only when
+`server.dashboard_key` is configured and SHALL authenticate with that key as a
+Bearer token using the same constant-time check as the dashboard. Secret
+material SHALL never appear in any management response.
+
+#### Scenario: Same answer everywhere
+
+WHEN an operator asks for deployment state via the API, the CLI, or an MCP
+tool call
+THEN all three report the same data because the latter two call the same API.
+
+#### Scenario: No key, no admin surface
+
+WHEN `server.dashboard_key` is not configured
+THEN `/admin` routes do not exist.
+
+### Requirement: Runtime management operations
+
+The admin API SHALL expose gateway status (uptime, version, counters),
+deployment state (provider, priority, limits, disabled, cooldown, in-flight,
+counters), credential state (id, kind, provider — never secrets), and the
+canonical model map. It SHALL allow enabling or disabling a credential's
+routing state, which affects every deployment drawing on it.
+
+#### Scenario: Disable a provider's key
+
+WHEN an operator disables a credential
+THEN new requests skip every deployment that uses it until it is re-enabled.
+
+### Requirement: Validated hot config reload
+
+The admin API SHALL offer `POST /admin/reload` that re-reads the config file,
+validates and rebuilds the executor, and swaps it in atomically. A failed
+reload SHALL leave the running config untouched and report the error. The
+request path SHALL stay overhead-free: one atomic read per request, no locks.
+
+#### Scenario: Bad config rejected safely
+
+WHEN the new config fails validation
+THEN the reload reports the error and the old config keeps serving.
+
 ### Requirement: Fast feedback loops
 
 CI/CD and tests SHALL stay fast: only needed steps, no unnecessary work, since
@@ -130,6 +178,25 @@ WHEN PR policy and coverage build xtask
 THEN PR policy SHALL use a separate small dependency cache rather than restoring
 the coverage job's workspace artifacts, and coverage SHALL keep its default Rust
 cache. xtask tests SHALL run in the coverage job rather than again in check.
+
+### Requirement: Rust benchmark tools
+
+The non-default `llmux-bench` workspace member SHALL provide `mock-upstream`,
+`compare-gateways`, and `live-reliability` subcommands. `cargo xtask bench` SHALL
+delegate to the release benchmark binary without depending on benchmark or
+gateway crates. Benchmark tests SHALL use local fake upstreams, not providers.
+
+#### Scenario: Comparable fixed-rate measurements
+
+WHEN measuring 1,000 RPS gateway overhead
+THEN the harness SHALL discard one direct/gateway warm-up pair, alternate timed
+route order, and compare the median paired p99 delta to the strict 1 ms target.
+
+#### Scenario: Safe comparison and reliability reports
+
+WHEN comparing two gateways or injecting reliability faults
+THEN the Rust tools SHALL preserve request caps, secret-reference inputs,
+redaction, offline mode, and JSON/HTML/Markdown report contracts.
 
 ### Requirement: Simple and extensible
 

@@ -33,6 +33,7 @@ pub struct ImportReport {
 pub struct ImportOptions<'a> {
     pub cloudflare_account_id_file: Option<&'a Path>,
     pub cloudflare_token_file: Option<&'a Path>,
+    pub workers_ai_models: Option<&'a Path>,
     pub kilo_free_models: Option<&'a Path>,
     pub kilo_key_file: Option<&'a Path>,
     pub openrouter_replacements: bool,
@@ -343,6 +344,10 @@ impl Expander<'_> {
                     }
                 };
                 let mut deployment = json!({"base_url":c.base_url,"upstream_model":model});
+                if c.provider.is_builtin("deepseek") {
+                    deployment["strip_request_fields"] =
+                        json!(["seed", "user", "safety_identifier", "reasoning.effort"]);
+                }
                 if c.policy == policy::ModelPolicy::Workers {
                     deployment["quota"] = json!({"rpm":1});
                 }
