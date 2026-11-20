@@ -16,6 +16,7 @@ edition = "2021"
 publish = false
 
 [workspace.dependencies]
+arc-swap = "1"
 llmux-types = { path = "crates/llmux-types" }
 llmux-config = { path = "crates/llmux-config" }
 llmux-core = { path = "crates/llmux-core" }

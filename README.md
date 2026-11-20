@@ -23,14 +23,14 @@ Lower numeric priority wins, with round-robin ordering among equal priorities. O
 
 `x-llmux-deployment` and `x-llmux-attempts` identify the winning deployment and number of HTTP attempts (not skipped deployments). Set `server.expose_routing_headers = false` to hide them. A stream commits on its first complete SSE event; after that, failures end the stream with an error payload rather than replaying the request.
 
-The MVP does not implement OAuth, multi-format translation, hot reload, circuit breakers, or failover on errors other than 429. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local RPM uses a bounded per-deployment sliding window only when configured.
+The MVP does not wire OAuth into server configuration, or implement multi-format translation, hot reload, circuit breakers, or failover on errors other than 429. The providers crate offers an OAuth 2.0 refresh-token credential source for programmatic use. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local RPM uses a bounded per-deployment sliding window only when configured.
 
 ## Development
 
 - `llmux-types` defines the shared model, IR, and provider contracts.
 - `llmux-config` parses and validates TOML and secret references.
 - `llmux-core` selects deployments, enforces limits, and executes attempts.
-- `llmux-providers` implements the API-key OpenAI-compatible adapter.
+- `llmux-providers` implements the OpenAI-compatible adapter with static API-key and OAuth refresh-token credential sources (OAuth configuration wiring is not yet available).
 - `llmux-server` assembles those crates and serves the HTTP API.
 - `llmux-testkit` provides loopback HTTP fixtures.
 

@@ -1,5 +1,6 @@
-//! Minimal OpenAI-compatible adapter and static-key credential source.
+//! OpenAI-compatible adapter and static-key / OAuth credential sources.
 
+pub mod oauth;
 mod openai_compat;
 mod sse;
 
