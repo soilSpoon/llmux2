@@ -43,11 +43,13 @@ pub struct OpenAiChatMetadata<'a> {
 pub struct RequestMetadata<'a> {
     pub model: Cow<'a, str>,
     pub stream: bool,
+    pub temperature: Option<&'a RawValue>,
     /// Bytes of strings and object keys in prompt fields, excluding `data:` URLs.
     pub prompt_bytes: u64,
     /// The output limit the inbound format forwards: Responses `max_output_tokens`,
     /// Chat `max_completion_tokens` else `max_tokens`, Anthropic `max_tokens`.
     pub max_output_tokens: Option<u32>,
+    pub has_gateway_routing_fields: bool,
 }
 
 #[derive(Deserialize)]
@@ -56,6 +58,8 @@ struct RawRequestMetadata<'a> {
     model: &'a RawValue,
     #[serde(default)]
     stream: Option<bool>,
+    #[serde(default, borrow)]
+    temperature: Option<&'a RawValue>,
     #[serde(default, borrow)]
     max_completion_tokens: Option<&'a RawValue>,
     #[serde(default, borrow)]
@@ -72,6 +76,16 @@ struct RawRequestMetadata<'a> {
     system: TextBytes,
     #[serde(default)]
     tools: TextBytes,
+    #[serde(default, deserialize_with = "field_present")]
+    min_discount_percent: bool,
+    #[serde(default, deserialize_with = "field_present")]
+    zdr: bool,
+    #[serde(default, deserialize_with = "field_present")]
+    ranking: bool,
+}
+
+fn field_present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer).map(|_| true)
 }
 
 impl<'a> RequestMetadata<'a> {
@@ -91,6 +105,7 @@ impl<'a> RequestMetadata<'a> {
         Ok(Self {
             model,
             stream: raw.stream.unwrap_or_default(),
+            temperature: raw.temperature,
             prompt_bytes: [
                 raw.messages,
                 raw.input,
@@ -108,6 +123,7 @@ impl<'a> RequestMetadata<'a> {
                 }
                 InboundFormat::AnthropicMessages => tokens(raw.max_tokens),
             },
+            has_gateway_routing_fields: raw.min_discount_percent || raw.zdr || raw.ranking,
         })
     }
 }
@@ -375,6 +391,8 @@ impl ProviderAdapter for OpenAiCompat {
             Ok(GatewayResponse::Stream(
                 if req.format == InboundFormat::OpenAiResponses {
                     responses::stream(stream)
+                } else if let Some(include_usage) = sse::requested_usage(&req.body) {
+                    sse::with_chat_usage(stream, include_usage)
                 } else {
                     stream
                 },

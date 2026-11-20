@@ -112,7 +112,31 @@ Direct targets expand through the same provider/connection checks as combo legs;
 they create a canonical provider/model entry when needed. Alias chains are
 flattened with cycle detection and a 128-hop limit.
 
-Wildcard mappings are evaluated only for known exact alias/mapping names; the
+### Direct provider/model IDs
+
+Valid, usable model legs in retained combos and resolved direct alias targets
+also supply direct canonical model entries. For each observed provider/model
+pair, the importer emits the registry ID and its supported routing alias
+(`ds`/`deepseek`, `kc`/`kilocode`), or the custom node's ID and nonempty,
+unambiguous prefix. Registry routing aliases are not reassigned to another provider.
+Observed direct strings with redundant custom routing segments remain usable;
+only matching routing segments are stripped upstream, not vendor segments.
+Each direct model uses **all eligible connections of its provider**, in ascending
+connection priority, even when its source combo leg was pinned or restricted.
+Anonymous connections use the same credential-free deployment mechanism.
+Combo and alias names (including unavailable winning mappings) reserve their
+names; direct collisions are skipped with deterministic warnings. Direct entries
+never participate in real combo-reference lookup or consume its expansion budget.
+Codex is excluded, and existing connection/provider exclusion rules still apply.
+
+No model catalog is invented or fetched. Node `models_path` values are discovery
+paths, not model IDs; excluded-model lists are not positive catalogs. Provider
+metadata in the inspected dump contains no positive model lists. Separate cached
+`key_value` custom/synced catalogs are not used by this importer: this version
+derives model IDs only from combo legs and resolved alias targets. A live
+`/v1/models` response or traffic log is measurement input only.
+
+Wildcard mappings are evaluated for known exact alias/mapping and combo-derived direct names; the
 importer does not invent an unbounded model catalog. Wildcard alias names,
 automatic catalog aliases, provider-scoped aliases, and settings-based aliases
 are not imported. Unsupported or malformed entries produce warnings.

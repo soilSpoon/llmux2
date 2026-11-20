@@ -1,0 +1,25 @@
+[Unit]
+Description=llmux2 gateway slot %i
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+WorkingDirectory=%h/llmux2
+ExecStart=%h/llmux2/bin/llmux-server-%i %h/llmux2/llmux-%i.toml
+Environment=TOKIO_WORKER_THREADS=1
+Restart=always
+RestartSec=1
+WatchdogSec=30
+TimeoutStartSec=120
+KillSignal=SIGTERM
+TimeoutStopSec=90
+Nice=10
+CPUQuota=40%
+MemoryMax=512M
+UMask=0077
+StandardOutput=append:%h/llmux2/server-%i.log
+StandardError=append:%h/llmux2/server-%i.log
+
+[Install]
+WantedBy=default.target

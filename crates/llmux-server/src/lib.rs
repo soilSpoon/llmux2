@@ -1,6 +1,10 @@
 //! Axum boundary for the OpenAI-compatible gateway.
 
 mod dashboard;
+mod lifecycle;
+#[cfg(unix)]
+mod notify;
+pub use lifecycle::{bind, serve};
 
 use axum::body::Bytes;
 use axum::{
@@ -26,8 +30,8 @@ use llmux_types::{
     ContextOverflow, CredentialSource, GatewayRequest, GatewayResponse, InboundFormat,
     ProviderRegistry, RequestId, UpstreamError,
 };
-use serde_json::{json, Value};
-use std::{convert::Infallible, error::Error, sync::Arc, time::Duration};
+use serde_json::{json, value::RawValue, Value};
+use std::{collections::BTreeMap, convert::Infallible, error::Error, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
@@ -44,14 +48,21 @@ struct AppState {
     dashboard: Option<dashboard::Dashboard>,
 }
 
-pub async fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Send + Sync>> {
+fn provider_registry() -> ProviderRegistry {
     let mut registry = ProviderRegistry::default();
     for kind in ["openai", "openai_compat"] {
         registry.register(Arc::new(OpenAiCompat::new(kind)));
     }
     registry.register(Arc::new(Anthropic::new(ANTHROPIC)));
     registry.register(Arc::new(OpenAiResponses::new()));
-    let mut sources = std::mem::take(&mut config.api_keys)
+    registry
+}
+
+fn static_sources(
+    config: &mut RuntimeConfig,
+) -> Result<std::collections::HashMap<Arc<str>, Arc<dyn CredentialSource>>, llmux_types::BuildError>
+{
+    std::mem::take(&mut config.api_keys)
         .into_iter()
         .map(|(id, ApiKey { provider, key })| {
             let source = if &*provider.0 == ANTHROPIC {
@@ -61,7 +72,20 @@ pub async fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Se
             };
             Ok((id, Arc::new(source) as Arc<dyn CredentialSource>))
         })
-        .collect::<Result<std::collections::HashMap<_, _>, llmux_types::BuildError>>()?;
+        .collect()
+}
+
+pub fn validate_startup(mut config: RuntimeConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let registry = provider_registry();
+    let sources = static_sources(&mut config)?;
+    let credentials = sources.keys().chain(config.oauth.keys()).cloned().collect();
+    Executor::validate(&config, &registry, &credentials)?;
+    Ok(())
+}
+
+pub async fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Send + Sync>> {
+    let registry = provider_registry();
+    let mut sources = static_sources(&mut config)?;
     for (id, credential) in std::mem::take(&mut config.oauth) {
         let mut oauth = OAuthConfig::new(
             credential.token_url,
@@ -92,6 +116,7 @@ pub async fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Se
         dashboard,
     });
     let mut router = Router::new()
+        .route("/healthz", get(|| async { "ok" }))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/responses", post(responses));
@@ -189,6 +214,15 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
             "Expected a JSON object with a nonempty string model and optional boolean stream",
         );
     };
+    if format == InboundFormat::OpenAiChat {
+        if let Some(temperature) = metadata.temperature {
+            match serde_json::from_str::<f64>(temperature.get()) {
+                Ok(value) if (0.0..=2.0).contains(&value) => {}
+                Ok(_) => return chat_bad_request("temperature: must be between 0 and 2"),
+                Err(_) => return chat_bad_request("temperature: must be a number"),
+            }
+        }
+    }
 
     let model: Arc<str> = Arc::from(metadata.model.as_ref());
     if state
@@ -205,6 +239,18 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
         );
     }
     let request_id = RequestId(Arc::from(uuid::Uuid::new_v4().to_string()));
+    let upstream_body = if metadata.has_gateway_routing_fields {
+        let Some(clean) = without_gateway_routing_fields(&body) else {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Invalid JSON body",
+            );
+        };
+        clean
+    } else {
+        body.clone()
+    };
     let request = |body: Bytes, prompt_bytes: u64| GatewayRequest {
         format,
         model: model.clone(),
@@ -220,7 +266,7 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
     let mut dropped = 0;
     let mut result = state
         .executor
-        .execute(request(body.clone(), metadata.prompt_bytes))
+        .execute(request(upstream_body.clone(), metadata.prompt_bytes))
         .await;
     if let Err(GatewayError::ContextLengthExceeded {
         limit,
@@ -229,7 +275,7 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
     }) = result
     {
         if let Some(truncated) = truncate_middle(
-            &body,
+            &upstream_body,
             metadata.prompt_bytes,
             metadata.max_output_tokens,
             limit,
@@ -243,6 +289,9 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
     }
     let routed = match result {
         Ok(routed) => routed,
+        Err(GatewayError::UnknownModel) if format == InboundFormat::OpenAiChat => {
+            return chat_bad_request("Invalid model format");
+        }
         Err(err) => return gateway_error(err),
     };
     let mut response = match routed.response {
@@ -299,6 +348,14 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
             .insert(ATTEMPTS_HEADER, HeaderValue::from(routed.attempts));
     }
     response
+}
+
+fn without_gateway_routing_fields(body: &[u8]) -> Option<Bytes> {
+    let mut fields: BTreeMap<String, &RawValue> = serde_json::from_slice(body).ok()?;
+    for field in ["min_discount_percent", "zdr", "ranking"] {
+        fields.remove(field);
+    }
+    serde_json::to_vec(&fields).ok().map(Bytes::from)
 }
 
 fn authorized(headers: &HeaderMap, keys: &[Arc<str>]) -> bool {
@@ -426,6 +483,14 @@ fn upstream_client_error(status: StatusCode, body: Bytes) -> Response {
         .entry("code")
         .or_insert_with(|| json!("upstream_client_error"));
     json_body(status, Body::from(payload.to_string()))
+}
+
+fn chat_bad_request(message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error":{"message":message,"type":"invalid_request_error","code":"bad_request"}})),
+    )
+        .into_response()
 }
 
 fn error(status: StatusCode, code: &str, message: &str) -> Response {

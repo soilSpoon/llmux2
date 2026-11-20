@@ -22,3 +22,4 @@ async-trait.workspace = true
 axum.workspace = true
 hyper.workspace = true
 llmux-testkit.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

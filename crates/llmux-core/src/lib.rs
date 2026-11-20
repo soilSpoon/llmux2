@@ -15,7 +15,7 @@ use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::{TokioExecutor, TokioTimer},
 };
-use limits::{DeploymentLimits, Permit};
+use limits::{DeploymentLimits, Permit, Window};
 use llmux_config::RuntimeConfig;
 use llmux_types::{
     AuthMaterial, BuildError, ContextOverflow, CredentialSource, Deployment, DeploymentIdx,
@@ -25,7 +25,7 @@ use llmux_types::{
 use stats::AttemptStats;
 pub use stats::DeploymentStats;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::Range,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -102,8 +102,25 @@ pub struct Executor {
 }
 
 impl Executor {
+    pub fn validate(
+        cfg: &RuntimeConfig,
+        registry: &ProviderRegistry,
+        credentials: &HashSet<Arc<str>>,
+    ) -> Result<(), InitError> {
+        for dep in &cfg.deployments {
+            if registry.get(&dep.provider).is_none() {
+                return Err(InitError::UnknownProvider(dep.provider.0.clone()));
+            }
+            if !dep.credential.is_empty() && !credentials.contains(&dep.credential) {
+                return Err(InitError::MissingCredential);
+            }
+        }
+        Ok(())
+    }
+
     fn shared_limits<'a>(
         shared: &mut Vec<(&'a Deployment, Arc<DeploymentLimits>)>,
+        key_windows: &HashMap<Arc<str>, Vec<Arc<Window>>>,
         dep: &'a Deployment,
     ) -> Arc<DeploymentLimits> {
         let same_route = |other: &&Deployment| {
@@ -116,7 +133,10 @@ impl Executor {
         if let Some((_, limits)) = shared.iter().find(|(other, _)| same_route(other)) {
             return limits.clone();
         }
-        let limits = Arc::new(DeploymentLimits::new(dep.quota));
+        let key = key_windows
+            .get(&dep.credential)
+            .map_or(&[][..], Vec::as_slice);
+        let limits = Arc::new(DeploymentLimits::with_shared(dep.quota, key));
         shared.push((dep, limits.clone()));
         limits
     }
@@ -126,9 +146,16 @@ impl Executor {
         registry: &ProviderRegistry,
         credentials: &HashMap<Arc<str>, Arc<dyn CredentialSource>>,
     ) -> Result<Self, InitError> {
+        Self::validate(&cfg, registry, &credentials.keys().cloned().collect())?;
         let mut disabled = HashMap::<Arc<str>, Arc<AtomicBool>>::new();
         // Deployments that reach the same upstream route draw on one provider limit.
         let mut shared_limits = Vec::<(&Deployment, Arc<DeploymentLimits>)>::new();
+        // A credential's quota is one set of windows shared by all of its deployments.
+        let key_windows: HashMap<Arc<str>, Vec<Arc<Window>>> = cfg
+            .credential_quotas
+            .iter()
+            .map(|(id, quota)| (id.clone(), Window::for_quota(*quota)))
+            .collect();
         let bindings = cfg
             .deployments
             .iter()
@@ -154,7 +181,7 @@ impl Executor {
                     adapter,
                     auth,
                     disabled,
-                    limits: Self::shared_limits(&mut shared_limits, dep),
+                    limits: Self::shared_limits(&mut shared_limits, &key_windows, dep),
                     stats: cfg.server.dashboard_key.is_some().then(Arc::default),
                 })
             })
@@ -319,7 +346,7 @@ impl Executor {
                     if attempts == self.cfg.routing.max_attempts {
                         break 'groups;
                     }
-                    let Some(permit) = binding.limits.admit() else {
+                    let Some(permit) = binding.limits.admit(needed) else {
                         last_transient = None;
                         break;
                     };
@@ -334,7 +361,9 @@ impl Executor {
                     last_transient = None;
                     match result {
                         Ok(response) => {
-                            binding.limits.succeeded();
+                            if matches!(response, GatewayResponse::Complete { .. }) {
+                                binding.limits.succeeded();
+                            }
                             return Ok(RoutedResponse {
                                 deployment: dep.id.clone(),
                                 attempts,
@@ -417,7 +446,7 @@ impl Executor {
                 !binding.disabled.load(Ordering::Relaxed)
                     && binding.adapter.supports(req.format) != Support::No
             })
-            .map(|binding| binding.limits.available_at(now))
+            .map(|binding| binding.limits.available_at(now, needed))
             .min()
             .unwrap_or(now);
         Err(GatewayError::AllCandidatesExhausted {
@@ -452,6 +481,14 @@ impl Executor {
             .request(upstream.map(Full::new))
             .await
             .map_err(|_| GatewayError::Client(UpstreamError::Connect))?;
+        if let Some(observed) = response
+            .status()
+            .is_success()
+            .then(|| binding.adapter.observe_limits(response.headers()))
+            .flatten()
+        {
+            binding.limits.observe(observed, self.cfg.cooldown.max);
+        }
         let response = binding
             .adapter
             .parse_response(req, dep, response)
@@ -470,18 +507,36 @@ impl Executor {
                     }))?
                     .map_err(GatewayError::Client)?;
                 let idle_timeout = self.cfg.server.request_timeout.min(dep.timeout);
+                let cooldown = (self.cfg.cooldown.default, self.cfg.cooldown.max);
                 let events = stream::unfold(
-                    Some((events, binding.stats.clone())),
+                    Some((events, binding.stats.clone(), binding.limits.clone())),
                     move |state| async move {
-                        let (mut events, stats) = state?;
+                        let (mut events, stats, limits) = state?;
                         let error = match timeout(idle_timeout, events.next()).await {
-                            Ok(Some(Ok(event))) => return Some((Ok(event), Some((events, stats)))),
+                            Ok(Some(Ok(event))) => {
+                                return Some((Ok(event), Some((events, stats, limits))))
+                            }
                             Ok(Some(Err(err))) => err,
-                            Ok(None) => return None,
+                            Ok(None) => {
+                                limits.succeeded();
+                                return None;
+                            }
                             Err(_) => UpstreamError::Timeout,
                         };
                         if let Some(stats) = &stats {
                             stats.record_stream_error();
+                        }
+                        let hint = match &error {
+                            UpstreamError::RateLimited { retry_after, .. } => Some(*retry_after),
+                            UpstreamError::QuotaExhausted { reset_at } => {
+                                Some(reset_at.map(|reset| {
+                                    reset.duration_since(SystemTime::now()).unwrap_or_default()
+                                }))
+                            }
+                            _ => None,
+                        };
+                        if let Some(hint) = hint {
+                            limits.limited(hint, cooldown.0, cooldown.1);
                         }
                         Some((Err(error), None))
                     },
