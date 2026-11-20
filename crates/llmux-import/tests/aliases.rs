@@ -24,6 +24,34 @@ fn fixture() -> Value {
 }
 
 #[test]
+fn direct_alias_targets_do_not_consume_real_combo_expansion_budget() {
+    let mut root = fixture();
+    root["provider_connections"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id":"last","provider":"anthropic","auth_type":"apikey","api_key":"synthetic-last-key"
+        }));
+    let mut steps = vec![json!("openai/test"); 600];
+    steps.push(json!("anthropic/last"));
+    root["combos"] = json!([{"name":"large","data":{"name":"large","models":steps}}]);
+    root["key_value"]["modelAliases"] = json!({"direct":"openai/test"});
+    root["model_combo_mappings"] = json!([]);
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let config = RuntimeConfig::load(output).unwrap();
+    let model = &config.models[config.model_names["large"]];
+    assert_eq!(model.deployments.len(), 601);
+    let last = &config.deployments[model.deployments[600].0 as usize];
+    assert_eq!(last.upstream_model.as_ref(), "last");
+    assert!(!report
+        .warnings
+        .iter()
+        .any(|w| w.contains("1024-step work budget")));
+}
+
+#[test]
 fn aliases_share_canonical_models_and_mapping_precedence() {
     let root = fixture();
     let dir = tempfile::tempdir().unwrap();
@@ -41,7 +69,7 @@ fn aliases_share_canonical_models_and_mapping_precedence() {
     }
     assert_eq!(
         (report.models, report.deployments, report.credentials),
-        (1, 1, 1)
+        (2, 2, 1)
     );
     let warnings = report.warnings.join("\n");
     assert!(warnings.contains("collision"));
@@ -78,7 +106,7 @@ fn direct_aliases_use_shared_provider_expansion_and_rows_are_supported() {
     assert!(config.model_names.contains_key("object"));
     assert_eq!(
         (report.models, report.deployments, report.credentials),
-        (3, 3, 1)
+        (4, 4, 1)
     );
     assert!(report
         .warnings

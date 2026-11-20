@@ -33,6 +33,8 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     pub client_keys: Box<[Arc<str>]>,
     pub request_timeout: Duration,
+    pub shutdown_timeout: Duration,
+    pub drain_grace: Duration,
     pub expose_routing_headers: bool,
     pub dashboard_key: Option<Arc<str>>,
 }
@@ -58,6 +60,8 @@ pub struct RuntimeConfig {
     pub cooldown: CooldownConfig,
     pub api_keys: HashMap<Arc<str>, ApiKey>,
     pub oauth: HashMap<Arc<str>, OAuthCredential>,
+    /// Quotas shared by every deployment that uses the credential.
+    pub credential_quotas: HashMap<Arc<str>, QuotaSpec>,
     pub model_names: HashMap<Arc<str>, usize>,
     pub model_allowed_keys: HashMap<usize, Box<[Arc<str>]>>,
     pub models: Box<[CanonicalModel]>,
@@ -109,6 +113,8 @@ struct RawServer {
     listen: SocketAddr,
     client_keys: Vec<String>,
     request_timeout_ms: u64,
+    shutdown_timeout_ms: u64,
+    drain_grace_ms: u64,
     expose_routing_headers: bool,
     dashboard_key: Option<String>,
 }
@@ -119,6 +125,8 @@ impl Default for RawServer {
             listen: SocketAddr::from(([127, 0, 0, 1], 8080)),
             client_keys: Vec::new(),
             request_timeout_ms: DEFAULT_TIMEOUT_MS,
+            shutdown_timeout_ms: 60_000,
+            drain_grace_ms: 2_000,
             expose_routing_headers: true,
             dashboard_key: None,
         }
@@ -168,6 +176,8 @@ enum RawCredential {
         id: String,
         provider: String,
         key: String,
+        #[serde(default)]
+        quota: QuotaSpec,
     },
     Oauth {
         id: String,
@@ -180,6 +190,8 @@ enum RawCredential {
         resource: Option<String>,
         refresh_skew_ms: Option<u64>,
         request_timeout_ms: Option<u64>,
+        #[serde(default)]
+        quota: QuotaSpec,
     },
 }
 
@@ -234,6 +246,9 @@ impl RawConfig {
             models,
         } = self;
         let request_timeout = timeout(server.request_timeout_ms)?;
+        if server.drain_grace_ms > 10_000 {
+            return Err(invalid("server.drain_grace_ms must be between 0 and 10000"));
+        }
         if server.client_keys.is_empty() {
             return Err(invalid(
                 "server.client_keys must contain at least one secret reference",
@@ -281,11 +296,29 @@ impl RawConfig {
         let mut provider_kinds = HashMap::new();
         let mut api_keys = HashMap::new();
         let mut oauth = HashMap::new();
+        let mut credential_quotas = HashMap::new();
         for credential in credentials {
-            let (id, provider) = match &credential {
-                RawCredential::ApiKey { id, provider, .. }
-                | RawCredential::Oauth { id, provider, .. } => (id, provider),
+            let (id, provider, quota) = match &credential {
+                RawCredential::ApiKey {
+                    id,
+                    provider,
+                    quota,
+                    ..
+                }
+                | RawCredential::Oauth {
+                    id,
+                    provider,
+                    quota,
+                    ..
+                } => (id, provider, *quota),
             };
+            if quota.concurrent.is_some()
+                || [quota.rpm, quota.rpd, quota.tpm, quota.tpd].contains(&Some(0))
+            {
+                return Err(invalid(
+                    "credential quota supports positive rpm, rpd, tpm and tpd only",
+                ));
+            }
             if id.is_empty() || provider.is_empty() || provider_kinds.contains_key(id.as_str()) {
                 return Err(invalid(
                     "credential IDs must be unique and IDs and providers must be nonempty",
@@ -294,6 +327,9 @@ impl RawConfig {
             let id: Arc<str> = id.as_str().into();
             let provider = ProviderKind(provider.as_str().into());
             provider_kinds.insert(id.clone(), provider.clone());
+            if quota != QuotaSpec::default() {
+                credential_quotas.insert(id.clone(), quota);
+            }
             match credential {
                 RawCredential::ApiKey { key, .. } => {
                     api_keys.insert(
@@ -462,11 +498,10 @@ impl RawConfig {
                 if dep.max_context == Some(0) {
                     return Err(invalid("max_context must be positive"));
                 }
-                if dep.quota.rpm == Some(0) || dep.quota.concurrent == Some(0) {
+                let quota = dep.quota;
+                if [quota.rpm, quota.rpd, quota.tpm, quota.tpd, quota.concurrent].contains(&Some(0))
+                {
                     return Err(invalid("configured limits must be positive"));
-                }
-                if dep.quota.rpd.is_some() || dep.quota.tpm.is_some() || dep.quota.tpd.is_some() {
-                    return Err(invalid("MVP quotas support rpm and concurrent only"));
                 }
                 let idx = DeploymentIdx(
                     u32::try_from(deployments.len())
@@ -500,10 +535,13 @@ impl RawConfig {
         }
 
         Ok(RuntimeConfig {
+            credential_quotas,
             server: ServerConfig {
                 listen: server.listen,
                 client_keys,
                 request_timeout,
+                shutdown_timeout: timeout(server.shutdown_timeout_ms)?,
+                drain_grace: Duration::from_millis(server.drain_grace_ms),
                 expose_routing_headers: server.expose_routing_headers,
                 dashboard_key,
             },
@@ -628,6 +666,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn token_and_daily_quotas_are_accepted_and_must_be_positive() {
+        let with_quota = |quota: &str| format!("{}quota = {{ {quota} }}\n", config(REQUIRED));
+        RuntimeConfig::parse(&with_quota("rpm = 20, rpd = 50, tpm = 30000, tpd = 200000"))
+            .expect("token and daily quotas");
+        for quota in ["rpd = 0", "tpm = 0", "tpd = 0"] {
+            let err = RuntimeConfig::parse(&with_quota(quota)).err().expect(quota);
+            assert!(err.to_string().contains("positive"), "{quota}: {err}");
+        }
+    }
+
+    #[test]
+    fn credential_quotas_are_shared_limits_that_must_be_positive() {
+        RuntimeConfig::parse(&config(&format!(
+            "{REQUIRED}\nquota = {{ rpm = 20, rpd = 50 }}"
+        )))
+        .expect("credential quota");
+        for quota in ["rpm = 0", "concurrent = 2"] {
+            let err = RuntimeConfig::parse(&config(&format!("{REQUIRED}\nquota = {{ {quota} }}")))
+                .err()
+                .expect(quota);
+            assert!(
+                err.to_string().contains("credential quota"),
+                "{quota}: {err}"
+            );
+        }
+    }
+
     fn config(fields: &str) -> String {
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| std::env::set_var("LLMUX_CONFIG_OAUTH_TEST_SECRET", "test-secret"));
@@ -654,6 +720,52 @@ upstream_model = "upstream"
     const REQUIRED: &str = r#"token_url = "https://example.com/token"
 client_id = "client"
 refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
+
+    #[test]
+    fn shutdown_timeout_validation() {
+        let base = config(REQUIRED);
+        assert_eq!(
+            RuntimeConfig::parse(&base).unwrap().server.shutdown_timeout,
+            Duration::from_secs(60)
+        );
+        for value in [0, 86_400_001] {
+            let input = base.replace(
+                "[server]",
+                &format!("[server]\nshutdown_timeout_ms = {value}"),
+            );
+            assert!(RuntimeConfig::parse(&input)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("timeouts"));
+        }
+        assert!(RuntimeConfig::parse(
+            &base.replace("[server]", "[server]\nshutdown_timeout_ms = 1234")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn drain_grace_validation() {
+        let base = config(REQUIRED);
+        assert_eq!(
+            RuntimeConfig::parse(&base).unwrap().server.drain_grace,
+            Duration::from_millis(2000)
+        );
+        for value in [0, 1, 2000, 10_000] {
+            let input = base.replace("[server]", &format!("[server]\ndrain_grace_ms = {value}"));
+            assert_eq!(
+                RuntimeConfig::parse(&input).unwrap().server.drain_grace,
+                Duration::from_millis(value)
+            );
+        }
+        let input = base.replace("[server]", "[server]\ndrain_grace_ms = 10001");
+        assert!(RuntimeConfig::parse(&input)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("drain_grace_ms"));
+    }
 
     fn error(fields: &str) -> String {
         RuntimeConfig::parse(&config(fields))

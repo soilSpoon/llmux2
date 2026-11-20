@@ -33,7 +33,7 @@ fn alias_map(root: &Value, warnings: &mut Vec<String>) -> BTreeMap<String, Strin
     result
 }
 
-fn matches(pattern: &str, name: &str) -> bool {
+pub(super) fn matches(pattern: &str, name: &str) -> bool {
     let pattern: Vec<_> = pattern.chars().collect();
     let name: Vec<_> = name.chars().collect();
     let (mut p, mut n, mut star) = (0, 0, None);
@@ -57,11 +57,12 @@ fn matches(pattern: &str, name: &str) -> bool {
 
 pub(super) fn prepare(
     root: &Value,
-    combos: &mut HashMap<String, Value>,
+    combos: &HashMap<String, Value>,
     combo_ids: &HashMap<String, String>,
+    direct: &BTreeMap<String, Value>,
     order: &mut Vec<String>,
     warnings: &mut Vec<String>,
-) -> BTreeMap<String, String> {
+) -> (BTreeMap<String, String>, HashMap<String, Value>) {
     let mut aliases = alias_map(root, warnings);
     let mut mappings: Vec<_> = array(root, "modelComboMappings")
         .iter()
@@ -75,6 +76,7 @@ pub(super) fn prepare(
             .then_with(|| string(a, "createdAt").cmp(string(b, "createdAt")))
     });
     let mut names: BTreeSet<_> = aliases.keys().cloned().collect();
+    names.extend(direct.keys().cloned());
     for row in &mappings {
         let pattern = string(row, "pattern");
         if exact(pattern) {
@@ -161,14 +163,15 @@ pub(super) fn prepare(
         }
         resolved.insert(name.clone(), terminal);
     }
+    let mut synthetic = HashMap::new();
     for terminal in direct_targets {
-        combos.insert(
+        synthetic.insert(
             terminal.clone(),
             json!({"name":terminal,"models":[{"kind":"model","model":terminal}]}),
         );
         order.push(terminal);
     }
-    resolved
+    (resolved, synthetic)
 }
 
 pub(super) fn attach(

@@ -29,13 +29,46 @@ curl -sS http://127.0.0.1:8080/v1/responses \
   -d '{"model":"llama-70b","input":"Hello"}'
 ```
 
-The Responses route translates requests to Chat Completions on OpenAI-compatible upstreams and converts replies back. It accepts reasoning effort as either `reasoning.effort` or `reasoning_effort`; conflicting values are rejected. Stateful Responses conversations and built-in non-function tools are unsupported. For SSE on either route, add `"stream":true` and use `curl -N`.
+The Responses route translates requests to Chat Completions on OpenAI-compatible upstreams and converts replies back. It accepts reasoning effort as either `reasoning.effort` or `reasoning_effort`; when both are non-null, `reasoning_effort` takes precedence. Stateful Responses conversations and built-in non-function tools are unsupported. For SSE on either route, add `"stream":true` and use `curl -N`.
+
+llmux2 accepts and discards the CheaperInference routing fields `min_discount_percent`, `zdr`, and `ranking`. These fields do not impose a price ceiling, guarantee zero data retention, or change how llmux2 ranks deployments. Enforce any retention requirements in your provider configuration.
 
 Credentials use `provider = "openai"` or `"openai_compat"` for OpenAI-compatible upstreams, or `provider = "anthropic"` for the Anthropic Messages API. Anthropic deployments use a base URL such as `https://api.anthropic.com/v1` (the adapter appends `/messages`) and send the key as `x-api-key`. The gateway converts chat requests, JSON responses and SSE chunks between the OpenAI Chat and Anthropic formats, so a model can mix both kinds of deployments and fail over between them.
 
 Use `POST /v1/messages` for Anthropic Messages JSON and SSE on Anthropic deployments. Authenticate with a gateway client key in `x-api-key` or `Authorization: Bearer`.
 
-For converted Anthropic Chat streams, set `stream_options.include_usage` to `true` for a separate usage chunk just before `[DONE]`, or `false` to omit usage. Without this option, usage remains on the finish chunk. Reported cache reads appear in `usage.prompt_tokens_details.cached_tokens` and cache writes in `usage.cache_creation_input_tokens`.
+Chat requests converted to Anthropic return one choice even when `n` asks for more. For converted Anthropic Chat streams, set `stream_options.include_usage` to `true` for a separate usage chunk just before `[DONE]`, or `false` to omit usage. Without this option, usage remains on the finish chunk. Reported cache reads appear in `usage.prompt_tokens_details.cached_tokens` and cache writes in `usage.cache_creation_input_tokens`.
+
+## Health, shutdown and deployment
+
+`GET /healthz` is unauthenticated and returns `200 ok`; it is excluded from
+dashboard statistics. On SIGTERM or SIGINT, the server marks itself draining
+and returns 503 only for health probes. For `server.drain_grace_ms` (default
+2000, valid range 0–10000 ms), it keeps accepting connections and serving
+real requests, adding `Connection: close` to HTTP/1 responses so keep-alive
+clients reconnect to the new slot. Zero disables this lame-duck interval.
+The 10-second cap stays below the unit's 30-second watchdog: a healthy new
+slot's shared-port probe can temporarily reach the draining old slot's 503.
+After that interval, it closes the listener and lets in-flight requests and
+SSE streams finish. The subsequent drain is bounded by
+`server.shutdown_timeout_ms` (default 60000, valid range 1–86400000 ms). It exits
+successfully when that timeout expires even if work remains; those unfinished
+connections are closed.
+Clients should allow streams to finish within that budget.
+
+`llmux-server --check CONFIG` loads and validates configuration without binding
+or contacting upstreams, prints the configured listen address, and exits 0
+(invalid config: exit 1). Existing configs need no changes. Older binaries do
+not recognize `shutdown_timeout_ms` or `drain_grace_ms`; remove unsupported fields
+when rolling back to an older version.
+
+Unix listeners use SO_REUSEADDR and SO_REUSEPORT for overlapping slot handoffs.
+Under systemd, NOTIFY_SOCKET receives READY=1 after application/listener setup
+and STOPPING=1 at drain start. WATCHDOG_USEC enables a periodic TCP HTTP health
+probe; only a successful HTTP 200 sends WATCHDOG=1. See the
+[user-systemd deployment guide](deploy/README.md) for install, recovery,
+migration and rollback instructions, including the host's TCP queue migration
+sysctl.
 
 ## Live dashboard
 
@@ -62,7 +95,7 @@ in its stats. Omit `dashboard_key` to disable the routes and collection.
 
 ## Routing
 
-Lower numeric priority wins, with round-robin ordering among equal priorities. On an upstream HTTP 429, the gateway tries the next deployment and skips the limited deployment until its `Retry-After` (seconds or HTTP date) expires. Missing values use the configured default, doubled for each consecutive 429 from that deployment until it serves a request again, and waits are capped by `cooldown.max_ms`. If none can serve the request, the gateway returns 429 with the earliest known retry delay. Optional local per-deployment RPM and concurrency limits also skip deployments without contacting them. Deployments under different models that share the same provider, credential, base URL, upstream model and quota share one cooldown and one set of local limits, so a 429 on one model's route is not immediately retried through another model.
+Lower numeric priority wins, with round-robin ordering among equal priorities. On an upstream HTTP 429, the gateway tries the next deployment and skips the limited deployment until its `Retry-After` (seconds or HTTP date) expires. Missing values use the configured default, doubled for each consecutive 429 from that deployment until it serves a request again, and waits are capped by `cooldown.max_ms`. A 429 or quota error that arrives after a stream has started cannot be retried, but it still cools the deployment down for later requests. A response whose rate-limit headers report zero remaining requests or tokens also skips that deployment until the reported reset. After a 429 or quota cooldown ends, the deployment takes one request at a time until one succeeds, and other requests fall back meanwhile, so a still-limited provider is not hit by every queued request at once. If none can serve the request, the gateway returns 429 with the earliest known retry delay. Optional local per-deployment request (`quota.rpm`, `quota.rpd`), estimated-token (`quota.tpm`, `quota.tpd`) and concurrency limits also skip deployments without contacting them. Deployments under different models that share the same provider, credential, base URL, upstream model and quota share one cooldown and one set of local limits, so a 429 on one model's route is not immediately retried through another model.
 
 Each deployment may set `max_context` (prompt plus completion tokens), defaulting to the model's `capabilities.max_context`. Before routing, the gateway estimates prompt tokens (about 4 bytes of prompt text per token, ignoring base64 `data:` URLs) plus the requested output limit (`max_output_tokens` for Responses, `max_completion_tokens` else `max_tokens` for Chat), and skips deployments of that model that it would not fit. It never falls back to a different model: if no deployment fits, it returns 400 `context_length_exceeded`, naming the limit, without contacting upstream.
 
@@ -70,7 +103,7 @@ Rejecting is the default. To trim instead, set `context_overflow = "middle-out"`
 
 `x-llmux-deployment` and `x-llmux-attempts` identify the winning deployment and number of HTTP attempts (not skipped deployments). Set `server.expose_routing_headers = false` to hide them. A stream commits on its first complete SSE event; after that, failures end the stream with an error payload rather than replaying the request.
 
-Before a response is committed, the gateway can fail over on upstream server, connection, and timeout errors within its attempt and time limits. Rate-limit and quota-exhaustion failover are controlled by `routing.fallback_on` and enabled by default. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local RPM uses a bounded per-deployment sliding window only when configured.
+Before a response is committed, the gateway can fail over on upstream server, connection, and timeout errors within its attempt and time limits. Rate-limit and quota-exhaustion failover are controlled by `routing.fallback_on` and enabled by default. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local request and token quotas use per-deployment sliding windows (one minute for `rpm`/`tpm`, one day for `rpd`/`tpd`) only when configured. Token quotas count the same prompt-plus-output estimate used for context fitting, and a single request larger than a token quota is still admitted when that window is empty. A credential may also set `quota` (`rpm`, `rpd`, `tpm`, `tpd`) for providers that limit per key or project across models; those windows are shared by every deployment that uses the credential.
 
 ## Credentials
 
@@ -210,6 +243,11 @@ cargo test --locked -p llmux-server --test chat -- --nocapture
 node --test crates/llmux-server/tests/dashboard.cjs
 ```
 
+In CI, `coverage` runs the Rust unit and integration tests once with coverage
+instrumentation, while `check` runs Rust doctests, lint, and the dashboard and
+repository tooling tests. Use `cargo test --locked --workspace` to run all Rust
+tests locally without instrumentation.
+
 ## Live gateway comparison
 
 Run on the gateway host with Python 3.9+ (stdlib only), reference first, llmux second.
@@ -237,8 +275,8 @@ Read `results.json` / `report.html` in a new private output directory; review be
 Learnings: API and dashboard ports differ—validate authenticated `/v1/models` first.
 Stored client keys may be encrypted; extract/decrypt readonly, server-side, into private files.
 Imported names can retain wrong upstream IDs or container-local URLs: import success ≠ usable routing.
-Tests (separate from Rust-only CI): `python3 -m unittest bench.test_compare_gateways` and
-`python3 -m py_compile bench/compare_gateways.py bench/test_compare_gateways.py`.
+Run just the comparison harness tests with `python3 -m unittest bench.test_compare_gateways`.
+Check Python syntax with `python3 -m py_compile bench/compare_gateways.py bench/test_compare_gateways.py`.
 
 ## Mock-upstream load benchmark
 

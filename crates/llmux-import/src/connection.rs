@@ -1,9 +1,21 @@
-use crate::{string, valid_secret};
+use crate::{array, string, valid_secret};
 use serde_json::Value;
 
 pub(super) enum SelectedAuth<'a> {
     Key(&'a str),
     None,
+}
+
+pub(super) fn valid_restrictions(step: &Value) -> bool {
+    !step
+        .get("connectionId")
+        .is_some_and(|v| !v.is_null() && !v.is_string())
+        && !step
+            .get("allowedConnectionIds")
+            .is_some_and(|v| !v.is_null() && !v.is_array())
+        && array(step, "allowedConnectionIds")
+            .iter()
+            .all(|v| v.as_str().is_some_and(|s| !s.trim().is_empty()))
 }
 
 pub(super) fn identity<'a>(connection: &'a Value, nodes: &'a [Value]) -> &'a str {

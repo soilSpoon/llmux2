@@ -4,7 +4,7 @@ use http::{HeaderMap, Request, Response};
 use hyper::body::Incoming;
 use llmux_types::{
     AuthError, AuthMaterial, BuildError, CanonicalModel, Capabilities, ContextOverflow,
-    InboundFormat, ProviderKind, RequestId, Strategy,
+    InboundFormat, LimitObservation, ProviderKind, RequestId, SseEvent, Strategy,
 };
 use std::{collections::VecDeque, sync::Mutex};
 
@@ -34,6 +34,9 @@ impl CredentialSource for Credential {
 struct Adapter {
     kind: ProviderKind,
     errors: Mutex<VecDeque<UpstreamError>>,
+    observed: Mutex<Option<LimitObservation>>,
+    status: Arc<std::sync::atomic::AtomicU16>,
+    stream_errors: Mutex<VecDeque<UpstreamError>>,
     calls: Mutex<Vec<(Arc<str>, Arc<str>)>>,
 }
 
@@ -41,6 +44,10 @@ struct Adapter {
 impl ProviderAdapter for Adapter {
     fn kind(&self) -> &ProviderKind {
         &self.kind
+    }
+
+    fn observe_limits(&self, _: &HeaderMap) -> Option<LimitObservation> {
+        self.observed.lock().unwrap().take()
     }
 
     fn supports(&self, _: InboundFormat) -> Support {
@@ -65,12 +72,22 @@ impl ProviderAdapter for Adapter {
 
     async fn parse_response(
         &self,
-        _: &GatewayRequest,
+        req: &GatewayRequest,
         _: &Deployment,
         _: Response<Incoming>,
     ) -> Result<GatewayResponse, UpstreamError> {
         if let Some(error) = self.errors.lock().unwrap().pop_front() {
             return Err(error);
+        }
+        if req.stream {
+            let event = SseEvent {
+                event: None,
+                data: "{}".into(),
+            };
+            let tail = self.stream_errors.lock().unwrap().pop_front();
+            return Ok(GatewayResponse::Stream(Box::pin(
+                futures_util::stream::iter(std::iter::once(Ok(event)).chain(tail.map(Err))),
+            )));
         }
         Ok(GatewayResponse::Complete {
             status: StatusCode::OK,
@@ -114,12 +131,40 @@ async fn fixture_with_models(
     models: &[(&str, &[u32])],
     shared_quota: llmux_types::QuotaSpec,
 ) -> Fixture {
-    let server = llmux_testkit::TestServer::start(axum::Router::new().fallback(|| async { "ok" }))
-        .await
-        .unwrap();
+    fixture_full(
+        errors,
+        refresh_fails,
+        max_context,
+        models,
+        shared_quota,
+        Default::default(),
+    )
+    .await
+}
+
+/// `second_quota` is the quota of credential "second", used only by dep2.
+async fn fixture_full(
+    errors: Vec<UpstreamError>,
+    refresh_fails: bool,
+    max_context: [Option<u32>; 3],
+    models: &[(&str, &[u32])],
+    shared_quota: llmux_types::QuotaSpec,
+    second_quota: llmux_types::QuotaSpec,
+) -> Fixture {
+    let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
+    let served_status = status.clone();
+    let server = llmux_testkit::TestServer::start(axum::Router::new().fallback(move || {
+        let status = StatusCode::from_u16(served_status.load(Ordering::Relaxed)).unwrap();
+        async move { (status, "ok") }
+    }))
+    .await
+    .unwrap();
     let adapter = Arc::new(Adapter {
         kind: ProviderKind("test".into()),
         errors: Mutex::new(errors.into()),
+        observed: Mutex::new(None),
+        status,
+        stream_errors: Mutex::new(VecDeque::new()),
         calls: Mutex::new(Vec::new()),
     });
     let credential = Arc::new(Credential {
@@ -156,6 +201,8 @@ async fn fixture_with_models(
             listen: "127.0.0.1:0".parse().unwrap(),
             client_keys: Box::new([]),
             request_timeout: Duration::from_secs(5),
+            shutdown_timeout: Duration::from_secs(60),
+            drain_grace: Duration::from_secs(2),
             expose_routing_headers: true,
             dashboard_key: None,
         },
@@ -168,6 +215,7 @@ async fn fixture_with_models(
             max: Duration::from_secs(5),
         },
         api_keys: HashMap::new(),
+        credential_quotas: HashMap::from([("second".into(), second_quota)]),
         oauth: HashMap::new(),
         model_names: models
             .iter()
@@ -474,12 +522,17 @@ async fn repeated_rate_limits_lengthen_cooldown_until_a_success() {
             .map_or(Duration::ZERO, |end| end - now)
     };
     let served = |adapter: &Adapter| adapter.calls.lock().unwrap().last().unwrap().0.clone();
+    let elapse = |duration| async move {
+        tokio::time::pause();
+        tokio::time::advance(duration).await;
+        tokio::time::resume();
+    };
 
     executor.execute(request()).await.unwrap();
     assert_eq!(served(&adapter).as_ref(), "dep2");
     assert!(cooldown(&executor) <= Duration::from_secs(1));
 
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    elapse(Duration::from_millis(1100)).await;
     adapter.errors.lock().unwrap().push_back(limited());
     executor.execute(request()).await.unwrap();
     assert_eq!(served(&adapter).as_ref(), "dep2");
@@ -489,7 +542,7 @@ async fn repeated_rate_limits_lengthen_cooldown_until_a_success() {
         "second consecutive 429 should double the cooldown, got {second:?}"
     );
 
-    tokio::time::sleep(second + Duration::from_millis(100)).await;
+    elapse(second + Duration::from_millis(100)).await;
     executor.execute(request()).await.unwrap();
     assert_eq!(served(&adapter).as_ref(), "dep0");
     adapter.errors.lock().unwrap().push_back(limited());
@@ -570,4 +623,219 @@ async fn local_rpm_budget_is_shared_by_models_on_the_same_upstream_route() {
         .map(|(dep, _)| dep.to_string())
         .collect();
     assert_eq!(calls, ["dep0", "dep2"]);
+}
+
+#[tokio::test]
+async fn exhausted_rate_limit_headers_skip_the_deployment_until_reset() {
+    for observed in [
+        LimitObservation {
+            remaining_requests: Some(0),
+            reset_requests: Some(Duration::from_secs(3)),
+            ..LimitObservation::default()
+        },
+        LimitObservation {
+            remaining_tokens: Some(0),
+            reset_tokens: Some(Duration::from_secs(3)),
+            ..LimitObservation::default()
+        },
+    ] {
+        let (executor, adapter, _, _server) = fixture(Vec::new(), false).await;
+        *adapter.observed.lock().unwrap() = Some(observed);
+        let first = executor.execute(request()).await.unwrap();
+        assert_eq!(first.deployment.as_ref(), "dep0");
+        let second = executor.execute(request()).await.unwrap();
+        assert_eq!(
+            second.deployment.as_ref(),
+            "dep2",
+            "a success reporting zero remaining requests or tokens must not be retried before reset"
+        );
+    }
+}
+
+#[tokio::test]
+async fn remaining_rate_limit_headers_keep_the_deployment() {
+    let (executor, adapter, _, _server) = fixture(Vec::new(), false).await;
+    *adapter.observed.lock().unwrap() = Some(LimitObservation {
+        remaining_requests: Some(1),
+        reset_requests: Some(Duration::from_secs(3)),
+        ..LimitObservation::default()
+    });
+    executor.execute(request()).await.unwrap();
+    let second = executor.execute(request()).await.unwrap();
+    assert_eq!(second.deployment.as_ref(), "dep0");
+}
+
+#[tokio::test]
+async fn rate_limit_headers_on_error_responses_do_not_cool_down() {
+    let (executor, adapter, _, _server) = fixture(Vec::new(), false).await;
+    adapter.status.store(400, Ordering::Relaxed);
+    *adapter.observed.lock().unwrap() = Some(LimitObservation {
+        remaining_requests: Some(0),
+        reset_requests: Some(Duration::from_secs(3)),
+        ..LimitObservation::default()
+    });
+    executor.execute(request()).await.unwrap();
+    assert!(executor.bindings[0]
+        .limits
+        .cooldown_until(Instant::now())
+        .is_none());
+}
+
+#[tokio::test]
+async fn limit_error_after_stream_start_cools_down_the_deployment() {
+    for error in [
+        UpstreamError::RateLimited {
+            retry_after: Some(Duration::from_secs(3)),
+            scope: llmux_types::LimitScope::Unknown,
+        },
+        UpstreamError::QuotaExhausted {
+            reset_at: Some(SystemTime::now() + Duration::from_secs(3)),
+        },
+    ] {
+        let (executor, adapter, _, _server) = fixture(Vec::new(), false).await;
+        adapter.stream_errors.lock().unwrap().push_back(error);
+        let streaming = || GatewayRequest {
+            stream: true,
+            ..request()
+        };
+        let routed = executor.execute(streaming()).await.unwrap();
+        assert_eq!(routed.deployment.as_ref(), "dep0");
+        let GatewayResponse::Stream(events) = routed.response else {
+            panic!("expected stream")
+        };
+        let events: Vec<_> = events.collect().await;
+        assert!(matches!(events.as_slice(), [Ok(_), Err(_)]));
+
+        let next = executor.execute(streaming()).await.unwrap();
+        assert_eq!(
+            next.deployment.as_ref(),
+            "dep2",
+            "the deployment whose stream ended in a limit error must cool down"
+        );
+    }
+}
+
+#[tokio::test]
+async fn repeated_limit_errors_after_stream_start_back_off() {
+    let (executor, adapter, _, _server) = fixture(Vec::new(), false).await;
+    let streaming = || GatewayRequest {
+        stream: true,
+        ..request()
+    };
+    let mut cooldowns = Vec::new();
+    for _ in 0..2 {
+        adapter
+            .stream_errors
+            .lock()
+            .unwrap()
+            .push_back(UpstreamError::RateLimited {
+                retry_after: None,
+                scope: llmux_types::LimitScope::Unknown,
+            });
+        let routed = executor.execute(streaming()).await.unwrap();
+        assert_eq!(routed.deployment.as_ref(), "dep0");
+        let GatewayResponse::Stream(events) = routed.response else {
+            panic!("expected stream")
+        };
+        let _: Vec<_> = events.collect().await;
+        let now = Instant::now();
+        let until = executor.bindings[0].limits.cooldown_until(now).unwrap();
+        cooldowns.push(until - now);
+        tokio::time::sleep(until - now + Duration::from_millis(50)).await;
+    }
+    assert!(
+        cooldowns[1] > Duration::from_millis(1500),
+        "a stream that started then hit a limit is not a success: {cooldowns:?}"
+    );
+}
+
+#[tokio::test]
+async fn token_quota_skips_a_deployment_without_calling_it() {
+    let (executor, adapter, _, _server) = fixture_with_models(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("model", &[0, 1, 2])],
+        llmux_types::QuotaSpec {
+            tpm: Some(100),
+            ..Default::default()
+        },
+    )
+    .await;
+    let sized = || GatewayRequest {
+        est_input_tokens: 60,
+        ..request()
+    };
+    executor.execute(sized()).await.unwrap();
+    executor.execute(sized()).await.unwrap();
+    let served: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(
+        served,
+        ["dep0", "dep2"],
+        "60 + 60 tokens exceed tpm = 100 on dep0"
+    );
+}
+
+#[tokio::test]
+async fn after_a_cooldown_other_requests_fall_back_while_a_probe_is_open() {
+    let (executor, adapter, _, _server) = fixture(
+        vec![UpstreamError::RateLimited {
+            retry_after: Some(Duration::from_millis(50)),
+            scope: llmux_types::LimitScope::Unknown,
+        }],
+        false,
+    )
+    .await;
+    assert_eq!(
+        executor
+            .execute(request())
+            .await
+            .unwrap()
+            .deployment
+            .as_ref(),
+        "dep2"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let streaming = GatewayRequest {
+        stream: true,
+        ..request()
+    };
+    let probe = executor.execute(streaming).await.unwrap();
+    assert_eq!(probe.deployment.as_ref(), "dep0");
+    let held_back = executor.execute(request()).await.unwrap();
+    assert_eq!(
+        held_back.deployment.as_ref(),
+        "dep2",
+        "dep0 has a probe open"
+    );
+    drop(probe);
+    assert_eq!(adapter.calls.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn credential_quota_limits_the_credentials_deployments() {
+    let (executor, adapter, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("model", &[2])],
+        Default::default(),
+        llmux_types::QuotaSpec {
+            rpm: Some(1),
+            ..Default::default()
+        },
+    )
+    .await;
+    executor.execute(request()).await.unwrap();
+    assert!(matches!(
+        executor.execute(request()).await,
+        Err(GatewayError::AllCandidatesExhausted { .. })
+    ));
+    assert_eq!(adapter.calls.lock().unwrap().len(), 1);
 }

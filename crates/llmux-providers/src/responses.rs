@@ -104,10 +104,7 @@ pub(crate) fn request(body: &[u8], model: &str) -> Result<Bytes, BuildError> {
     }
     let effort = body.pointer("/reasoning/effort").filter(|v| !v.is_null());
     let alias = obj.get("reasoning_effort").filter(|v| !v.is_null());
-    if matches!((effort, alias), (Some(a), Some(b)) if a != b) {
-        return Err(BuildError::InvalidBody);
-    }
-    if let Some(value) = effort.or(alias) {
+    if let Some(value) = alias.or(effort) {
         out["reasoning_effort"] = value.clone();
     }
     if let Some(format) = body.pointer("/text/format") {
@@ -481,12 +478,17 @@ mod tests {
             )["reasoning_effort"],
             "high"
         );
-        let conflict =
-            json!({"input":"hello","reasoning_effort":"high","reasoning":{"effort":"low"}});
-        assert!(matches!(
-            request(conflict.to_string().as_bytes(), "upstream"),
-            Err(BuildError::InvalidBody)
-        ));
+    }
+
+    #[test]
+    fn top_level_reasoning_effort_wins_when_aliases_disagree() {
+        for stream in [false, true] {
+            let request = json!({"input":"hello","stream":stream,
+                "reasoning_effort":"high","reasoning":{"effort":"low"}});
+            let translated = self::request(request.to_string().as_bytes(), "upstream").unwrap();
+            let translated: Value = serde_json::from_slice(&translated).unwrap();
+            assert_eq!(translated["reasoning_effort"], "high");
+        }
     }
 
     #[test]
