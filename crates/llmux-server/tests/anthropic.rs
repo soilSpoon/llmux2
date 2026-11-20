@@ -42,6 +42,7 @@ enum Reply {
     Ok,
     Limit,
     Image,
+    Document,
     BrokenStream,
     ProtocolHeaders,
 }
@@ -96,6 +97,8 @@ async fn messages(State(up): State<Arc<Upstream>>, headers: HeaderMap, body: Byt
         };
         assert_eq!(source["type"], "base64");
         assert_eq!(source["data"].as_str().unwrap().len(), 32_000);
+    } else if matches!(up.reply, Reply::Document) {
+        assert_eq!(request["messages"][0]["content"][0]["type"], "document");
     } else {
         assert_eq!(
             request["messages"],
@@ -155,12 +158,12 @@ struct Fixture {
 
 impl Fixture {
     async fn start(anthropic: (Reply, i32), openai: (Reply, i32)) -> Self {
-        Self::with_context(anthropic, openai, "").await
+        Self::with_config(anthropic, (openai.0, Some(openai.1)), "").await
     }
 
-    async fn with_context(
+    async fn with_config(
         anthropic: (Reply, i32),
-        openai: (Reply, i32),
+        openai: (Reply, Option<i32>),
         capabilities: &str,
     ) -> Self {
         let (anthropic_reply, anthropic_priority) = anthropic;
@@ -186,11 +189,30 @@ impl Fixture {
             fs::write(secrets.path().join(key), format!("{key}\n")).unwrap();
         }
         let base = secrets.path().display();
+        let openai_deployment = openai_priority
+            .map(|priority| {
+                format!(
+                    r#"
+[[models.deployments]]
+id = "gpt"
+credential = "openai-key"
+base_url = "{}/v1"
+upstream_model = "gpt-upstream"
+priority = {priority}
+quota = {{ rpm = 1 }}
+"#,
+                    o.url()
+                )
+            })
+            .unwrap_or_default();
         let config = format!(
             r#"
 [server]
 client_keys = ["file:{base}/test-client"]
 request_timeout_ms = 4000
+
+[routing]
+max_attempts = 2
 
 [[credentials]]
 id = "claude-key"
@@ -215,15 +237,9 @@ base_url = "{}/v1"
 upstream_model = "claude-upstream"
 priority = {anthropic_priority}
 
-[[models.deployments]]
-id = "gpt"
-credential = "openai-key"
-base_url = "{}/v1"
-upstream_model = "gpt-upstream"
-priority = {openai_priority}
+{openai_deployment}
 "#,
-            a.url(),
-            o.url()
+            a.url()
         );
         let gateway = TestServer::start(
             llmux_server::app(RuntimeConfig::parse(&config).unwrap())
@@ -404,9 +420,9 @@ async fn native_messages_forwards_anthropic_protocol_headers() {
 
 #[tokio::test]
 async fn native_messages_base64_image_does_not_use_prompt_text_budget() {
-    let fixture = Fixture::with_context(
+    let fixture = Fixture::with_config(
         (Reply::Image, 0),
-        (Reply::Ok, 10),
+        (Reply::Ok, Some(10)),
         "capabilities = { max_context = 4500 }",
     )
     .await;
@@ -423,9 +439,9 @@ async fn native_messages_base64_image_does_not_use_prompt_text_budget() {
 
 #[tokio::test]
 async fn native_messages_nested_base64_image_does_not_use_prompt_text_budget() {
-    let fixture = Fixture::with_context(
+    let fixture = Fixture::with_config(
         (Reply::Image, 0),
-        (Reply::Ok, 10),
+        (Reply::Ok, Some(10)),
         "capabilities = { max_context = 4500 }",
     )
     .await;
@@ -446,7 +462,7 @@ async fn native_messages_nested_base64_image_does_not_use_prompt_text_budget() {
 
 #[tokio::test]
 async fn native_messages_preserves_anthropic_rate_limit_error() {
-    let fixture = Fixture::start((Reply::Limit, 0), (Reply::Ok, 10)).await;
+    let fixture = Fixture::with_config((Reply::Limit, 0), (Reply::Ok, None), "").await;
     let (response, body) = fixture
         .send_to(
             "/v1/messages",
@@ -491,6 +507,26 @@ async fn native_messages_emits_anthropic_broken_stream_error() {
     assert_eq!(error["error"]["type"], "api_error");
     assert!(!body.contains("event: message_stop"));
     assert_eq!(fixture.counts(), [1, 0]);
+}
+
+#[tokio::test]
+async fn native_messages_skips_conversion_that_cannot_handle_documents() {
+    let fixture = Fixture::start((Reply::Document, 10), (Reply::Ok, 0)).await;
+    for stream in [false, true] {
+        let (response, body) = fixture.send_to(
+            "/v1/messages", header::AUTHORIZATION, "Bearer test-client",
+            json!({"model":"assistant","max_tokens":4096,"system":"Be brief","stream":stream,
+                "messages":[{"role":"user","content":[{"type":"document",
+                    "source":{"type":"base64","media_type":"application/pdf","data":"JVBERg=="}}]}]
+            }),
+        ).await;
+        check_route(&response, "claude", "1");
+        assert!(body.contains("Hi from Claude"));
+    }
+    assert_eq!(fixture.counts(), [2, 0]);
+    let (response, _) = fixture.request(false).await;
+    check_route(&response, "gpt", "1");
+    assert_eq!(fixture.counts(), [2, 1]);
 }
 
 #[tokio::test]
