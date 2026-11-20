@@ -53,7 +53,7 @@ fn sections(body: &str) -> HashMap<String, String> {
             .map_or(lines.len(), |(i, _, _)| *i);
         let content = lines[start + 1..end]
             .iter()
-            .filter(|line| heading(line).is_none())
+            .filter(|line| heading(line).is_none() && !line.trim().chars().all(|c| c == '#'))
             .copied()
             .collect::<Vec<_>>()
             .join("\n");
