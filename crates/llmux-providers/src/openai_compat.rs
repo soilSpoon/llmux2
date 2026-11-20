@@ -488,6 +488,11 @@ fn parse_duration(mut value: &str) -> Option<Duration> {
 fn error_details(body: &[u8]) -> serde_json::Value {
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()
+        .map(|value| match value {
+            // Google's OpenAI-compatible endpoint wraps errors in a one-element array.
+            serde_json::Value::Array(mut items) if !items.is_empty() => items.swap_remove(0),
+            value => value,
+        })
         .and_then(|mut value| value.get_mut("error").map(serde_json::Value::take))
         .unwrap_or_default()
 }
@@ -582,6 +587,12 @@ fn classify_error_details(
         401 => UpstreamError::Auth { refreshable: true },
         403 => UpstreamError::Auth { refreshable: false },
         408 => UpstreamError::Timeout,
+        400 if message.contains("pass a valid api key")
+            || message.contains("api key not valid")
+            || details.to_string().contains("API_KEY_INVALID") =>
+        {
+            UpstreamError::Auth { refreshable: false }
+        }
         400 | 413 | 422
             if code == "context_length_exceeded"
                 || kind == "context_length_exceeded"
@@ -680,6 +691,26 @@ mod tests {
             Bytes::copy_from_slice(body.as_bytes()),
             SystemTime::UNIX_EPOCH,
         )
+    }
+
+    #[test]
+    fn gemini_invalid_api_key_400_is_a_rejected_credential() {
+        for body in [
+            r#"[{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT","details":[{"reason":"API_KEY_INVALID"}]}}]"#,
+            r#"{"error":{"code":400,"message":"Please pass a valid API key","status":"INVALID_ARGUMENT"}}"#,
+        ] {
+            assert!(matches!(
+                classify(400, body),
+                UpstreamError::Auth { refreshable: false }
+            ));
+        }
+        assert!(matches!(
+            classify(
+                400,
+                r#"{"error":{"code":400,"message":"Invalid value for temperature","status":"INVALID_ARGUMENT"}}"#
+            ),
+            UpstreamError::BadRequest { .. }
+        ));
     }
 
     #[test]
