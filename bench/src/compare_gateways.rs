@@ -773,7 +773,7 @@ async fn send(gateway: &Value, case: &Value, timeout: f64, secrets: &[String]) -
             case["path"].as_str().ok_or("missing path")?
         );
         validate_url(&url)?;
-        let client = crate::http_client::client()?;
+        let client = crate::http_client::client(&url)?;
         let request = Request::post(url)
             .header(
                 "authorization",
@@ -983,7 +983,9 @@ impl Inputs {
 }
 pub async fn run(args: &[String]) -> Result<()> {
     let inputs=Inputs::parse(args).map_err(|_|"Invalid inputs, over-budget plan, unreadable key/model file, or output already exists. Nothing sent.")?;
-    crate::http_client::client()?;
+    for gateway in &inputs.gateways {
+        crate::http_client::client(gateway["base_url"].as_str().ok_or("missing base URL")?)?;
+    }
     let secrets: Vec<_> = inputs
         .gateways
         .iter()

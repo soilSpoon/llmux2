@@ -1,8 +1,4 @@
-use crate::{
-    http_client::{client, HttpClient},
-    process::Directory,
-    Result,
-};
+use crate::{http_client::client, process::Directory, Result};
 use futures_util::stream;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full, StreamBody};
 use hyper::{
@@ -265,7 +261,6 @@ struct State {
     routes: Mutex<Vec<Route>>,
     fake_hits: Mutex<usize>,
     auth: Mutex<Auth>,
-    client: HttpClient,
 }
 struct Lab {
     address: String,
@@ -290,7 +285,6 @@ impl Lab {
                 fail: false,
                 grants: 0,
             }),
-            client: client()?,
         });
         let inner = state.clone();
         let task = tokio::spawn(async move {
@@ -526,7 +520,7 @@ async fn handle(
     }
     let response = match tokio::time::timeout(
         Duration::from_secs(options["upstream_timeout"].as_u64().unwrap_or(120)),
-        state.client.request(request.body(Full::new(body))?),
+        client(&upstream)?.request(request.body(Full::new(body))?),
     )
     .await
     {
@@ -695,7 +689,7 @@ async fn request(url: &str, key: &str, payload: Value) -> Result<Reply> {
         stream: payload["stream"] == true,
     };
     let operation = async {
-        let response = client()?
+        let response = client(url)?
             .request(
                 Request::post(url)
                     .header("authorization", format!("Bearer {key}"))
@@ -1277,6 +1271,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         )?)?)?
     };
     for target in &targets {
+        client(&target.base_url)?;
         if let Ok(secret) = crate::compare_gateways::read_key(&target.key_ref) {
             secrets.push(secret);
         }
