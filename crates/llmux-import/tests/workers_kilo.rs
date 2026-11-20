@@ -36,6 +36,76 @@ fn success(output: &std::process::Output) -> String {
 }
 
 #[test]
+fn official_replacements_and_rejected_openrouter_routes_never_get_fallback() {
+    let mut root = fixture();
+    let official = "openrouter/anthropic/claude-fable-5.2";
+    let paid = "openrouter/x-ai/grok-4.7";
+    root["providerConnections"].as_array_mut().unwrap().push(json!({"id":"anthropic","provider":"anthropic","authType":"apikey","apiKey":"synthetic-anthropic-key"}));
+    root["combos"].as_array_mut().unwrap().extend([
+        json!({"name":"official-combo","models":[official]}),
+        json!({"name":"rejected-combo","models":[paid]}),
+        json!({"name":paid,"models":["openai/unverified"]}),
+        json!({"name":official,"models":["openai/unverified"]}),
+        json!({"name":"nested-official","models":[{"kind":"combo-ref","comboName":official}]}),
+    ]);
+    root["modelAliases"] = json!({"verified-alias":official, "paid-alias":paid, "paid-chain":"paid-alias", "prefixed-paid":format!("combo/{paid}")});
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("fallback-key");
+    fs::write(&key, "synthetic-fallback-key").unwrap();
+    let key = format!("file:{}", key.display());
+    success(&run(
+        &root,
+        dir.path(),
+        &[
+            ("--openrouter-replacements", dir.path()),
+            (
+                "--omniroute-fallback",
+                Path::new("http://127.0.0.1:20128/v1"),
+            ),
+            ("--omniroute-key", Path::new(&key)),
+        ],
+    ));
+    let config = RuntimeConfig::load(dir.path().join("out.toml")).unwrap();
+    for name in [
+        official,
+        "verified-alias",
+        "official-combo",
+        "nested-official",
+    ] {
+        let model = &config.models[config.model_names[name]];
+        assert_eq!(model.deployments.len(), 1, "fallback on {name}");
+        assert_eq!(
+            config.deployments[model.deployments[0].0 as usize]
+                .base_url
+                .to_string(),
+            "https://api.anthropic.com/v1"
+        );
+    }
+    assert!(config.catch_all_exclude.iter().any(|p| p == "openrouter/*"));
+    for name in [
+        paid,
+        "paid-alias",
+        "paid-chain",
+        "prefixed-paid",
+        "rejected-combo",
+    ] {
+        assert!(!config.model_names.contains_key(name));
+        assert!(
+            config.catch_all_exclude.iter().any(|p| p == name
+                || p.strip_suffix('*')
+                    .is_some_and(|prefix| name.starts_with(prefix))),
+            "catch-all permits {name}"
+        );
+    }
+    assert_eq!(
+        config.models[config.model_names["baseline"]]
+            .deployments
+            .len(),
+        2
+    );
+}
+
+#[test]
 fn replacement_rewriting_preserves_source_codex_fallback_exclusions() {
     let mut root = fixture();
     let name = "openrouter/anthropic/claude-fable-5.2";

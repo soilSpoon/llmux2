@@ -162,6 +162,14 @@ alias and mapping preparation, so dependent replacement names stay unavailable.
 WHEN an OpenRouter leg has `connectionId` or nonempty `allowedConnectionIds`
 THEN it is not rewritten onto an unrelated replacement connection.
 
+#### Scenario: Explicit OmniRoute fallback cannot bypass replacement policy
+
+WHEN `--omniroute-fallback` and `--openrouter-replacements` are both enabled
+THEN Codex exclusions are computed from the original source combos before
+rewriting, and OpenRouter namespaces, source aliases, mappings, and nested
+routes receive no OmniRoute fallback deployment and are excluded from the
+catch-all, whether their replacement was accepted or rejected.
+
 #### Scenario: Compatibility and rollback
 
 WHEN an operator needs the previous Cloudflare or OpenRouter policy

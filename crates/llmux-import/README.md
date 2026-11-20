@@ -170,6 +170,10 @@ providers, unverified transports (including Gemma 31B via Gemini Interactions),
 and unavailable targets remain unrouted with warnings. Source OpenRouter
 connections are skipped in this mode; there is no OpenRouter fallback. Pinned
 OpenRouter connection restrictions are not redirected to unrelated connections.
+Even with `--omniroute-fallback`, OpenRouter names and source aliases, mappings,
+and nested routes are excluded from both fallback deployments and the catch-all.
+Codex exclusions are computed before rewriting source combos, so replacement
+cannot erase owner-only fallback restrictions.
 Reviewed `:batch` IDs are synchronous same-model alternatives, with a warning:
 batch scheduling and discounts are not preserved. Existing connected Anthropic,
 Gemini, and Mistral keys may still be billable; this flag is not a promise of

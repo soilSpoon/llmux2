@@ -641,7 +641,18 @@ pub fn import_with_options(
         combos.insert(name, combo);
     }
     let fallback_exclusions = fallback
-        .map(|_| fallback::exclusions(&root, &combos, &combo_ids))
+        .map(|_| {
+            let mut excluded = fallback::exclusions(&root, &combos, &combo_ids, "codex")?;
+            if policy.openrouter_replacements {
+                excluded.extend(fallback::exclusions(
+                    &root,
+                    &combos,
+                    &combo_ids,
+                    "openrouter",
+                )?);
+            }
+            Ok::<_, String>(excluded)
+        })
         .transpose()?;
     if policy.openrouter_replacements {
         for name in &order {
