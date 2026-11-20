@@ -119,6 +119,7 @@ async fn fixture(
             billing: Default::default(),
             quota: Default::default(),
             timeout: Duration::from_secs(1),
+            max_context: None,
         })
         .collect();
     let cfg = RuntimeConfig {

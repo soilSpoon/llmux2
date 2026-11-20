@@ -197,6 +197,7 @@ struct RawDeployment {
     #[serde(default)]
     quota: QuotaSpec,
     timeout_ms: Option<u64>,
+    max_context: Option<u32>,
 }
 
 impl RawConfig {
@@ -335,6 +336,9 @@ impl RawConfig {
                 ));
             }
 
+            if model.capabilities.max_context == Some(0) {
+                return Err(invalid("max_context must be positive"));
+            }
             let mut candidates = Vec::new();
             for dep in model.deployments {
                 let id: Arc<str> = dep.id.into();
@@ -349,6 +353,9 @@ impl RawConfig {
                     return Err(invalid(
                         "upstream_model must not be empty and weight must be positive",
                     ));
+                }
+                if dep.max_context == Some(0) {
+                    return Err(invalid("max_context must be positive"));
                 }
                 if dep.quota.rpm == Some(0) || dep.quota.concurrent == Some(0) {
                     return Err(invalid("configured limits must be positive"));
@@ -373,6 +380,7 @@ impl RawConfig {
                     billing: dep.billing,
                     quota: dep.quota,
                     timeout: timeout(dep.timeout_ms.unwrap_or(server.request_timeout_ms))?,
+                    max_context: dep.max_context.or(model.capabilities.max_context),
                 });
             }
 
@@ -581,5 +589,43 @@ refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
         assert!(error(&format!("{REQUIRED}\nrequest_timeout_ms = 0")).contains("timeouts"));
         assert!(error(&format!("{REQUIRED}\nrefresh_skew_ms = 86400001"))
             .contains("oauth refresh_skew_ms"));
+    }
+    fn context_config(model: &str, deployment: &str) -> String {
+        config(REQUIRED).replace(
+            "[[models]]\nname = \"model\"\n",
+            &format!("[[models]]\nname = \"model\"\n{model}\n"),
+        ) + &format!(
+            "{deployment}\n[[models.deployments]]\nid = \"other\"\ncredential = \"oauth\"\nbase_url = \"https://example.com/v1\"\nupstream_model = \"upstream\"\n"
+        )
+    }
+
+    #[test]
+    fn deployment_max_context_overrides_model_capability() {
+        let parsed = RuntimeConfig::parse(&context_config("", "")).unwrap();
+        assert!(parsed
+            .deployments
+            .iter()
+            .all(|dep| dep.max_context.is_none()));
+        let parsed = RuntimeConfig::parse(&context_config(
+            "capabilities = { max_context = 8192 }",
+            "max_context = 32768",
+        ))
+        .unwrap();
+        let limits: Vec<_> = parsed
+            .deployments
+            .iter()
+            .map(|dep| dep.max_context)
+            .collect();
+        assert_eq!(limits, [Some(32768), Some(8192)]);
+        for (model, deployment) in [
+            ("capabilities = { max_context = 0 }", ""),
+            ("", "max_context = 0"),
+        ] {
+            assert!(RuntimeConfig::parse(&context_config(model, deployment))
+                .err()
+                .expect("invalid config")
+                .to_string()
+                .contains("max_context must be positive"));
+        }
     }
 }
