@@ -285,6 +285,14 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
     } else {
         body.clone()
     };
+    let mut anthropic_headers = HeaderMap::new();
+    if format == InboundFormat::AnthropicMessages {
+        for name in ["anthropic-version", "anthropic-beta"] {
+            for value in parts.headers.get_all(name) {
+                anthropic_headers.append(HeaderName::from_static(name), value.clone());
+            }
+        }
+    }
     let request = |body: Bytes, prompt_bytes: u64| GatewayRequest {
         format,
         model: model.clone(),
@@ -293,6 +301,7 @@ async fn execute_authorized(state: &AppState, request: Request, format: InboundF
         max_output_tokens: metadata.max_output_tokens,
         context_overflow,
         body,
+        anthropic_headers: anthropic_headers.clone(),
         request_id: request_id.clone(),
     };
 

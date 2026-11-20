@@ -43,6 +43,7 @@ enum Reply {
     Limit,
     Image,
     BrokenStream,
+    ProtocolHeaders,
 }
 
 struct Upstream {
@@ -72,7 +73,16 @@ impl Upstream {
 async fn messages(State(up): State<Arc<Upstream>>, headers: HeaderMap, body: Bytes) -> Response {
     let request: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(headers["x-api-key"], "test-anthropic");
-    assert_eq!(headers["anthropic-version"], "2023-06-01");
+    if matches!(up.reply, Reply::ProtocolHeaders) {
+        assert_eq!(headers["anthropic-version"], "2024-01-01");
+        assert_eq!(
+            headers.get_all("anthropic-beta").iter().collect::<Vec<_>>(),
+            ["first-beta", "second-beta"]
+        );
+    } else {
+        assert_eq!(headers["anthropic-version"], "2023-06-01");
+        assert!(!headers.contains_key("anthropic-beta"));
+    }
     assert!(!headers.contains_key(header::AUTHORIZATION));
     assert_eq!(request["model"], "claude-upstream");
     assert_eq!(request["max_tokens"], 4096);
@@ -121,6 +131,8 @@ async fn chat(State(up): State<Arc<Upstream>>, headers: HeaderMap, body: Bytes) 
     let request: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(headers[header::AUTHORIZATION], "Bearer test-openai");
     assert!(!headers.contains_key("x-api-key"));
+    assert!(!headers.contains_key("anthropic-beta"));
+    assert!(!headers.contains_key("anthropic-version"));
     assert_eq!(request["model"], "gpt-upstream");
     if let Some(limited) = up.limited() {
         return limited;
@@ -261,8 +273,19 @@ priority = {openai_priority}
         key: &str,
         payload: Value,
     ) -> (Response<Body>, String) {
-        let request = Request::post(format!("{}{path}", self.gateway.url()))
-            .header(auth_header, key)
+        self.send_request(
+            Request::post(format!("{}{path}", self.gateway.url())).header(auth_header, key),
+            payload,
+        )
+        .await
+    }
+
+    async fn send_request(
+        &self,
+        request: http::request::Builder,
+        payload: Value,
+    ) -> (Response<Body>, String) {
+        let request = request
             .header(header::CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from(payload.to_string())))
             .unwrap();
@@ -346,6 +369,37 @@ async fn native_messages_authentication_and_passthrough() {
         );
     }
     assert_eq!(fixture.counts(), [2, 0]);
+}
+
+#[tokio::test]
+async fn native_messages_forwards_anthropic_protocol_headers() {
+    let fixture = Fixture::start((Reply::ProtocolHeaders, 0), (Reply::Ok, 10)).await;
+    let request = |fixture: &Fixture, path| {
+        Request::post(format!("{}{path}", fixture.gateway.url()))
+            .header(header::AUTHORIZATION, "Bearer test-client")
+            .header("anthropic-version", "2024-01-01")
+            .header("anthropic-beta", "first-beta")
+            .header("anthropic-beta", "second-beta")
+    };
+    let (response, _) = fixture
+        .send_request(
+            request(&fixture, "/v1/messages"),
+            json!({"model":"assistant","max_tokens":4096,"system":"Be brief",
+            "messages":[{"role":"user","content":[{"type":"text","text":"Hello"}]}]}),
+        )
+        .await;
+    check_route(&response, "claude", "1");
+    assert_eq!(fixture.counts(), [1, 0]);
+
+    let fixture = Fixture::start((Reply::Ok, 10), (Reply::Ok, 0)).await;
+    let (response, _) = fixture
+        .send_request(
+            request(&fixture, "/v1/chat/completions"),
+            json!({"model":"assistant","messages":[{"role":"user","content":"Hello"}]}),
+        )
+        .await;
+    check_route(&response, "gpt", "1");
+    assert_eq!(fixture.counts(), [0, 1]);
 }
 
 #[tokio::test]
