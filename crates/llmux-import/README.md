@@ -95,7 +95,8 @@ skipped because custom headers are unsupported. Hints identify custom nodes
 by their provider prefix and contain only fixed documentation URLs, never
 connection-supplied URLs. Anonymous connections still pass provider/URL validation.
 When an anonymous-only import has no client keys, loader validation uses a
-temporary public marker file which is removed before return; generated config
+unique temporary public marker file, safe for concurrent imports sharing a
+secrets directory, which is removed on success or error; generated config
 still requires `LLMUX_CLIENT_KEY` and retains no upstream credentials.
 
 ### Public model aliases

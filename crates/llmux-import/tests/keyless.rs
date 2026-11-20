@@ -46,6 +46,57 @@ fn anonymous_only_import_needs_no_credentials_or_secret_files() {
 }
 
 #[test]
+fn concurrent_anonymous_imports_share_a_secrets_directory() {
+    let root = json!({
+        "providerConnections":[{"id":"anonymous","provider":"kilo","authType":"none"}],
+        "combos": (0..64).map(|i| json!({"name":format!("model-{i}"),"models":["kilo/vendor/free"]})).collect::<Vec<_>>()
+    }).to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = dir.path().join("secrets");
+    let start = std::sync::Barrier::new(2);
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|i| {
+                let root = &root;
+                let secrets = &secrets;
+                let start = &start;
+                let output = dir.path().join(format!("output-{i}.toml"));
+                scope.spawn(move || {
+                    start.wait();
+                    llmux_import::import(root, &output, Some(secrets))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    for result in results {
+        let report = result.unwrap();
+        assert_eq!(
+            (report.models, report.deployments, report.credentials),
+            (64, 64, 0)
+        );
+    }
+    assert_eq!(fs::read_dir(secrets).unwrap().count(), 0);
+    let client_key = dir.path().join("client-key");
+    fs::write(&client_key, "synthetic-client-key").unwrap();
+    for i in 0..2 {
+        let mut config: toml::Value = toml::from_str(
+            &fs::read_to_string(dir.path().join(format!("output-{i}.toml"))).unwrap(),
+        )
+        .unwrap();
+        config["server"]["client_keys"] =
+            toml::Value::Array(vec![format!("file:{}", client_key.display()).into()]);
+        let config = RuntimeConfig::parse(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(config.models.len(), 64);
+        assert!(config.api_keys.is_empty());
+        assert!(config.deployments.iter().all(|d| d.credential.is_empty()));
+    }
+}
+
+#[test]
 fn one_model_can_mix_anonymous_and_keyed_kilo_deployments() {
     let mut root = fixture();
     root["providerConnections"] = json!([
