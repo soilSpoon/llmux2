@@ -24,8 +24,10 @@ pub(crate) fn routes() -> Router<Arc<AppState>> {
 }
 
 fn authorize(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    let admin_key = state.active.load().config.server.dashboard_key.clone();
-    match admin_key.as_ref() {
+    // The live config owns the admin key, so a reload that rotates or
+    // removes `server.dashboard_key` revokes the old key immediately.
+    let active = state.active.load();
+    match active.config.server.dashboard_key.as_ref() {
         Some(key) if authorized(headers, std::slice::from_ref(key)) => None,
         _ => Some(
             (
@@ -155,6 +157,8 @@ async fn reload(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         )
             .into_response();
     };
+    // Serialize reloads: an older build must never overwrite a newer swap.
+    let _guard = state.reload_lock.lock().await;
     let config = match llmux_config::RuntimeConfig::load(path) {
         Ok(config) => config,
         Err(err) => {
@@ -172,11 +176,34 @@ async fn reload(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
                 .iter()
                 .map(|model| model.name.to_string())
                 .collect();
+            // Fields only `run` reads at startup cannot change at runtime.
+            let previous = state.active.load();
+            let restart_only = [
+                ("listen", previous.config.server.listen != config.server.listen),
+                (
+                    "shutdown_timeout",
+                    previous.config.server.shutdown_timeout != config.server.shutdown_timeout,
+                ),
+                (
+                    "drain_grace",
+                    previous.config.server.drain_grace != config.server.drain_grace,
+                ),
+            ];
+            let warnings: Vec<String> = restart_only
+                .into_iter()
+                .filter(|(_, changed)| *changed)
+                .map(|(field, _)| {
+                    format!("server.{field} changes apply on restart only")
+                })
+                .collect();
             state.active.store(Arc::new(Active {
                 config,
                 executor: Arc::new(executor),
             }));
-            no_store(Json(json!({"reloaded": true, "models": models})).into_response())
+            no_store(
+                Json(json!({"reloaded": true, "models": models, "warnings": warnings}))
+                    .into_response(),
+            )
         }
         Err(err) => (
             StatusCode::BAD_REQUEST,

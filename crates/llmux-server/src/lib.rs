@@ -52,6 +52,7 @@ struct AppState {
     active: arc_swap::ArcSwap<Active>,
     dashboard: Option<dashboard::Dashboard>,
     config_path: Option<std::path::PathBuf>,
+    reload_lock: tokio::sync::Mutex<()>,
 }
 
 fn provider_registry() -> ProviderRegistry {
@@ -110,6 +111,7 @@ pub async fn app_with_path(
         }),
         dashboard,
         config_path,
+        reload_lock: tokio::sync::Mutex::new(()),
     });
     let mut router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -128,6 +130,13 @@ async fn build(
 ) -> Result<(Arc<RuntimeConfig>, Executor), Box<dyn Error + Send + Sync>> {
     let registry = provider_registry();
     let mut sources = static_sources(&mut config)?;
+    // Validate before starting OAuth sources: a rejected build must not
+    // rotate refresh tokens the running gateway still relies on.
+    Executor::validate(
+        &config,
+        &registry,
+        &sources.keys().chain(config.oauth.keys()).cloned().collect(),
+    )?;
     for (id, credential) in std::mem::take(&mut config.oauth) {
         let mut oauth = OAuthConfig::new(
             credential.token_url,
