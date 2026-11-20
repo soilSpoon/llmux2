@@ -1,4 +1,5 @@
 {
+  "devin_review_markers": ["<!-- devin-review-summary -->", "<!-- devin-review-session-triaged -->"],
   "verifier_logins": ["devin-ai-integration", "soilspoon"],
   "blocking_markers": {
     "codesolarlght": ["Changes recommended"]

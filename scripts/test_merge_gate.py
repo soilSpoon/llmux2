@@ -6,6 +6,7 @@ from merge_gate import evaluate, fetch, main, pages
 
 SHA = 'a' * 40
 POLICY = {'blocking_markers': {'codesolarlght': ['Changes recommended']},
+          'devin_review_markers': ['<!-- devin-review-summary -->', '<!-- devin-review-session-triaged -->'],
           'verifier_logins': ['devin-ai-integration', 'soilspoon'],
           'unable_to_review_markers': {'copilot': ['quota exceeded']}}
 
@@ -18,7 +19,7 @@ def fixture():
                         'head_sha': SHA}],
             'threads': [{'isResolved': True}],
             'reviews': [{'id': 1, 'user': {'login': 'devin-ai-integration'},
-                         'commit_id': SHA, 'state': 'COMMENTED', 'body': ''}],
+                         'commit_id': SHA, 'state': 'COMMENTED', 'body': '<!-- devin-review-summary -->'}],
             'comments': [{'id': 1, 'user': {'login': 'devin-ai-integration[bot]'}, 'body': marker()}]}
 
 
@@ -27,6 +28,20 @@ def marker(sha=SHA, verdict='pass', reviewer='independent'):
 
 
 class MergeGateTest(unittest.TestCase):
+    def test_devin_review_requires_real_body_marker(self):
+        for body in ('', 'Fixed in abc123', 'Devin Review', '<!-- unrelated -->'):
+            with self.subTest(body=body):
+                data = fixture()
+                data['reviews'][0]['body'] = body
+                self.assertIn('Devin Review has not submitted a review on the head SHA.',
+                              evaluate(data, ['check'], POLICY))
+        for body in POLICY['devin_review_markers']:
+            data = fixture()
+            data['reviews'][0]['body'] = body
+            self.assertEqual(evaluate(data, ['check'], POLICY), [])
+        data['reviews'][0]['user']['login'] = 'someone-else'
+        self.assertTrue(evaluate(data, ['check'], POLICY))
+
     def test_queued_rerun_without_timestamps_blocks(self):
         data = fixture()
         data['checks'][0].update(id=1, started_at='2026-01-01T00:00:00Z')

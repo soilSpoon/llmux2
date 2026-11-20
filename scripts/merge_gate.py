@@ -56,6 +56,7 @@ def evaluate(data, required, policy):
                    for m in policy['unable_to_review_markers'].get(login, []))
 
     if not any(reviewer_login(r) == 'devin-ai-integration'
+               and any(marker in (r.get('body') or '') for marker in policy['devin_review_markers'])
                and r.get('commit_id') == sha and not unavailable(r) for r in reviews):
         errors.append('Devin Review has not submitted a review on the head SHA.')
     latest = {}
