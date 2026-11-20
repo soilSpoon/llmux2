@@ -343,6 +343,19 @@ priority = 0
         ]
     }
 
+    async fn skip_reasons(&self, id: &str) -> Value {
+        let response = self.get("/dashboard/stats", Some("test-dashboard")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let stats: Value = serde_json::from_str(&body(response).await).unwrap();
+        stats["deployments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap()["skip_reasons"]
+            .clone()
+    }
+
     async fn request(&self, key: &str, model: &str, streaming: bool) -> Response<Body> {
         let payload = json!({
             "model": model, "stream": streaming,
@@ -1342,10 +1355,13 @@ async fn non_json_upstream_error_preserves_status_and_returns_a_json_error() {
 
 #[tokio::test]
 async fn rpm_limit_skips_primary_without_sending_another_request() {
-    let fixture = Fixture::start(
+    let fixture = Fixture::start_with_options(
         [Reply::Complete, Reply::Complete],
         [Reply::Complete, Reply::Complete],
         "quota = { rpm = 1 }",
+        4,
+        true,
+        true,
     )
     .await;
     let first = fixture.request("test-client", "shared", false).await;
@@ -1353,14 +1369,55 @@ async fn rpm_limit_skips_primary_without_sending_another_request() {
     let fallback = fixture.request("test-client", "shared", false).await;
     check_route(&fallback, "d2", "1");
     assert_eq!(fixture.counts(), [1, 1]);
+    assert_eq!(
+        fixture.skip_reasons("d1").await,
+        json!({"admission_limited":1})
+    );
+}
+
+#[tokio::test]
+async fn converted_requests_record_unsupported_conversion_and_admission_skips() {
+    let fixture = Fixture::start_with_options(
+        [Reply::Complete, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "quota = { rpm = 1 }",
+        4,
+        true,
+        true,
+    )
+    .await;
+    let rejected = fixture.post("/v1/messages", "test-client", r#"{
+        "model":"shared","max_tokens":16,"messages":[{"role":"user","content":[
+            {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"AA=="}}
+        ]}]
+    }"#).await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(fixture.counts(), [0, 0]);
+
+    let first = fixture.responses("test-client", "shared", false).await;
+    check_route(&first, "d1", "1");
+    let fallback = fixture.responses("test-client", "shared", false).await;
+    check_route(&fallback, "d2", "1");
+    assert_eq!(fixture.counts(), [1, 1]);
+    assert_eq!(
+        fixture.skip_reasons("d1").await,
+        json!({"unsupported_conversion":1,"admission_limited":1})
+    );
+    assert_eq!(
+        fixture.skip_reasons("d2").await,
+        json!({"unsupported_conversion":1})
+    );
 }
 
 #[tokio::test]
 async fn context_precheck_skips_small_deployments_and_rejects_without_upstream() {
-    let fixture = Fixture::start(
+    let fixture = Fixture::start_with_options(
         [Reply::Complete, Reply::Complete],
         [Reply::Complete, Reply::Complete],
         "max_context = 30",
+        4,
+        true,
+        true,
     )
     .await;
     let payload = |max_tokens: u32| {
@@ -1395,6 +1452,14 @@ async fn context_precheck_skips_small_deployments_and_rejects_without_upstream()
     assert!(message.contains("100000 tokens"), "{message}");
     assert!(message.contains("200000 requested"), "{message}");
     assert_eq!(fixture.counts(), calls);
+    assert_eq!(
+        fixture.skip_reasons("d1").await,
+        json!({"context_length":2})
+    );
+    assert_eq!(
+        fixture.skip_reasons("d2").await,
+        json!({"context_length":1})
+    );
 }
 
 #[tokio::test]
