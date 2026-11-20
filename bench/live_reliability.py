@@ -380,7 +380,7 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
         events = 0
         try:
             while True:
-                line = response.fp.readline()
+                line = response.readline()
                 if not line:
                     break
                 self._chunk(line)
@@ -580,8 +580,11 @@ class Gateway:
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
         start = time.time()
         try:
-            connection.request("POST", path, body=json.dumps(payload), headers={"Authorization": "Bearer " + self.key, "Content-Type": "application/json"})
-            response = connection.getresponse()
+            try:
+                connection.request("POST", path, body=json.dumps(payload), headers={"Authorization": "Bearer " + self.key, "Content-Type": "application/json"})
+                response = connection.getresponse()
+            except (OSError, http.client.HTTPException) as exc:
+                return Result(0, {}, b"", time.time() - start, stream, type(exc).__name__)
             body = b""
             error = None
             try:
@@ -601,11 +604,14 @@ class Gateway:
         self.log.close()
 
 
+REDACT = str
+
+
 class Result:
     def __init__(self, status, headers, body, seconds, stream, transport_error=None):
         self.status = status
         self.headers = headers
-        self.body = body.decode("utf-8", "replace")
+        self.body = REDACT(body.decode("utf-8", "replace"))
         self.seconds = seconds
         self.stream = stream
         self.transport_error = transport_error
@@ -836,8 +842,11 @@ class Suite:
             s.check("stream_idle_stall", "stream: primary stalls after 2 events -> stream_broken after the 4s idle timeout, no replay", r.status == 200 and r.deployment == "primary" and r.stream_error and froute.hits == 0 and r.seconds < 20, r.summary() + " fallback_hits=%d" % froute.hits)
         finally:
             gw.close()
-        ok, gw, proute, froute = s.failover("responses_429_failover", "status", "Responses API: 429 on primary -> fallback", route="responses", primary_options={"status": 429, "headers": {"Retry-After": "5"}})
-        gw.close()
+        if s.fallback.provider == "anthropic":
+            s.skip("responses_429_failover", "Responses API: 429 on primary -> fallback", "Anthropic fallback cannot serve the Responses API")
+        else:
+            ok, gw, proute, froute = s.failover("responses_429_failover", "status", "Responses API: 429 on primary -> fallback", route="responses", primary_options={"status": 429, "headers": {"Retry-After": "5"}})
+            gw.close()
 
         # OAuth refresh -------------------------------------------------------------------
         if s.primary.provider not in ("openai", "openai_compat") or oauth_key is None:
@@ -982,6 +991,8 @@ def main(argv=None):
                     with contextlib.suppress(OSError, KeyError, ValueError):
                         secrets_seen.append(read_secret(target.key_ref))
             redact = make_redactor(secrets_seen)
+            global REDACT
+            REDACT = redact
             probes = probe(args.binary, proxy, workroot, targets, redact)
             healthy = [t for t, row in zip(targets, probes) if row["healthy"]]
 
