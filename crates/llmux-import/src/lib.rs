@@ -657,7 +657,9 @@ pub fn import_with_options(
                 break;
             }
             for name in blocked {
-                combos.get_mut(&name).unwrap()["models"] = json!([]);
+                if let Some(combo) = combos.get_mut(&name) {
+                    combo["models"] = json!([]);
+                }
             }
         }
     }
