@@ -238,7 +238,7 @@ pub(crate) fn stream(
             if chunk.data == "[DONE]" {
                 let finish = reason.ok_or_else(bad_gateway)?;
                 let finish = if refusal && finish != "max_tokens" { "refusal" } else { finish };
-                if let Some(index) = text {
+                if let Some((index, _)) = text {
                     yield block_stop(index);
                 }
                 for index in tools.into_values() {
@@ -262,16 +262,19 @@ pub(crate) fn stream(
                 started = true;
             }
             let delta = &choice["delta"];
-            if delta["refusal"].as_str().is_some_and(|s| !s.is_empty()) {
-                refusal = true;
-            }
-            for fragment in ["content", "refusal"].into_iter()
-                .filter_map(|field| delta[field].as_str().filter(|s| !s.is_empty()))
-            {
-                let index = if let Some(index) = text { index } else {
+            for (field, is_refusal) in [("content", false), ("refusal", true)] {
+                let Some(fragment) = delta[field].as_str().filter(|s| !s.is_empty()) else { continue };
+                refusal |= is_refusal;
+                if let Some((index, was_refusal)) = text {
+                    if is_refusal != was_refusal {
+                        yield block_stop(index);
+                        text = None;
+                    }
+                }
+                let index = if let Some((index, _)) = text { index } else {
                     let index = next;
                     next += 1;
-                    text = Some(index);
+                    text = Some((index, is_refusal));
                     yield event("content_block_start", json!({"index":index,"content_block":{"type":"text","text":""}}));
                     index
                 };
@@ -279,7 +282,7 @@ pub(crate) fn stream(
             }
             if let Some(calls) = delta["tool_calls"].as_array() {
                 for call in calls {
-                    if let Some(index) = text.take() {
+                    if let Some((index, _)) = text.take() {
                         yield block_stop(index);
                     }
                     let upstream = call["index"].as_u64().ok_or_else(bad_gateway)?;
@@ -341,6 +344,67 @@ mod tests {
         assert_eq!(complete["stop_reason"], "refusal");
         assert_eq!(text, "Cannot help.");
         assert_eq!(events[events.len() - 2]["delta"]["stop_reason"], "refusal");
+    }
+
+    #[tokio::test]
+    async fn messages_conversion_stream_separates_text_and_refusal() {
+        let chat = json!({"id":"chat","model":"model","choices":[{
+            "message":{"content":"Sorry. ","refusal":"Cannot help."},"finish_reason":"stop"
+        }]});
+        let (complete, _) = complete_chat(&chat).unwrap();
+        let input = [
+            json!({"id":"chat","model":"model","choices":[{"delta":{"content":"Sorry. ","refusal":"Cannot "}}]}).to_string(),
+            json!({"choices":[{"delta":{"refusal":"help."},"finish_reason":"stop"}]}).to_string(),
+            "[DONE]".into(),
+        ];
+        let events: Vec<_> = super::stream(Box::pin(stream::iter(
+            input
+                .into_iter()
+                .map(|data| Ok(SseEvent { event: None, data })),
+        )))
+        .map(|event| serde_json::from_str::<Value>(&event.unwrap().data).unwrap())
+        .collect()
+        .await;
+        let block_events: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event["type"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("content_block_")
+            })
+            .map(|event| {
+                (
+                    event["type"].as_str().unwrap(),
+                    event["index"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            block_events,
+            [
+                ("content_block_start", 0),
+                ("content_block_delta", 0),
+                ("content_block_stop", 0),
+                ("content_block_start", 1),
+                ("content_block_delta", 1),
+                ("content_block_delta", 1),
+                ("content_block_stop", 1),
+            ]
+        );
+        for index in [0, 1] {
+            let text: String = events
+                .iter()
+                .filter(|event| event["index"] == index)
+                .filter_map(|event| event["delta"]["text"].as_str())
+                .collect();
+            assert_eq!(
+                text,
+                complete["content"][index as usize]["text"]
+                    .as_str()
+                    .unwrap()
+            );
+        }
     }
 
     #[test]
