@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "deploy",
     "xtask",
     "crates/llmux-login",
     "crates/llmux-import",

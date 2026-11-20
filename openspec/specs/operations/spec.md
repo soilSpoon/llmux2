@@ -6,6 +6,38 @@ Operability and the engineering standards the project holds itself to.
 
 ## Requirements
 
+### Requirement: Standalone slot deployment tools
+
+The non-default `llmux2-ops` workspace package SHALL build standalone
+`llmux2-deploy` and `llmux2-guard` binaries installed under `$HOME/llmux2/bin`.
+Production hosts SHALL NOT require Python or Cargo for deployment or recovery.
+The tools SHALL serialize through the same deployment lock, use private atomic
+file replacement, preserve the source and installed configuration checks,
+observe seven stable unit samples at half-second intervals, and try health up
+to sixty times before stopping the old slot. The health probe SHALL use a
+two-second TCP connect/read timeout and accept only HTTP 200 with an `ok` body
+prefix. systemctl and configuration checks SHALL have 130- and 120-second
+deadlines respectively.
+
+#### Scenario: Failed handoff before old-slot stop
+
+WHEN the new slot fails to start, remain stable, or become healthy
+THEN deployment SHALL stop the new slot and leave the old slot unchanged,
+reporting cleanup failures separately.
+
+#### Scenario: Recovery and late handoff errors
+
+WHEN neither slot is active and the recorded listen address is unhealthy
+THEN the guard SHALL start the recorded slot.
+WHEN deployment reaches old-slot stop and a subsequent operation fails
+THEN it SHALL leave the new slot running and report that handoff stage.
+
+#### Scenario: Deployment test ownership
+
+WHEN CI runs deployment tests
+THEN it SHALL run the Rust tests once in the coverage job, using fake waits,
+while the check job SHALL retain the remaining Python merge-gate tests.
+
 ### Requirement: Bounded fallback traffic visibility
 The gateway SHALL expose reporting-only deployment `fallback` flags, defaulting
 to false and always true for catch-all deployments. The importer SHALL mark
