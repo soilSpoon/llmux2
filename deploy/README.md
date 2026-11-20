@@ -1,18 +1,19 @@
 # User-systemd deployment
 
-Linux, Python 3.9+ (stdlib only), and a user systemd manager are required.
+Linux and a user systemd manager are required. The deployment and guard tools
+are standalone Rust binaries; hosts do not need Python or Cargo.
 Run these commands as the service user. Have an administrator enable lingering
 (`loginctl enable-linger USER`) so the user manager survives logout.
 
 ## Install
 
-Build `cargo build --locked --release -p llmux-server`. From the repository:
+Build `cargo build --locked --release -p llmux-server -p llmux2-ops`. From the repository
+(or copy the resulting binaries to the host before installing):
 
 ```sh
 mkdir -p "$HOME/llmux2/bin" "$HOME/.config/systemd/user"
 chmod 700 "$HOME/llmux2" "$HOME/llmux2/bin"
-install -m 700 deploy/llmux2-deploy deploy/llmux2-guard "$HOME/llmux2/bin/"
-install -m 600 deploy/llmux2_ops.py "$HOME/llmux2/bin/"
+install -m 700 target/release/llmux2-deploy target/release/llmux2-guard "$HOME/llmux2/bin/"
 install -m 600 deploy/systemd/* "$HOME/.config/systemd/user/"
 systemctl --user daemon-reload
 ```
