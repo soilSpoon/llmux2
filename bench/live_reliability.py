@@ -48,7 +48,7 @@ PROMPT = "Reply with the single word OK."
 MAX_BODY = 4096
 
 
-# --------------------------------------------------------------------------- config
+## config
 
 
 def parse_toml_subset(text):
@@ -220,7 +220,7 @@ def read_secret(reference):
     raise ValueError("secret references must be env: or file:")
 
 
-# --------------------------------------------------------------------------- fault proxy
+## fault proxy
 
 
 class Route:
@@ -403,7 +403,7 @@ class _ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
-# --------------------------------------------------------------------------- oauth token server
+## oauth token server
 
 
 class OAuthServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -469,7 +469,7 @@ class _OAuthHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-# --------------------------------------------------------------------------- fake upstream (offline mode)
+## fake upstream (offline mode)
 
 
 class FakeUpstream(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -540,7 +540,7 @@ class _FakeHandler(http.server.BaseHTTPRequestHandler):
         super().send_header(key, value)
 
 
-# --------------------------------------------------------------------------- gateway
+## gateway
 
 
 def free_port():
@@ -650,7 +650,7 @@ class Result:
         return " ".join(parts)
 
 
-# --------------------------------------------------------------------------- scenarios
+## scenarios
 
 
 class Suite:
@@ -904,7 +904,7 @@ class Suite:
             auth.close()
 
 
-# --------------------------------------------------------------------------- probes and report
+## probes and report
 
 
 def probe(binary, proxy, workroot, targets, redact):
