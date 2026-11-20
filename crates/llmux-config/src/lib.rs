@@ -205,9 +205,9 @@ impl RawConfig {
             || routing
                 .fallback_on
                 .iter()
-                .any(|kind| *kind != ErrorKind::RateLimited)
+                .any(|kind| !matches!(kind, ErrorKind::RateLimited | ErrorKind::QuotaExhausted))
         {
-            return Err(invalid("MVP routing supports priority, no same-deployment retries, and rate_limited fallback only"));
+            return Err(invalid("MVP routing supports priority, no same-deployment retries, and rate_limited or quota_exhausted fallback only"));
         }
         if cooldown.default_ms == 0
             || cooldown.max_ms < cooldown.default_ms
