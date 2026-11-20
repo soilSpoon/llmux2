@@ -42,6 +42,7 @@ enum Reply {
     Ok,
     Limit,
     Timeout,
+    NotFound(&'static str),
     Image,
     Document,
     BrokenStream,
@@ -72,6 +73,16 @@ impl Upstream {
                 Some((StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "30")]).into_response())
             }
             Reply::Timeout => Some(StatusCode::REQUEST_TIMEOUT.into_response()),
+            Reply::NotFound(code) => Some(
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "type":"error",
+                        "error":{"type":"not_found_error","code":code,"message":"Model unavailable"}
+                    })),
+                )
+                    .into_response(),
+            ),
             _ => None,
         }
     }
@@ -431,6 +442,40 @@ async fn anthropic_http_408_fails_over() {
     check_route(&response, "gpt", "2");
     assert!(text.contains("Hi from OpenAI"));
     assert_eq!(fixture.counts(), [1, 1]);
+}
+
+#[tokio::test]
+async fn only_explicit_anthropic_model_not_found_fails_over() {
+    for code in ["not_found", "model_not_found"] {
+        let fixture = Fixture::start((Reply::NotFound(code), 0), (Reply::Ok, 10)).await;
+        let (response, text) = fixture.request(false).await;
+        if code == "model_not_found" {
+            check_route(&response, "gpt", "2");
+            assert!(text.contains("Hi from OpenAI"));
+            assert_eq!(fixture.counts(), [1, 1]);
+        } else {
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(fixture.counts(), [1, 0]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_anthropic_model_not_found_uses_the_chat_error_envelope() {
+    let fixture = Fixture::start(
+        (Reply::NotFound("model_not_found"), 10),
+        (Reply::NotFound("model_not_found"), 0),
+    )
+    .await;
+    let (response, text) = fixture.request(false).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(fixture.counts(), [1, 1]);
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap(),
+        json!({
+            "error":{"type":"not_found_error","code":"model_not_found","message":"Model unavailable","param":null}
+        })
+    );
 }
 
 #[tokio::test]

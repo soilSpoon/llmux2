@@ -259,22 +259,33 @@ fn convert_response(v: &Value) -> Value {
 
 fn client_error(status: StatusCode, body: Bytes, convert: bool) -> UpstreamError {
     let value = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-    if crate::openai_compat::is_model_not_found(status, &value["error"]) {
-        return UpstreamError::ModelNotFound { status, body };
-    }
-    if matches!(status.as_u16(), 400 | 413)
-        && value["error"]["message"]
+    let details = &value["error"];
+    let model_not_found = crate::openai_compat::is_model_not_found(status, details);
+    if !model_not_found
+        && matches!(status.as_u16(), 400 | 413)
+        && details["message"]
             .as_str()
             .is_some_and(|s| s.contains("prompt is too long"))
     {
         return UpstreamError::ContextLength;
     }
     let body = if convert {
-        Bytes::from(json!({"error":{"message":value["error"]["message"].as_str().unwrap_or("Upstream request failed"),"type":value["error"]["type"].as_str().unwrap_or("invalid_request_error")}}).to_string())
+        let mut error = json!({
+            "message": details["message"].as_str().unwrap_or("Upstream request failed"),
+            "type": details["type"].as_str().unwrap_or("invalid_request_error")
+        });
+        if model_not_found {
+            error["code"] = details["code"].clone();
+        }
+        Bytes::from(json!({"error": error}).to_string())
     } else {
         body
     };
-    UpstreamError::BadRequest { status, body }
+    if model_not_found {
+        UpstreamError::ModelNotFound { status, body }
+    } else {
+        UpstreamError::BadRequest { status, body }
+    }
 }
 
 #[derive(Default)]
