@@ -15,6 +15,51 @@ fn fixture() -> Value {
 }
 
 #[test]
+fn gemini_endpoint_deployments_strip_only_seed_and_user_through_loader() {
+    use llmux_types::ChatRequestField;
+    for (url, model, expected) in [
+        (
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "gemini-3-flash-preview",
+            vec![ChatRequestField::Seed, ChatRequestField::User],
+        ),
+        (
+            "https://GENERATIVELANGUAGE.GOOGLEAPIS.COM:443/v1beta/openai/",
+            "gemini-3-flash-preview",
+            vec![ChatRequestField::Seed, ChatRequestField::User],
+        ),
+        (
+            "https://generativelanguage.googleapis.com.evil.example/v1beta/openai",
+            "gemini-3-flash-preview",
+            vec![],
+        ),
+        ("https://example.com/v1", "gemini-3-flash-preview", vec![]),
+        (
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "deepseek-r1",
+            vec![
+                ChatRequestField::Seed,
+                ChatRequestField::User,
+                ChatRequestField::SafetyIdentifier,
+                ChatRequestField::ReasoningEffort,
+            ],
+        ),
+    ] {
+        let mut root = fixture();
+        root["providerNodes"][0]["baseUrl"] = json!(url);
+        root["combos"][0]["models"] = json!([format!("gateway/{model}")]);
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out.toml");
+        llmux_import::import(&root.to_string(), &output, None).unwrap();
+        let config = RuntimeConfig::load(output).unwrap();
+        assert!(!config.deployments.is_empty());
+        for dep in &config.deployments {
+            assert_eq!(dep.strip_request_fields.as_ref(), expected, "{url}");
+        }
+    }
+}
+
+#[test]
 fn deepseek_models_on_anthropic_nodes_import_without_stripping() {
     let mut root = fixture();
     root["providerNodes"][0]["type"] = json!("anthropic-compatible");
