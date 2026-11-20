@@ -1,5 +1,7 @@
 //! Axum boundary for the OpenAI-compatible gateway.
 
+mod dashboard;
+
 use axum::body::Bytes;
 use axum::{
     body::{self, Body},
@@ -37,6 +39,7 @@ const ANTHROPIC_KEY_HEADER: HeaderName = HeaderName::from_static("x-api-key");
 struct AppState {
     config: Arc<RuntimeConfig>,
     executor: Executor,
+    dashboard: Option<dashboard::Dashboard>,
 }
 
 pub async fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Send + Sync>> {
@@ -75,10 +78,23 @@ pub async fn app(mut config: RuntimeConfig) -> Result<Router, Box<dyn Error + Se
 
     let config = Arc::new(config);
     let executor = Executor::new(config.clone(), &registry, &sources)?;
-    Ok(Router::new()
+    let dashboard = config
+        .server
+        .dashboard_key
+        .clone()
+        .map(dashboard::Dashboard::new);
+    let state = Arc::new(AppState {
+        config,
+        executor,
+        dashboard,
+    });
+    let mut router = Router::new()
         .route("/v1/chat/completions", post(chat))
-        .route("/v1/responses", post(responses))
-        .with_state(Arc::new(AppState { config, executor })))
+        .route("/v1/responses", post(responses));
+    if state.dashboard.is_some() {
+        router = router.merge(dashboard::routes());
+    }
+    Ok(router.with_state(state))
 }
 
 async fn chat(State(state): State<Arc<AppState>>, request: Request) -> Response {
@@ -101,6 +117,15 @@ async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) 
             .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
         return response;
     }
+    let start = state.dashboard.as_ref().map(|_| std::time::Instant::now());
+    let response = execute_authorized(&state, request, format).await;
+    if let (Some(dashboard), Some(start)) = (&state.dashboard, start) {
+        dashboard.record_response(response.status(), start.elapsed());
+    }
+    response
+}
+
+async fn execute_authorized(state: &AppState, request: Request, format: InboundFormat) -> Response {
     let context_overflow = match request.headers().get(CONTEXT_OVERFLOW_HEADER) {
         None => None,
         Some(value) => match value.to_str().ok().and_then(ContextOverflow::from_name) {

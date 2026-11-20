@@ -34,6 +34,7 @@ pub struct ServerConfig {
     pub client_keys: Box<[Arc<str>]>,
     pub request_timeout: Duration,
     pub expose_routing_headers: bool,
+    pub dashboard_key: Option<Arc<str>>,
 }
 
 pub struct RoutingConfig {
@@ -107,6 +108,7 @@ struct RawServer {
     client_keys: Vec<String>,
     request_timeout_ms: u64,
     expose_routing_headers: bool,
+    dashboard_key: Option<String>,
 }
 
 impl Default for RawServer {
@@ -116,6 +118,7 @@ impl Default for RawServer {
             client_keys: Vec::new(),
             request_timeout_ms: DEFAULT_TIMEOUT_MS,
             expose_routing_headers: true,
+            dashboard_key: None,
         }
     }
 }
@@ -230,6 +233,19 @@ impl RawConfig {
             .iter()
             .map(|key| resolve_secret(key))
             .collect::<Result<Box<[_]>, _>>()?;
+        let dashboard_key = server
+            .dashboard_key
+            .as_deref()
+            .map(resolve_secret)
+            .transpose()?;
+        if dashboard_key
+            .as_ref()
+            .is_some_and(|key| client_keys.contains(key))
+        {
+            return Err(invalid(
+                "server.dashboard_key must differ from server.client_keys",
+            ));
+        }
         if routing.max_attempts == 0 {
             return Err(invalid("routing.max_attempts must be positive"));
         }
@@ -433,6 +449,7 @@ impl RawConfig {
                 client_keys,
                 request_timeout,
                 expose_routing_headers: server.expose_routing_headers,
+                dashboard_key,
             },
             routing: RoutingConfig {
                 max_attempts: routing.max_attempts,

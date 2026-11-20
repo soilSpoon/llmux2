@@ -31,6 +31,27 @@ The Responses route translates requests to Chat Completions on OpenAI-compatible
 
 Credentials use `provider = "openai"` or `"openai_compat"` for OpenAI-compatible upstreams, or `provider = "anthropic"` for the Anthropic Messages API. Anthropic deployments use a base URL such as `https://api.anthropic.com/v1` (the adapter appends `/messages`) and send the key as `x-api-key`. The gateway converts chat requests, JSON responses and SSE chunks between the OpenAI Chat and Anthropic formats, so a model can mix both kinds of deployments and fail over between them.
 
+## Live dashboard
+
+Add `dashboard_key = "env:LLMUX_DASHBOARD_KEY"` to `[server]`, set that
+environment variable to a strong key distinct from the gateway client keys,
+and restart llmux2. Open `http://127.0.0.1:8080/dashboard` (or the configured
+gateway address) and enter the dashboard key. Use TLS when accessing it
+remotely. The page keeps the key in memory until you lock or close it.
+
+The dashboard shows response rate, status counts, mean time to response
+(first upstream event for streams), and routed requests, failed attempts,
+stream errors and cooldowns per deployment. In-flight counts are shown
+where a concurrency limit is configured. A 429 that successfully fails
+over appears as a failed attempt, not a gateway 429. Gateway counts cover
+authorized requests to the chat and Responses endpoints. They count
+responses when ready, not when downstream transfer finishes.
+
+Metrics stay in memory on each instance and reset on restart. The chart
+starts collecting when opened; it polls every two seconds. The dashboard
+does not collect prompts, responses, upstream URLs or credential values
+in its stats. Omit `dashboard_key` to disable the routes and collection.
+
 ## Routing
 
 Lower numeric priority wins, with round-robin ordering among equal priorities. On an upstream HTTP 429, the gateway tries the next deployment and skips the limited deployment until its `Retry-After` (seconds or HTTP date) expires. Missing values use the configured default, and waits are capped by `cooldown.max_ms`. If none can serve the request, the gateway returns 429 with the earliest known retry delay. Optional local per-deployment RPM and concurrency limits also skip deployments without contacting them.
@@ -92,6 +113,7 @@ See the [engineering standards](AGENTS.md) for test-first development, reliabili
 ```sh
 cargo test --locked --workspace
 cargo test --locked -p llmux-server --test chat -- --nocapture
+node --test crates/llmux-server/tests/dashboard.cjs
 ```
 
 ## Mock-upstream load benchmark
