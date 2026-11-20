@@ -27,9 +27,14 @@ fn anonymous_only_import_needs_no_credentials_or_secret_files() {
             let dir = tempfile::tempdir().unwrap();
             let output = dir.path().join("out.toml");
             let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+            let models = if matches!(provider, "kilocode" | "custom-kilo") {
+                3
+            } else {
+                2
+            };
             assert_eq!(
                 (report.models, report.deployments, report.credentials),
-                (1, 1, 0)
+                (models, models, 0)
             );
             let config = RuntimeConfig::load(&output).unwrap();
             assert!(config.api_keys.is_empty());
@@ -76,7 +81,7 @@ fn concurrent_anonymous_imports_share_a_secrets_directory() {
         let report = result.unwrap();
         assert_eq!(
             (report.models, report.deployments, report.credentials),
-            (64, 64, 0)
+            (65, 65, 0)
         );
     }
     assert_eq!(fs::read_dir(secrets).unwrap().count(), 0);
@@ -90,7 +95,7 @@ fn concurrent_anonymous_imports_share_a_secrets_directory() {
         config["server"]["client_keys"] =
             toml::Value::Array(vec![format!("file:{}", client_key.display()).into()]);
         let config = RuntimeConfig::parse(&toml::to_string(&config).unwrap()).unwrap();
-        assert_eq!(config.models.len(), 64);
+        assert_eq!(config.models.len(), 65);
         assert!(config.api_keys.is_empty());
         assert!(config.deployments.iter().all(|d| d.credential.is_empty()));
     }
@@ -109,7 +114,7 @@ fn one_model_can_mix_anonymous_and_keyed_kilo_deployments() {
     let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
     assert_eq!(
         (report.models, report.deployments, report.credentials),
-        (1, 2, 1)
+        (2, 4, 1)
     );
     let config = RuntimeConfig::load(output).unwrap();
     assert!(config.deployments[0].credential.is_empty());
@@ -242,7 +247,7 @@ fn imports_horde_anonymous_and_keyed_and_kilo_keyed() {
     let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
     assert_eq!(
         (report.models, report.deployments, report.credentials),
-        (8, 8, 4)
+        (16, 26, 4)
     );
     let config = RuntimeConfig::load(&output).unwrap();
     for (name, expected_model, expected_url) in [
