@@ -1,0 +1,9 @@
+{
+  "blocking_markers": {
+    "codesolarlght": ["Changes recommended"]
+  },
+  "unable_to_review_markers": {
+    "copilot": ["quota exceeded", "review quota", "couldn't review", "unable to review"],
+    "copilot-pull-request-reviewer": ["quota exceeded", "review quota", "couldn't review", "unable to review"]
+  }
+}

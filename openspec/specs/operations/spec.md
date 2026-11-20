@@ -26,6 +26,20 @@ tooling, not only by written rules.
 WHEN a PR changes `crates/*/src` without a test change or exemption
 THEN the `pr-policy` check fails.
 
+### Requirement: Autonomous merge gate
+
+Devin bots SHALL merge only after the merge gate verifies an open, non-draft,
+conflict-free PR targeting the default branch, successful required head checks,
+no failed head checks or unresolved review threads, a head-specific Devin Review,
+no blocking latest reviews, and a passing head-specific independent session attestation.
+Required checks SHALL come from the checked-in ruleset and review markers from
+the merge policy. Fetch failures SHALL block merging.
+
+#### Scenario: New commit invalidates verification
+
+WHEN a PR head changes after review or independent verification
+THEN the gate rejects stale evidence and merging requires fresh evidence.
+
 ### Requirement: Fast feedback loops
 
 CI/CD and tests SHALL stay fast: only needed steps, no unnecessary work, since

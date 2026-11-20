@@ -1,0 +1,120 @@
+import unittest
+from unittest.mock import patch
+
+from merge_gate import evaluate, fetch, main, pages
+
+
+SHA = 'a' * 40
+POLICY = {'blocking_markers': {'codesolarlght': ['Changes recommended']},
+          'unable_to_review_markers': {'copilot': ['quota exceeded']}}
+
+
+def fixture():
+    return {'pr': {'state': 'open', 'draft': False, 'base': {'ref': 'main'},
+                   'mergeable': True, 'head': {'sha': SHA}, 'body': 'Author-Session: author'},
+            'default_branch': 'main',
+            'checks': [{'name': 'check', 'status': 'completed', 'conclusion': 'success',
+                        'head_sha': SHA}],
+            'threads': [{'isResolved': True}],
+            'reviews': [{'id': 1, 'user': {'login': 'devin-ai-integration'},
+                         'commit_id': SHA, 'state': 'COMMENTED', 'body': ''}],
+            'comments': [{'id': 1, 'body': marker()}]}
+
+
+def marker(sha=SHA, verdict='pass', reviewer='independent'):
+    return f'<!-- llmux-verify:v1 sha={sha} verdict={verdict} reviewer={reviewer} -->'
+
+
+class MergeGateTest(unittest.TestCase):
+    def test_pass(self):
+        self.assertEqual(evaluate(fixture(), ['check'], POLICY), [])
+
+    def test_github_bot_logins(self):
+        data = fixture()
+        data['reviews'][0]['user']['login'] += '[bot]'
+        self.assertEqual(evaluate(data, ['check'], POLICY), [])
+        data['reviews'].append({'id': 2, 'user': {'login': 'codesolarlght[bot]'},
+                                'body': 'Changes recommended', 'state': 'COMMENTED'})
+        self.assertTrue(evaluate(data, ['check'], POLICY))
+
+    def test_failures(self):
+        mutations = {
+            'closed': lambda d: d['pr'].update(state='closed'),
+            'draft': lambda d: d['pr'].update(draft=True),
+            'base': lambda d: d['pr']['base'].update(ref='other'),
+            'conflict': lambda d: d['pr'].update(mergeable=False),
+            'unknown_mergeability': lambda d: d['pr'].update(mergeable=None),
+            'missing_check': lambda d: d.update(checks=[]),
+            'pending': lambda d: d['checks'][0].update(status='in_progress'),
+            'failed': lambda d: d['checks'][0].update(conclusion='failure'),
+            'skipped': lambda d: d['checks'][0].update(conclusion='skipped'),
+            'old_check': lambda d: d['checks'][0].update(head_sha='b' * 40),
+            'other_failed': lambda d: d['checks'].append(dict(d['checks'][0], name='extra', conclusion='failure')),
+            'thread': lambda d: d['threads'].append({'isResolved': False}),
+            'no_devin': lambda d: d.update(reviews=[]),
+            'old_devin': lambda d: d['reviews'][0].update(commit_id='b' * 40),
+            'changes_requested': lambda d: d['reviews'][0].update(state='CHANGES_REQUESTED'),
+            'blocking_marker': lambda d: d['reviews'].append({'id': 2, 'user': {'login': 'codesolarlght'}, 'body': 'Changes recommended', 'state': 'COMMENTED'}),
+            'no_verification': lambda d: d.update(comments=[]),
+            'old_verification': lambda d: d['comments'][0].update(body=marker(sha='b' * 40)),
+            'self': lambda d: d['comments'][0].update(body=marker(reviewer='author')),
+            'failed_verification': lambda d: d['comments'].append({'id': 2, 'body': marker(verdict='fail')}),
+            'no_author': lambda d: d['pr'].update(body=''),
+            'ambiguous_author': lambda d: d['pr'].update(body='Author-Session: a\nAuthor-Session: b'),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                data = fixture()
+                mutate(data)
+                self.assertTrue(evaluate(data, ['check'], POLICY), name)
+
+    def test_latest_review_and_marker_win(self):
+        data = fixture()
+        data['reviews'] += [
+            {'id': 2, 'user': {'login': 'codesolarlght'}, 'body': 'Changes recommended', 'state': 'COMMENTED'},
+            {'id': 3, 'user': {'login': 'codesolarlght'}, 'body': 'Fixed', 'state': 'APPROVED'},
+            {'id': 4, 'user': {'login': 'copilot'}, 'body': 'quota exceeded', 'state': 'CHANGES_REQUESTED'},
+        ]
+        data['comments'] += [{'id': 2, 'body': marker(verdict='fail')},
+                             {'id': 3, 'body': marker()},
+                             {'id': 4, 'body': marker(sha='b' * 40, verdict='fail')}]
+        self.assertEqual(evaluate(data, ['check'], POLICY), [])
+
+    def test_rest_pagination(self):
+        with patch('merge_gate.gh', side_effect=[[{'id': i} for i in range(100)], [{'id': 100}]]) as api:
+            self.assertEqual(len(pages('endpoint')), 101)
+            self.assertIn('page=2', api.call_args.args[0])
+
+    def test_fetch_thread_pagination_and_head_race(self):
+        def run(changed=False):
+            calls = []
+            def api(*args):
+                calls.append(args)
+                if args[0] == 'repos/{owner}/{repo}':
+                    return {'full_name': 'owner/repo', 'default_branch': 'main'}
+                if args[0] == 'repos/owner/repo/pulls/1':
+                    pr = fixture()['pr']
+                    if changed and sum(c[0] == args[0] for c in calls) > 1:
+                        pr['head']['sha'] = 'b' * 40
+                    return pr
+                if args[0] == 'graphql':
+                    second = 'cursor=next' in args
+                    return {'data': {'repository': {'pullRequest': {'reviewThreads': {
+                        'nodes': [{'isResolved': not second}],
+                        'pageInfo': {'hasNextPage': not second, 'endCursor': 'next'}}}}}}
+                if 'check-runs' in args[0]:
+                    return {'check_runs': []}
+                return []
+            with patch('merge_gate.gh', side_effect=api):
+                return fetch(1)
+        self.assertEqual(run()['threads'], [{'isResolved': True}, {'isResolved': False}])
+        with self.assertRaisesRegex(ValueError, 'head changed'):
+            run(changed=True)
+
+    def test_api_error_exits_closed(self):
+        with patch('sys.argv', ['merge_gate.py', '1']), patch('merge_gate.fetch', side_effect=OSError('offline')):
+            self.assertEqual(main(), 1)
+
+
+if __name__ == '__main__':
+    unittest.main()
