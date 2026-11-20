@@ -35,7 +35,10 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--key" => parsed.key = Some(args.next().ok_or("--key needs a value")?),
             flag if flag.starts_with("--") => {
                 // Report the flag name only: `--key=SECRET` must not echo the key.
-                return Err(format!("unknown flag {}", flag.split('=').next().unwrap()));
+                return Err(format!(
+                    "unknown flag {}",
+                    flag.split('=').next().unwrap_or(flag)
+                ));
             }
             command if parsed.command.is_empty() => parsed.command = command.to_owned(),
             arg => {
@@ -98,10 +101,13 @@ async fn run() -> Result<String, String> {
         encoded
     }
     let parsed_url = url::Url::parse(&args.url).map_err(|err| format!("bad --url: {err}"))?;
-    let loopback = matches!(
-        parsed_url.host_str(),
-        Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
-    );
+    // 127.0.0.0/8 and ::1 are all loopback, not just 127.0.0.1.
+    let loopback = match parsed_url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(domain)) => domain == "localhost",
+        None => false,
+    };
     if parsed_url.scheme() == "http" && !loopback && args.key.is_some() {
         return Err(
             "refusing to send the admin key over plaintext http to a non-loopback host".into(),
