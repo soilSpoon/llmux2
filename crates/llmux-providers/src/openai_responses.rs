@@ -23,6 +23,44 @@ impl Default for OpenAiResponses {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assistant_refusals_survive_chat_history_conversion() {
+        for message in [
+            json!({"role":"assistant","content":null,"refusal":"No"}),
+            json!({"role":"assistant","content":[{"type":"refusal","refusal":"No"}]}),
+            json!({"role":"assistant","content":"Sorry","refusal":"No"}),
+            json!({"role":"assistant","content":[{"type":"text","text":"Sorry"},{"type":"refusal","refusal":"No"}]}),
+            json!({"role":"assistant","content":null,"refusal":""}),
+        ] {
+            let result = chat_request(&json!({"messages":[message.clone()]})).unwrap();
+            assert_eq!(result["input"].as_array().unwrap().len(), 1);
+            let item = &result["input"][0];
+            assert_eq!(item["type"], "message");
+            assert_eq!(item["role"], "assistant");
+            assert_eq!(item["status"], "completed");
+            assert!(item["id"].as_str().unwrap().starts_with("msg_"));
+            let parts = item["content"].as_array().unwrap();
+            let refusal = parts.last().unwrap();
+            assert_eq!(refusal["type"], "refusal");
+            assert_eq!(
+                refusal["refusal"],
+                if message["refusal"] == "" { "" } else { "No" }
+            );
+            if parts.len() == 2 {
+                assert_eq!(
+                    parts[0],
+                    json!({"type":"output_text","text":"Sorry","annotations":[]})
+                );
+            }
+        }
+        assert!(chat_request(&json!({"messages":[{"role":"assistant","refusal":42}]})).is_err());
+    }
+}
+
 impl OpenAiResponses {
     pub fn new() -> Self {
         Self::default()
@@ -242,7 +280,14 @@ fn chat_request(chat: &Value) -> Result<Value, BuildError> {
         if !matches!(role, "user" | "assistant" | "developer") {
             return Err(BuildError::InvalidBody);
         }
-        if !message["content"].is_null() {
+        let has_refusal = role == "assistant"
+            && (!message["refusal"].is_null()
+                || message["content"]
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|part| part["type"] == "refusal")));
+        if has_refusal {
+            input.push(refusal_message(message, input.len())?);
+        } else if !message["content"].is_null() {
             let content = if let Some(parts) = message["content"].as_array() {
                 let mut content = Vec::new();
                 for part in parts {
@@ -314,6 +359,30 @@ fn chat_request(chat: &Value) -> Result<Value, BuildError> {
         out.insert("text".into(), json!({"format":if format["type"] == "json_schema" { let mut schema = format["json_schema"].as_object().ok_or(BuildError::InvalidBody)?.clone(); schema.insert("type".into(), json!("json_schema")); Value::Object(schema) } else { format.clone() }}));
     }
     Ok(Value::Object(out))
+}
+
+fn refusal_message(message: &Value, index: usize) -> Result<Value, BuildError> {
+    let mut content = Vec::new();
+    if let Some(text) = message["content"].as_str() {
+        content.push(json!({"type":"output_text","text":text,"annotations":[]}));
+    } else if !message["content"].is_null() {
+        for part in message["content"]
+            .as_array()
+            .ok_or(BuildError::InvalidBody)?
+        {
+            content.push(match part["type"].as_str() {
+                Some("text") => json!({"type":"output_text","text":part["text"].as_str().ok_or(BuildError::InvalidBody)?,"annotations":[]}),
+                Some("refusal") => json!({"type":"refusal","refusal":part["refusal"].as_str().ok_or(BuildError::InvalidBody)?}),
+                _ => return Err(BuildError::InvalidBody),
+            });
+        }
+    }
+    if !message["refusal"].is_null() {
+        content.push(json!({"type":"refusal","refusal":message["refusal"].as_str().ok_or(BuildError::InvalidBody)?}));
+    }
+    Ok(
+        json!({"type":"message","id":format!("msg_llmux_history_{index}"),"role":"assistant","status":"completed","content":content}),
+    )
 }
 
 fn usage(response: &Value) -> Option<Usage> {
