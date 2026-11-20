@@ -66,7 +66,7 @@ fn reviewed_free_xplabs_model_is_prepended_ahead_of_paid_legs() {
         );
         assert!(warnings
             .iter()
-            .any(|w| w == &format!("combo {name}: reviewed free XPLabs route placed first")));
+            .any(|w| w == &format!("combo {name}: prioritized reviewed free XPLabs route")));
     }
 }
 
@@ -154,6 +154,40 @@ fn ineligible_connections_and_combos_are_unchanged() {
     for root in cases {
         let (actual, warnings) = routes(&root);
         assert_eq!(actual, paid, "{root}");
-        assert!(warnings.iter().all(|w| !w.contains("placed first")));
+        assert!(warnings.iter().all(|w| !w.contains("prioritized")));
     }
+}
+
+fn credentials(root: &Value) -> Vec<(String, String)> {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.toml");
+    llmux_import::import_with_options(&root.to_string(), &out, None, &ImportOptions::default())
+        .unwrap();
+    let config = RuntimeConfig::load(&out).unwrap();
+    let name = root["combos"][0]["name"].as_str().unwrap();
+    let model = &config.models[*config.model_names.get(name).unwrap()];
+    model
+        .deployments
+        .iter()
+        .map(|i| {
+            let dep = &config.deployments[i.0 as usize];
+            (dep.upstream_model.to_string(), dep.credential.to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn moved_declared_leg_keeps_its_pinned_connection() {
+    let legs = json!(["paid/a", {"model":"experlabs/deepseek-v4.1-flash","connectionId":"xplabs"}]);
+    let with = |name: &str| {
+        let mut root = fixture(name, legs.clone());
+        root["providerConnections"][1]["priority"] = 5.into();
+        root["providerConnections"].as_array_mut().unwrap().push(json!({"id":"xplabs-other","provider":"experlabs-node","authType":"apikey","apiKey":"synthetic-xplabs-other","priority":1}));
+        root
+    };
+    let declared = credentials(&with("deepseek-v4.1-flash-free"));
+    let pinned = declared[1].clone();
+    assert_eq!(pinned.0, "deepseek-v4.1-flash");
+    let moved = credentials(&with("deepseek-v4.1-flash"));
+    assert_eq!(moved, [pinned, declared[0].clone()]);
 }

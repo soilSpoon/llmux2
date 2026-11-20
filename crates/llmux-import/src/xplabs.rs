@@ -56,7 +56,8 @@ pub(super) fn step(
     Some(step)
 }
 
-/// Places `free` first (after the verified Morph route in fast combos), dropping duplicates.
+/// Places `free` first (after the verified Morph route in fast combos). Declared legs for the
+/// same model and endpoint are moved instead, keeping their pinned connections.
 pub(super) fn place(
     name: &str,
     deployments: &mut Vec<Value>,
@@ -71,7 +72,11 @@ pub(super) fn place(
     let same = |a: &Value, b: &Value| {
         a["base_url"] == b["base_url"] && a["upstream_model"] == b["upstream_model"]
     };
-    deployments.retain(|dep| !free.iter().any(|f| same(f, dep)));
+    let (declared, rest): (Vec<_>, Vec<_>) = deployments
+        .drain(..)
+        .partition(|dep| free.iter().any(|f| same(f, dep)));
+    *deployments = rest;
+    let free = if declared.is_empty() { free } else { declared };
     let at = if name.ends_with("fast") {
         deployments
             .iter()
@@ -87,7 +92,7 @@ pub(super) fn place(
         .collect();
     if placed != original {
         warnings.push(format!(
-            "combo {name}: reviewed free XPLabs route placed first"
+            "combo {name}: prioritized reviewed free XPLabs route"
         ));
     }
 }

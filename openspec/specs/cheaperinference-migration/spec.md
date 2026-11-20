@@ -143,7 +143,8 @@ matching Experiential Labs (XPLabs) model (`gpt-6-luna` or
 `deepseek-v4.1-flash`) first, pinned to an active, usable API-key connection of
 the custom `experlabs` node at `https://api.experientiallabs.ai/v1`. In the fast
 combo it SHALL follow the verified Morph route. A declared leg for the same model
-and endpoint SHALL be moved instead of duplicated, other legs SHALL keep their
+and endpoint SHALL be moved instead of duplicated, keeping its pinned
+connection, other legs SHALL keep their
 relative order, and a warning SHALL be emitted when the order changes. This
 follows OCI verification that these models cost 0 on the existing key and that
 XPLabs DeepSeek returns logprobs. XPLabs models OCI observed billing
