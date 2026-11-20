@@ -16,7 +16,7 @@ use http_body_util::LengthLimitError;
 use llmux_config::RuntimeConfig;
 use llmux_core::{Executor, GatewayError};
 use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
-use llmux_providers::{OpenAiChatMetadata, OpenAiCompat, StaticKey};
+use llmux_providers::{OpenAiCompat, RequestMetadata, StaticKey};
 use llmux_types::{
     CredentialSource, GatewayRequest, GatewayResponse, InboundFormat, ProviderRegistry, RequestId,
     UpstreamError,
@@ -110,7 +110,7 @@ async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) 
             )
         }
     };
-    let Ok(metadata) = OpenAiChatMetadata::parse(&body) else {
+    let Ok(metadata) = RequestMetadata::parse(&body) else {
         return error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -122,7 +122,8 @@ async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) 
         format,
         model: Arc::from(metadata.model.as_ref()),
         stream: metadata.stream,
-        est_input_tokens: body.len().div_ceil(4) as u32,
+        est_input_tokens: u32::try_from(metadata.prompt_bytes.div_ceil(4)).unwrap_or(u32::MAX),
+        max_output_tokens: metadata.max_output_tokens,
         body,
         parsed: Default::default(),
         request_id: RequestId(Arc::from(uuid::Uuid::new_v4().to_string())),
@@ -218,6 +219,21 @@ fn gateway_error(err: GatewayError) -> Response {
             "invalid_request_error",
             "Invalid or unsupported request body",
         ),
+        GatewayError::ContextLengthExceeded {
+            limit,
+            prompt_tokens,
+            max_output_tokens,
+        } => {
+            let output = max_output_tokens.unwrap_or(0);
+            let needed = u64::from(prompt_tokens) + u64::from(output);
+            error(
+                StatusCode::BAD_REQUEST,
+                "context_length_exceeded",
+                &format!(
+                    "This model's maximum context length is {limit} tokens. However, the request needs about {needed} tokens ({prompt_tokens} estimated in the prompt, {output} requested for the output). Reduce the prompt or the maximum output tokens."
+                ),
+            )
+        }
         GatewayError::AllCandidatesExhausted { retry_after, .. } => rate_limited(retry_after),
         GatewayError::Client(UpstreamError::RateLimited { retry_after, .. }) => {
             rate_limited(retry_after.unwrap_or_default())

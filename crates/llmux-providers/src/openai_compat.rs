@@ -39,6 +39,144 @@ pub struct OpenAiChatMetadata<'a> {
     pub stream: bool,
 }
 
+/// Request fields the gateway reads before routing, parsed in one pass.
+pub struct RequestMetadata<'a> {
+    pub model: Cow<'a, str>,
+    pub stream: bool,
+    /// Bytes of strings and object keys in prompt fields, excluding `data:` URLs.
+    pub prompt_bytes: u64,
+    /// `max_completion_tokens`, else `max_tokens`, else `max_output_tokens`.
+    pub max_output_tokens: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct RawRequestMetadata<'a> {
+    #[serde(borrow)]
+    model: &'a RawValue,
+    #[serde(default)]
+    stream: Option<bool>,
+    #[serde(default, borrow)]
+    max_completion_tokens: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    max_tokens: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    max_output_tokens: Option<&'a RawValue>,
+    #[serde(default)]
+    messages: TextBytes,
+    #[serde(default)]
+    input: TextBytes,
+    #[serde(default)]
+    instructions: TextBytes,
+    #[serde(default)]
+    system: TextBytes,
+    #[serde(default)]
+    tools: TextBytes,
+}
+
+impl<'a> RequestMetadata<'a> {
+    pub fn parse(body: &'a [u8]) -> Result<Self, BuildError> {
+        if body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+            return Err(BuildError::InvalidBody);
+        }
+        let raw: RawRequestMetadata<'_> =
+            serde_json::from_slice(body).map_err(|_| BuildError::InvalidBody)?;
+        let model = serde_json::from_str::<BorrowedModel<'_>>(raw.model.get())
+            .map_err(|_| BuildError::InvalidBody)?
+            .0;
+        if model.is_empty() {
+            return Err(BuildError::InvalidBody);
+        }
+        let tokens = |value: Option<&RawValue>| value.and_then(|v| v.get().parse::<u32>().ok());
+        Ok(Self {
+            model,
+            stream: raw.stream.unwrap_or_default(),
+            prompt_bytes: [
+                raw.messages,
+                raw.input,
+                raw.instructions,
+                raw.system,
+                raw.tools,
+            ]
+            .iter()
+            .map(|text| text.0)
+            .sum(),
+            max_output_tokens: tokens(raw.max_completion_tokens)
+                .or_else(|| tokens(raw.max_tokens))
+                .or_else(|| tokens(raw.max_output_tokens)),
+        })
+    }
+}
+
+/// Sums string and key lengths of any JSON value without allocating.
+#[derive(Default)]
+struct TextBytes(u64);
+
+impl<'de> Deserialize<'de> for TextBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = TextBytes;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<TextBytes, E> {
+                Ok(TextBytes(if v.starts_with("data:") {
+                    0
+                } else {
+                    v.len() as u64
+                }))
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<TextBytes, E> {
+                Ok(TextBytes(0))
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<TextBytes, E> {
+                Ok(TextBytes(0))
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<TextBytes, E> {
+                Ok(TextBytes(0))
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<TextBytes, E> {
+                Ok(TextBytes(0))
+            }
+
+            fn visit_unit<E>(self) -> Result<TextBytes, E> {
+                Ok(TextBytes(0))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<TextBytes, A::Error> {
+                let mut total = 0;
+                while let Some(TextBytes(n)) = seq.next_element()? {
+                    total += n;
+                }
+                Ok(TextBytes(total))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<TextBytes, A::Error> {
+                let mut total = 0;
+                while let Some((TextBytes(k), TextBytes(v))) = map.next_entry()? {
+                    total += k + v;
+                }
+                Ok(TextBytes(total))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 impl<'a> OpenAiChatMetadata<'a> {
     pub fn parse(body: &'a [u8]) -> Result<Self, BuildError> {
         Self::parse_with_range(body).map(|(metadata, _)| metadata)
@@ -887,6 +1025,52 @@ mod tests {
     }
 
     #[test]
+    fn request_metadata_counts_prompt_text_and_output_tokens() {
+        let body = br#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"h\u00e9llo"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}],"tools":[{"type":"function"}],"metadata":{"ignored":"text"},"max_tokens":7,"temperature":0.5}"#;
+        let meta = RequestMetadata::parse(body).unwrap();
+        assert_eq!(meta.model, "m");
+        assert!(!meta.stream);
+        let counted = [
+            "role",
+            "user",
+            "content",
+            "type",
+            "text",
+            "text",
+            "h\u{e9}llo",
+        ]
+        .iter()
+        .chain(&["type", "image_url", "image_url", "url", "type", "function"])
+        .map(|text| text.len() as u64)
+        .sum::<u64>();
+        assert_eq!(meta.prompt_bytes, counted);
+        assert_eq!(meta.max_output_tokens, Some(7));
+        for (fields, expected) in [
+            (r#""max_tokens":7,"max_completion_tokens":9"#, Some(9)),
+            (r#""max_output_tokens":5,"input":"abcd""#, Some(5)),
+            (r#""max_tokens":null,"max_output_tokens":5"#, Some(5)),
+            (r#""max_tokens":-1"#, None),
+            (r#""max_tokens":1.5"#, None),
+            (r#""max_tokens":"7""#, None),
+            (r#""max_tokens":99999999999"#, None),
+        ] {
+            let body = format!(r#"{{"model":"m",{fields}}}"#);
+            assert_eq!(
+                RequestMetadata::parse(body.as_bytes())
+                    .unwrap()
+                    .max_output_tokens,
+                expected,
+                "{fields}"
+            );
+        }
+        let meta = RequestMetadata::parse(
+            br#"{"model":"m","input":"abcd","instructions":"ef","system":null}"#,
+        )
+        .unwrap();
+        assert_eq!(meta.prompt_bytes, 6);
+    }
+
+    #[test]
     fn null_stream_setting_defaults_to_non_streaming() {
         let raw = br#"{"model":"model","stream":null}"#;
         assert!(!OpenAiChatMetadata::parse(raw).unwrap().stream);
@@ -905,6 +1089,10 @@ mod tests {
         ] {
             assert!(
                 OpenAiChatMetadata::parse(invalid.as_bytes()).is_err(),
+                "{invalid}"
+            );
+            assert!(
+                RequestMetadata::parse(invalid.as_bytes()).is_err(),
                 "{invalid}"
             );
         }

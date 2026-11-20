@@ -872,6 +872,7 @@ mod tests {
             body: Bytes::from_static(br#"{ "model":"alias", "future":{"model":"untouched"} }"#),
             parsed: Default::default(),
             est_input_tokens: 0,
+            max_output_tokens: None,
             request_id: RequestId("r".into()),
         };
         for auth in [

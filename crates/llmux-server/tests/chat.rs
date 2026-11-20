@@ -203,7 +203,7 @@ key = "file:{base}/test-secondary"
 [[models]]
 name = "shared"
 aliases = ["alias"]
-capabilities = {{ stream = true }}
+capabilities = {{ stream = true, max_context = 100000 }}
 
 [[models.deployments]]
 id = "d2"
@@ -669,4 +669,46 @@ async fn rpm_limit_skips_primary_without_sending_another_request() {
     let fallback = fixture.request("test-client", "shared", false).await;
     check_route(&fallback, "d2", "1");
     assert_eq!(fixture.counts(), [1, 1]);
+}
+
+#[tokio::test]
+async fn context_precheck_skips_small_deployments_and_rejects_without_upstream() {
+    let fixture = Fixture::start(
+        [Reply::Complete, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "max_context = 30",
+    )
+    .await;
+    let payload = |max_tokens: u32| {
+        json!({
+            "model": "shared",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "vendor_option": {"model": "leave-me-alone"},
+            "max_tokens": max_tokens,
+        })
+        .to_string()
+    };
+    let response = fixture
+        .post("/v1/chat/completions", "test-client", payload(5))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = fixture
+        .post("/v1/chat/completions", "test-client", payload(200))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let calls = fixture.counts();
+    assert_eq!(calls.iter().sum::<usize>(), 2);
+    assert!(calls[1] >= 1);
+
+    let response = fixture
+        .post("/v1/chat/completions", "test-client", payload(200_000))
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: Value = serde_json::from_str(&body(response).await).unwrap();
+    assert_eq!(error["error"]["code"], "context_length_exceeded");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("100000 tokens"), "{message}");
+    assert!(message.contains("200000 requested"), "{message}");
+    assert_eq!(fixture.counts(), calls);
 }

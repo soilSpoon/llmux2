@@ -48,6 +48,12 @@ pub enum GatewayError {
     UnsupportedStream,
     #[error("invalid or unsupported request body")]
     InvalidRequest,
+    #[error("request does not fit any deployment's context window")]
+    ContextLengthExceeded {
+        limit: u32,
+        prompt_tokens: u32,
+        max_output_tokens: Option<u32>,
+    },
     #[error("all candidates are rate limited")]
     AllCandidatesExhausted {
         attempts: usize,
@@ -77,6 +83,8 @@ struct Binding {
 struct ModelOrder {
     next: AtomicUsize,
     groups: Box<[Range<usize>]>,
+    /// Smallest deployment context window; requests within it skip per-deployment checks.
+    min_context: u32,
 }
 
 pub struct Executor {
@@ -135,6 +143,12 @@ impl Executor {
                 ModelOrder {
                     next: AtomicUsize::new(0),
                     groups,
+                    min_context: model
+                        .deployments
+                        .iter()
+                        .filter_map(|idx| cfg.deployments[idx.0 as usize].max_context)
+                        .min()
+                        .unwrap_or(u32::MAX),
                 }
             })
             .collect();
@@ -169,6 +183,39 @@ impl Executor {
             return Err(GatewayError::UnsupportedStream);
         }
         let order = &self.orders[model_idx];
+        let needed =
+            u64::from(req.est_input_tokens) + u64::from(req.max_output_tokens.unwrap_or(0));
+        let check_context = needed > u64::from(order.min_context);
+        let fits = |dep: &Deployment| {
+            !check_context
+                || dep
+                    .max_context
+                    .is_none_or(|limit| needed <= u64::from(limit))
+        };
+        if check_context {
+            let mut limit = None;
+            for &idx in &model.deployments {
+                let dep = &self.cfg.deployments[index(idx)];
+                let binding = &self.bindings[index(idx)];
+                if binding.disabled.load(Ordering::Relaxed)
+                    || binding.adapter.supports(req.format) == Support::No
+                {
+                    continue;
+                }
+                if fits(dep) {
+                    limit = None;
+                    break;
+                }
+                limit = limit.max(dep.max_context);
+            }
+            if let Some(limit) = limit {
+                return Err(GatewayError::ContextLengthExceeded {
+                    limit,
+                    prompt_tokens: req.est_input_tokens,
+                    max_output_tokens: req.max_output_tokens,
+                });
+            }
+        }
         let sequence = if order.groups.iter().any(|group| group.len() > 1) {
             order.next.fetch_add(1, Ordering::Relaxed)
         } else {
@@ -189,6 +236,7 @@ impl Executor {
                 let binding = &self.bindings[idx];
                 if binding.disabled.load(Ordering::Relaxed)
                     || binding.adapter.supports(req.format) == Support::No
+                    || !fits(dep)
                 {
                     continue;
                 }
@@ -288,6 +336,7 @@ impl Executor {
         let earliest = model
             .deployments
             .iter()
+            .filter(|idx| fits(&self.cfg.deployments[index(**idx)]))
             .map(|idx| &self.bindings[index(*idx)])
             .filter(|binding| {
                 !binding.disabled.load(Ordering::Relaxed)
