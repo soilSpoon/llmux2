@@ -23,7 +23,7 @@ use std::{
 };
 use tokio::{
     sync::Semaphore,
-    time::{sleep_until, timeout, Instant},
+    time::{advance, pause, resume, timeout, Instant},
 };
 
 #[derive(Clone)]
@@ -689,7 +689,9 @@ async fn verify_failover(streaming: bool) {
     drop(body(during_cooldown).await);
     assert_eq!(fixture.counts(), [1, 2]);
 
-    sleep_until(resume_at).await;
+    pause();
+    advance(resume_at.saturating_duration_since(Instant::now())).await;
+    resume();
     let after_cooldown = fixture.request("test-client", "shared", streaming).await;
     check_route(&after_cooldown, "d1", "1");
     drop(body(after_cooldown).await);

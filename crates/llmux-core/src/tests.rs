@@ -501,12 +501,17 @@ async fn repeated_rate_limits_lengthen_cooldown_until_a_success() {
             .map_or(Duration::ZERO, |end| end - now)
     };
     let served = |adapter: &Adapter| adapter.calls.lock().unwrap().last().unwrap().0.clone();
+    let elapse = |duration| async move {
+        tokio::time::pause();
+        tokio::time::advance(duration).await;
+        tokio::time::resume();
+    };
 
     executor.execute(request()).await.unwrap();
     assert_eq!(served(&adapter).as_ref(), "dep2");
     assert!(cooldown(&executor) <= Duration::from_secs(1));
 
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    elapse(Duration::from_millis(1100)).await;
     adapter.errors.lock().unwrap().push_back(limited());
     executor.execute(request()).await.unwrap();
     assert_eq!(served(&adapter).as_ref(), "dep2");
@@ -516,7 +521,7 @@ async fn repeated_rate_limits_lengthen_cooldown_until_a_success() {
         "second consecutive 429 should double the cooldown, got {second:?}"
     );
 
-    tokio::time::sleep(second + Duration::from_millis(100)).await;
+    elapse(second + Duration::from_millis(100)).await;
     executor.execute(request()).await.unwrap();
     assert_eq!(served(&adapter).as_ref(), "dep0");
     adapter.errors.lock().unwrap().push_back(limited());

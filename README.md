@@ -239,6 +239,11 @@ cargo test --locked -p llmux-server --test chat -- --nocapture
 node --test crates/llmux-server/tests/dashboard.cjs
 ```
 
+In CI, `coverage` runs the Rust unit and integration tests once with coverage
+instrumentation, while `check` runs Rust doctests, lint, and the dashboard and
+repository tooling tests. Use `cargo test --locked --workspace` to run all Rust
+tests locally without instrumentation.
+
 ## Live gateway comparison
 
 Run on the gateway host with Python 3.9+ (stdlib only), reference first, llmux second.
@@ -266,8 +271,8 @@ Read `results.json` / `report.html` in a new private output directory; review be
 Learnings: API and dashboard ports differ—validate authenticated `/v1/models` first.
 Stored client keys may be encrypted; extract/decrypt readonly, server-side, into private files.
 Imported names can retain wrong upstream IDs or container-local URLs: import success ≠ usable routing.
-Tests (separate from Rust-only CI): `python3 -m unittest bench.test_compare_gateways` and
-`python3 -m py_compile bench/compare_gateways.py bench/test_compare_gateways.py`.
+Run just the comparison harness tests with `python3 -m unittest bench.test_compare_gateways`.
+Check Python syntax with `python3 -m py_compile bench/compare_gateways.py bench/test_compare_gateways.py`.
 
 ## Mock-upstream load benchmark
 
