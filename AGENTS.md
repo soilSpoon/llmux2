@@ -45,6 +45,29 @@ python3 -B -m unittest discover -s scripts -v
 - Put exactly one `Author-Session: <id>` line in the PR body. Session IDs use letters, digits, `.`, `_`, `:`, or `-`. A different verifier session must check every applicable `REVIEW.md` item against the diff and inspect the red/green evidence, then post an issue comment with `<!-- llmux-verify:v1 sha=<full head sha> verdict=pass reviewer=<session id> -->` (use `verdict=fail` for a failure). The latest marker for that SHA wins. These are trusted session attestations, not authenticated identities.
 - Any new commit invalidates Devin Review and independent verification: obtain both for the new head. Resolve all review threads and blocking latest reviews. The gate reads required checks from `.github/rulesets/main.json` and reviewer markers from `.github/merge-policy.json`; API errors and unknown mergeability block merging.
 
+## Rules and what enforces them
+
+Each standard above pairs with the mechanism that makes it fail before merge. A rule marked "review/docs" has no mechanical guard yet: if its mistake recurs, upgrade it to a lint, test, type, or CI check in the same change that fixes the mistake (the `/correct` loop — architecture first, types, lint/CI, tests, docs last). Drop a rule once its mistake cannot happen.
+
+| Rule | Enforced by | Level |
+| --- | --- | --- |
+| Format and lint clean | `cargo fmt --check`, `clippy -D warnings` in CI `check` job | CI |
+| Tests pass | `cargo test --locked --workspace` and the bench/scripts/dashboard suites in CI `check` job | CI |
+| `crates/*/src` changes need test evidence or `Test exemption:` | `pr-policy` job (`scripts/pr_policy.py`) | CI |
+| PR template sections non-empty | `pr-policy` job | CI |
+| Workspace line coverage never drops | `coverage` job vs `.github/coverage-floor` | CI |
+| Required plugins pinned to reviewed commits | `.devin/config.json` requiredPlugins SHAs | Config |
+| Review findings addressed | Devin Review on each PR | Review |
+| Spec changes ship with behavior changes (OpenSpec) | `openspec/` workflow | Review/docs |
+| Small, atomic PRs focused on one outcome | PR scope review | Review/docs |
+| Test-first (failing test before the fix) | PR review + `pr-policy` test evidence | Review/docs |
+| Synthetic credentials only; no credential values in errors, logs, or config | Review checklist row | Review/docs |
+| Provider-specific behavior stays out of the routing core | Adapter contract + review | Review/docs |
+| No speculative dependencies, unbounded work, or unrelated cleanup | Review checklist | Review/docs |
+| Merges only through the gate with passing checks and reviews | `scripts/merge_gate.py` + `.github/rulesets/main.json` + `.github/merge-policy.json` | CI/gate |
+| Independent verifier marker per head SHA | `llmux-verify:v1` comment check in merge gate | CI/gate |
+
+
 ## Compound what was learned
 
 When a fix or review corrects an assumption likely to recur, keep the lesson in the smallest durable form: a regression test or lint for a checkable invariant, an update to the existing docs or examples for user-visible behavior, or a short linked note in `docs/solutions/` if the rationale is not recoverable from those. Include the symptom, why it happened, and how to verify it. Update stale guidance rather than duplicating it. Link the result in the PR, or say why no new lesson belongs in the repo.
