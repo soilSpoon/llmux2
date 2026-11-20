@@ -4,7 +4,7 @@ use http::{HeaderMap, Request, Response};
 use hyper::body::Incoming;
 use llmux_types::{
     AuthError, AuthMaterial, BuildError, CanonicalModel, Capabilities, ContextOverflow,
-    InboundFormat, ProviderKind, RequestId, Strategy,
+    InboundFormat, ProviderKind, RequestId, SseEvent, Strategy,
 };
 use std::{collections::VecDeque, sync::Mutex};
 
@@ -34,6 +34,7 @@ impl CredentialSource for Credential {
 struct Adapter {
     kind: ProviderKind,
     errors: Mutex<VecDeque<UpstreamError>>,
+    stream_errors: Mutex<VecDeque<UpstreamError>>,
     calls: Mutex<Vec<(Arc<str>, Arc<str>)>>,
 }
 
@@ -65,12 +66,22 @@ impl ProviderAdapter for Adapter {
 
     async fn parse_response(
         &self,
-        _: &GatewayRequest,
+        req: &GatewayRequest,
         _: &Deployment,
         _: Response<Incoming>,
     ) -> Result<GatewayResponse, UpstreamError> {
         if let Some(error) = self.errors.lock().unwrap().pop_front() {
             return Err(error);
+        }
+        if req.stream {
+            let event = SseEvent {
+                event: None,
+                data: "{}".into(),
+            };
+            let tail = self.stream_errors.lock().unwrap().pop_front();
+            return Ok(GatewayResponse::Stream(Box::pin(
+                futures_util::stream::iter(std::iter::once(Ok(event)).chain(tail.map(Err))),
+            )));
         }
         Ok(GatewayResponse::Complete {
             status: StatusCode::OK,
@@ -120,6 +131,7 @@ async fn fixture_with_models(
     let adapter = Arc::new(Adapter {
         kind: ProviderKind("test".into()),
         errors: Mutex::new(errors.into()),
+        stream_errors: Mutex::new(VecDeque::new()),
         calls: Mutex::new(Vec::new()),
     });
     let credential = Arc::new(Credential {
@@ -570,4 +582,72 @@ async fn local_rpm_budget_is_shared_by_models_on_the_same_upstream_route() {
         .map(|(dep, _)| dep.to_string())
         .collect();
     assert_eq!(calls, ["dep0", "dep2"]);
+}
+
+#[tokio::test]
+async fn limit_error_after_stream_start_cools_down_the_deployment() {
+    for error in [
+        UpstreamError::RateLimited {
+            retry_after: Some(Duration::from_secs(3)),
+            scope: llmux_types::LimitScope::Unknown,
+        },
+        UpstreamError::QuotaExhausted {
+            reset_at: Some(SystemTime::now() + Duration::from_secs(3)),
+        },
+    ] {
+        let (executor, adapter, _, _server) = fixture(Vec::new(), false).await;
+        adapter.stream_errors.lock().unwrap().push_back(error);
+        let streaming = || GatewayRequest {
+            stream: true,
+            ..request()
+        };
+        let routed = executor.execute(streaming()).await.unwrap();
+        assert_eq!(routed.deployment.as_ref(), "dep0");
+        let GatewayResponse::Stream(events) = routed.response else {
+            panic!("expected stream")
+        };
+        let events: Vec<_> = events.collect().await;
+        assert!(matches!(events.as_slice(), [Ok(_), Err(_)]));
+
+        let next = executor.execute(streaming()).await.unwrap();
+        assert_eq!(
+            next.deployment.as_ref(),
+            "dep2",
+            "the deployment whose stream ended in a limit error must cool down"
+        );
+    }
+}
+
+#[tokio::test]
+async fn repeated_limit_errors_after_stream_start_back_off() {
+    let (executor, adapter, _, _server) = fixture(Vec::new(), false).await;
+    let streaming = || GatewayRequest {
+        stream: true,
+        ..request()
+    };
+    let mut cooldowns = Vec::new();
+    for _ in 0..2 {
+        adapter
+            .stream_errors
+            .lock()
+            .unwrap()
+            .push_back(UpstreamError::RateLimited {
+                retry_after: None,
+                scope: llmux_types::LimitScope::Unknown,
+            });
+        let routed = executor.execute(streaming()).await.unwrap();
+        assert_eq!(routed.deployment.as_ref(), "dep0");
+        let GatewayResponse::Stream(events) = routed.response else {
+            panic!("expected stream")
+        };
+        let _: Vec<_> = events.collect().await;
+        let now = Instant::now();
+        let until = executor.bindings[0].limits.cooldown_until(now).unwrap();
+        cooldowns.push(until - now);
+        tokio::time::sleep(until - now + Duration::from_millis(50)).await;
+    }
+    assert!(
+        cooldowns[1] > Duration::from_millis(1500),
+        "a stream that started then hit a limit is not a success: {cooldowns:?}"
+    );
 }
