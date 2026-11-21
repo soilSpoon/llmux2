@@ -2,7 +2,6 @@ name: TLA+
 
 on:
   pull_request:
-    paths: ['tla/**', 'crates/llmux-core/src/machine.rs', '.github/workflows/tla.yml']
   push:
     branches: [main]
 
