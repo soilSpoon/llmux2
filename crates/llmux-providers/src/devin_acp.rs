@@ -112,6 +112,69 @@ pub fn strip_summary(text: &str) -> &str {
         .map_or(trimmed, str::trim)
 }
 
+const SUMMARY_OPEN: &str = "<summary>";
+const SUMMARY_CLOSE: &str = "</summary>";
+
+/// Incremental `strip_summary`: buffers only until it is known whether the reply opens
+/// with `<summary>`, then releases text while holding back trailing whitespace and a
+/// possible `</summary>` so the wrapper never leaks.
+#[derive(Default)]
+struct Unwrapper {
+    buf: String,
+    decided: bool,
+    wrapped: bool,
+}
+
+impl Unwrapper {
+    fn push(&mut self, text: &str) -> String {
+        self.buf.push_str(text);
+        if !self.decided {
+            let head = self.buf.trim_start();
+            if head.len() < SUMMARY_OPEN.len() && SUMMARY_OPEN.starts_with(head) {
+                return String::new();
+            }
+            self.decided = true;
+            self.wrapped = head.starts_with(SUMMARY_OPEN);
+            self.buf = head
+                .strip_prefix(SUMMARY_OPEN)
+                .unwrap_or(head)
+                .trim_start()
+                .to_owned();
+        }
+        let visible = self.buf.trim_end().len();
+        let mut cut = if self.wrapped {
+            visible.saturating_sub(SUMMARY_CLOSE.len())
+        } else {
+            visible
+        };
+        while !self.buf.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        self.buf.drain(..cut).collect()
+    }
+
+    fn finish(self) -> String {
+        if !self.decided {
+            return self.buf.trim().to_owned();
+        }
+        let rest = self.buf.trim_end();
+        let rest = if self.wrapped {
+            rest.strip_suffix(SUMMARY_CLOSE).unwrap_or(rest).trim_end()
+        } else {
+            rest
+        };
+        rest.to_owned()
+    }
+}
+
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 fn content_text(content: &Value) -> String {
     match content {
         Value::String(text) => text.clone(),
@@ -181,6 +244,7 @@ struct Session {
     lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     next_id: u64,
     reply: String,
+    chunks: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl Session {
@@ -197,6 +261,7 @@ impl Session {
             lines: BufReader::new(stdout).lines(),
             next_id: 1,
             reply: String::new(),
+            chunks: None,
         })
     }
 
@@ -228,8 +293,11 @@ impl Session {
             if message["method"] == "session/update" {
                 let update = &message["params"]["update"];
                 if update["sessionUpdate"] == "agent_message_chunk" {
-                    self.reply
-                        .push_str(update["content"]["text"].as_str().unwrap_or(""));
+                    let text = update["content"]["text"].as_str().unwrap_or("");
+                    self.reply.push_str(text);
+                    if let Some(chunks) = &self.chunks {
+                        let _ = chunks.send(text.to_owned());
+                    }
                     if self.reply.len() > MAX_REPLY_BYTES {
                         return Err(UpstreamError::Server {
                             status: StatusCode::BAD_GATEWAY,
@@ -365,6 +433,65 @@ impl ProviderAdapter for DevinAcp {
 }
 
 impl DevinAcp {
+    /// Streams one SSE delta per ACP `agent_message_chunk` as the child emits it. Errors
+    /// before the first event surface as the first stream item so the executor can fail over.
+    fn stream(&self, model: String, prompt: String) -> GatewayResponse {
+        let config = self.config.clone();
+        GatewayResponse::Stream(Box::pin(async_stream::stream! {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let session = match Session::spawn(&config) {
+                Ok(mut session) => {
+                    session.chunks = Some(tx);
+                    session
+                }
+                Err(err) => {
+                    yield Err(err);
+                    return;
+                }
+            };
+            let mut task = {
+                let config = config.clone();
+                let model = model.clone();
+                AbortOnDrop(tokio::spawn(async move {
+                    timeout(config.turn_timeout, session.turn(&config, &model, &prompt))
+                        .await
+                        .map_err(|_| UpstreamError::Timeout)?
+                }))
+            };
+            let delta = |text: String| {
+                let mut chunk = completion(&model, &text, true);
+                chunk["choices"][0]["delta"] = json!({"role":"assistant","content":text});
+                Ok(SseEvent { event: None, data: chunk.to_string() })
+            };
+            let mut unwrapper = Unwrapper::default();
+            while let Some(text) = rx.recv().await {
+                let text = unwrapper.push(&text);
+                if !text.is_empty() {
+                    yield delta(text);
+                }
+            }
+            match (&mut task.0).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    yield Err(err);
+                    return;
+                }
+                Err(_) => {
+                    yield Err(UpstreamError::StreamBroken { bytes_sent: 0 });
+                    return;
+                }
+            }
+            let text = unwrapper.finish();
+            if !text.is_empty() {
+                yield delta(text);
+            }
+            let mut done = completion(&model, "", true);
+            done["choices"][0] = json!({"index":0,"delta":{},"finish_reason":"stop"});
+            yield Ok(SseEvent { event: None, data: done.to_string() });
+            yield Ok(SseEvent { event: None, data: "[DONE]".into() });
+        }))
+    }
+
     async fn serve(
         &self,
         req: &GatewayRequest,
@@ -383,6 +510,9 @@ impl DevinAcp {
                 body: Bytes::new(),
             })?;
         let model = crate::upstream_model(req, dep);
+        if req.stream {
+            return Ok(self.stream(model.to_owned(), prompt));
+        }
         let text = timeout(
             self.config.turn_timeout,
             Session::spawn(&self.config)?.turn(&self.config, model, &prompt),
@@ -390,19 +520,6 @@ impl DevinAcp {
         .await
         .map_err(|_| UpstreamError::Timeout)??;
         let mut headers = HeaderMap::new();
-        if req.stream {
-            let mut done = completion(model, &text, true);
-            done["choices"][0] = json!({"index":0,"delta":{},"finish_reason":"stop"});
-            let events = [
-                completion(model, &text, true).to_string(),
-                done.to_string(),
-                "[DONE]".into(),
-            ]
-            .map(|data| Ok(SseEvent { event: None, data }));
-            return Ok(GatewayResponse::Stream(Box::pin(
-                futures_util::stream::iter(events),
-            )));
-        }
         headers.insert("content-type", HeaderValue::from_static("application/json"));
         Ok(GatewayResponse::Complete {
             status: StatusCode::OK,
@@ -457,6 +574,17 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         fn script(dir: &std::path::Path, reply: &str) -> DevinAcpConfig {
+            chunked_script(dir, &[reply])
+        }
+
+        fn chunked_script(dir: &std::path::Path, replies: &[&str]) -> DevinAcpConfig {
+            let chunks: String = replies
+                .iter()
+                .map(|reply| format!(
+                    r#"      printf '{{{{"jsonrpc":"2.0","method":"session/update","params":{{{{"update":{{{{"sessionUpdate":"agent_message_chunk","content":{{{{"text":"{reply}"}}}}}}}}}}}}}}\n'
+"#
+                ))
+                .collect();
             let path = dir.join("devin");
             let body = format!(
                 r#"#!/bin/sh
@@ -468,8 +596,7 @@ while read -r line; do
     *'"initialize"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id";;
     *'"session/new"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"s1"}}}}\n' "$id";;
     *'"session/prompt"'*)
-      printf '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"text":"{reply}"}}}}}}}}\n'
-      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"stopReason":"end_turn"}}}}\n' "$id";;
+{chunks}      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"stopReason":"end_turn"}}}}\n' "$id";;
   esac
 done
 "#
@@ -494,6 +621,63 @@ done
                 .turn(&config, "swe-2-high", "hi")
                 .await;
             assert_eq!(text.unwrap(), "OK");
+        }
+
+        async fn streamed(replies: &[&str]) -> Vec<String> {
+            use futures_util::StreamExt;
+            let dir = tempfile::tempdir().unwrap();
+            let adapter = DevinAcp::new(chunked_script(dir.path(), replies));
+            let GatewayResponse::Stream(events) = adapter.stream("m".into(), "hi".into()) else {
+                panic!("expected a stream");
+            };
+            let events: Vec<_> = events.collect().await;
+            let data: Vec<String> = events.into_iter().map(|e| e.unwrap().data).collect();
+            assert_eq!(data.last().unwrap(), "[DONE]");
+            assert!(data[data.len() - 2].contains(r#""finish_reason":"stop""#));
+            data[..data.len() - 2]
+                .iter()
+                .map(|d| {
+                    let v: Value = serde_json::from_str(d).unwrap();
+                    v["choices"][0]["delta"]["content"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn stream_emits_one_delta_per_chunk() {
+            assert_eq!(
+                streamed(&["Hel", "lo ", "world"]).await,
+                ["Hel", "lo ", "world"]
+            );
+        }
+
+        #[tokio::test]
+        async fn stream_streams_unwrapped_text_for_wrapped_reply() {
+            let deltas = streamed(&["<sum", "mary>He", "llo wor", "ld</summ", "ary>"]).await;
+            assert!(deltas.len() >= 2, "{deltas:?}");
+            assert_eq!(deltas.concat(), "Hello world");
+        }
+
+        #[test]
+        fn unwrapper_matches_strip_summary() {
+            for text in [
+                "<summary>\nOK\n</summary>\n",
+                " OK ",
+                "a <summary>b</summary>",
+                "<sumX",
+                "<summary>é✓</summary>",
+            ] {
+                let mut unwrapper = Unwrapper::default();
+                let mut out = String::new();
+                for ch in text.chars() {
+                    out.push_str(&unwrapper.push(&ch.to_string()));
+                }
+                out.push_str(&unwrapper.finish());
+                assert_eq!(out, strip_summary(text), "{text:?}");
+            }
         }
 
         #[tokio::test]
