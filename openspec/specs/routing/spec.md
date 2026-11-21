@@ -147,3 +147,14 @@ quota for models that sell well instead of spending it on low-value traffic.
 WHEN a deployment's quota is shared between a high-selling model and a
 low-value one
 THEN the low-value model is deprioritized first as quota runs low.
+
+### Requirement: Selection phases are explicit
+
+Deployment selection SHALL follow the `Select` → `Admit` → `Build` → `Gate` →
+`Send` phases of `machine::State`; a cooldown that appears during `Build` SHALL
+send the request back to `Select` without consuming an attempt.
+
+#### Scenario: Cooldown set during build
+
+WHEN a deployment enters cooldown while its request is being built
+THEN `Gate` skips it without an attempt and the next candidate is considered.

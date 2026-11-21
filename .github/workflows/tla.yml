@@ -1,0 +1,26 @@
+name: TLA+
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tlc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fetch pinned tla2tools
+        run: |
+          curl -fsSL -o tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          echo "fdffef247f563ef6edbfd44958d2a82db79e7564e07cb673262d896353fa6713  tla2tools.jar" | sha256sum -c -
+      - name: Model check
+        working-directory: tla
+        run: |
+          for m in RequestPath StreamLifecycle DeploySlots; do
+            java -cp ../tla2tools.jar tlc2.TLC -config $m.cfg $m.tla | tee /tmp/$m.log
+            grep -q "No error has been found" /tmp/$m.log
+          done
