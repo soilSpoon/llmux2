@@ -538,6 +538,7 @@ impl ProviderAdapter for OpenAiCompat {
             .body(strip_request_fields(body, &dep.strip_request_fields)?)?;
 
         request.headers_mut().extend(dep.headers.clone());
+        llmux_types::default_user_agent(request.headers_mut());
         apply_auth(
             request.headers_mut(),
             auth,
@@ -856,6 +857,7 @@ fn classify_error_details(
         },
         429 => UpstreamError::RateLimited { retry_after: wait },
         401 => UpstreamError::Auth { refreshable: true },
+        403 if body.trim_ascii_start().starts_with(b"<") => UpstreamError::Server { status },
         403 => UpstreamError::Auth { refreshable: false },
         408 => UpstreamError::Timeout,
         400 if message.contains("pass a valid api key")
@@ -1193,6 +1195,77 @@ mod tests {
             ),
             UpstreamError::BadRequest { .. }
         ));
+    }
+
+    #[test]
+    fn waf_html_403_is_transient_not_an_auth_failure() {
+        for body in [
+            "<!DOCTYPE html>\n<html><title>Attention Required! | Cloudflare</title></html>",
+            "  <html>blocked</html>",
+        ] {
+            assert!(matches!(
+                classify(403, body),
+                UpstreamError::Server { status } if status == StatusCode::FORBIDDEN
+            ));
+        }
+        for body in [r#"{"error":{"message":"forbidden"}}"#, "Forbidden", ""] {
+            assert!(matches!(
+                classify(403, body),
+                UpstreamError::Auth { refreshable: false }
+            ));
+        }
+        assert!(matches!(
+            classify(401, "<html>login</html>"),
+            UpstreamError::Auth { refreshable: true }
+        ));
+    }
+
+    #[test]
+    fn request_carries_a_default_user_agent_unless_the_deployment_sets_one() {
+        use futures_util::FutureExt;
+        use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
+        let adapter = OpenAiCompat::new("openai_compat");
+        let mut deployment = Deployment {
+            headers: Default::default(),
+            idx: DeploymentIdx(0),
+            id: "d".into(),
+            provider: adapter.kind().clone(),
+            credential: "key".into(),
+            base_url: "https://example.com/v1".parse().unwrap(),
+            upstream_model: "m".into(),
+            strip_request_fields: Box::default(),
+            priority: 0,
+            quota: QuotaSpec::default(),
+            timeout: Duration::from_secs(5),
+            max_context: None,
+            fallback: false,
+        };
+        let req = GatewayRequest {
+            format: InboundFormat::OpenAiChat,
+            model: "m".into(),
+            stream: false,
+            body: Bytes::from_static(br#"{"model":"m","messages":[]}"#),
+            est_input_tokens: 0,
+            anthropic_headers: HeaderMap::new(),
+            max_output_tokens: None,
+            context_overflow: None,
+            request_id: RequestId("r".into()),
+        };
+        let build = |dep: &Deployment| {
+            adapter
+                .build_request(&req, dep, &AuthMaterial::None)
+                .now_or_never()
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(
+            build(&deployment).headers()[header::USER_AGENT],
+            concat!("llmux/", env!("CARGO_PKG_VERSION"))
+        );
+        deployment
+            .headers
+            .insert(header::USER_AGENT, HeaderValue::from_static("custom/1"));
+        assert_eq!(build(&deployment).headers()[header::USER_AGENT], "custom/1");
     }
 
     #[test]

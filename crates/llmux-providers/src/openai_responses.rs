@@ -57,6 +57,7 @@ impl ProviderAdapter for OpenAiResponses {
             .header(header::ACCEPT, "text/event-stream")
             .body(Bytes::from(body.to_string()))?;
         request.headers_mut().extend(dep.headers.clone());
+        llmux_types::default_user_agent(request.headers_mut());
         apply_auth(
             request.headers_mut(),
             auth,

@@ -22,6 +22,10 @@ struct Fake {
 }
 
 async fn token(State(fake): State<Arc<Fake>>, headers: HeaderMap) -> Json<serde_json::Value> {
+    assert_eq!(
+        headers["user-agent"],
+        concat!("llmux/", env!("CARGO_PKG_VERSION"))
+    );
     fake.presented
         .lock()
         .unwrap()
@@ -39,6 +43,10 @@ async fn chat(
     State(fake): State<Arc<Fake>>,
     headers: HeaderMap,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    assert_eq!(
+        headers[header::USER_AGENT],
+        concat!("llmux/", env!("CARGO_PKG_VERSION"))
+    );
     let bearer = headers[header::AUTHORIZATION].to_str().unwrap().to_owned();
     fake.inference.lock().unwrap().push(bearer.clone());
     if bearer == "Bearer access-1" {

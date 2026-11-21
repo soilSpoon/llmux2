@@ -88,7 +88,10 @@ impl NousLogin {
             )
             .await?;
         if status != http::StatusCode::OK {
-            return Err(Error::Http);
+            return Err(Error::Poll(format!(
+                "Nous Portal device code request failed: {}",
+                received(status, &body, "")
+            )));
         }
         let device: DeviceCode = serde_json::from_slice(&body).map_err(|_| Error::Http)?;
         if device.device_code.is_empty() || device.verification_uri_complete.is_empty() {
@@ -97,12 +100,18 @@ impl NousLogin {
         announce(&device.verification_uri_complete, &device.user_code);
         let deadline = Instant::now() + Duration::from_secs(device.expires_in.max(1));
         let mut interval = Duration::from_secs(device.interval).max(self.min_poll);
+        let mut transient: Option<String> = None;
+        let mut failures = 0u32;
         let tokens: Tokens = loop {
             if Instant::now() >= deadline {
-                return Err(Error::Timeout);
+                return Err(transient.map_or(Error::Timeout, Error::Poll));
             }
-            tokio::time::sleep(interval.min(deadline - Instant::now())).await;
-            let (status, body) = self
+            let backoff = interval
+                .saturating_mul(1 << failures.min(5))
+                .min(Duration::from_secs(30))
+                .max(interval);
+            tokio::time::sleep(backoff.min(deadline - Instant::now())).await;
+            let response = self
                 .form(
                     &http,
                     "/api/oauth/token",
@@ -112,21 +121,45 @@ impl NousLogin {
                         ("device_code", &device.device_code),
                     ],
                 )
-                .await?;
+                .await;
+            let (status, body) = match response {
+                Ok(response) => response,
+                Err(Error::Http) => {
+                    failures += 1;
+                    transient = Some("Nous Portal token poll failed: no response".into());
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if status == http::StatusCode::OK {
-                break serde_json::from_slice(&body).map_err(|_| Error::Http)?;
+                if let Ok(tokens) = serde_json::from_slice(&body) {
+                    break tokens;
+                }
             }
             let error = serde_json::from_slice::<serde_json::Value>(&body)
                 .ok()
                 .and_then(|v| v["error"].as_str().map(str::to_owned));
             match error.as_deref() {
-                Some("authorization_pending") => {}
+                Some("authorization_pending") => failures = 0,
                 Some("slow_down") => {
+                    failures = 0;
                     interval = (interval + Duration::from_secs(1)).min(Duration::from_secs(30))
                 }
                 Some("access_denied") => return Err(Error::AccessDenied),
                 Some("expired_token") => return Err(Error::Timeout),
-                _ => return Err(Error::Authorization),
+                Some(_) => {
+                    return Err(Error::Poll(format!(
+                        "Nous Portal rejected the sign-in: {}",
+                        received(status, &body, &device.device_code)
+                    )))
+                }
+                None => {
+                    failures += 1;
+                    transient = Some(format!(
+                        "Nous Portal token poll kept failing until the device code expired; last response: {}",
+                        received(status, &body, &device.device_code)
+                    ));
+                }
             }
         };
         if tokens.access_token.is_empty() || tokens.refresh_token.is_empty() {
@@ -164,6 +197,24 @@ impl NousLogin {
         .map_err(|_| Error::Storage)?;
         Ok(state)
     }
+}
+
+/// `HTTP <status> <first 200 characters of the body>`; never the device code.
+fn received(status: http::StatusCode, body: &[u8], device_code: &str) -> String {
+    let text = String::from_utf8_lossy(body);
+    let text = if device_code.is_empty() {
+        text
+    } else {
+        text.replace(device_code, "[redacted]").into()
+    };
+    let text: String = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(200)
+        .collect();
+    format!("HTTP {} {text}", status.as_u16())
 }
 
 pub fn snippet(state_path: &Path) -> String {

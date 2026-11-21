@@ -111,3 +111,27 @@ WHEN a deployment uses a `nous_portal` credential created by `llmux-login nous`
 THEN requests go to inference-api.nousresearch.com with the portal access token
 via `openai_compat`, refreshed ahead of expiry and once on a 401, the model is
 exposed as `nous/<portal id>`, and it never joins another vendor's combo.
+
+#### Scenario: Default User-Agent on upstream requests
+
+WHEN any adapter (`openai_compat`, `anthropic`, `openai_responses`), the OAuth
+and Nous refresh clients, or `llmux-login` sends a request
+THEN it carries `User-Agent: llmux/<version>` unless the deployment's `headers`
+already set one, because Nous's Cloudflare and Vercel edges answer a request
+without a User-Agent with HTTP 403.
+
+#### Scenario: Cloudflare/WAF 403 is not an auth failure
+
+WHEN an `openai_compat` upstream answers 403 with an HTML body
+THEN it is classified as a transient server error and the credential stays
+enabled; a 403 with a JSON or plain body remains a non-refreshable auth failure
+and a 401 remains refreshable.
+
+#### Scenario: Nous login keeps polling through transient portal responses
+
+WHEN `llmux-login nous` polls and the portal answers 403/429/5xx, a non-JSON
+body, or fails to respond
+THEN it backs off and keeps polling until the device code expires, failing early
+only on a definitive OAuth error (`access_denied`, `expired_token`, or another
+OAuth `error` code). Errors name the HTTP status and the first 200 characters of
+the body, never the device code or tokens.
