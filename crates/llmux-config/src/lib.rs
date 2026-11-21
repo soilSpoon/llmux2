@@ -503,7 +503,10 @@ impl RawConfig {
                 }
                 let provider = match (&dep.auth, &dep.credential, &dep.provider) {
                     (Some(DeploymentAuth::None), None, Some(provider))
-                        if matches!(provider.as_str(), provider::OPENAI | provider::OPENAI_COMPAT) =>
+                        if matches!(
+                            provider.as_str(),
+                            provider::OPENAI | provider::OPENAI_COMPAT | provider::DEVIN_ACP
+                        ) =>
                     {
                         ProviderKind(provider.as_str().into())
                     }
@@ -538,6 +541,10 @@ impl RawConfig {
                     .or_else(|| {
                         (provider.0.as_ref() == provider::OPENAI_RESPONSES)
                             .then_some("https://api.openai.com/v1")
+                    })
+                    .or_else(|| {
+                        (provider.0.as_ref() == provider::DEVIN_ACP)
+                            .then_some(provider::DEVIN_ACP_BASE_URL)
                     })
                     .ok_or_else(|| invalid("deployment requires base_url"))?;
                 if dep.upstream_model.is_empty() {

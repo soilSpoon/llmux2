@@ -52,6 +52,17 @@ pub trait ProviderAdapter: Send + Sync + 'static {
         resp: Response<Incoming>,
     ) -> Result<GatewayResponse, UpstreamError>;
 
+    /// Serves the request without an HTTP round trip (for example a local
+    /// subprocess). `None`, the default, means the executor sends the request
+    /// from `build_request` upstream and calls `parse_response`.
+    async fn invoke(
+        &self,
+        _req: &GatewayRequest,
+        _dep: &Deployment,
+    ) -> Option<Result<GatewayResponse, UpstreamError>> {
+        None
+    }
+
     fn observe_limits(&self, _headers: &HeaderMap) -> Option<LimitObservation> {
         None
     }
