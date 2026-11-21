@@ -9,6 +9,7 @@ fn run() -> Result<(), String> {
     let mut workers_models = None;
     let mut kilo_free = None;
     let mut kilo_key = None;
+    let mut devin_models = None;
     let mut replacements = false;
     let mut fallback = None;
     let mut key = None;
@@ -30,10 +31,11 @@ fn run() -> Result<(), String> {
             Some("--workers-ai-models") => &mut workers_models,
             Some("--kilo-free-models") => &mut kilo_free,
             Some("--kilo-key-file") => &mut kilo_key,
+            Some("--devin-models") => &mut devin_models,
             Some("--omniroute-fallback") => &mut fallback,
             Some("--omniroute-key") => &mut key,
             _ => return Err(
-                "usage: llmux-import --input export.json --output llmux.toml [--secrets-dir DIR] [--cloudflare-account-id-file PATH --cloudflare-token-file PATH] [--workers-ai-models PATH] [--kilo-free-models PATH] [--kilo-key-file PATH] [--openrouter-replacements] [--omniroute-fallback BASE_URL --omniroute-key SECRET_REF]"
+                "usage: llmux-import --input export.json --output llmux.toml [--secrets-dir DIR] [--cloudflare-account-id-file PATH --cloudflare-token-file PATH] [--workers-ai-models PATH] [--kilo-free-models PATH] [--kilo-key-file PATH] [--devin-models PATH] [--openrouter-replacements] [--omniroute-fallback BASE_URL --omniroute-key SECRET_REF]"
                     .into(),
             ),
         };
@@ -61,6 +63,7 @@ fn run() -> Result<(), String> {
         workers_ai_models: workers_models.as_deref(),
         kilo_free_models: kilo_free.as_deref(),
         kilo_key_file: kilo_key.as_deref(),
+        devin_models: devin_models.as_deref(),
         openrouter_replacements: replacements,
         omniroute_fallback: fallback,
     };

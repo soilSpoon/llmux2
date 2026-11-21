@@ -1,6 +1,9 @@
 use crate::{string, PROVIDERS};
 use http::Uri;
-use llmux_types::provider::{ANTHROPIC as KIND_ANTHROPIC, OPENAI_COMPAT as KIND_OPENAI_COMPAT};
+use llmux_types::provider::{
+    ANTHROPIC as KIND_ANTHROPIC, DEVIN_ACP as DEVIN_ACP_KIND, DEVIN_ACP_BASE_URL,
+    OPENAI_COMPAT as KIND_OPENAI_COMPAT,
+};
 use serde_json::{json, Value};
 use std::net::IpAddr;
 
@@ -9,6 +12,7 @@ pub(super) const PROVIDER_ALIASES: &[(&str, &str)] = &[
     ("kc", "kilocode"),
     ("cfpd", "cloudflare-direct"),
     ("cfp", "cloudflare-playground"),
+    ("dva", "devin-cli-agentic"),
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -204,6 +208,9 @@ pub(super) fn resolve(
     warnings: &mut Vec<String>,
 ) -> Result<(String, String), &'static str> {
     let id = string(connection, "provider");
+    if crate::devin::bridge(id) {
+        return Ok((DEVIN_ACP_KIND.into(), DEVIN_ACP_BASE_URL.into()));
+    }
     let (kind, fallback) = if let Some((_, kind, url)) = PROVIDERS.iter().find(|(p, _, _)| *p == id)
     {
         (*kind, *url)
