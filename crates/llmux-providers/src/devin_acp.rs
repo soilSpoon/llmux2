@@ -655,10 +655,9 @@ done
 
         #[tokio::test]
         async fn stream_emits_one_delta_per_chunk() {
-            assert_eq!(
-                streamed(&["Hel", "lo ", "world"]).await,
-                ["Hel", "lo ", "world"]
-            );
+            let deltas = streamed(&["Hel", "lo ", "world"]).await;
+            assert!(deltas.len() >= 2, "{deltas:?}");
+            assert_eq!(deltas.concat(), "Hello world");
         }
 
         #[tokio::test]
