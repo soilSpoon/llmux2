@@ -9,6 +9,7 @@ mod devin;
 mod direct;
 mod fallback;
 mod morph;
+mod nous;
 mod policy;
 mod replacements;
 mod secondary;
@@ -45,6 +46,10 @@ pub struct ImportOptions<'a> {
     pub openrouter_replacements: bool,
     /// Saved `devin models` output; its `Free` rows rank ahead of Devin-plan models.
     pub devin_models: Option<&'a Path>,
+    /// Nous Portal login state (`llmux-login nous`) and a saved `GET /v1/models`
+    /// listing; together they add `nous/<id>` models, free ones first.
+    pub nous_state: Option<&'a Path>,
+    pub nous_models: Option<&'a Path>,
     pub omniroute_fallback: Option<OmniRouteFallback<'a>>,
 }
 
@@ -501,6 +506,11 @@ pub fn import_with_options(
     options: &ImportOptions<'_>,
 ) -> Result<ImportReport, String> {
     let policy = policy::Policy::load(options)?;
+    let nous = match (options.nous_state, options.nous_models) {
+        (None, None) => None,
+        (Some(state), Some(models)) => Some(nous::Nous::load(state, models)?),
+        _ => return Err("--nous-state and --nous-models must be provided together".into()),
+    };
     let fallback = options.omniroute_fallback;
     if let Some(options) = &fallback {
         if !["env:", "file:"].iter().any(|prefix| {
@@ -990,6 +1000,26 @@ pub fn import_with_options(
             .iter()
             .map(|model| array(model, "deployments").len())
             .sum();
+    }
+    if let Some(nous) = &nous {
+        let credential = unique("nous", &mut ids);
+        let taken: HashSet<String> = models
+            .iter()
+            .flat_map(|model| {
+                std::iter::once(string(model, "name")).chain(
+                    array(model, "aliases")
+                        .iter()
+                        .map(|alias| alias.as_str().unwrap_or("")),
+                )
+            })
+            .map(str::to_owned)
+            .collect();
+        let added = nous.models(&credential, &taken, &mut deployment_ids, &mut warnings);
+        if !added.is_empty() {
+            credentials.push(nous.credential(&credential));
+            deployment_count += added.len();
+            models.extend(added);
+        }
     }
     let credential_providers: HashMap<_, _> = credentials
         .iter()

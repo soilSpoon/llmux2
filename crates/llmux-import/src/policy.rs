@@ -35,7 +35,7 @@ fn reference(path: &Path) -> Result<String, String> {
     Ok(format!("file:{path}"))
 }
 
-fn zero(value: &Value) -> bool {
+pub(super) fn zero(value: &Value) -> bool {
     if let Some(number) = value.as_number() {
         return number.as_u64() == Some(0);
     }

@@ -95,3 +95,11 @@ shared fallback pool.
 WHEN a deployment uses an OAuth credential minted by `llmux-login xai`
 (the public Grok CLI client on auth.x.ai)
 THEN requests go to api.x.ai with the OAuth bearer via `openai_compat`.
+
+#### Scenario: Nous Portal subscription deployment
+
+WHEN a deployment uses a `nous_portal` credential created by `llmux-login nous`
+(device-code login, rotating refresh token in an owner-only state file)
+THEN requests go to inference-api.nousresearch.com with the portal access token
+via `openai_compat`, refreshed ahead of expiry and once on a 401, the model is
+exposed as `nous/<portal id>`, and it never joins another vendor's combo.

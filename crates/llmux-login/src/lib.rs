@@ -1,6 +1,7 @@
 //! OpenAI Sign in with ChatGPT authorization-code flow.
 
 mod http;
+pub mod nous;
 mod storage;
 
 use axum::{
