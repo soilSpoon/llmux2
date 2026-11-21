@@ -123,6 +123,7 @@ struct Unwrapper {
     buf: String,
     decided: bool,
     wrapped: bool,
+    emitted: bool,
 }
 
 impl Unwrapper {
@@ -141,6 +142,9 @@ impl Unwrapper {
                 .trim_start()
                 .to_owned();
         }
+        if !self.emitted {
+            self.buf = self.buf.trim_start().to_owned();
+        }
         let visible = self.buf.trim_end().len();
         let mut cut = if self.wrapped {
             visible.saturating_sub(SUMMARY_CLOSE.len())
@@ -150,7 +154,10 @@ impl Unwrapper {
         while !self.buf.is_char_boundary(cut) {
             cut -= 1;
         }
-        self.buf.drain(..cut).collect()
+        cut = self.buf[..cut].trim_end().len();
+        let out: String = self.buf.drain(..cut).collect();
+        self.emitted |= !out.is_empty();
+        out
     }
 
     fn finish(self) -> String {
@@ -581,7 +588,7 @@ mod tests {
             let chunks: String = replies
                 .iter()
                 .map(|reply| format!(
-                    r#"      printf '{{{{"jsonrpc":"2.0","method":"session/update","params":{{{{"update":{{{{"sessionUpdate":"agent_message_chunk","content":{{{{"text":"{reply}"}}}}}}}}}}}}}}\n'
+                    r#"      printf '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"text":"{reply}"}}}}}}}}\n'
 "#
                 ))
                 .collect();
