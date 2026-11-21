@@ -50,7 +50,7 @@ impl Drop for Api {
 }
 fn fixture() -> Value {
     let sha = "a".repeat(40);
-    let checks = ["check", "pr-policy", "advisories", "coverage"]
+    let checks = ["check", "pr-policy", "advisories", "coverage", "tlc"]
         .iter()
         .map(|name| json!({"name":name,"status":"completed","conclusion":"success","head_sha":sha}))
         .collect::<Vec<_>>();
