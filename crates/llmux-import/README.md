@@ -217,8 +217,11 @@ fingerprint). Cloudflare direct (`cloudflare-direct`/`cfpd`) and DeepAI Code
 baseUrl and a valid API key, including the reviewed loopback proxies
 `http://127.0.0.1:8790/cfp/v1` and `http://127.0.0.1:8790/deepai/v1`. A
 DeepAI or Cloudflare-direct row with no key and no baseUrl is still dropped.
-DuckDuckGo stays dropped: its chat path is a browser challenge, not a
-key-based HTTP API. Other loopback URLs stay skipped.
+DuckDuckGo and Cloudflare Playground have no native adapter. Their skip
+warning names `--omniroute-fallback` and `--omniroute-key`. With both flags,
+each of their export model ids, alias prefixes, and combos that use them gets
+an OmniRoute fallback deployment last, with the same upstream model id.
+Other loopback URLs stay skipped.
 xAI OAuth (`xai-oauth`/`xao`), Codex OAuth (`codex`/`cx`), and Antigravity
 OAuth import when the export has a refresh token and a client id. A missing
 refresh token or client id skips that row with a counted warning and does not

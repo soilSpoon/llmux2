@@ -43,13 +43,15 @@ pub(super) fn identity<'a>(connection: &'a Value, nodes: &'a [Value]) -> &'a str
 
 fn replacement(provider: &str) -> Option<&'static str> {
     match provider {
-        "cloudflare-playground" | "cfp" => Some(
-            "replace with a Cloudflare Workers AI account API token at https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1 and a free-eligible model",
-        ),
-        // DuckDuckGo's chat path is a browser challenge, not a key-based HTTP API.
-        "duckduckgo-web" => Some("no official HTTP API; dropped"),
+        "cloudflare-playground" | "cfp" | "duckduckgo-web" => Some(SESSION_FALLBACK),
         _ => None,
     }
+}
+
+pub(super) const SESSION_FALLBACK: &str = "no native adapter; pass --omniroute-fallback and --omniroute-key to keep serving this provider through OmniRoute";
+
+pub(super) fn session_provider(provider: &str) -> bool {
+    matches!(provider, "duckduckgo-web" | "cloudflare-playground" | "cfp")
 }
 
 fn workers_hint() -> &'static str {

@@ -1025,12 +1025,21 @@ pub fn import_with_options(
         credentials.push(
             json!({"id":credential,"kind":"api_key","provider":"openai_compat","key":options.key}),
         );
+        let session_excluded = exclusions.clone();
         fallback::append(
             &mut models,
             &options,
             &credential,
             &mut deployment_ids,
             exclusions,
+        )?;
+        fallback::ensure_session_models(
+            &mut models,
+            &fallback::session_names(&combos, nodes),
+            &options,
+            &credential,
+            &mut deployment_ids,
+            &session_excluded,
         )?;
         deployment_count = models
             .iter()
@@ -1067,6 +1076,12 @@ pub fn import_with_options(
         }
     }
     if models.is_empty() {
+        if warnings
+            .iter()
+            .any(|warning| warning.contains("--omniroute-fallback"))
+        {
+            return Err("no importable models; pass --omniroute-fallback and --omniroute-key to keep serving DuckDuckGo and Cloudflare Playground through OmniRoute".into());
+        }
         return Err("no importable models; no configuration written".into());
     }
     let mut client_keys = Vec::new();

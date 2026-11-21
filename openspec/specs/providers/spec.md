@@ -85,7 +85,9 @@ multi-account pooling, or multi-IP distribution to raise limits, and SHALL NOT
 add paid paths that cost provider fees unless the owner explicitly asks.
 DuckDuckGo and Cloudflare Playground have no key-based HTTP API and SHALL NOT
 be integrated by copying a session cookie, solving a browser challenge, or
-driving a headless browser to pass a TLS fingerprint check.
+driving a headless browser to pass a TLS fingerprint check. The importer SHALL
+keep their model ids on an OmniRoute fallback leg when that fallback is
+configured, and SHALL otherwise warn that the fallback flags are required.
 
 #### Scenario: Codex access
 

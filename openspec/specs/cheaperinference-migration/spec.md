@@ -83,9 +83,11 @@ A missing refresh token or client id SHALL skip that row with a counted
 warning and SHALL NOT panic. The importer SHALL NOT invent a client secret.
 A keyed OpenAI-compatible `deepai`/`deepai-code` or `cloudflare-direct`/`cfpd`
 node with a baseUrl SHALL import as `openai_compat` at that baseUrl, including
-loopback. DuckDuckGo and Cloudflare Playground SHALL stay dropped unless a
-Workers AI opt-in replaces Playground: neither has a key-based HTTP API.
-Factory, Augment, and Z.AI SHALL remain excluded.
+loopback. DuckDuckGo and Cloudflare Playground have no native adapter. Without
+`--omniroute-fallback` and `--omniroute-key`, their skip warning SHALL name
+those flags. With both flags, each of their model ids SHALL get an OmniRoute
+fallback deployment last, with that same upstream model id. Factory, Augment,
+and Z.AI SHALL remain excluded.
 
 #### Scenario: xAI OAuth token URL
 

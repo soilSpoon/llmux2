@@ -1,4 +1,5 @@
 use llmux_config::RuntimeConfig;
+use llmux_import::{ImportOptions, OmniRouteFallback};
 use serde_json::{json, Value};
 
 fn base() -> Value {
@@ -10,6 +11,98 @@ fn base() -> Value {
         "combos": [{"name":"baseline","models":["openai/test"]}],
         "apiKeys": [{"key":"synthetic-client","isActive":true}]
     })
+}
+
+fn session_export() -> Value {
+    let mut root = base();
+    root["providerConnections"]
+        .as_array_mut()
+        .unwrap()
+        .extend([
+            json!({"id":"ddg","provider":"duckduckgo-web","authType":"apikey","apiKey":"synthetic-ddg-key"}),
+            json!({"id":"cfp","provider":"cloudflare-playground","authType":"none"}),
+        ]);
+    root["combos"].as_array_mut().unwrap().push(json!({
+        "name":"ddg-only",
+        "models":["duckduckgo-web/mistral-small-2603","cfp/meta/llama-3.1-8b-instruct"]
+    }));
+    root
+}
+
+#[test]
+fn session_providers_need_omniroute_fallback_and_keep_the_same_model_id() {
+    let root = session_export();
+    let (report, config, text) = import(&root);
+    let warnings = report.warnings.join("\n");
+    assert!(
+        warnings.contains("pass --omniroute-fallback and --omniroute-key"),
+        "{warnings}"
+    );
+    assert!(warnings.contains("(ddg): skipped"));
+    assert!(warnings.contains("(cfp): skipped"));
+    assert!(!warnings.contains("unsupported"));
+    assert!(!warnings.contains("dropped"));
+    assert!(!config.model_names.contains_key("ddg-only"));
+    assert!(!config
+        .model_names
+        .contains_key("duckduckgo-web/mistral-small-2603"));
+    assert!(!text.contains("synthetic-ddg-key"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let key = dir.path().join("fallback-key");
+    std::fs::write(&key, "synthetic-session-fallback-secret").unwrap();
+    let reference = format!("file:{}", key.display());
+    let options = ImportOptions {
+        omniroute_fallback: Some(OmniRouteFallback {
+            base_url: "http://127.0.0.1:20128/v1",
+            key: &reference,
+        }),
+        ..ImportOptions::default()
+    };
+    let report =
+        llmux_import::import_with_options(&root.to_string(), &output, None, &options).unwrap();
+    let text = std::fs::read_to_string(&output).unwrap();
+    assert!(!text.contains("synthetic-session-fallback-secret"));
+    assert!(!text.contains("synthetic-ddg-key"));
+    assert!(!report
+        .warnings
+        .join("\n")
+        .contains("synthetic-session-fallback-secret"));
+    let config = RuntimeConfig::load(&output).unwrap();
+    for name in [
+        "ddg-only",
+        "duckduckgo-web/mistral-small-2603",
+        "cloudflare-playground/meta/llama-3.1-8b-instruct",
+        "cfp/meta/llama-3.1-8b-instruct",
+    ] {
+        let model = &config.models[*config
+            .model_names
+            .get(name)
+            .unwrap_or_else(|| panic!("missing {name}"))];
+        let deps: Vec<_> = model
+            .deployments
+            .iter()
+            .map(|idx| &config.deployments[idx.0 as usize])
+            .collect();
+        let last = deps.last().unwrap();
+        assert!(last.fallback, "{name}");
+        assert_eq!(last.upstream_model.as_ref(), name, "{name}");
+        assert!(
+            deps[..deps.len() - 1].iter().all(|dep| !dep.fallback),
+            "{name}"
+        );
+        assert!(
+            deps[..deps.len() - 1]
+                .iter()
+                .all(|dep| dep.priority < last.priority),
+            "{name}"
+        );
+        assert_eq!(
+            last.base_url.to_string().trim_end_matches('/'),
+            "http://127.0.0.1:20128/v1"
+        );
+    }
 }
 
 fn import(root: &Value) -> (llmux_import::ImportReport, RuntimeConfig, String) {

@@ -352,7 +352,7 @@ fn skip_precedence_is_explicit_and_replacement_warnings_are_static() {
             "no-auth",
             "",
             "",
-            "replace with a Cloudflare Workers AI account API token",
+            "pass --omniroute-fallback and --omniroute-key",
         ),
         (
             "custom-cf",
@@ -366,7 +366,7 @@ fn skip_precedence_is_explicit_and_replacement_warnings_are_static() {
             "apikey",
             "",
             "",
-            "no official HTTP API; dropped",
+            "pass --omniroute-fallback and --omniroute-key",
         ),
         (
             "custom-hms",
