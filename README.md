@@ -20,7 +20,7 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
 
 For Chat Completions on OpenAI-compatible upstreams, the gateway rewrites only the top-level request model. Other request fields and successful response payloads pass through.
 
-Use authenticated `GET /v1/models` to list configured model names and aliases, not upstream deployment names or the full CheaperInference catalog. An optional catch-all accepts additional IDs but is not listed.
+Use authenticated `GET /v1/models` to list configured model names and aliases, not upstream deployment names or the full CheaperInference catalog. An optional catch-all accepts additional IDs but is not listed. A `devin_acp` name is omitted only after `devin models` has loaded and every deployment of that name is `devin_acp` with an upstream id missing from that catalog. The refresh runs at most once a minute, a failure keeps the last successful catalog (or the full configured list if none has loaded), and chat requests do not wait on it. Ids the CLI reports but the config does not name are not added; a new public name still requires import or a config reload.
 
 ```sh
 curl -sS http://127.0.0.1:8080/v1/responses \

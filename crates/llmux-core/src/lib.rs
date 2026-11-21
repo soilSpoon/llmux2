@@ -18,9 +18,9 @@ use hyper_util::{
 use limits::{DeploymentLimits, Permit, Window};
 use llmux_config::RuntimeConfig;
 use llmux_types::{
-    AuthMaterial, BuildError, ContextOverflow, CredentialSource, Deployment, DeploymentIdx,
-    ErrorKind, GatewayRequest, GatewayResponse, ProviderAdapter, ProviderRegistry, Support,
-    UpstreamError,
+    provider, AuthMaterial, BuildError, ContextOverflow, CredentialSource, Deployment,
+    DeploymentIdx, ErrorKind, GatewayRequest, GatewayResponse, ProviderAdapter, ProviderRegistry,
+    Support, UpstreamError,
 };
 use machine::{Built, Effect, Event, Outcome, Phase, State};
 use stats::AttemptStats;
@@ -30,7 +30,7 @@ use std::{
     ops::Range,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        Arc, RwLock,
     },
     time::{Duration, SystemTime},
 };
@@ -97,12 +97,34 @@ struct ModelOrder {
     min_context: u32,
 }
 
+/// Upstream ids from the last successful Devin CLI catalog. `None` means no catalog has loaded.
+#[derive(Debug, Default)]
+pub struct LiveModels {
+    ids: RwLock<Option<Arc<HashSet<Arc<str>>>>>,
+}
+
+impl LiveModels {
+    pub fn get(&self) -> Option<Arc<HashSet<Arc<str>>>> {
+        self.ids
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+
+    pub fn replace(&self, ids: impl IntoIterator<Item = Arc<str>>) {
+        *self.ids.write().unwrap_or_else(|err| err.into_inner()) =
+            Some(Arc::new(ids.into_iter().collect()));
+    }
+}
+
 pub struct Executor {
     catch_all_stats: Option<stats::CatchAllCounter>,
     cfg: Arc<RuntimeConfig>,
     bindings: Box<[Binding]>,
     orders: Box<[ModelOrder]>,
     credentials: HashMap<Arc<str>, Arc<AtomicBool>>,
+    /// Shared with the server so a refresh is visible without rebuilding the executor.
+    devin_catalog: Arc<LiveModels>,
     http: HttpClient,
 }
 
@@ -259,8 +281,23 @@ impl Executor {
             bindings,
             orders,
             credentials: disabled,
+            devin_catalog: Arc::new(LiveModels::default()),
             http: builder.build(connector),
         })
+    }
+
+    /// Use the process catalog. A loaded catalog skips a `devin_acp` deployment
+    /// whose upstream id is absent, the same way a cooldown does.
+    pub fn set_devin_catalog(&mut self, catalog: Arc<LiveModels>) {
+        self.devin_catalog = catalog;
+    }
+
+    fn devin_upstream_missing(&self, dep: &Deployment) -> bool {
+        dep.provider.0.as_ref() == provider::DEVIN_ACP
+            && self
+                .devin_catalog
+                .get()
+                .is_some_and(|ids| !ids.contains(dep.upstream_model.as_ref()))
     }
 
     /// Whether the credential is disabled in routing; `None` for unknown ids.
@@ -402,7 +439,8 @@ impl Executor {
                 {
                     Event::Ineligible
                 } else if support != Support::Convert
-                    && binding.limits.cooldown_until(now).is_some()
+                    && (binding.limits.cooldown_until(now).is_some()
+                        || self.devin_upstream_missing(dep))
                 {
                     Event::Cooling
                 } else if now >= deadline {

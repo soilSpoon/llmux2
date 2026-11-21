@@ -1,6 +1,7 @@
 //! Axum boundary for the OpenAI-compatible gateway.
 
 mod admin;
+mod catalog;
 mod dashboard;
 mod lifecycle;
 #[cfg(unix)]
@@ -22,7 +23,7 @@ use futures_util::StreamExt;
 use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use http_body_util::LengthLimitError;
 use llmux_config::{ApiKey, RuntimeConfig};
-use llmux_core::{Executor, GatewayError};
+use llmux_core::{Executor, GatewayError, LiveModels};
 use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
 use llmux_providers::{
     truncate_middle_for_format, Anthropic, DevinAcp, DevinAcpConfig, OpenAiCompat, OpenAiResponses,
@@ -53,16 +54,17 @@ struct AppState {
     dashboard: Option<dashboard::Dashboard>,
     config_path: Option<std::path::PathBuf>,
     reload_lock: tokio::sync::Mutex<()>,
+    catalog: Arc<catalog::Catalog>,
 }
 
-fn provider_registry() -> ProviderRegistry {
+fn provider_registry(devin: DevinAcpConfig) -> ProviderRegistry {
     let mut registry = ProviderRegistry::default();
     for kind in [provider::OPENAI, provider::OPENAI_COMPAT] {
         registry.register(Arc::new(OpenAiCompat::new(kind)));
     }
     registry.register(Arc::new(Anthropic::new(provider::ANTHROPIC)));
     registry.register(Arc::new(OpenAiResponses::new()));
-    registry.register(Arc::new(DevinAcp::new(DevinAcpConfig::from_env())));
+    registry.register(Arc::new(DevinAcp::new(devin)));
     registry
 }
 
@@ -84,7 +86,7 @@ fn static_sources(
 }
 
 pub fn validate_startup(mut config: RuntimeConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let registry = provider_registry();
+    let registry = provider_registry(DevinAcpConfig::from_env());
     let sources = static_sources(&mut config)?;
     let credentials = sources.keys().chain(config.oauth.keys()).cloned().collect();
     Executor::validate(&config, &registry, &credentials)?;
@@ -99,7 +101,25 @@ pub async fn app_with_path(
     config: RuntimeConfig,
     config_path: Option<std::path::PathBuf>,
 ) -> Result<Router, Box<dyn Error + Send + Sync>> {
-    let (config, executor) = build(config).await?;
+    app_with(config, config_path, DevinAcpConfig::from_env()).await
+}
+
+/// Same as [`app`], with an explicit Devin CLI config. Tests use this so they
+/// never read process environment or a real `devin` binary.
+pub async fn app_with_devin(
+    config: RuntimeConfig,
+    devin: DevinAcpConfig,
+) -> Result<Router, Box<dyn Error + Send + Sync>> {
+    app_with(config, None, devin).await
+}
+
+async fn app_with(
+    config: RuntimeConfig,
+    config_path: Option<std::path::PathBuf>,
+    devin: DevinAcpConfig,
+) -> Result<Router, Box<dyn Error + Send + Sync>> {
+    let catalog = Arc::new(catalog::Catalog::new(devin.clone()));
+    let (config, executor) = build(config, devin, catalog.live()).await?;
     let dashboard = config
         .server
         .dashboard_key
@@ -113,6 +133,7 @@ pub async fn app_with_path(
         dashboard,
         config_path,
         reload_lock: tokio::sync::Mutex::new(()),
+        catalog,
     });
     let mut router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -128,8 +149,10 @@ pub async fn app_with_path(
 
 async fn build(
     mut config: RuntimeConfig,
+    devin: DevinAcpConfig,
+    live: Arc<LiveModels>,
 ) -> Result<(Arc<RuntimeConfig>, Executor), Box<dyn Error + Send + Sync>> {
-    let registry = provider_registry();
+    let registry = provider_registry(devin);
     let mut sources = static_sources(&mut config)?;
     // Validate before starting OAuth sources: a rejected build must not
     // rotate refresh tokens the running gateway still relies on.
@@ -156,7 +179,8 @@ async fn build(
     }
 
     let config = Arc::new(config);
-    let executor = Executor::new(config.clone(), &registry, &sources)?;
+    let mut executor = Executor::new(config.clone(), &registry, &sources)?;
+    executor.set_devin_catalog(live);
     Ok((config, executor))
 }
 
@@ -165,13 +189,16 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     if !authorized(&headers, &active.config.server.client_keys) {
         return unauthorized();
     }
-    let mut ids: Vec<&str> = active
-        .config
-        .model_names
-        .keys()
-        .map(AsRef::as_ref)
-        .collect();
-    ids.sort_unstable();
+    let live = if catalog::has_devin(&active.config) {
+        let kick = state.catalog.kick();
+        if kick.inflight && state.catalog.loaded().is_none() {
+            state.catalog.wait_for(kick.target).await;
+        }
+        state.catalog.loaded()
+    } else {
+        None
+    };
+    let ids = catalog::listed_ids(&active.config, live.as_deref());
     let data: Vec<_> = ids
         .into_iter()
         .map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "llmux2"}))
@@ -223,6 +250,9 @@ async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) 
     let active = state.active.load();
     if !authorized_for_format(request.headers(), &active.config.server.client_keys, format) {
         return unauthorized();
+    }
+    if catalog::has_devin(&active.config) {
+        state.catalog.kick();
     }
     let start = state.dashboard.as_ref().map(|_| std::time::Instant::now());
     let response = execute_authorized(&active, request, format).await;
