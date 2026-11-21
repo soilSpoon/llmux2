@@ -5,6 +5,7 @@ mod bridge;
 mod connection;
 mod context;
 mod db_dump;
+mod devin;
 mod direct;
 mod fallback;
 mod morph;
@@ -15,7 +16,8 @@ mod upstream;
 mod validation;
 
 use llmux_types::provider::{
-    ANTHROPIC as KIND_ANTHROPIC, OPENAI as KIND_OPENAI, OPENAI_COMPAT as KIND_OPENAI_COMPAT,
+    ANTHROPIC as KIND_ANTHROPIC, DEVIN_ACP as KIND_DEVIN_ACP, OPENAI as KIND_OPENAI,
+    OPENAI_COMPAT as KIND_OPENAI_COMPAT,
 };
 use serde_json::{json, Value};
 use std::{
@@ -41,6 +43,8 @@ pub struct ImportOptions<'a> {
     pub kilo_free_models: Option<&'a Path>,
     pub kilo_key_file: Option<&'a Path>,
     pub openrouter_replacements: bool,
+    /// Saved `devin models` output; its `Free` rows rank ahead of Devin-plan models.
+    pub devin_models: Option<&'a Path>,
     pub omniroute_fallback: Option<OmniRouteFallback<'a>>,
 }
 
@@ -574,6 +578,10 @@ pub fn import_with_options(
     for (index, c) in array(&root, "providerConnections").iter().enumerate() {
         let label = format!("connection {index} ({})", string(c, "id"));
         let identity = connection::identity(c, array(&root, "providerNodes"));
+        if let Some(reason) = devin::excluded(identity) {
+            warnings.push(format!("{label}: skipped {reason}"));
+            continue;
+        }
         if policy.openrouter_replacements && identity == "openrouter" {
             warnings.push(format!(
                 "{label}: skipped OpenRouter; only verified connected replacements enabled"
@@ -640,6 +648,10 @@ pub fn import_with_options(
                 let key = write_secret(&dir, &id, value)?;
                 credentials.push(json!({"id":id,"kind":"api_key","provider":kind,"key":key}));
                 Some(id)
+            }
+            connection::SelectedAuth::None if kind == KIND_DEVIN_ACP => {
+                warnings.push(format!("{label}: Devin CLI bridge uses the host's own devin credentials; none imported"));
+                None
             }
             connection::SelectedAuth::None => {
                 if kind != KIND_OPENAI_COMPAT {
@@ -919,6 +931,7 @@ pub fn import_with_options(
         }
         .expand(&name, &mut Vec::new(), &mut deployments);
         morph::order(&name, &mut deployments, &connections, nodes, &mut warnings);
+        devin::free_first(&mut deployments, &connections, policy.devin_free.as_ref());
         if combos.contains_key(&name) {
             let steps = secondary::steps(
                 &name,

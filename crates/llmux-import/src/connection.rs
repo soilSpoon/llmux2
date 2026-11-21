@@ -63,6 +63,9 @@ pub(super) fn select_auth<'a>(
     if let Some(reason) = replacement(provider) {
         return Err(reason);
     }
+    if crate::devin::bridge(provider) {
+        return Ok(SelectedAuth::None);
+    }
     let auth = string(connection, "authType");
     if matches!(auth, "no-auth" | "none") {
         if nodes

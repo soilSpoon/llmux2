@@ -670,24 +670,29 @@ impl Executor {
         binding: &Binding,
         upstream: Request<Bytes>,
     ) -> Result<GatewayResponse, GatewayError> {
-        let response = self
-            .http
-            .request(upstream.map(Full::new))
-            .await
-            .map_err(|_| GatewayError::Client(UpstreamError::Connect))?;
-        if let Some(observed) = response
-            .status()
-            .is_success()
-            .then(|| binding.adapter.observe_limits(response.headers()))
-            .flatten()
-        {
-            binding.limits.observe(observed, self.cfg.cooldown.max);
-        }
-        let response = binding
-            .adapter
-            .parse_response(req, dep, response)
-            .await
-            .map_err(GatewayError::Client)?;
+        let response = match binding.adapter.invoke(req, dep).await {
+            Some(local) => local.map_err(GatewayError::Client)?,
+            None => {
+                let response = self
+                    .http
+                    .request(upstream.map(Full::new))
+                    .await
+                    .map_err(|_| GatewayError::Client(UpstreamError::Connect))?;
+                if let Some(observed) = response
+                    .status()
+                    .is_success()
+                    .then(|| binding.adapter.observe_limits(response.headers()))
+                    .flatten()
+                {
+                    binding.limits.observe(observed, self.cfg.cooldown.max);
+                }
+                binding
+                    .adapter
+                    .parse_response(req, dep, response)
+                    .await
+                    .map_err(GatewayError::Client)?
+            }
+        };
 
         match response {
             GatewayResponse::Complete { .. } if !req.stream => Ok(response),
