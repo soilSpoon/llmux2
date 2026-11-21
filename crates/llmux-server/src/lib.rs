@@ -24,6 +24,7 @@ use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use http_body_util::LengthLimitError;
 use llmux_config::{ApiKey, RuntimeConfig};
 use llmux_core::{Executor, GatewayError, LiveModels};
+use llmux_providers::nous_portal::{NousPortalConfig, NousPortalSource};
 use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
 use llmux_providers::{
     truncate_middle_for_format, Anthropic, Antigravity, DevinAcp, DevinAcpConfig, OpenAiCompat,
@@ -90,7 +91,12 @@ fn static_sources(
 pub fn validate_startup(mut config: RuntimeConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
     let registry = provider_registry(DevinAcpConfig::from_env());
     let sources = static_sources(&mut config)?;
-    let credentials = sources.keys().chain(config.oauth.keys()).cloned().collect();
+    let credentials = sources
+        .keys()
+        .chain(config.oauth.keys())
+        .chain(config.nous.keys())
+        .cloned()
+        .collect();
     Executor::validate(&config, &registry, &credentials)?;
     Ok(())
 }
@@ -161,7 +167,12 @@ async fn build(
     Executor::validate(
         &config,
         &registry,
-        &sources.keys().chain(config.oauth.keys()).cloned().collect(),
+        &sources
+            .keys()
+            .chain(config.oauth.keys())
+            .chain(config.nous.keys())
+            .cloned()
+            .collect(),
     )?;
     for (id, credential) in std::mem::take(&mut config.oauth) {
         let mut oauth = OAuthConfig::new(
@@ -178,6 +189,12 @@ async fn build(
         oauth.refresh_skew = credential.refresh_skew;
         oauth.request_timeout = credential.request_timeout;
         sources.insert(id, Arc::new(OAuthCredentialSource::start(oauth).await?));
+    }
+    for (id, credential) in std::mem::take(&mut config.nous) {
+        let mut nous = NousPortalConfig::new(credential.state_path);
+        nous.refresh_skew = credential.refresh_skew;
+        nous.request_timeout = credential.request_timeout;
+        sources.insert(id, Arc::new(NousPortalSource::start(nous).await?));
     }
 
     let config = Arc::new(config);

@@ -10,9 +10,10 @@ async fn main() {
 }
 
 fn usage() -> &'static str {
-    "usage: llmux-login [codex|xai] [--dir DIR]\n\
+    "usage: llmux-login [codex|xai|nous] [--dir DIR]\n\
      codex: Continue with ChatGPT. Default dir: ~/.config/llmux/codex/\n\
      xai: Continue with xAI (api.x.ai). Default dir: ~/.config/llmux/xai/\n\
+     nous: Nous Portal subscription (device code). Default dir: ~/.config/llmux/nous/ (state.json)\n\
      Use separate directories for different account/workspace registrations."
 }
 
@@ -39,7 +40,7 @@ fn parse_args(
             Some("--dir") if dir.is_none() => {
                 dir = Some(PathBuf::from(args.next().ok_or("--dir requires a path")?))
             }
-            Some("codex" | "xai") if provider.is_none() => {
+            Some("codex" | "xai" | "nous") if provider.is_none() => {
                 provider = Some(arg.to_str().unwrap().to_owned())
             }
             Some("--help" | "-h") => {
@@ -66,6 +67,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Some(dir) => dir,
         None => default_dir(provider)?,
     };
+    if provider == "nous" {
+        let state_path = std::path::absolute(dir.join("state.json"))?;
+        llmux_login::nous::NousLogin::default()
+            .run(&state_path, |url, code| {
+                println!("Open this URL to approve the sign-in:\n{url}\nIf prompted, enter code: {code}\nWaiting for approval...");
+            })
+            .await?;
+        println!(
+            "Sign-in complete. State written to {} (mode 0600). Paste this into llmux.toml:\n{}",
+            state_path.display(),
+            llmux_login::nous::snippet(&state_path)
+        );
+        return Ok(());
+    }
     let flow = match provider {
         "codex" => Flow::codex(endpoints(provider)?),
         "xai" => Flow::xai(endpoints(provider)?),
@@ -123,6 +138,11 @@ mod tests {
             parse_args(args(&["codex", "--dir", "/tmp/d"])).unwrap(),
             (Some("codex".into()), Some(PathBuf::from("/tmp/d")))
         );
+        assert_eq!(
+            parse_args(args(&["nous", "--dir", "/tmp/n"])).unwrap(),
+            (Some("nous".into()), Some(PathBuf::from("/tmp/n")))
+        );
+        assert!(default_dir("nous").unwrap().ends_with(".config/llmux/nous"));
         assert!(parse_args(args(&["gitlab"])).is_err());
         assert!(parse_args(args(&["xai", "codex"])).is_err());
         assert!(parse_args(args(&["--dir"])).is_err());

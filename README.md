@@ -404,6 +404,46 @@ Do not run login concurrently with a gateway using the same rotating token file.
 Unlike Codex, an xAI credential needs no `allowed_keys` restriction unless
 your own policy wants one.
 
+## Nous Portal (subscription login)
+
+Nous Portal runs on the owner's subscription through the same OAuth device-code
+flow Hermes Agent uses, so no API key is created. On a machine with no browser:
+
+```sh
+cargo run -p llmux-login -- nous --dir ~/.config/llmux/nous
+```
+
+It prints a verification URL and a user code, polls until you approve in any
+browser, and writes `~/.config/llmux/nous/state.json` with mode 0600 (directory
+0700). The state holds the rotating refresh token and the short-lived access
+token, which is the bearer for `https://inference-api.nousresearch.com/v1`.
+Treat it as a secret, never commit it, and do not run login while a gateway
+uses the same file: Nous refresh tokens are single use.
+
+```toml
+[[credentials]]
+id = "nous"
+kind = "nous_portal"
+provider = "openai_compat"
+state_file = "/absolute/path/to/.config/llmux/nous/state.json"
+
+[[models]]
+name = "nous/tencent/hy4-flash:free"
+
+[[models.deployments]]
+id = "nous-hy4-flash-free"
+credential = "nous"
+base_url = "https://inference-api.nousresearch.com/v1"
+upstream_model = "tencent/hy4-flash:free"
+```
+
+Startup fails with a message naming `llmux-login nous` when `state_file` is
+missing or unreadable. The gateway refreshes ahead of expiry and once on a 401.
+Nous models are separate `nous/<portal id>` models and never a leg of another
+vendor's combo. To import them, save `GET /v1/models` from the inference API and
+run `llmux-import ... --nous-state PATH --nous-models PATH`; free models
+(`:free` ids, or zero prompt and completion price) rank ahead of paid ones.
+
 ## Development
 
 ### Sign in with ChatGPT

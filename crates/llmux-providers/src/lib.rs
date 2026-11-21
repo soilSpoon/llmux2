@@ -4,6 +4,7 @@ mod anthropic;
 mod antigravity;
 mod devin_acp;
 mod messages;
+pub mod nous_portal;
 pub mod oauth;
 mod openai_compat;
 mod openai_responses;

@@ -255,11 +255,32 @@ struct Session {
 }
 
 impl Session {
+    /// Spawns the CLI, retrying while the kernel reports the binary as busy.
+    ///
+    /// Replacing a running binary in place leaves `ETXTBSY` on the next exec until the
+    /// last process holding it exits, and a freshly written script can be held the same
+    /// way by a child another thread forked mid-write. Neither is a real failure.
+    fn spawn_binary(config: &DevinAcpConfig) -> Result<tokio::process::Child, UpstreamError> {
+        let mut attempt = 0;
+        loop {
+            match config
+                .command(&["acp", "--agent-type", "summarizer"])
+                .spawn()
+            {
+                Ok(child) => return Ok(child),
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 20 =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => return Err(UpstreamError::Connect),
+            }
+        }
+    }
+
     fn spawn(config: &DevinAcpConfig) -> Result<Self, UpstreamError> {
-        let mut child = config
-            .command(&["acp", "--agent-type", "summarizer"])
-            .spawn()
-            .map_err(|_| UpstreamError::Connect)?;
+        let mut child = Self::spawn_binary(config)?;
         let stdin = child.stdin.take().ok_or(UpstreamError::Connect)?;
         let stdout = child.stdout.take().ok_or(UpstreamError::Connect)?;
         Ok(Self {
@@ -608,8 +629,12 @@ while read -r line; do
 done
 "#
             );
-            std::fs::write(&path, body).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Write under a private name, then rename into place: exec'ing a file another
+            // thread still holds open for writing fails with ETXTBSY, and a rename is atomic.
+            let staged = dir.join("devin.tmp");
+            std::fs::write(&staged, body).unwrap();
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::rename(&staged, &path).unwrap();
             std::fs::create_dir_all(dir.join(".local/share")).unwrap();
             std::fs::write(dir.join(".local/share/marker"), "").unwrap();
             DevinAcpConfig {

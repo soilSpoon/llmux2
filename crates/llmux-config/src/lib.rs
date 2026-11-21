@@ -3,7 +3,7 @@
 use http::Uri;
 use llmux_types::{
     provider, CanonicalModel, Capabilities, ChatRequestField, ContextOverflow, Deployment,
-    DeploymentIdx, ErrorKind, ProviderKind, QuotaSpec,
+    DeploymentIdx, ErrorKind, NousState, ProviderKind, QuotaSpec,
 };
 use serde::Deserialize;
 use std::{
@@ -66,6 +66,7 @@ pub struct RuntimeConfig {
     pub cooldown: CooldownConfig,
     pub api_keys: HashMap<Arc<str>, ApiKey>,
     pub oauth: HashMap<Arc<str>, OAuthCredential>,
+    pub nous: HashMap<Arc<str>, NousPortalCredential>,
     /// Quotas shared by every deployment that uses the credential.
     pub credential_quotas: HashMap<Arc<str>, QuotaSpec>,
     pub credential_meta: HashMap<Arc<str>, CredentialMeta>,
@@ -85,6 +86,12 @@ pub struct OAuthCredential {
     pub scopes: Option<Vec<String>>,
     pub resource: Option<String>,
     pub refresh_token_path: Option<PathBuf>,
+    pub refresh_skew: Duration,
+    pub request_timeout: Duration,
+}
+
+pub struct NousPortalCredential {
+    pub state_path: PathBuf,
     pub refresh_skew: Duration,
     pub request_timeout: Duration,
 }
@@ -198,6 +205,15 @@ enum RawCredential {
         #[serde(default)]
         quota: QuotaSpec,
     },
+    NousPortal {
+        id: String,
+        provider: String,
+        state_file: String,
+        refresh_skew_ms: Option<u64>,
+        request_timeout_ms: Option<u64>,
+        #[serde(default)]
+        quota: QuotaSpec,
+    },
 }
 
 #[derive(Deserialize)]
@@ -305,6 +321,7 @@ impl RawConfig {
         let mut credential_meta = HashMap::new();
         let mut api_keys = HashMap::new();
         let mut oauth = HashMap::new();
+        let mut nous = HashMap::new();
         let mut credential_quotas = HashMap::new();
         for credential in credentials {
             let (id, provider, quota) = match &credential {
@@ -315,6 +332,12 @@ impl RawConfig {
                     ..
                 }
                 | RawCredential::Oauth {
+                    id,
+                    provider,
+                    quota,
+                    ..
+                }
+                | RawCredential::NousPortal {
                     id,
                     provider,
                     quota,
@@ -340,7 +363,10 @@ impl RawConfig {
                 id.clone(),
                 CredentialMeta {
                     provider: provider.clone(),
-                    oauth: matches!(credential, RawCredential::Oauth { .. }),
+                    oauth: matches!(
+                        credential,
+                        RawCredential::Oauth { .. } | RawCredential::NousPortal { .. }
+                    ),
                 },
             );
             if quota != QuotaSpec::default() {
@@ -353,6 +379,34 @@ impl RawConfig {
                         ApiKey {
                             provider,
                             key: resolve_secret(&key)?,
+                        },
+                    );
+                }
+                RawCredential::NousPortal {
+                    state_file,
+                    refresh_skew_ms,
+                    request_timeout_ms,
+                    ..
+                } => {
+                    let state_path = PathBuf::from(&state_file);
+                    if state_file.is_empty() || !state_path.is_absolute() {
+                        return Err(invalid("nous_portal state_file must be an absolute path"));
+                    }
+                    if NousState::load(&state_path).is_err() {
+                        return Err(invalid("nous_portal state_file is missing or unreadable; run `llmux-login nous` to sign in and create it"));
+                    }
+                    let refresh_skew_ms = refresh_skew_ms.unwrap_or(120_000);
+                    if refresh_skew_ms > MAX_TIMEOUT_MS {
+                        return Err(invalid(
+                            "nous_portal refresh_skew_ms must be at most 86400000",
+                        ));
+                    }
+                    nous.insert(
+                        id,
+                        NousPortalCredential {
+                            state_path,
+                            refresh_skew: Duration::from_millis(refresh_skew_ms),
+                            request_timeout: timeout(request_timeout_ms.unwrap_or(30_000))?,
                         },
                     );
                 }
@@ -619,6 +673,7 @@ impl RawConfig {
             },
             api_keys,
             oauth,
+            nous,
             credential_meta,
             model_names,
             catch_all,
