@@ -10,6 +10,10 @@ pub const OPENAI_RESPONSES: &str = "openai_responses";
 /// Anthropic Messages API.
 pub const ANTHROPIC: &str = "anthropic";
 
+/// xAI OAuth at api.x.ai. Chat and Responses, selected per model.
+pub const XAI: &str = "xai";
+/// Antigravity Cloud Code `streamGenerateContent` with Google OAuth.
+pub const ANTIGRAVITY: &str = "antigravity";
 /// Devin CLI bridge: one `devin acp` child per request, spoken to over stdio.
 pub const DEVIN_ACP: &str = "devin_acp";
 /// Placeholder endpoint for deployments that have no network upstream.
@@ -33,12 +37,14 @@ mod tests {
                 OPENAI_COMPAT,
                 OPENAI_RESPONSES,
                 ANTHROPIC,
+                XAI,
+                ANTIGRAVITY,
                 DEVIN_ACP
             ]
             .into_iter()
             .collect::<HashSet<_>>()
             .len(),
-            5
+            7
         );
         assert_eq!(ANTHROPIC_KEY_HEADER, "x-api-key");
     }

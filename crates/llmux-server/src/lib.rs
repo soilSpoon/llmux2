@@ -26,8 +26,8 @@ use llmux_config::{ApiKey, RuntimeConfig};
 use llmux_core::{Executor, GatewayError, LiveModels};
 use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
 use llmux_providers::{
-    truncate_middle_for_format, Anthropic, DevinAcp, DevinAcpConfig, OpenAiCompat, OpenAiResponses,
-    RequestMetadata, StaticKey,
+    truncate_middle_for_format, Anthropic, Antigravity, DevinAcp, DevinAcpConfig, OpenAiCompat,
+    OpenAiResponses, RequestMetadata, StaticKey, Xai,
 };
 use llmux_types::{
     provider, ContextOverflow, CredentialSource, GatewayRequest, GatewayResponse, InboundFormat,
@@ -64,6 +64,8 @@ fn provider_registry(devin: DevinAcpConfig) -> ProviderRegistry {
     }
     registry.register(Arc::new(Anthropic::new(provider::ANTHROPIC)));
     registry.register(Arc::new(OpenAiResponses::new()));
+    registry.register(Arc::new(Xai::new()));
+    registry.register(Arc::new(Antigravity::new()));
     registry.register(Arc::new(DevinAcp::new(devin)));
     registry
 }

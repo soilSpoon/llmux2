@@ -237,6 +237,9 @@ fn fallback_only_import_preserves_env_reference() {
     assert_eq!(config["models"][0]["name"].as_str(), Some("*"));
     assert_eq!(
         config["models"][0]["exclude"].as_array().unwrap(),
-        &[toml::Value::String("codex/*".into())]
+        &[
+            toml::Value::String("codex/*".into()),
+            toml::Value::String("cx/*".into()),
+        ]
     );
 }
