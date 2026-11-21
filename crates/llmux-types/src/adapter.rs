@@ -63,6 +63,14 @@ pub trait ProviderAdapter: Send + Sync + 'static {
         None
     }
 
+    /// Called when the upstream rejected a request body with `error`.
+    /// Returning a corrected body makes the executor resend it to the same
+    /// deployment, never to another one; `None`, the default, surfaces the
+    /// error. Each call must remove something from the body so retries end.
+    fn repair_rejected(&self, _body: &Bytes, _error: &UpstreamError) -> Option<Bytes> {
+        None
+    }
+
     fn observe_limits(&self, _headers: &HeaderMap) -> Option<LimitObservation> {
         None
     }

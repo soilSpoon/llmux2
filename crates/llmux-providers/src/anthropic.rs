@@ -1,5 +1,8 @@
 use crate::{
-    openai_compat::{apply_auth, bad_gateway, collect, endpoint_uri, retry_after, rewrite_model},
+    openai_compat::{
+        apply_auth, bad_gateway, collect, endpoint_uri, retry_after, rewrite_model,
+        strip_request_fields,
+    },
     sse,
 };
 use async_trait::async_trait;
@@ -70,6 +73,8 @@ fn anthropic_retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Duratio
                 .max()
         })
 }
+
+const DEPRECATABLE_FIELDS: [&str; 3] = ["temperature", "top_p", "top_k"];
 
 pub struct Anthropic(ProviderKind);
 
@@ -497,6 +502,7 @@ impl ProviderAdapter for Anthropic {
             Support::Passthrough => rewrite_model(&req.body, crate::upstream_model(req, dep))?,
             Support::Convert => convert_request(&req.body, crate::upstream_model(req, dep))?,
         };
+        let body = strip_request_fields(body, &dep.strip_request_fields)?;
         let uri = endpoint_uri(&dep.base_url, "/messages")?;
         let mut request = Request::builder()
             .method(Method::POST)
@@ -577,6 +583,25 @@ impl ProviderAdapter for Anthropic {
             headers: parts.headers,
             body,
         })
+    }
+    fn repair_rejected(&self, body: &Bytes, error: &UpstreamError) -> Option<Bytes> {
+        let UpstreamError::BadRequest {
+            body: rejection, ..
+        } = error
+        else {
+            return None;
+        };
+        let rejection = serde_json::from_slice::<Value>(rejection).ok()?;
+        let message = rejection["error"]["message"]
+            .as_str()
+            .or_else(|| rejection["message"].as_str())?;
+        let field = DEPRECATABLE_FIELDS
+            .into_iter()
+            .find(|field| message.contains(&format!("`{field}` is deprecated for this model")))?;
+        let mut payload = serde_json::from_slice::<Value>(body).ok()?;
+        payload.as_object_mut()?.remove(field)?;
+        eprintln!("llmux: anthropic rejected `{field}` as deprecated for this model; retrying the same deployment without it");
+        Some(Bytes::from(payload.to_string()))
     }
     fn observe_limits(&self, headers: &HeaderMap) -> Option<LimitObservation> {
         let now = SystemTime::now();
@@ -1146,5 +1171,105 @@ mod tests {
             .unwrap();
         let body: Value = serde_json::from_slice(request.body()).unwrap();
         assert_eq!(body["model"], "alias");
+    }
+    fn rejection(message: &str) -> UpstreamError {
+        UpstreamError::BadRequest {
+            status: StatusCode::BAD_REQUEST,
+            body: Bytes::from(
+                json!({"type":"error","error":{"type":"invalid_request_error","message":message}})
+                    .to_string(),
+            ),
+        }
+    }
+
+    #[test]
+    fn strip_request_fields_applies_to_converted_and_passthrough_bodies() {
+        let a = Anthropic::new(provider::ANTHROPIC);
+        let dep = Deployment {
+            headers: Default::default(),
+            fallback: false,
+            idx: DeploymentIdx(0),
+            id: "a".into(),
+            provider: a.kind().clone(),
+            credential: "key".into(),
+            base_url: "https://example.com/v1/".parse().unwrap(),
+            upstream_model: "claude".into(),
+            strip_request_fields: Box::new([
+                llmux_types::ChatRequestField::Temperature,
+                llmux_types::ChatRequestField::TopP,
+                llmux_types::ChatRequestField::TopK,
+            ]),
+            priority: 0,
+            quota: QuotaSpec::default(),
+            timeout: Duration::from_secs(10),
+            max_context: None,
+        };
+        for (format, body) in [
+            (
+                InboundFormat::OpenAiChat,
+                r#"{"model":"m","temperature":0.7,"top_p":0.9,"messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+            (
+                InboundFormat::AnthropicMessages,
+                r#"{"model":"m","max_tokens":5,"temperature":0.7,"top_p":0.9,"top_k":4,"messages":[]}"#,
+            ),
+        ] {
+            let req = GatewayRequest {
+                format,
+                model: "m".into(),
+                stream: false,
+                body: Bytes::from_static(body.as_bytes()),
+                anthropic_headers: HeaderMap::new(),
+                est_input_tokens: 0,
+                max_output_tokens: None,
+                context_overflow: None,
+                request_id: RequestId("r".into()),
+            };
+            let request = a
+                .build_request(&req, &dep, &AuthMaterial::None)
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+            let sent: Value = serde_json::from_slice(request.body()).unwrap();
+            for field in ["temperature", "top_p", "top_k"] {
+                assert!(sent.get(field).is_none(), "{format:?} kept {field}");
+            }
+            assert_eq!(sent["model"], "claude");
+        }
+    }
+
+    #[test]
+    fn deprecated_parameter_rejections_drop_only_the_named_field() {
+        let a = Anthropic::new(provider::ANTHROPIC);
+        let body = Bytes::from_static(br#"{"model":"m","temperature":0.7,"top_p":0.9,"top_k":4}"#);
+        for (field, kept) in [
+            ("temperature", ["top_p", "top_k"]),
+            ("top_p", ["temperature", "top_k"]),
+            ("top_k", ["temperature", "top_p"]),
+        ] {
+            let message = format!("`{field}` is deprecated for this model.");
+            let repaired = a.repair_rejected(&body, &rejection(&message)).unwrap();
+            let repaired: Value = serde_json::from_slice(&repaired).unwrap();
+            assert!(repaired.get(field).is_none());
+            assert!(kept.iter().all(|key| repaired.get(key).is_some()));
+            assert_eq!(repaired["model"], "m");
+        }
+    }
+
+    #[test]
+    fn unrelated_or_unactionable_rejections_are_not_repaired() {
+        let a = Anthropic::new(provider::ANTHROPIC);
+        let body = Bytes::from_static(br#"{"model":"m","temperature":0.7}"#);
+        assert!(a
+            .repair_rejected(&body, &rejection("max_tokens: field required"))
+            .is_none());
+        assert!(a.repair_rejected(&body, &UpstreamError::Timeout).is_none());
+        let without = Bytes::from_static(br#"{"model":"m"}"#);
+        assert!(a
+            .repair_rejected(
+                &without,
+                &rejection("`temperature` is deprecated for this model.")
+            )
+            .is_none());
     }
 }

@@ -579,15 +579,29 @@ impl RawConfig {
                 {
                     return Err(invalid("OAuth openai_responses models require allowed_keys for the owner's gateway keys"));
                 }
-                if !dep.strip_request_fields.is_empty()
-                    && !matches!(
-                        provider.0.as_ref(),
-                        provider::OPENAI | provider::OPENAI_COMPAT
-                    )
-                {
-                    return Err(invalid(
-                        "strip_request_fields requires openai or openai_compat",
-                    ));
+                if !dep.strip_request_fields.is_empty() {
+                    match provider.0.as_ref() {
+                        provider::OPENAI | provider::OPENAI_COMPAT => {}
+                        provider::ANTHROPIC
+                            if dep.strip_request_fields.iter().all(|field| {
+                                matches!(
+                                    field,
+                                    ChatRequestField::Temperature
+                                        | ChatRequestField::TopP
+                                        | ChatRequestField::TopK
+                                )
+                            }) => {}
+                        provider::ANTHROPIC => {
+                            return Err(invalid(
+                                "strip_request_fields on anthropic accepts only temperature, top_p and top_k",
+                            ))
+                        }
+                        _ => {
+                            return Err(invalid(
+                                "strip_request_fields requires openai, openai_compat or anthropic",
+                            ))
+                        }
+                    }
                 }
                 let base_url = dep
                     .base_url
@@ -1211,5 +1225,45 @@ refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
                 .to_string()
                 .contains("max_context must be positive"));
         }
+    }
+
+    #[test]
+    fn strip_request_fields_on_anthropic_accepts_only_sampling_parameters() {
+        let base = |provider: &str, fields: &str| {
+            std::env::set_var("LLMUX_CONFIG_OAUTH_TEST_SECRET", "test-secret");
+            format!(
+                r#"
+[server]
+client_keys = ["env:LLMUX_CONFIG_OAUTH_TEST_SECRET"]
+[[credentials]]
+id = "key"
+kind = "api_key"
+provider = "{provider}"
+key = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET"
+[[models]]
+name = "model"
+[[models.deployments]]
+id = "deployment"
+credential = "key"
+base_url = "https://example.com/v1"
+upstream_model = "upstream"
+strip_request_fields = {fields}
+"#
+            )
+        };
+        let loaded =
+            RuntimeConfig::parse(&base("anthropic", r#"["temperature", "top_p", "top_k"]"#))
+                .unwrap();
+        assert_eq!(
+            loaded.deployments[0].strip_request_fields.as_ref(),
+            [
+                ChatRequestField::Temperature,
+                ChatRequestField::TopP,
+                ChatRequestField::TopK
+            ]
+        );
+        assert!(RuntimeConfig::parse(&base("anthropic", r#"["temperature", "seed"]"#)).is_err());
+        assert!(RuntimeConfig::parse(&base("xai", r#"["temperature"]"#)).is_err());
+        assert!(RuntimeConfig::parse(&base("openai", r#"["seed", "temperature"]"#)).is_ok());
     }
 }

@@ -35,6 +35,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 use thiserror::Error;
+
+/// A rejected request body may be repaired and resent to the same deployment
+/// at most this many times (one per removable field).
+const MAX_REPAIRS: usize = 3;
 use tokio::time::{timeout_at, Instant};
 
 #[derive(Debug, Error)]
@@ -711,24 +715,35 @@ impl Executor {
         let response = match binding.adapter.invoke(req, dep).await {
             Some(local) => local.map_err(GatewayError::Client)?,
             None => {
-                let response = self
-                    .http
-                    .request(upstream.map(Full::new))
-                    .await
-                    .map_err(|_| GatewayError::Client(UpstreamError::Connect))?;
-                if let Some(observed) = response
-                    .status()
-                    .is_success()
-                    .then(|| binding.adapter.observe_limits(response.headers()))
-                    .flatten()
-                {
-                    binding.limits.observe(observed, self.cfg.cooldown.max);
+                let mut upstream = upstream;
+                let mut repairs = 0;
+                loop {
+                    let (parts, body) = upstream.into_parts();
+                    let response = self
+                        .http
+                        .request(Request::from_parts(parts.clone(), Full::new(body.clone())))
+                        .await
+                        .map_err(|_| GatewayError::Client(UpstreamError::Connect))?;
+                    if let Some(observed) = response
+                        .status()
+                        .is_success()
+                        .then(|| binding.adapter.observe_limits(response.headers()))
+                        .flatten()
+                    {
+                        binding.limits.observe(observed, self.cfg.cooldown.max);
+                    }
+                    match binding.adapter.parse_response(req, dep, response).await {
+                        Err(error) if repairs < MAX_REPAIRS => {
+                            let Some(repaired) = binding.adapter.repair_rejected(&body, &error)
+                            else {
+                                return Err(GatewayError::Client(error));
+                            };
+                            upstream = Request::from_parts(parts, repaired);
+                            repairs += 1;
+                        }
+                        parsed => break parsed.map_err(GatewayError::Client)?,
+                    }
                 }
-                binding
-                    .adapter
-                    .parse_response(req, dep, response)
-                    .await
-                    .map_err(GatewayError::Client)?
             }
         };
 

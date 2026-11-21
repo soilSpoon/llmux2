@@ -98,14 +98,21 @@ not be misrepresented as total context windows. No capability/output enforcement
 is added. With no context rows, deployment limits remain unchanged. To roll back,
 regenerate with the previous importer or omit the context override table.
 
+### Anthropic sampling parameters
+
+`anthropic` deployments whose upstream model is `claude-<family>-5…` or
+`claude-opus-4-8…` (`.` or `-` separators) import with
+`strip_request_fields = ["temperature", "top_p"]`, because Anthropic rejects
+those fields for these models. Older Claude models are unchanged.
+
 ### Provider parameter compatibility
 
 Deployments with a DeepSeek upstream model ID set
 `strip_request_fields = ["seed", "user", "safety_identifier", "reasoning.effort"]`
 using the core per-deployment option on `openai` and `openai_compat` adapters,
 independent of the connection provider or public combo name. Other adapters,
-including `anthropic-compatible` nodes, import without field stripping because
-the core does not support it on those protocols.
+including `anthropic-compatible` nodes, import without DeepSeek field stripping
+because those protocols do not carry those fields.
 After routing-prefix stripping, matching is case-insensitive:
 the final model segment starts with `deepseek-` and has a nonempty suffix, or a
 preceding vendor segment is exactly `deepseek` or `deepseek-ai`. This includes
