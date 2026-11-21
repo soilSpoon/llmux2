@@ -32,7 +32,8 @@
           { "context": "check" },
           { "context": "pr-policy" },
           { "context": "advisories" },
-          { "context": "coverage" }
+          { "context": "coverage" },
+          { "context": "tlc" }
         ]
       }
     }

@@ -38,6 +38,7 @@ struct Adapter {
     status: Arc<std::sync::atomic::AtomicU16>,
     stream_errors: Mutex<VecDeque<UpstreamError>>,
     calls: Mutex<Vec<(Arc<str>, Arc<str>)>>,
+    cool_on_build: Mutex<Option<Arc<DeploymentLimits>>>,
 }
 
 #[async_trait]
@@ -67,6 +68,9 @@ impl ProviderAdapter for Adapter {
             && (req.body == "document" || req.body == "image" && dep.idx == DeploymentIdx(2))
         {
             return Err(BuildError::UnsupportedConversion);
+        }
+        if let Some(limits) = self.cool_on_build.lock().unwrap().take() {
+            limits.cool_down(Duration::from_secs(30));
         }
         let AuthMaterial::Bearer(token) = auth else {
             panic!("expected bearer")
@@ -175,6 +179,7 @@ async fn fixture_full(
         status,
         stream_errors: Mutex::new(VecDeque::new()),
         calls: Mutex::new(Vec::new()),
+        cool_on_build: Mutex::new(None),
     });
     let credential = Arc::new(Credential {
         refreshes: AtomicUsize::new(0),
@@ -992,4 +997,27 @@ async fn credential_peers_cool_only_until_the_quota_resets() {
         ["dep0", "dep1"],
         "dep0's own route limit is not the key's"
     );
+}
+
+#[tokio::test]
+async fn convert_deployment_cooled_during_build_is_skipped_at_the_gate() {
+    let (executor, adapter, _, _server) = fixture_with_models(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("model", &[0, 2])],
+        Default::default(),
+    )
+    .await;
+    *adapter.cool_on_build.lock().unwrap() = Some(executor.bindings[0].limits.clone());
+    let result = executor
+        .execute(GatewayRequest {
+            format: InboundFormat::AnthropicMessages,
+            body: Bytes::from_static(b"plain"),
+            ..request()
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.deployment.as_ref(), "dep2");
+    assert_eq!(adapter.calls.lock().unwrap().len(), 2);
 }
