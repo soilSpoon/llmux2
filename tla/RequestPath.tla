@@ -31,7 +31,8 @@ Select(d) ==
   /\ UNCHANGED <<attempts, now, cooldownUntil, committed, replayed,
                  startedAfterDeadline, permitHeld, wire>>
 
-Admit == /\ phase = "Admit" /\ permitHeld' = TRUE /\ phase' = "Build"
+\* A Convert deployment holds no permit here; it is admitted at the Gate.
+Admit == /\ phase = "Admit" /\ permitHeld' \in BOOLEAN /\ phase' = "Build"
          /\ UNCHANGED <<attempts, now, cur, cooldownUntil, committed, replayed,
                         startedAfterDeadline, selectedInCooldown, wire>>
 
@@ -53,13 +54,13 @@ GateFail == /\ phase = "Gate" /\ cooldownUntil[cur] > now
                            startedAfterDeadline, selectedInCooldown, wire>>
 
 GateOk == /\ phase = "Gate" /\ cooldownUntil[cur] <= now
-          /\ attempts' = attempts + 1 /\ phase' = "Send"
+          /\ attempts' = attempts + 1 /\ phase' = "Send" /\ permitHeld' = TRUE
           \* timeout_at(attempt_deadline, ..) means no upstream I/O is issued once
           \* the deadline passed; the attempt counts but resolves as Timeout.
           /\ wire' = (now < Deadline)
           /\ startedAfterDeadline' = (startedAfterDeadline \/ (wire' /\ now >= Deadline))
           /\ UNCHANGED <<now, cur, cooldownUntil, committed, replayed,
-                         selectedInCooldown, permitHeld>>
+                         selectedInCooldown>>
 
 SendSuccess == /\ phase = "Send" /\ wire /\ committed' = TRUE /\ phase' = "Done"
                /\ UNCHANGED <<attempts, now, cur, cooldownUntil, replayed,

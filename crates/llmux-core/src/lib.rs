@@ -431,12 +431,12 @@ impl Executor {
                         }
                         Effect::Admit if machine.phase == Phase::Admit => {
                             permit = if support == Support::Convert {
-                                Some(None)
+                                None
                             } else {
-                                binding.limits.admit(needed).map(Some)
+                                binding.limits.admit(needed)
                             };
                             event = Event::Admit {
-                                permit: permit.is_some(),
+                                permit: support == Support::Convert || permit.is_some(),
                             };
                         }
                         Effect::Build => {
@@ -460,20 +460,13 @@ impl Executor {
                             break;
                         }
                         Effect::Admit => {
-                            permit = permit
-                                .take()
-                                .flatten()
-                                .map_or_else(
-                                    || {
-                                        if binding.limits.cooldown_until(Instant::now()).is_some() {
-                                            None
-                                        } else {
-                                            binding.limits.admit(needed)
-                                        }
-                                    },
-                                    Some,
-                                )
-                                .map(Some);
+                            permit = permit.take().or_else(|| {
+                                if binding.limits.cooldown_until(Instant::now()).is_some() {
+                                    None
+                                } else {
+                                    binding.limits.admit(needed)
+                                }
+                            });
                             event = Event::Gate {
                                 permit: permit.is_some(),
                             };
@@ -549,7 +542,7 @@ impl Executor {
                             return Ok(RoutedResponse {
                                 deployment: dep.id.clone(),
                                 attempts: machine.attempts as _,
-                                response: match permit.take().flatten() {
+                                response: match permit.take() {
                                     Some(permit) => hold_permit(response, permit),
                                     None => response,
                                 },
