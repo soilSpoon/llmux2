@@ -12,13 +12,15 @@ pub(super) fn bridge(provider: &str) -> bool {
     matches!(provider, PROVIDER | "dva")
 }
 
-/// Providers dropped from llmux2: Augment and Z.AI have no balance to spend and
-/// Factory was removed, so none may serve customer traffic.
+/// Providers dropped from llmux2: Augment and Z.AI have no balance to spend,
+/// Factory was removed, and lmarena/uncloseai stay inactive.
 pub(super) fn excluded(provider: &str) -> Option<&'static str> {
     match provider {
         "auggie" | "aug" => Some("Augment (auggie) is excluded: no recharge, free models only"),
         "zcode" | "zc" => Some("ZCode (Z.AI) is excluded: no recharge, free models only"),
         "factory" | "droid" => Some("Factory is removed from llmux2"),
+        "lmarena" | "arena" => Some("lmarena is inactive"),
+        "uncloseai" => Some("uncloseai is inactive"),
         _ => None,
     }
 }
@@ -64,7 +66,15 @@ mod tests {
 
     #[test]
     fn exclusions_cover_names_and_prefixes() {
-        for id in ["auggie", "aug", "zcode", "zc", "factory"] {
+        for id in [
+            "auggie",
+            "aug",
+            "zcode",
+            "zc",
+            "factory",
+            "lmarena",
+            "uncloseai",
+        ] {
             assert!(excluded(id).is_some(), "{id}");
         }
         assert!(excluded(PROVIDER).is_none());

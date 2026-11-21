@@ -13,6 +13,8 @@ pub(super) const PROVIDER_ALIASES: &[(&str, &str)] = &[
     ("cfpd", "cloudflare-direct"),
     ("cfp", "cloudflare-playground"),
     ("dva", "devin-cli-agentic"),
+    ("xao", "xai-oauth"),
+    ("cx", "codex"),
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -244,12 +246,15 @@ pub(super) fn resolve(
     if url.is_empty() {
         return Err("missing upstream base URL");
     }
+    let identity = super::connection::identity(connection, nodes);
     let url = if ProviderIdentity::connection(id, nodes).is_builtin("morph")
         && local_host(url, false)
     {
         warnings.push(format!("connection {}: reviewed Morph loopback override replaced with official https://api.morphllm.com/v1", string(connection, "id")));
         super::morph::OFFICIAL_URL
-    } else if local_host(url, true) {
+    } else if local_host(url, true)
+        && !(local_host(url, false) && super::connection::keyed_loopback_bridge(identity))
+    {
         return Err("loopback/localhost upstream; configure a reachable connection base URL");
     } else {
         url
