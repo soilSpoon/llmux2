@@ -131,6 +131,16 @@ fn deepseek_model(model: &str) -> bool {
             }))
 }
 
+/// Anthropic rejects `temperature` and `top_p` unless they equal 1 on the
+/// Claude 5 generation, Fable 5 and Opus 4.8.
+fn anthropic_rejects_sampling(model: &str) -> bool {
+    let leaf = model.rsplit('/').next().unwrap_or_default();
+    let normalized = leaf.to_ascii_lowercase().replace('.', "-");
+    let parts: Vec<_> = normalized.split('-').collect();
+    matches!(parts.as_slice(), ["claude", family, "5", ..] if family.chars().all(|c| c.is_ascii_alphabetic()))
+        || matches!(parts.as_slice(), ["claude", "opus", "4", "8", ..])
+}
+
 fn unique(raw: &str, used: &mut HashSet<String>) -> String {
     let base: String = raw
         .chars()
@@ -1101,6 +1111,10 @@ pub fn import_with_options(
                     {
                         deployment["strip_request_fields"] = json!(["seed", "user"]);
                     }
+                } else if provider == KIND_ANTHROPIC
+                    && anthropic_rejects_sampling(string(deployment, "upstream_model"))
+                {
+                    deployment["strip_request_fields"] = json!(["temperature", "top_p"]);
                 }
             }
         }

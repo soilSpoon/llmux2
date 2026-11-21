@@ -196,6 +196,17 @@ member and drops the enclosing `reasoning` object if it becomes empty. It does
 not remove the separate top-level `reasoning_effort`. Other deployments are
 unchanged. Remove the setting to restore passthrough.
 
+### Anthropic models that reject sampling parameters
+
+Claude 5 models, Fable 5 and Opus 4.8 answer 400 `` `temperature` is deprecated
+for this model`` unless the value is the default. Set
+`strip_request_fields = ["temperature", "top_p"]` (`top_k` is also accepted) on
+the `anthropic` deployment to omit them from both `/v1/chat/completions` and
+`/v1/messages` requests; `llmux-import` does this for those models. Without the
+setting the gateway also heals itself: on that exact 400 it drops the named
+field and resends once to the same deployment (logging the field), so the served
+model never changes.
+
 ### Catch-all route for cutover
 
 Add one `[[models]]` entry named `"*"` to forward otherwise unknown IDs, for

@@ -49,6 +49,36 @@ WHEN an OpenAI Chat deployment is configured to strip an unsupported field
 THEN only the configured field is dropped, including only the `effort` member
 for `reasoning.effort` unless the enclosing object becomes empty.
 
+### Requirement: Anthropic sampling parameter compatibility
+
+Current Claude models (Claude 5 generation, Fable 5, Opus 4.8) reject
+`temperature`, `top_p` and `top_k` with HTTP 400 `` `<field>` is deprecated for
+this model`` unless the value is the default. The Anthropic adapter SHALL accept
+`strip_request_fields` limited to `temperature`, `top_p` and `top_k` and omit
+them from the upstream body on both the OpenAI Chat conversion and the native
+Messages passthrough. When an upstream still answers such a 400 for a field
+that was sent, the adapter SHALL remove only that field and resend the same
+deployment's request, and SHALL log which field was dropped. The retry SHALL NOT
+move to another deployment, so the served model never changes, and SHALL NOT
+apply to any other 400.
+
+#### Scenario: Configured stripping
+
+WHEN an anthropic deployment sets `strip_request_fields = ["temperature", "top_p"]`
+THEN neither field reaches the upstream on /v1/chat/completions or /v1/messages,
+and other fields are untouched.
+
+#### Scenario: Deprecation rejection heals
+
+WHEN the upstream answers 400 `` `temperature` is deprecated for this model``
+THEN the same deployment is retried once without `temperature`, and the client
+receives that retry's response.
+
+#### Scenario: Other bad request
+
+WHEN the upstream answers any other 400
+THEN it is returned to the client without a retry.
+
 ### Requirement: Static deployment headers
 
 The gateway SHALL support optional per-deployment headers with literal or

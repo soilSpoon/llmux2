@@ -371,7 +371,10 @@ pub(crate) fn rewrite_model(body: &Bytes, model: &str) -> Result<Bytes, BuildErr
     Ok(rewritten.freeze())
 }
 
-fn strip_request_fields(body: Bytes, strip: &[ChatRequestField]) -> Result<Bytes, BuildError> {
+pub(crate) fn strip_request_fields(
+    body: Bytes,
+    strip: &[ChatRequestField],
+) -> Result<Bytes, BuildError> {
     if strip.is_empty() {
         return Ok(body);
     }
@@ -386,6 +389,9 @@ fn strip_request_fields(body: Bytes, strip: &[ChatRequestField]) -> Result<Bytes
             ChatRequestField::SafetyIdentifier => "safety_identifier",
             ChatRequestField::Logprobs => "logprobs",
             ChatRequestField::TopLogprobs => "top_logprobs",
+            ChatRequestField::Temperature => "temperature",
+            ChatRequestField::TopP => "top_p",
+            ChatRequestField::TopK => "top_k",
             ChatRequestField::ReasoningEffort => {
                 if let Some(mut object) = fields
                     .get("reasoning")

@@ -28,6 +28,18 @@ THEN the gateway SHALL try the next eligible deployment within the existing
 attempt and time budgets, before committing a response. An ordinary upstream
 400 or generic 404 SHALL remain terminal.
 
+### Requirement: Same-deployment repair of a deprecated parameter
+
+The gateway SHALL let a provider adapter repair a rejected request body and
+resend it to the same deployment before any response is committed, at most three
+times per attempt. The Anthropic adapter uses this to drop a `temperature`,
+`top_p` or `top_k` that the upstream reports as deprecated for the model.
+
+#### Scenario: Repair stays on the deployment
+
+WHEN a repaired request is sent
+THEN it targets the same deployment and counts as one HTTP attempt toward routing limits.
+
 ### Requirement: Stream commitment
 
 Once a streaming response has been committed, the gateway

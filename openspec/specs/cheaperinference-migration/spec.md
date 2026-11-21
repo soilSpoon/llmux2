@@ -151,6 +151,24 @@ THEN no DeepSeek field stripping is added, even on a DeepSeek provider connectio
 WHEN a DeepSeek upstream model uses an anthropic-compatible node
 THEN the deployment imports successfully without strip_request_fields.
 
+### Requirement: Anthropic sampling parameter compatibility
+
+The importer SHALL set `strip_request_fields = ["temperature", "top_p"]` on
+anthropic adapter deployments whose upstream model leaf, with `.` and `-`
+treated alike and case ignored, is `claude-<family>-5…` (for example
+`claude-sonnet-5-5`, `claude-haiku-5.5`, `claude-fable-5-1`) or `claude-opus-4-8…`.
+Older Claude models, such as `claude-sonnet-4-6`, SHALL import unchanged.
+
+#### Scenario: Claude 5 deployment
+
+WHEN a combo expands onto `anthropic/claude-sonnet-5-5`
+THEN the generated deployment loads with `temperature` and `top_p` stripped.
+
+#### Scenario: Older Claude model
+
+WHEN the upstream model is `claude-sonnet-4-6`
+THEN no field stripping is added.
+
 ### Requirement: Reviewed Morph official migration and logprobs order
 The importer SHALL migrate only built-in Morph loopback connection overrides to
 `https://api.morphllm.com/v1`, warning about the reviewed endpoint substitution.
