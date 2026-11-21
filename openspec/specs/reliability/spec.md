@@ -119,3 +119,27 @@ overhead per request.
 
 WHEN request volume stays high for an extended period
 THEN latency and error rates stay within target without resource exhaustion.
+
+### Requirement: Explicit request-path state machine
+
+The attempt loop SHALL be driven by the pure transition function
+`machine::State::step`, with phases `Select`, `Admit`, `Build`, `Gate`, `Send`,
+`Refresh`, and `Done`. The following invariants SHALL hold and are model-checked
+in `tla/` (names in parentheses):
+
+- A retry never starts after a response was committed (`NoReplayAfterCommit`,
+  `NoRetryAfterCommit`).
+- Attempts never exceed `routing.max_attempts` and no attempt starts after the
+  request deadline (`AttemptsBounded`, `NoAttemptAfterDeadline`).
+- A permit is released on every terminal path: failure, exhaustion, stream end,
+  idle timeout, mid-stream error, and client disconnect (`PermitReleasedOnExhaust`,
+  `PermitReleasedWhenClosed`).
+- A deployment in cooldown is not selected before `cooldown_until`
+  (`NoSelectInCooldown`).
+- During a slot handoff at least one slot accepts connections and a draining
+  slot accepts none (`AlwaysOneAccepting`, `DrainingNotAccepting`).
+
+#### Scenario: Transition table
+
+WHEN `max_attempts` is reached in `Select` or `Admit`
+THEN `step` returns `StopGroups` and no further attempt starts.
