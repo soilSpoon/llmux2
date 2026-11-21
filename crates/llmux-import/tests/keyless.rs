@@ -366,14 +366,7 @@ fn skip_precedence_is_explicit_and_replacement_warnings_are_static() {
             "apikey",
             "",
             "",
-            "no official replacement; dropped",
-        ),
-        (
-            "custom-deepai",
-            "apikey",
-            "test-key",
-            "deepai",
-            "no official replacement; dropped",
+            "no official HTTP API; dropped",
         ),
         (
             "custom-hms",

@@ -80,9 +80,12 @@ used only if the client omitted a version.
 
 ### Requirement: Excluded providers and practices
 
-The gateway SHALL NOT integrate OpenRouter, Factory, multi-account pooling, or
-multi-IP distribution to raise limits, and SHALL NOT add paid paths that cost
-provider fees unless the owner explicitly asks.
+The gateway SHALL NOT integrate OpenRouter, Factory, Augment, Z.AI,
+multi-account pooling, or multi-IP distribution to raise limits, and SHALL NOT
+add paid paths that cost provider fees unless the owner explicitly asks.
+DuckDuckGo and Cloudflare Playground have no key-based HTTP API and SHALL NOT
+be integrated by copying a session cookie, solving a browser challenge, or
+driving a headless browser to pass a TLS fingerprint check.
 
 #### Scenario: Codex access
 
@@ -93,5 +96,8 @@ shared fallback pool.
 #### Scenario: xAI OAuth deployment
 
 WHEN a deployment uses an OAuth credential minted by `llmux-login xai`
+or imported from an `xai-oauth` connection
 (the public Grok CLI client on auth.x.ai)
-THEN requests go to api.x.ai with the OAuth bearer via `openai_compat`.
+THEN requests go to api.x.ai with the OAuth bearer. Chat models use Chat
+Completions and the responses-only catalog ids use Responses. A client effort
+suffix is stripped before the upstream id.

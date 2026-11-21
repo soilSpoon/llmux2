@@ -17,7 +17,7 @@ mod validation;
 
 use llmux_types::provider::{
     ANTHROPIC as KIND_ANTHROPIC, DEVIN_ACP as KIND_DEVIN_ACP, OPENAI as KIND_OPENAI,
-    OPENAI_COMPAT as KIND_OPENAI_COMPAT,
+    OPENAI_COMPAT as KIND_OPENAI_COMPAT, OPENAI_RESPONSES as KIND_OPENAI_RESPONSES,
 };
 use serde_json::{json, Value};
 use std::{
@@ -338,8 +338,12 @@ impl Expander<'_> {
                 ));
                 continue;
             }
-            let antigravity =
-                p.is_builtin("antigravity") && replacements::antigravity(model).is_some();
+            let native_antigravity = self.connections.iter().any(|connection| {
+                connection.provider.is_builtin("antigravity") && connection.kind == "antigravity"
+            });
+            let antigravity = p.is_builtin("antigravity")
+                && replacements::antigravity(model).is_some()
+                && !native_antigravity;
             let bridge = self
                 .policy
                 .openrouter_replacements
@@ -604,6 +608,8 @@ pub fn import_with_options(
                 "openai_compat".into(),
                 policy.workers.as_ref().unwrap().base_url.clone(),
             ))
+        } else if let connection::SelectedAuth::Oauth(oauth) = &auth {
+            Ok((oauth.kind.to_owned(), oauth.base_url.to_owned()))
         } else {
             upstream::resolve(c, array(&root, "providerNodes"), &mut warnings)
         } {
@@ -635,6 +641,8 @@ pub fn import_with_options(
             warnings.push(format!("{label}: skipped missing/duplicate connection id"));
             continue;
         }
+        let keyed = matches!(auth, connection::SelectedAuth::Key(_));
+        let workers_auth = matches!(auth, connection::SelectedAuth::Workers);
         let credential = match auth {
             connection::SelectedAuth::Workers => workers_credential.clone(),
             connection::SelectedAuth::Key(value) => {
@@ -647,6 +655,44 @@ pub fn import_with_options(
                 let id = unique(&format!("upstream-{source_id}"), &mut ids);
                 let key = write_secret(&dir, &id, value)?;
                 credentials.push(json!({"id":id,"kind":"api_key","provider":kind,"key":key}));
+                Some(id)
+            }
+            connection::SelectedAuth::Oauth(oauth) => {
+                let id = unique(&format!("upstream-{source_id}"), &mut ids);
+                let refresh = write_secret(&dir, &id, &oauth.refresh)?;
+                let mut credential = json!({
+                    "id": id,
+                    "kind": "oauth",
+                    "provider": kind,
+                    "token_url": oauth.token_url,
+                    "client_id": oauth.client_id,
+                    "refresh_token": refresh,
+                });
+                if let Some(secret) = &oauth.client_secret {
+                    let secret_id = unique(&format!("{id}-secret"), &mut ids);
+                    credential["client_secret"] = write_secret(&dir, &secret_id, secret)?.into();
+                }
+                if let Some(scopes) = &oauth.scopes {
+                    credential["scopes"] = json!(scopes);
+                }
+                credentials.push(credential);
+                if kind == "openai_responses" {
+                    header_refs.insert("originator".into(), "codex_cli_rs".into());
+                    header_refs.insert("version".into(), "0.165.0".into());
+                    header_refs.insert(
+                        "user-agent".into(),
+                        "codex-cli/0.165.0 (Linux; x86_64)".into(),
+                    );
+                    header_refs.insert("origin".into(), "https://chatgpt.com".into());
+                    if let Some(workspace) = &oauth.workspace {
+                        header_refs.insert("chatgpt-account-id".into(), workspace.clone().into());
+                    }
+                }
+                if kind == "antigravity" {
+                    if let Some(project) = &oauth.project {
+                        header_refs.insert("x-llmux-project".into(), project.clone().into());
+                    }
+                }
                 Some(id)
             }
             connection::SelectedAuth::None if kind == KIND_DEVIN_ACP => {
@@ -680,9 +726,9 @@ pub fn import_with_options(
             kind,
             base_url,
             priority: c["priority"].as_i64().unwrap_or(0),
-            policy: if policy::cloudflare(identity) {
+            policy: if workers_auth {
                 policy::ModelPolicy::Workers
-            } else if policy::kilo(identity) && matches!(auth, connection::SelectedAuth::Key(_)) {
+            } else if policy::kilo(identity) && keyed {
                 policy::ModelPolicy::KiloFree
             } else {
                 policy::ModelPolicy::Any
@@ -1044,6 +1090,24 @@ pub fn import_with_options(
         warnings.push(
             "no active client keys; set LLMUX_CLIENT_KEY before starting llmux-server".into(),
         );
+    }
+    let owner_oauth: HashSet<String> = credentials
+        .iter()
+        .filter(|credential| {
+            string(credential, "kind") == "oauth"
+                && string(credential, "provider") == KIND_OPENAI_RESPONSES
+        })
+        .map(|credential| string(credential, "id").to_owned())
+        .collect();
+    if !owner_oauth.is_empty() {
+        for model in &mut models {
+            if array(model, "deployments")
+                .iter()
+                .any(|deployment| owner_oauth.contains(string(deployment, "credential")))
+            {
+                model["allowed_keys"] = json!(client_keys);
+            }
+        }
     }
     let config = json!({"server":{"listen":"127.0.0.1:8080","client_keys":client_keys},"credentials":credentials,"models":models});
     validation::validate(

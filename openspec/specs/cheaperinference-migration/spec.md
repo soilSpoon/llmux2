@@ -43,7 +43,11 @@ gemini-3-flash-preview and antigravity/gemini-3.1-flash-lite to the GA
 gemini-3.1-flash-lite on all eligible built-in Gemini API-key connections in
 priority order, preserving aliases and combo references. Source Antigravity
 connection restrictions SHALL be replaced by the eligible Gemini set with a
-warning. Antigravity OAuth connections SHALL remain skipped. Ordinary OmniRoute
+warning. An Antigravity OAuth connection that lacks a refresh token, client
+id, or project id SHALL remain skipped. A complete connection SHALL be imported
+as the native `antigravity` provider and SHALL serve the requested model id,
+not a rewritten Gemini id. The reviewed Gemini rewrite SHALL apply only when
+no complete Antigravity OAuth connection was imported. Ordinary OmniRoute
 fallback semantics SHALL apply after native deployments when enabled.
 No other Antigravity models SHALL be mapped. Both reviewed routes SHALL receive
 the Gemini endpoint's seed/user request-field stripping.
@@ -65,6 +69,40 @@ with modelVersion gemini-3.1-flash-lite.
 
 WHEN no eligible Gemini API-key connection exists
 THEN no native replacement deployment is emitted and a warning explains why.
+
+### Requirement: Import live OAuth and keyed loopback bridges
+
+The importer SHALL import `xai-oauth`/`xao` as an `xai` OAuth credential
+refreshing at `https://auth.x.ai/oauth2/token` with deployments at
+`https://api.x.ai/v1`. It SHALL import `codex`/`cx` as `openai_responses` at
+`https://chatgpt.com/backend-api/codex`, refreshing at
+`https://auth.openai.com/oauth/token`, and SHALL restrict those models to the
+imported gateway keys. It SHALL import a complete Antigravity OAuth connection
+at `https://daily-cloudcode-pa.googleapis.com` without rewriting the model id.
+A missing refresh token or client id SHALL skip that row with a counted
+warning and SHALL NOT panic. The importer SHALL NOT invent a client secret.
+A keyed OpenAI-compatible `deepai`/`deepai-code` or `cloudflare-direct`/`cfpd`
+node with a baseUrl SHALL import as `openai_compat` at that baseUrl, including
+loopback. DuckDuckGo and Cloudflare Playground SHALL stay dropped unless a
+Workers AI opt-in replaces Playground: neither has a key-based HTTP API.
+Factory, Augment, and Z.AI SHALL remain excluded.
+
+#### Scenario: xAI OAuth token URL
+
+WHEN an `xai-oauth` connection has a refresh token and client id
+THEN the generated credential refreshes at `https://auth.x.ai/oauth2/token`
+AND the deployment base URL is `https://api.x.ai/v1`
+AND the refresh token is not written into the configuration or warnings.
+
+#### Scenario: Missing refresh token
+
+WHEN an `xai-oauth` connection has no refresh token
+THEN import skips that row with a missing-refresh-token warning and continues.
+
+#### Scenario: DeepAI Code loopback
+
+WHEN a DeepAI Code node has a valid API key and `http://127.0.0.1:8790/deepai/v1`
+THEN its deployment uses `openai_compat` at that URL and the same model id.
 
 ### Requirement: Custom provider headers
 
@@ -347,7 +385,8 @@ THEN no replacement deployment is generated.
 #### Scenario: Opt-in and explicit fallback
 
 WHEN the flag is absent
-THEN bridges retain their previous skipped behavior.
+THEN a keyed OpenAI-compatible bridge with a baseUrl is imported at that URL,
+and DuckDuckGo stays dropped because it has no key-based HTTP API.
 WHEN explicit OmniRoute fallback is configured
 THEN it follows the normal last-deployment and Codex exclusion policy; bridge
 replacement introduces no new fallback bypass.
