@@ -339,8 +339,7 @@ fn chat_stream(
                 let delta = &collected.text[before..];
                 yield chunk(&model, json!({"content":delta}), None);
             }
-            if collected.tool_calls.len() > tools {
-                let call = collected.tool_calls.last().cloned().unwrap_or(Value::Null);
+            for call in &collected.tool_calls[tools..] {
                 yield chunk(&model, json!({"tool_calls":[call]}), None);
             }
         }
@@ -523,5 +522,38 @@ mod tests {
         assert_eq!(body["model"], "gemini-3-flash");
         assert_eq!(body["choices"][0]["message"]["content"], "same-model");
         assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn stream_emits_every_tool_call_added_by_one_event() {
+        let payload = r#"{"response":{"candidates":[{"content":{"parts":[{"functionCall":{"name":"first","args":{"a":1}}},{"functionCall":{"name":"second","args":{"b":2}}}]},"finishReason":"STOP"}]}}"#;
+        let input: BoxStream<'static, Result<SseEvent, UpstreamError>> =
+            Box::pin(futures_util::stream::iter(vec![Ok(SseEvent {
+                event: None,
+                data: payload.into(),
+            })]));
+        let events: Vec<SseEvent> = chat_stream("gemini-3-flash".into(), input)
+            .map(|event| event.unwrap())
+            .collect()
+            .await;
+        let calls: Vec<Value> = events
+            .iter()
+            .filter_map(|event| serde_json::from_str::<Value>(&event.data).ok())
+            .flat_map(|chunk| {
+                chunk["choices"][0]["delta"]["tool_calls"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect();
+        let names: Vec<&str> = calls
+            .iter()
+            .map(|call| call["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["first", "second"]);
+        assert_eq!(calls[0]["id"], "first-0");
+        assert_eq!(calls[1]["id"], "second-1");
+        let last: Value = serde_json::from_str(&events[events.len() - 2].data).unwrap();
+        assert_eq!(last["choices"][0]["finish_reason"], "tool_calls");
     }
 }
