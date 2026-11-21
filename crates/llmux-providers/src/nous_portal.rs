@@ -249,6 +249,7 @@ impl Inner {
         let request = Request::post(self.uri.clone())
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .header(header::ACCEPT, "application/json")
+            .header(header::USER_AGENT, llmux_types::USER_AGENT)
             .header("x-nous-refresh-token", refresh)
             .body(Full::new(Bytes::from(body)))
             .map_err(|_| AuthError::RefreshFailed)?;
@@ -329,6 +330,10 @@ mod tests {
         headers: http::HeaderMap,
         body: String,
     ) -> (http::StatusCode, String) {
+        assert_eq!(
+            headers["user-agent"],
+            concat!("llmux/", env!("CARGO_PKG_VERSION"))
+        );
         let presented = headers["x-nous-refresh-token"].to_str().unwrap().to_owned();
         portal.requests.lock().await.push((presented, body));
         tokio::time::sleep(Duration::from_millis(30)).await;

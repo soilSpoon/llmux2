@@ -516,6 +516,7 @@ impl ProviderAdapter for Anthropic {
             request.headers_mut().extend(req.anthropic_headers.clone());
         }
         request.headers_mut().extend(dep.headers.clone());
+        llmux_types::default_user_agent(request.headers_mut());
         apply_auth(
             request.headers_mut(),
             auth,
@@ -1097,6 +1098,10 @@ mod tests {
                 .unwrap();
             assert_eq!(request.uri(), "https://example.com/v1/messages");
             assert_eq!(request.headers()["x-deployment"], "static-value");
+            assert_eq!(
+                request.headers()[header::USER_AGENT],
+                concat!("llmux/", env!("CARGO_PKG_VERSION"))
+            );
             assert_eq!(request.method(), Method::POST);
             assert_eq!(request.headers()["anthropic-version"], "2023-06-01");
             assert_eq!(request.headers()[header::ACCEPT], "text/event-stream");

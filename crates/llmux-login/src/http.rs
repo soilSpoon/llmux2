@@ -54,7 +54,8 @@ impl Http {
         validate_url(url)?;
         let mut request = Request::builder()
             .uri(url.as_str())
-            .header(header::ACCEPT, "application/json");
+            .header(header::ACCEPT, "application/json")
+            .header(header::USER_AGENT, llmux_types::USER_AGENT);
         let body = if let Some(form) = form {
             request = request
                 .method("POST")

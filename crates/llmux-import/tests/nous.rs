@@ -82,6 +82,10 @@ fn free_models_rank_ahead_of_paid_and_each_gets_one_nous_deployment() {
             "https://inference-api.nousresearch.com/v1"
         );
         assert_eq!(&*deployment.provider.0, "openai_compat");
+        assert!(
+            deployment.headers.is_empty(),
+            "the adapter's default User-Agent makes a per-deployment header unnecessary"
+        );
         assert_eq!(
             format!("nous/{}", deployment.upstream_model),
             model.name.as_ref()

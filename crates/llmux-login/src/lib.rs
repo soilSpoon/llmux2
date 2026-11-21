@@ -69,6 +69,8 @@ pub enum Error {
     PlanPermission,
     #[error("required OAuth scope {0} was not granted")]
     MissingScope(&'static str),
+    #[error("{0}")]
+    Poll(String),
 }
 
 impl Error {
