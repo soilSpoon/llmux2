@@ -213,7 +213,13 @@ impl Inner {
                 }
                 let snapshot = guard.state.clone();
                 let path = self.config.state_path.clone();
-                let _ = tokio::task::spawn_blocking(move || snapshot.save(&path)).await;
+                // A save failure is not fatal: the in-memory state already carries the
+                // rotated token, so this process keeps working. It only costs a refresh
+                // on the next start, because the state file still holds the spent token.
+                match tokio::task::spawn_blocking(move || snapshot.save(&path)).await {
+                    Ok(Ok(())) => {}
+                    _ => eprintln!("llmux: could not persist rotated Nous refresh token"),
+                }
                 match make_token(&access, lifetime, self.config.refresh_skew) {
                     Ok(token) if lifetime > 0 => {
                         self.token.store(Some(Arc::new(token)));
