@@ -302,9 +302,12 @@ impl Usage {
                 return at + span;
             }
         }
+        // No entries to wait on: reached only when the request can never fit
+        // the window (cost > max on a hard window), so the reset is a full
+        // span out rather than "now".
         self.entries
             .back()
-            .map_or_else(Instant::now, |&(at, _)| at + span)
+            .map_or_else(|| Instant::now() + span, |&(at, _)| at + span)
     }
 }
 
@@ -523,6 +526,24 @@ mod tests {
         assert!(
             own_quota.admit(150).is_some(),
             "a deployment quota still admits an oversized request when idle"
+        );
+    }
+
+    /// A request that can never fit a credential window must report a retry
+    /// when the window resets, not "now": an empty window's `free_at` has no
+    /// entries to wait on, so it would otherwise answer immediately.
+    #[test]
+    fn an_impossible_request_on_a_credential_window_retries_when_it_resets() {
+        let key = Window::for_credential(QuotaSpec {
+            tpd: Some(100),
+            ..QuotaSpec::default()
+        });
+        let shared = Arc::new(DeploymentLimits::with_shared(QuotaSpec::default(), &key));
+        let now = Instant::now();
+        assert!(shared.admit(150).is_none());
+        assert!(
+            shared.available_at(now, 150) >= now + Duration::from_secs(86_399),
+            "a request that can never fit waits the whole window"
         );
     }
 
