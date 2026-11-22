@@ -538,6 +538,10 @@ installed one. `deploy/prune.sh` reads it from `active.json`.
 validation: `[server]`/`[routing]` keys merge field-wise, and extra
 `[[credentials]]`/`[[models]]` append — the local settings the export does
 not carry. Scheduled re-imports must pass the site's overlay (an empty file
-is a valid no-op) or the regenerated config drops them.
+is a valid no-op) or the regenerated config drops them. A `[server].listen`
+in the overlay must match `--listen` exactly — the prune reads the deployed
+address from `active.json`, so a conflicting overlay listen aborts the
+import rather than silently changing the port. `--exclude-models` applies
+after the merge, so dead overlay models are dropped with the rest.
 An import therefore never advertises an embedding or typed-endpoint model as
 a chat route.

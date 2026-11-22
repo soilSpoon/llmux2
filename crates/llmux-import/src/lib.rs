@@ -1548,14 +1548,39 @@ pub fn import_with_options(
             )
             .map_err(|_| "invalid site overlay TOML".to_owned())?,
         )?;
+        // An overlay [server].listen is a site choice when no --listen was
+        // passed, but it must never silently override the deployed address a
+        // scheduled re-import was told to keep.
+        if let (Some(expected), Some(actual)) =
+            (options.listen, overlay["server"]["listen"].as_str())
+        {
+            if actual != expected {
+                return Err(format!(
+                    "site overlay listen {actual} conflicts with --listen {expected}"
+                ));
+            }
+        }
         merge_overlay(&mut config, overlay)?;
+        // Overlay models are routes too: drop the ones the sweep marked dead
+        // and shield their names from the catch-all.
+        if !dead.is_empty() {
+            if let Some(list) = config["models"].as_array_mut() {
+                list.retain(|model| !dead.contains(model["name"].as_str().unwrap_or("")));
+                for model in list.iter_mut() {
+                    if model["name"].as_str() == Some("*") {
+                        if let Some(exclude) = model["exclude"].as_array_mut() {
+                            for name in &dead {
+                                if !exclude.iter().any(|e| e.as_str() == Some(name)) {
+                                    exclude.push(json!(name));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
-    validation::validate(
-        &config,
-        client_count == 0,
-        &dir,
-        &policy.external_references(),
-    )?;
+    validation::validate(&config, &dir, &policy.external_references())?;
     let value = toml::Value::try_from(&config).map_err(|_| "could not encode configuration")?;
     let content = toml::to_string_pretty(&value).map_err(|_| "could not encode configuration")?;
     let mut file = OpenOptions::new()

@@ -1,5 +1,6 @@
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::{
+    collections::HashMap,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -40,12 +41,40 @@ impl Drop for ValidationMarker {
     }
 }
 
-pub(super) fn validate(
-    config: &Value,
-    fallback: bool,
+fn substitute_env(
+    value: &mut Value,
     dir: &Path,
-    external: &[&str],
+    markers: &mut HashMap<String, ValidationMarker>,
 ) -> Result<(), String> {
+    match value {
+        Value::String(reference) if reference.starts_with("env:") => {
+            // Secret references cannot be resolved on the importing host; a
+            // per-name marker keeps allowed_keys ⊆ client_keys checks exact.
+            let marker = match markers.get(reference) {
+                Some(marker) => marker,
+                None => {
+                    let marker = ValidationMarker::create(dir)?;
+                    markers.entry(reference.clone()).or_insert(marker)
+                }
+            };
+            *reference = format!("file:{}", marker.0.display());
+        }
+        Value::Array(list) => {
+            for item in list {
+                substitute_env(item, dir, markers)?;
+            }
+        }
+        Value::Object(object) => {
+            for (_, item) in object.iter_mut() {
+                substitute_env(item, dir, markers)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub(super) fn validate(config: &Value, dir: &Path, external: &[&str]) -> Result<(), String> {
     let mut config = config.clone();
     let mut temporary = None;
     if !external.is_empty() {
@@ -61,17 +90,8 @@ pub(super) fn validate(
         }
         temporary = Some(marker);
     }
-    if fallback {
-        let reference = if let Some(reference) = config["credentials"][0]["key"].as_str() {
-            reference.to_owned()
-        } else {
-            let marker = ValidationMarker::create(dir)?;
-            let reference = format!("file:{}", marker.0.display());
-            temporary = Some(marker);
-            reference
-        };
-        config["server"]["client_keys"] = json!([reference]);
-    }
+    let mut markers = HashMap::new();
+    substitute_env(&mut config, dir, &mut markers)?;
     let result = (|| {
         let value = toml::Value::try_from(&config).map_err(|_| "could not encode configuration")?;
         let content = toml::to_string(&value).map_err(|_| "could not encode configuration")?;
@@ -88,12 +108,13 @@ pub(super) fn validate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn failed_validation_removes_the_public_marker() {
         let dir = tempfile::tempdir().unwrap();
         let config = json!({"server":{"listen":"invalid"},"credentials":[],"models":[]});
-        assert!(validate(&config, true, dir.path(), &[]).is_err());
+        assert!(validate(&config, dir.path(), &[]).is_err());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }
