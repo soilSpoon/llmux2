@@ -290,11 +290,13 @@ redaction, offline mode, and JSON/HTML/Markdown report contracts.
 
 The `llmux2-ops` package SHALL provide a standalone `llmux2-probe` binary that
 verifies the running gateway as a client sees it: `GET /healthz` and
-`GET /v1/models` on every run, then a one-token `POST /v1/chat/completions`
+`GET /v1/models` on every run, then a `POST /v1/chat/completions`
 for `--per-run` canonical models (default 1) chosen by a rotation cursor in
 `--state-file`, so each timer interval costs one synthetic provider request
 per run rather than one per model. `--models` SHALL pin an explicit set and
 `--all-formats` SHALL add one `/v1/responses` and one `/v1/messages` probe.
+All three inference formats SHALL use an output token limit of 16 so providers
+that reject smaller limits can be probed without request-shape failures.
 The probe SHALL authenticate with the gateway client key from `--key-file`,
 bound each request by `--timeout`, bound response bodies, print a JSON report
 naming each check's status and latency, never print the key, and exit 0 only
@@ -307,6 +309,12 @@ run it periodically as a oneshot user unit.
 WHEN the timer fires repeatedly
 THEN each run probes `--per-run` models in sorted rotation, persisting the
 cursor atomically so every canonical model is covered over successive runs.
+
+#### Scenario: Provider minimum token limit is respected
+
+WHEN a route rejects output token limits below 16
+THEN chat, responses, and messages probes send a limit of 16 rather than
+failing because the probe requested too few tokens.
 
 #### Scenario: Failure is observable
 

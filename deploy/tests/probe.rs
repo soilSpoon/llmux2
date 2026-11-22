@@ -324,6 +324,41 @@ fn nonpositive_or_unrepresentable_timeout_is_an_argument_error() {
 }
 
 #[test]
+fn all_probe_formats_send_provider_compatible_token_limits() {
+    let home = Home::new();
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        models_reply(),
+        Reply::json(200, json!({"choices":[{}]})),
+        Reply::json(200, json!({"output":[]})),
+        Reply::json(200, json!({"content":[{"type":"text"}]})),
+    ]);
+    let output = listen_flag(&home, &gateway, &["--all-formats"]);
+    stop.send(()).unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let requests = gateway.requests.lock().unwrap();
+    let limits: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method == "POST")
+        .map(|request| {
+            let field = if request.path == "/v1/responses" {
+                "max_output_tokens"
+            } else {
+                "max_tokens"
+            };
+            (request.path.as_str(), request.body[field].as_u64())
+        })
+        .collect();
+    assert_eq!(limits.len(), 3);
+    assert!(
+        limits
+            .iter()
+            .all(|(_, limit)| limit.is_some_and(|n| n >= 16)),
+        "probe token limits must be at least 16: {limits:?}"
+    );
+}
+
+#[test]
 fn healthy_gateway_probes_each_route_and_reports_json() {
     let home = Home::new();
     let (gateway, stop) = Gateway::start(vec![
