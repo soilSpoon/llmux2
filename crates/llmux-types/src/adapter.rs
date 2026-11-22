@@ -74,6 +74,43 @@ pub trait ProviderAdapter: Send + Sync + 'static {
     fn observe_limits(&self, _headers: &HeaderMap) -> Option<LimitObservation> {
         None
     }
+
+    /// Provider-side request id found in response `headers`, then in the
+    /// response body's `id`/`request_id` when the body is the provider's
+    /// own payload. Adapters that synthesize the body must override this
+    /// to look at headers only.
+    fn upstream_request_id(&self, headers: &HeaderMap, body: Option<&Bytes>) -> Option<Arc<str>> {
+        header_request_id(headers).or_else(|| body.and_then(body_request_id))
+    }
+}
+
+/// Request id carried in upstream response headers.
+pub fn header_request_id(headers: &HeaderMap) -> Option<Arc<str>> {
+    ["anthropic-request-id", "x-request-id", "request-id"]
+        .iter()
+        .filter_map(|name| headers.get(*name))
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| !value.is_empty())
+        .map(Arc::from)
+}
+
+/// Request id carried in a provider-owned JSON body: `request_id`, `id`,
+/// or `error.request_id`.
+pub fn body_request_id(body: &Bytes) -> Option<Arc<str>> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    for key in ["request_id", "id"] {
+        if let Some(id) = value.get(key).and_then(|v| v.as_str()) {
+            if !id.is_empty() {
+                return Some(Arc::from(id));
+            }
+        }
+    }
+    value
+        .get("error")
+        .and_then(|error| error.get("request_id"))
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.is_empty())
+        .map(Arc::from)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

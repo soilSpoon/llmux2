@@ -346,6 +346,9 @@ fn client_error(status: StatusCode, body: Bytes, convert: bool) -> UpstreamError
         if model_not_found {
             error["code"] = details["code"].clone();
         }
+        if let Some(request_id) = value.get("request_id") {
+            error["request_id"] = request_id.clone();
+        }
         Bytes::from(json!({"error": error}).to_string())
     } else {
         body

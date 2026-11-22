@@ -4,11 +4,13 @@ use bytes::Bytes;
 use http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use llmux_types::{
+    header_request_id,
     provider::{DEEPAI as KIND_DEEPAI, DEEPAI_KEY_HEADER, DEEPAI_TEXT_MODELS},
     AuthMaterial, BuildError, Deployment, GatewayRequest, GatewayResponse, InboundFormat,
     ProviderAdapter, ProviderKind, Support, UpstreamError,
 };
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct DeepAi(ProviderKind);
@@ -29,6 +31,12 @@ impl DeepAi {
 impl ProviderAdapter for DeepAi {
     fn kind(&self) -> &ProviderKind {
         &self.0
+    }
+
+    /// The complete body is synthesized; only upstream response headers
+    /// carry a real request id.
+    fn upstream_request_id(&self, headers: &HeaderMap, _body: Option<&Bytes>) -> Option<Arc<str>> {
+        header_request_id(headers)
     }
 
     fn supports(&self, inbound: InboundFormat) -> Support {

@@ -8,17 +8,33 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use std::{
     fs,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 use tokio::time::timeout;
 
 struct Upstream {
     bodies: Mutex<Vec<Value>>,
+    calls: AtomicUsize,
 }
 
 async fn messages(State(up): State<Arc<Upstream>>, body: Bytes) -> impl IntoResponse {
     let request: Value = serde_json::from_slice(&body).unwrap();
     up.bodies.lock().unwrap().push(request);
+    if up.calls.fetch_add(1, Ordering::Relaxed) == 1 {
+        // A rejected request carries its provider id only in the error body.
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "type": "error",
+                "request_id": "req_err_99",
+                "error": {"type": "invalid_request_error", "message": "bad request"}
+            })),
+        )
+            .into_response();
+    }
     Json(json!({
         "id": "msg_01XFDUD",
         "type": "message",
@@ -28,12 +44,14 @@ async fn messages(State(up): State<Arc<Upstream>>, body: Bytes) -> impl IntoResp
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 1, "output_tokens": 1}
     }))
+    .into_response()
 }
 
 #[tokio::test]
 async fn request_log_attributes_key_images_and_upstream_id() {
     let upstream = Arc::new(Upstream {
         bodies: Mutex::new(Vec::new()),
+        calls: AtomicUsize::new(0),
     });
     let server = TestServer::start(
         Router::new()
@@ -104,6 +122,22 @@ upstream_model = "claude-upstream"
     .unwrap()
     .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+
+    // A rejected request still records the provider id from the error body.
+    let response = timeout(
+        Duration::from_secs(10),
+        client.request(
+            Request::post(format!("{}/v1/messages", gateway.url()))
+                .header(header::AUTHORIZATION, "Bearer client-key")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from(body.to_string())))
+                .unwrap(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_ne!(response.status(), StatusCode::OK);
     drop(gateway);
     drop(server);
 
@@ -116,7 +150,7 @@ upstream_model = "claude-upstream"
                     .lines()
                     .map(|line| serde_json::from_str(line).unwrap())
                     .collect();
-                if !found.is_empty() {
+                if found.len() == 2 {
                     break;
                 }
             }
@@ -124,7 +158,7 @@ upstream_model = "claude-upstream"
         }
         found
     };
-    assert_eq!(lines.len(), 1);
+    assert_eq!(lines.len(), 2);
     let record = &lines[0];
     assert_eq!(record["upstream_request_id"], "msg_01XFDUD");
     assert_eq!(record["image_count"], 1);
@@ -135,4 +169,6 @@ upstream_model = "claude-upstream"
     );
     assert_ne!(fingerprint, "client-key");
     assert_eq!(record["outcome"], "routed");
+    assert_eq!(lines[1]["outcome"], "error");
+    assert_eq!(lines[1]["upstream_request_id"], "req_err_99");
 }

@@ -854,26 +854,22 @@ impl Executor {
         binding.adapter.build_request(req, dep, &auth).await
     }
 
-    /// Provider request ids come from response headers (`x-request-id`,
-    /// `request-id`, `anthropic-request-id`) or a complete body's `id` field.
-    fn upstream_request_id(headers: &HeaderMap, body: Option<&Bytes>) -> Option<Arc<str>> {
-        for name in ["anthropic-request-id", "x-request-id", "request-id"] {
-            if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
-                if !value.is_empty() {
-                    return Some(Arc::from(value));
-                }
+    /// A provider id found only in an error body still gets recorded, so a
+    /// flag matched by `request_id` works for rejected requests too.
+    fn record_error_request_id(
+        adapter: &dyn ProviderAdapter,
+        error: &UpstreamError,
+        trace: &mut RouteTrace,
+    ) {
+        let body = match error {
+            UpstreamError::BadRequest { body, .. } | UpstreamError::ModelNotFound { body, .. } => {
+                body
             }
+            _ => return,
+        };
+        if let Some(id) = adapter.upstream_request_id(&HeaderMap::new(), Some(body)) {
+            trace.upstream_request_id = Some(id);
         }
-        if let Some(body) = body {
-            if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(body) {
-                if let Some(id) = map.get("id").and_then(serde_json::Value::as_str) {
-                    if !id.is_empty() {
-                        return Some(Arc::from(id));
-                    }
-                }
-            }
-        }
-        None
     }
 
     async fn attempt(
@@ -885,6 +881,7 @@ impl Executor {
         needed: u64,
         trace: &mut RouteTrace,
     ) -> Result<GatewayResponse, GatewayError> {
+        trace.upstream_request_id = None;
         let response = match binding.adapter.invoke(req, dep).await {
             Some(local) => local.map_err(GatewayError::Client)?,
             None => {
@@ -905,11 +902,15 @@ impl Executor {
                     {
                         binding.limits.observe(observed, self.cfg.cooldown.max);
                     }
-                    if let Some(id) = Self::upstream_request_id(response.headers(), None) {
-                        trace.upstream_request_id = Some(id);
-                    }
+                    trace.upstream_request_id = binding
+                        .adapter
+                        .upstream_request_id(response.headers(), None);
                     match binding.adapter.parse_response(req, dep, response).await {
-                        Err(error) if repairs < MAX_REPAIRS => {
+                        Err(error) => {
+                            Self::record_error_request_id(&*binding.adapter, &error, trace);
+                            if repairs >= MAX_REPAIRS {
+                                return Err(GatewayError::Client(error));
+                            }
                             let Some(repaired) = binding.adapter.repair_rejected(&body, &error)
                             else {
                                 return Err(GatewayError::Client(error));
@@ -929,8 +930,8 @@ impl Executor {
         let response = match response {
             GatewayResponse::Complete { .. } if !req.stream => {
                 if let GatewayResponse::Complete { headers, body, .. } = &response {
-                    if let Some(id) = Self::upstream_request_id(headers, Some(body)) {
-                        trace.upstream_request_id = Some(id.clone());
+                    if let Some(id) = binding.adapter.upstream_request_id(headers, Some(body)) {
+                        trace.upstream_request_id = Some(id);
                     }
                 }
                 return Ok(response);
