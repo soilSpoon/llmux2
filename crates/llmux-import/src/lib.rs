@@ -894,8 +894,9 @@ pub fn import_with_options(
         let mut header_refs = serde_json::Map::new();
         for (name, value) in headers {
             // Deterministic per connection+header name so a scheduled
-            // re-import resolves the same secret file.
-            let id = unique(&format!("upstream-header-{source_id}-{name}"), &mut ids);
+            // re-import resolves the same secret file; the `header-` prefix
+            // can never collide with `upstream-{source_id}` credential names.
+            let id = unique(&format!("header-{source_id}-{name}"), &mut ids);
             header_refs.insert(name, write_secret(&dir, &id, &value)?.into());
         }
         if source_id.is_empty() || !source_ids.insert(source_id.to_owned()) {
