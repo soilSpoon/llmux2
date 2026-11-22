@@ -1,0 +1,415 @@
+//! Live `devin models` catalog: configured names stay the allowlist, a successful
+//! load hides a Devin id the CLI no longer has, and a chat request is not sent
+//! to that stale upstream.
+
+use axum::body::{Body, Bytes};
+use http::{header, Request, StatusCode};
+use http_body_util::{BodyExt, Full};
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use llmux_config::RuntimeConfig;
+use llmux_providers::DevinAcpConfig;
+use llmux_testkit::TestServer;
+use serde_json::{json, Value};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+use tokio::time::{timeout, Instant};
+
+enum ModelsMode {
+    /// Prints a catalog that still has `swe-2-high` and not `swe-2-retired`.
+    Live,
+    /// Exits without a catalog. Must not hide configured names.
+    Fail,
+    /// Blocks until `release` exists, so a chat request can prove it does not wait.
+    Block,
+}
+
+struct Gateway {
+    server: TestServer,
+    calls: PathBuf,
+    acp_log: PathBuf,
+    release: PathBuf,
+    _home: tempfile::TempDir,
+}
+
+impl Gateway {
+    async fn start(mode: ModelsMode) -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("devin");
+        let calls = home.path().join("calls");
+        let acp_log = home.path().join("acp.log");
+        let release = home.path().join("release");
+        let key = home.path().join("client");
+        fs::write(&key, "test-client\n").unwrap();
+        fs::create_dir_all(home.path().join(".local/share")).unwrap();
+        fs::write(home.path().join(".local/share/marker"), "").unwrap();
+        write_cli(&bin, &calls, &acp_log, &release, mode);
+
+        let config = format!(
+            r#"
+[server]
+client_keys = ["file:{}"]
+request_timeout_ms = 4000
+
+[[models]]
+name = "retired"
+aliases = ["old-swe"]
+
+[[models.deployments]]
+id = "retired-devin"
+auth = "none"
+provider = "devin_acp"
+upstream_model = "swe-2-retired"
+priority = 0
+
+[[models]]
+name = "swe"
+aliases = ["swe-alias"]
+
+[[models.deployments]]
+id = "swe-stale"
+auth = "none"
+provider = "devin_acp"
+upstream_model = "swe-2-retired"
+priority = 0
+
+[[models.deployments]]
+id = "swe-live"
+auth = "none"
+provider = "devin_acp"
+upstream_model = "swe-2-high"
+priority = 10
+
+[[models]]
+name = "combo"
+
+[[models.deployments]]
+id = "combo-stale"
+auth = "none"
+provider = "devin_acp"
+upstream_model = "swe-2-retired"
+priority = 0
+
+[[models.deployments]]
+id = "combo-openai"
+auth = "none"
+provider = "openai_compat"
+base_url = "http://127.0.0.1:9/v1"
+upstream_model = "plain-upstream"
+priority = 10
+
+[[models]]
+name = "plain"
+
+[[models.deployments]]
+id = "plain-openai"
+auth = "none"
+provider = "openai_compat"
+base_url = "http://127.0.0.1:9/v1"
+upstream_model = "plain-upstream"
+priority = 0
+
+[[models]]
+name = "gone"
+
+[[models.deployments]]
+id = "gone-devin"
+auth = "none"
+provider = "devin_acp"
+upstream_model = "swe-2-retired"
+priority = 0
+"#,
+            key.display()
+        );
+
+        let router = llmux_server::app_with_devin(
+            RuntimeConfig::parse(&config).unwrap(),
+            DevinAcpConfig {
+                binary: bin,
+                home: home.path().to_owned(),
+                turn_timeout: Duration::from_secs(10),
+            },
+        )
+        .await
+        .unwrap();
+        let server = TestServer::start(router).await.unwrap();
+        Self {
+            server,
+            calls,
+            acp_log,
+            release,
+            _home: home,
+        }
+    }
+
+    fn calls(&self) -> Vec<String> {
+        fs::read_to_string(&self.calls)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn acp_log(&self) -> String {
+        fs::read_to_string(&self.acp_log).unwrap_or_default()
+    }
+
+    async fn models(&self) -> Vec<String> {
+        let response = request(
+            &self.server,
+            "GET",
+            "/v1/models",
+            None,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let list: Value = serde_json::from_str(&body(response).await).unwrap();
+        list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    async fn chat(&self, model: &str, limit: Duration) -> http::Response<Body> {
+        let payload = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+        request(
+            &self.server,
+            "POST",
+            "/v1/chat/completions",
+            Some(payload.to_string()),
+            limit,
+        )
+        .await
+    }
+}
+
+impl Drop for Gateway {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.release, "go");
+    }
+}
+
+fn write_cli(bin: &Path, calls: &Path, acp_log: &Path, release: &Path, mode: ModelsMode) {
+    let models = match mode {
+        ModelsMode::Fail => "exit 1".to_owned(),
+        ModelsMode::Live => concat!(
+            "printf '  swe-2-high   SWE-2 High  [262K context, Free]\\n'\n",
+            "printf '  adaptive   Adaptive  [1K context]\\n'\n",
+            "exit 0"
+        )
+        .to_owned(),
+        ModelsMode::Block => format!(
+            "while [ ! -f '{}' ]; do sleep 0.05; done\n{}",
+            release.display(),
+            concat!(
+                "printf '  swe-2-high   SWE-2 High  [262K context, Free]\\n'\n",
+                "exit 0"
+            )
+        ),
+    };
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$1" >> '{calls}'
+if [ "$1" = models ]; then
+{models}
+fi
+test -f "$XDG_DATA_HOME/marker" || exit 3
+while read -r line; do
+  printf '%s\n' "$line" >> '{acp}'
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id";;
+    *'"session/new"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"s1"}}}}\n' "$id";;
+    *'"session/prompt"'*)
+      printf '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"text":"ok"}}}}}}}}\n'
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"stopReason":"end_turn"}}}}\n' "$id";;
+  esac
+done
+"#,
+        calls = calls.display(),
+        acp = acp_log.display(),
+        models = models,
+    );
+    fs::write(bin, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(bin, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+fn models_invocations(calls: &[String]) -> usize {
+    calls
+        .iter()
+        .filter(|call| call.as_str() == "models")
+        .count()
+}
+
+async fn request(
+    server: &TestServer,
+    method: &str,
+    path: &str,
+    payload: Option<String>,
+    limit: Duration,
+) -> http::Response<Body> {
+    let request = Request::builder()
+        .method(method)
+        .uri(format!("{}{path}", server.url()))
+        .header(header::AUTHORIZATION, "Bearer test-client")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(payload.unwrap_or_default())))
+        .unwrap();
+    timeout(
+        limit,
+        Client::builder(TokioExecutor::new())
+            .build_http()
+            .request(request),
+    )
+    .await
+    .expect("request timed out")
+    .unwrap()
+    .map(Body::new)
+}
+
+async fn body(response: http::Response<Body>) -> String {
+    let bytes = timeout(Duration::from_secs(5), response.into_body().collect())
+        .await
+        .unwrap()
+        .unwrap()
+        .to_bytes();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn stale_devin_id_is_omitted_after_a_successful_catalog_load() {
+    let gateway = Gateway::start(ModelsMode::Live).await;
+    let ids = gateway.models().await;
+    assert_eq!(
+        ids,
+        ["combo", "plain", "swe", "swe-alias"],
+        "a configured Devin id missing from the loaded catalog must be omitted, and catalog-only ids must not be added"
+    );
+    let again = gateway.models().await;
+    assert_eq!(again, ids);
+    assert_eq!(
+        models_invocations(&gateway.calls()),
+        1,
+        "a second list within the refresh interval must reuse the cached catalog"
+    );
+}
+
+#[tokio::test]
+async fn failed_catalog_load_does_not_hide_configured_names() {
+    let gateway = Gateway::start(ModelsMode::Fail).await;
+    let ids = gateway.models().await;
+    assert_eq!(
+        ids,
+        [
+            "combo",
+            "gone",
+            "old-swe",
+            "plain",
+            "retired",
+            "swe",
+            "swe-alias"
+        ],
+        "a failed load must leave the configured allowlist unchanged"
+    );
+    assert!(!ids.iter().any(|id| id == "adaptive"));
+    let again = gateway.models().await;
+    assert_eq!(again, ids);
+    assert_eq!(
+        models_invocations(&gateway.calls()),
+        1,
+        "a failed refresh must be attempted, then cached as a failure for the interval"
+    );
+}
+
+#[tokio::test]
+async fn stale_devin_deployment_is_skipped_for_a_same_model_fallback() {
+    let gateway = Gateway::start(ModelsMode::Live).await;
+    // Listing waits for the first catalog attempt. Chat must then skip the stale leg.
+    let _ = gateway.models().await;
+
+    let response = gateway.chat("swe", Duration::from_secs(5)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-llmux-deployment"], "swe-live");
+    assert_eq!(response.headers()["x-llmux-attempts"], "1");
+    let payload: Value = serde_json::from_str(&body(response).await).unwrap();
+    assert_eq!(payload["model"], "swe-2-high");
+    let acp = gateway.acp_log();
+    assert!(
+        acp.contains("swe-2-high"),
+        "the live same-model deployment should have been invoked: {acp}"
+    );
+    assert!(
+        !acp.contains("swe-2-retired"),
+        "a stale upstream must not be invoked: {acp}"
+    );
+
+    let before = gateway.acp_log();
+    let gone = gateway.chat("gone", Duration::from_secs(5)).await;
+    assert_eq!(gone.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(!gone.headers().contains_key(header::RETRY_AFTER));
+    let error: Value = serde_json::from_str(&body(gone).await).unwrap();
+    assert_eq!(error["error"]["code"], "rate_limit_exceeded");
+    assert_eq!(error["error"]["message"], "No upstream currently available");
+    assert_eq!(
+        gateway.acp_log(),
+        before,
+        "an exhausted model must not be rewritten onto another model's deployment"
+    );
+    assert_eq!(models_invocations(&gateway.calls()), 1);
+}
+
+#[tokio::test]
+async fn concurrent_lists_share_one_catalog_refresh() {
+    let gateway = Gateway::start(ModelsMode::Block).await;
+    let release = gateway.release.clone();
+    let lists = async {
+        let (left, right) = tokio::join!(gateway.models(), gateway.models());
+        (left, right)
+    };
+    let releaser = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        fs::write(release, "go").unwrap();
+    });
+    let (left, right) = timeout(Duration::from_secs(5), lists)
+        .await
+        .expect("concurrent lists waited on two catalog refreshes");
+    releaser.await.unwrap();
+    assert_eq!(left, ["combo", "plain", "swe", "swe-alias"]);
+    assert_eq!(right, left);
+    assert_eq!(
+        models_invocations(&gateway.calls()),
+        1,
+        "overlapping lists must share one in-flight refresh"
+    );
+}
+
+#[tokio::test]
+async fn chat_does_not_wait_for_a_devin_catalog_refresh() {
+    let gateway = Gateway::start(ModelsMode::Block).await;
+    let started = Instant::now();
+    let response = gateway.chat("retired", Duration::from_secs(2)).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "chat blocked on devin models for {:?}",
+        started.elapsed()
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-llmux-deployment"], "retired-devin");
+    assert_eq!(
+        models_invocations(&gateway.calls()),
+        1,
+        "chat should kick a background refresh without waiting for it"
+    );
+}

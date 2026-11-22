@@ -1,7 +1,7 @@
 {
   "devin_review_status_context": "Devin Review",
   "devin_review_markers": ["<!-- devin-review-summary -->", "<!-- devin-review-session-triaged -->"],
-  "verifier_logins": ["devin-ai-integration", "soilspoon"],
+  "verifier_logins": ["devin-ai-integration", "soilspoon", "capy-ai"],
   "blocking_markers": {
     "codesolarlght": ["Changes recommended"]
   },

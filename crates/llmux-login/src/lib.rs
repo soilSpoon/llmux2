@@ -1,6 +1,7 @@
 //! OpenAI Sign in with ChatGPT authorization-code flow.
 
 mod http;
+pub mod nous;
 mod storage;
 
 use axum::{
@@ -68,6 +69,8 @@ pub enum Error {
     PlanPermission,
     #[error("required OAuth scope {0} was not granted")]
     MissingScope(&'static str),
+    #[error("{0}")]
+    Poll(String),
 }
 
 impl Error {

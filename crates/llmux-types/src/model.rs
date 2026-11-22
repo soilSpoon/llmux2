@@ -46,6 +46,9 @@ pub enum ChatRequestField {
     ReasoningEffort,
     Logprobs,
     TopLogprobs,
+    Temperature,
+    TopP,
+    TopK,
 }
 
 #[derive(Debug)]

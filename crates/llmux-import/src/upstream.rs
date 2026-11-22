@@ -1,6 +1,9 @@
 use crate::{string, PROVIDERS};
 use http::Uri;
-use llmux_types::provider::{ANTHROPIC as KIND_ANTHROPIC, OPENAI_COMPAT as KIND_OPENAI_COMPAT};
+use llmux_types::provider::{
+    ANTHROPIC as KIND_ANTHROPIC, DEVIN_ACP as DEVIN_ACP_KIND, DEVIN_ACP_BASE_URL,
+    OPENAI_COMPAT as KIND_OPENAI_COMPAT,
+};
 use serde_json::{json, Value};
 use std::net::IpAddr;
 
@@ -9,6 +12,9 @@ pub(super) const PROVIDER_ALIASES: &[(&str, &str)] = &[
     ("kc", "kilocode"),
     ("cfpd", "cloudflare-direct"),
     ("cfp", "cloudflare-playground"),
+    ("dva", "devin-cli-agentic"),
+    ("xao", "xai-oauth"),
+    ("cx", "codex"),
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -204,6 +210,9 @@ pub(super) fn resolve(
     warnings: &mut Vec<String>,
 ) -> Result<(String, String), &'static str> {
     let id = string(connection, "provider");
+    if crate::devin::bridge(id) {
+        return Ok((DEVIN_ACP_KIND.into(), DEVIN_ACP_BASE_URL.into()));
+    }
     let (kind, fallback) = if let Some((_, kind, url)) = PROVIDERS.iter().find(|(p, _, _)| *p == id)
     {
         (*kind, *url)
@@ -237,12 +246,15 @@ pub(super) fn resolve(
     if url.is_empty() {
         return Err("missing upstream base URL");
     }
+    let identity = super::connection::identity(connection, nodes);
     let url = if ProviderIdentity::connection(id, nodes).is_builtin("morph")
         && local_host(url, false)
     {
         warnings.push(format!("connection {}: reviewed Morph loopback override replaced with official https://api.morphllm.com/v1", string(connection, "id")));
         super::morph::OFFICIAL_URL
-    } else if local_host(url, true) {
+    } else if local_host(url, true)
+        && !(local_host(url, false) && super::connection::keyed_loopback_bridge(identity))
+    {
         return Err("loopback/localhost upstream; configure a reachable connection base URL");
     } else {
         url

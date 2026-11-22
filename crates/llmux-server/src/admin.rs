@@ -169,7 +169,9 @@ async fn reload(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
                 .into_response()
         }
     };
-    match build(config).await {
+    let devin = llmux_providers::DevinAcpConfig::from_env();
+    state.catalog.set_config(devin.clone());
+    match build(config, devin, state.catalog.live()).await {
         Ok((config, executor)) => {
             let models: Vec<String> = config
                 .models
