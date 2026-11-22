@@ -229,13 +229,20 @@ declared position.
   prefix, the combo is unreviewed or billed, or the combo uses round-robin
 - **THEN** the combo's deployments are unchanged
 
-### Requirement: Reviewed Respan secondary routes
+### Requirement: Reviewed secondary routes
 For the existing source combo `gpt-6-luna`, the importer SHALL append the
 ordered upstream IDs `gpt-6-luna`, `openai/gpt-6-luna`, and
 `perplexity/gpt-6-luna` after surviving source legs, using one active, usable
 API-key custom openai_compat connection whose node prefix is `respan` and whose
 normalized endpoint is exactly `https://api.respan.ai/api/v1`. This reviewed
-tuple follows OCI verification of Responses JSON and SSE. Azure OpenAI, Azure
+tuple follows OCI verification of Responses JSON and SSE. For the existing
+source combo `kimi-k3.1-pro`, the importer SHALL append `morph-kimik31` after
+surviving source legs using one active, usable API-key builtin `morph`
+connection whose endpoint is exactly `https://api.morphllm.com/v1`; a builtin
+reviewed secondary needs no provider node, and free-first routing keeps the
+declared numes leg primary. This reviewed tuple follows OCI verification that
+the pod-internal `cfpd` sidecar is unreachable from the llmux2 host and that
+Morph serves the Kimi traffic. Azure OpenAI, Azure
 Foundry and Bedrock variants SHALL NOT be added by this policy.
 The importer SHALL use the first eligible connection in existing priority
 order, skip each upstream ID already deployed on that endpoint, preserve source
@@ -434,12 +441,10 @@ and `openai_compat` for the sidecar.
 ### Requirement: Reviewed same-model bridge replacements
 
 With `--openrouter-replacements`, the importer SHALL also replace only the
-DuckDuckGo, DeepAI Code and `cloudflare-direct`/`cfpd` model IDs explicitly
-reviewed in `src/bridge.rs` with the same declared model family, version and
-size on eligible connected official endpoints — including reviewed Morph
-targets such as `morph-kimik31` for `moonshotai/kimi-k3.1-pro`. It SHALL NOT
-import bridge authentication, infer a similar model, use Codex/Factory/
-OpenRouter targets, or relax Workers AI eligibility.
+DuckDuckGo and DeepAI Code model IDs explicitly reviewed in `src/bridge.rs`
+with the same declared model family, version and size on eligible connected
+official endpoints. It SHALL NOT import bridge authentication, infer a similar
+model, use Codex/Factory/OpenRouter targets, or relax Workers AI eligibility.
 
 #### Scenario: Bridge leg expansion and precedence
 

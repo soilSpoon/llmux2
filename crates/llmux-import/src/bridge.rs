@@ -9,18 +9,14 @@ use std::collections::BTreeMap;
 pub(super) fn source(provider: &ProviderIdentity, nodes: &[Value]) -> Option<&'static str> {
     if provider.is_builtin("duckduckgo-web") {
         Some("duckduckgo-web")
-    } else if provider.is_builtin("cloudflare-direct") {
-        Some("cfpd")
+    } else if nodes.iter().any(|node| {
+        matches!(provider, ProviderIdentity::Custom(id) if id == string(node, "id"))
+            && string(node, "prefix") == "deepai"
+            && string(node, "type") == "openai-compatible"
+    }) {
+        Some("deepai")
     } else {
-        let node = nodes.iter().find(|node| {
-            matches!(provider, ProviderIdentity::Custom(id) if id == string(node, "id"))
-                && string(node, "type") == "openai-compatible"
-        })?;
-        match string(node, "prefix") {
-            "deepai" => Some("deepai"),
-            "cloudflare-direct" => Some("cfpd"),
-            _ => None,
-        }
+        None
     }
 }
 
@@ -43,15 +39,11 @@ pub(super) fn seed(
     nodes: &[Value],
     connections: &[Connection],
 ) {
-    let providers = std::iter::once(ProviderIdentity::Builtin("duckduckgo-web".into()))
-        .chain(std::iter::once(ProviderIdentity::Builtin(
-            "cloudflare-direct".into(),
-        )))
-        .chain(
-            nodes
-                .iter()
-                .map(|node| ProviderIdentity::Custom(string(node, "id").into())),
-        );
+    let providers = std::iter::once(ProviderIdentity::Builtin("duckduckgo-web".into())).chain(
+        nodes
+            .iter()
+            .map(|node| ProviderIdentity::Custom(string(node, "id").into())),
+    );
     for provider in providers {
         let Some(source) = source(&provider, nodes) else {
             continue;
@@ -83,17 +75,10 @@ pub(super) fn seed(
 fn routes(source: &str) -> &'static [replacements::Route] {
     match source {
         "duckduckgo-web" => DUCKDUCKGO,
-        "cfpd" => CFPD,
         "deepai" => DEEPAI,
         _ => &[],
     }
 }
-
-// The cfpd sidecar is a pod-internal Cloudflare bridge the llmux2 host
-// cannot reach, and Workers policy gates it to free-eligible models.
-// OCI verified Morph's morph-kimik31 serves this traffic on the
-// already-imported Morph key.
-const CFPD: &[replacements::Route] = &[("moonshotai/kimi-k3.1-pro", "morph", "morph-kimik31")];
 
 // OmniRoute open-sse/executors/duckduckgo-web/models.ts and
 // open-sse/config/freeModelCatalog.data.ts identify these exact models.
