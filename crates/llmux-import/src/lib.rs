@@ -57,6 +57,11 @@ pub struct ImportOptions<'a> {
     pub nous_state: Option<&'a Path>,
     pub nous_models: Option<&'a Path>,
     pub omniroute_fallback: Option<OmniRouteFallback<'a>>,
+    /// JSON list of dead route names (e.g. `llmux2-probe --dead-file` output).
+    /// Listed models are dropped from the import instead of being advertised,
+    /// their aliases are pruned, and with `--omniroute-fallback` they land in
+    /// the catch-all's `exclude` so the wildcard never serves them again.
+    pub exclude_models: Option<&'a Path>,
 }
 
 #[derive(Clone, Copy)]
@@ -672,6 +677,25 @@ pub fn import_with_options(
     options: &ImportOptions<'_>,
 ) -> Result<ImportReport, String> {
     let policy = policy::Policy::load(options)?;
+    let mut dead: HashSet<String> = match options.exclude_models {
+        Some(path) => serde_json::from_str::<Vec<String>>(
+            &fs::read_to_string(path)
+                .map_err(|e| format!("could not read --exclude-models {}: {e}", path.display()))?,
+        )
+        .ok()
+        .and_then(|list| {
+            list.iter()
+                .all(|name| !name.is_empty() && !name.contains('*'))
+                .then(|| list.into_iter().collect())
+        })
+        .ok_or_else(|| {
+            format!(
+                "--exclude-models {} must be a JSON array of nonempty model names",
+                path.display()
+            )
+        })?,
+        None => HashSet::new(),
+    };
     let nous = match (options.nous_state, options.nous_models) {
         (None, None) => None,
         (Some(state), Some(models)) => Some(nous::Nous::load(state, models)?),
@@ -1094,7 +1118,7 @@ pub fn import_with_options(
             }
         }
     }
-    let (aliases, mut synthetic, unavailable_aliases) = aliases::prepare(
+    let (mut aliases, mut synthetic, unavailable_aliases) = aliases::prepare(
         &root,
         &combos,
         &combo_ids,
@@ -1105,6 +1129,15 @@ pub fn import_with_options(
             .openrouter_replacements
             .then_some(&unavailable_combos),
     );
+    // Aliases into a dead route die with it and join the exclusion set so the
+    // catch-all cannot resurrect them either.
+    aliases.retain(|alias, target| {
+        let keep = !dead.contains(alias) && !dead.contains(target);
+        if !keep {
+            dead.insert(alias.clone());
+        }
+        keep
+    });
     direct.extend(direct::collect(&synthetic, nodes, &connections));
     for (name, model) in direct {
         let official = policy.openrouter_replacements
@@ -1127,6 +1160,12 @@ pub fn import_with_options(
     context.reset_usage();
     let mut deployment_ids = HashSet::new();
     for name in order {
+        if dead.contains(&name) {
+            warnings.push(format!(
+                "model {name}: dropped dead route listed in --exclude-models"
+            ));
+            continue;
+        }
         let lookup = if synthetic.contains_key(&name) {
             &synthetic
         } else {
@@ -1231,6 +1270,8 @@ pub fn import_with_options(
         credentials.push(
             json!({"id":credential,"kind":"api_key","provider":"openai_compat","key":options.key}),
         );
+        let mut exclusions = exclusions.clone();
+        exclusions.extend(dead.iter().cloned());
         let session_excluded = exclusions.clone();
         fallback::append(
             &mut models,
@@ -1261,7 +1302,8 @@ pub fn import_with_options(
             })
             .map(str::to_owned)
             .collect();
-        let added = nous.models(&credential, &taken, &mut deployment_ids, &mut warnings);
+        let mut added = nous.models(&credential, &taken, &mut deployment_ids, &mut warnings);
+        added.retain(|model| !dead.contains(string(model, "name")));
         if !added.is_empty() {
             credentials.push(nous.credential(&credential));
             models.extend(added);

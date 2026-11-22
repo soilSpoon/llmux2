@@ -142,6 +142,14 @@ model. `--all-formats` additionally probes `/v1/responses` and `/v1/messages`
 once each with the first model, covering the other inbound wire formats.
 `--models a,b` pins an explicit set instead of rotating.
 
+The state file also accumulates each probed model's consecutive failure
+streak. A model whose last `--dead-after` probes (default 2) all returned
+404 — a deterministic "the upstream cannot serve this" — is listed under
+`dead` in the report, and `--dead-file PATH` writes those names as a JSON
+list that `llmux-import --exclude-models` consumes so the next import drops
+them instead of advertising them. Transient failures (429 cooldowns, 502
+upstream errors) never count toward dead.
+
 `--listen` defaults to the gateway's default `127.0.0.1:8080`; the shipped
 unit passes `127.0.0.1:8090` for the OCI slots.
 

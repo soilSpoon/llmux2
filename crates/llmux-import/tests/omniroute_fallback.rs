@@ -128,6 +128,75 @@ fn fallback_is_last_and_codex_routes_are_excluded() {
 }
 
 #[test]
+fn exclude_models_drops_dead_routes_and_their_aliases() {
+    let mut dead_list = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+    std::io::Write::write_all(
+        &mut dead_list,
+        br#"["public","mapped-owner","owner-alias"]"#,
+    )
+    .unwrap();
+    let (dir, result) = run(
+        &fixture(),
+        &[
+            "--omniroute-fallback",
+            "http://127.0.0.1:20128/v1",
+            "--omniroute-key",
+            "KEY_REF",
+            "--exclude-models",
+            dead_list.path().to_str().unwrap(),
+        ],
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("public") && stderr.contains("dropped"),
+        "{stderr}"
+    );
+    let cfg =
+        RuntimeConfig::parse(&fs::read_to_string(dir.path().join("out.toml")).unwrap()).unwrap();
+    for gone in ["public", "public-alias", "mapped-owner", "owner-alias"] {
+        assert!(!cfg.model_names.contains_key(gone), "{gone}");
+    }
+    // A dropped route is never served again: it lands in the catch-all
+    // exclusion list, and aliases resolving to it (public-alias) or into a
+    // dropped mapping are pruned too.
+    for excluded in ["public", "public-alias", "mapped-owner", "owner-alias"] {
+        assert!(
+            cfg.catch_all_exclude.contains(&excluded.to_string()),
+            "{excluded}"
+        );
+    }
+    // Surviving models still work: nested-owner stays advertised, and the
+    // "chain" alias still resolves to it through the dropped owner-alias.
+    assert_eq!(cfg.model_names["chain"], cfg.model_names["nested-owner"]);
+}
+
+#[test]
+fn exclude_models_rejects_malformed_lists_without_writing_config() {
+    for body in [r#"["ok", 1]"#, r#"{"not":"a list"}"#, "not json", r#"[""]"#] {
+        let mut dead_list = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        std::io::Write::write_all(&mut dead_list, body.as_bytes()).unwrap();
+        let (dir, result) = run(
+            &fixture(),
+            &[
+                "--omniroute-fallback",
+                "http://127.0.0.1:20128/v1",
+                "--omniroute-key",
+                "KEY_REF",
+                "--exclude-models",
+                dead_list.path().to_str().unwrap(),
+            ],
+        );
+        assert!(!result.status.success(), "{body}");
+        assert!(!dir.path().join("out.toml").exists(), "{body}");
+    }
+}
+
+#[test]
 fn rejects_unrepresentable_codex_mapping_without_writing_config() {
     for pattern in ["private-?", "private-*-suffix", "private-**"] {
         let mut root = fixture();
