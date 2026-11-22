@@ -16,6 +16,7 @@ enum Action {
     Deploy {
         binary: Option<PathBuf>,
         config: Option<PathBuf>,
+        canary: f64,
     },
     Help(String),
 }
@@ -60,7 +61,7 @@ fn parse(args: &[OsString], guard: bool) -> std::result::Result<Action, String> 
             "usage: llmux2-deploy {} {}\n",
             command.to_string_lossy(),
             if command == "deploy" {
-                "[-h] [--binary BINARY] [--config CONFIG]"
+                "[-h] [--binary BINARY] [--config CONFIG] [--canary SECONDS]"
             } else {
                 "[-h]"
             }
@@ -78,11 +79,12 @@ fn parse(args: &[OsString], guard: bool) -> std::result::Result<Action, String> 
     }
     let mut binary = None;
     let mut config = None;
+    let mut canary = 0.0;
     let mut index = 1;
     while index < args.len() {
         if args[index] == "-h" || args[index] == "--help" {
             return Ok(Action::Help(
-                "usage: llmux2-deploy deploy [-h] [--binary BINARY] [--config CONFIG]\n".into(),
+                "usage: llmux2-deploy deploy [-h] [--binary BINARY] [--config CONFIG] [--canary SECONDS]\n".into(),
             ));
         }
         let bytes = args[index].as_bytes();
@@ -96,8 +98,9 @@ fn parse(args: &[OsString], guard: bool) -> std::result::Result<Action, String> 
             },
         );
         let target = match flag.to_str() {
-            Some("--binary") => &mut binary,
-            Some("--config") => &mut config,
+            Some("--binary") => Some(&mut binary),
+            Some("--config") => Some(&mut config),
+            Some("--canary") => None,
             _ => {
                 return Err(format!(
                     "unrecognized arguments: {}",
@@ -110,16 +113,34 @@ fn parse(args: &[OsString], guard: bool) -> std::result::Result<Action, String> 
         } else {
             index += 1;
             args.get(index)
-                .filter(|s| !s.as_bytes().starts_with(b"-"))
+                .filter(|s| !s.as_bytes().starts_with(b"-") || flag == "--canary")
                 .map(OsString::as_os_str)
                 .ok_or_else(|| {
                     format!("argument {}: expected one argument", flag.to_string_lossy())
                 })?
         };
-        *target = Some(PathBuf::from(value));
+        match target {
+            Some(target) => *target = Some(PathBuf::from(value)),
+            None => {
+                canary = value
+                    .to_str()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .ok_or_else(|| {
+                        format!(
+                            "argument --canary: invalid value: '{}'",
+                            value.to_string_lossy()
+                        )
+                    })?;
+            }
+        }
         index += 1;
     }
-    Ok(Action::Deploy { binary, config })
+    Ok(Action::Deploy {
+        binary,
+        config,
+        canary,
+    })
 }
 #[allow(deprecated)]
 fn home() -> Result<PathBuf> {
@@ -141,10 +162,15 @@ fn execute(action: Action) -> Result<()> {
     match action {
         Action::Guard => deployment.guard()?,
         Action::Status => println!("{}", serde_json::to_string_pretty(&deployment.status()?)?),
-        Action::Deploy { binary, config } => {
+        Action::Deploy {
+            binary,
+            config,
+            canary,
+        } => {
             let slot = deployment.deploy(
                 &binary.unwrap_or_else(|| root.join("bin/llmux-server")),
                 &config.unwrap_or_else(|| root.join("llmux.toml")),
+                canary,
             )?;
             println!("active slot: {slot}");
         }

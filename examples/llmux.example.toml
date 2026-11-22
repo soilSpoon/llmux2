@@ -86,3 +86,28 @@ credential = "anthropic-key"
 base_url = "https://api.anthropic.com/v1"
 upstream_model = "claude-sonnet-4-5"
 timeout_ms = 60000
+
+# Devin SWE-2 through the `devin acp` CLI bridge. `devin_acp` takes no
+# credential: the gateway spawns `devin` (LLMUX_DEVIN_BIN, default `devin` on
+# PATH) with HOME pointed at LLMUX_DEVIN_HOME (default $HOME/.devin-sandbox),
+# which must hold the CLI's own credentials.toml. swe-2-high is free.
+[[models]]
+name = "swe-2"
+capabilities = { stream = true, max_context = 262144 }
+
+[[models.deployments]]
+id = "devin-swe2-high"
+auth = "none"
+provider = "devin_acp"
+upstream_model = "swe-2-high"
+priority = 0
+timeout_ms = 120000
+
+# Paid sibling (about $1 / 1M input); enable only when paid Devin usage is wanted.
+# [[models.deployments]]
+# id = "devin-swe2-lightning"
+# auth = "none"
+# provider = "devin_acp"
+# upstream_model = "swe-2-high-lightning"
+# priority = 10
+# timeout_ms = 120000

@@ -79,6 +79,7 @@ or live catalog, not a guarantee that they remain free or available.
 | 5 AI Horde | `https://oai.aihorde.net/v1`; Horde key or public anonymous key | Free queue-based access [H1]; live example `koboldcpp/Artemis-31B-v1.2` [H3]; numerical quota **unverified** | Anonymous lowest priority, may be restricted at high load. Volunteer workers see requests; do not send secrets. Kudos cannot be bought/sold [H1]. Yes via official chat front, not native v2 API. |
 | 6 SambaNova (evaluation only) | Console-issued base URL; historical `https://api.sambanova.ai/v1` **not reverified**; API key | Free Tier without payment method; free table `gpt-oss-120b` and `gemma-4-31B-it`: 20 RPM / 20 RPD / 200,000 TPD [S1] | All SambaCloud models preview, explicitly not for production [S1]. Training/resale/multi-account rules **unverified**; website terms are not API-service terms. Chat SDK yes [S2]; get current URL from console before use. |
 | 7 Cohere (evaluation only) | `https://api.cohere.ai/compatibility/v1`; trial API key | 1,000 calls/month; Command A family 20 requests/min [C1]. Compatibility example `command-a-plus-05-2026` [C2] | Trial/evaluation, not a production serving entitlement. Data training, resale and multi-account clauses **unverified**. Yes, supported compatibility subset. |
+| Devin SWE-2 | local `devin acp` CLI bridge, not an HTTP upstream; `provider = "devin_acp"` with `auth = "none"` | `swe-2-high` marked **Free** in the `devin models` catalog [DV1]; `swe-2-high-lightning` is paid ($1 / 1M input) | Needs the Devin CLI installed and signed in under `LLMUX_DEVIN_HOME`; it runs the owner's own Devin account, so do not treat it as a shared free pool. Chat via the bridge only. |
 | Conditional: Groq | `https://api.groq.com/openai/v1`; API key [R2] | Current free-plan entitlement and numerical free limits **unverified** in retrieved rate-limit page (account Limits page required) [R1]. `openai/gpt-oss-20b`, `openai/gpt-oss-120b` [R2–3] | Do not copy historical 30 RPM/14,400 RPD into config. Organization-scoped limits [R1]; default no retention with exceptions [R4]. Resale/multi-account terms **unverified**. Chat compatible [R2]. |
 | Trial only: Cerebras | `https://api.cerebras.ai/v1`; API key [B2] | $5 credits, verified payment method, expires 30 days; explicitly no permanently free tier [B1]. `gpt-oss-120b`: 5 RPM, 30K uncached TPM, 90K total TPM, 1M TPH/TPD | Not recurring free. `qwen-3.8-27b` also listed; do not infer its separate limits from GPT-OSS. Training/resale/multi-account terms **unverified**. Chat yes. |
 | Trial only: Scaleway | Console endpoint; current base URL/auth details **unverified** in fetched quickstart [SC2] | New customers get 1,000,000 tokens, then paid [SC1]; `glm-5.3` listed | Not verified as recurring monthly. OpenAI-compatible per official product page; billing/retention/resale/multi-account details **unverified**. No ready-to-enable config until endpoint/key confirmed. |
@@ -490,10 +491,33 @@ free eligibility and current free limits before adopting it. No snippets are
 provided for providers whose current offer is paid, retired, provenance-unclear,
 or otherwise not established as free.
 
+### Devin SWE-2 (devin_acp bridge)
+
+Not an HTTP provider: the gateway spawns `devin acp --agent-type summarizer`
+per request over ACP on stdio. `swe-2-high` is marked Free by `devin models`;
+`swe-2-high-lightning` is paid. The CLI must be installed on the gateway host
+(LLMUX_DEVIN_BIN) and signed in under a dedicated home (LLMUX_DEVIN_HOME,
+default `$HOME/.devin-sandbox`).
+
+```toml
+[[models]]
+name = "swe-2"
+capabilities = { stream = true, max_context = 262144 }
+
+[[models.deployments]]
+id = "devin-swe2-high"
+auth = "none"
+provider = "devin_acp"
+upstream_model = "swe-2-high"
+priority = 0
+timeout_ms = 120000
+```
+
 ## Validation performed
 
-All eight TOML blocks were extracted verbatim into separate temporary config
-files outside the repository. A small external Rust harness depending on this
+All eight HTTP-provider TOML blocks were extracted verbatim into separate temporary config
+files outside the repository (the Devin `devin_acp` block below was checked with
+`llmux-server --check` instead, since it is not an `openai_compat` snippet). A small external Rust harness depending on this
 checkout's `llmux-config` called `RuntimeConfig::load` for every file, supplying
 non-secret printable placeholder environment values and asserting one model,
 the expected deployments, and `openai_compat`. No production credentials or upstream
@@ -516,6 +540,14 @@ Parser tests within `cargo test --locked --workspace`:
 ```text
 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
+
+- **DV1** Local `devin models` catalog output on the gateway host:
+  `swe-2-high   SWE-2 High   [262K context, Free]` and
+  `swe-2-high-lightning   SWE-2 High Lightning   [262K context, $1 / 1M Input, new]`.
+  The Devin block above was validated the same way: `llmux-server --check` on a
+  minimal config carrying only the `swe-2` model and its `devin_acp` deployment
+  passed. The catalog is fetched live by the gateway; a stale upstream id is
+  skipped like a cooled deployment (see the routing spec).
 
 This validates config loading only: placeholders, actual account entitlements,
 live generations, upstream payload edge cases and UI rendering were not tested.
