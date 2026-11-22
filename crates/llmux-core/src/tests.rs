@@ -158,6 +158,7 @@ async fn fixture_with_models(
         shared_quota,
         Default::default(),
         false,
+        None,
         [None; 3],
     )
     .await
@@ -173,6 +174,7 @@ async fn fixture_full(
     shared_quota: llmux_types::QuotaSpec,
     second_quota: llmux_types::QuotaSpec,
     split_routes: bool,
+    request_log: Option<std::path::PathBuf>,
     expiry: [Option<SystemTime>; 3],
 ) -> Fixture {
     let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
@@ -242,6 +244,7 @@ async fn fixture_full(
             drain_grace: Duration::from_secs(2),
             expose_routing_headers: true,
             dashboard_key: None,
+            request_log,
             end_user_header: None,
             end_user_salt: None,
             end_user_from_body: false,
@@ -294,8 +297,15 @@ async fn fixture_full(
             }),
         ),
     ]);
+    let log = cfg
+        .server
+        .request_log
+        .as_deref()
+        .map(crate::RequestLog::open)
+        .transpose()
+        .unwrap();
     (
-        Executor::new(Arc::new(cfg), &registry, &credentials).unwrap(),
+        Executor::new(Arc::new(cfg), &registry, &credentials, log).unwrap(),
         adapter,
         credential,
         server,
@@ -410,6 +420,7 @@ async fn expired_deployments_are_skipped() {
         Default::default(),
         Default::default(),
         false,
+        None,
         [
             Some(SystemTime::now() - Duration::from_secs(60)),
             Some(SystemTime::now() + Duration::from_secs(3600)),
@@ -438,6 +449,7 @@ async fn exhaustion_retry_hint_ignores_expired_deployments() {
         Default::default(),
         Default::default(),
         false,
+        None,
         [
             None,
             Some(SystemTime::now() - Duration::from_secs(60)),
@@ -522,6 +534,7 @@ async fn retry_after_excludes_a_deployment_that_does_not_have_the_model() {
             ..Default::default()
         },
         false,
+        None,
         [None; 3],
     )
     .await;
@@ -915,6 +928,7 @@ async fn committed_stream_quota_cools_shared_credential_without_replay() {
             Default::default(),
             Default::default(),
             true,
+            None,
             [None; 3],
         )
         .await;
@@ -1098,6 +1112,7 @@ async fn credential_quota_limits_the_credentials_deployments() {
             ..Default::default()
         },
         false,
+        None,
         [None; 3],
     )
     .await;
@@ -1119,6 +1134,7 @@ async fn exhausted_quota_cools_every_deployment_on_the_credential() {
         Default::default(),
         Default::default(),
         true,
+        None,
         [None; 3],
     )
     .await;
@@ -1154,6 +1170,7 @@ async fn credential_peers_cool_only_until_the_quota_resets() {
         Default::default(),
         Default::default(),
         true,
+        None,
         [None; 3],
     )
     .await;
@@ -1181,6 +1198,75 @@ async fn credential_peers_cool_only_until_the_quota_resets() {
         ["dep0", "dep1"],
         "dep0's own route limit is not the key's"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn request_log_records_each_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, _adapter, _, _server) = fixture_full(
+        vec![UpstreamError::RateLimited {
+            retry_after: Some(Duration::from_secs(1)),
+        }],
+        false,
+        [Some(1024); 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+    )
+    .await;
+
+    assert!(matches!(
+        executor.execute(request()).await,
+        Err(GatewayError::AllCandidatesExhausted { .. })
+    ));
+    // The exhausted request reached dep0 before its cooldown; the next one
+    // cannot even start an attempt.
+    assert!(matches!(
+        executor.execute(request()).await,
+        Err(GatewayError::AllCandidatesExhausted { .. })
+    ));
+    tokio::time::advance(Duration::from_secs(2)).await;
+    executor.execute(request()).await.unwrap();
+    // A middle-out context rejection is a preliminary probe the server retries;
+    // it must not produce a record.
+    let probe = GatewayRequest {
+        est_input_tokens: 10_000,
+        context_overflow: Some(ContextOverflow::MiddleOut),
+        ..request()
+    };
+    assert!(matches!(
+        executor.execute(probe).await,
+        Err(GatewayError::ContextLengthExceeded {
+            middle_out: true,
+            ..
+        })
+    ));
+    drop(executor);
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0]["outcome"], "error");
+    assert_eq!(lines[0]["error_kind"], "all_candidates_exhausted");
+    assert_eq!(lines[0]["deployment"], "dep0");
+    assert_eq!(lines[0]["provider"], "test");
+    assert_eq!(lines[0]["attempts"], 1);
+    assert_eq!(lines[1]["outcome"], "error");
+    assert_eq!(lines[1]["attempts"], 0);
+    assert!(lines[1].get("deployment").is_none());
+    assert_eq!(lines[2]["outcome"], "routed");
+    assert_eq!(lines[2]["model"], "model");
+    assert_eq!(lines[2]["deployment"], "dep0");
+    assert_eq!(lines[2]["attempts"], 1);
+    assert!(lines[2]["latency_ms"].is_number());
+    assert!(lines[2]["ts_ms"].is_number());
 }
 
 #[tokio::test]

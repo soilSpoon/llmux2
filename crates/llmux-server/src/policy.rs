@@ -295,6 +295,7 @@ mod tests {
             drain_grace: Duration::from_millis(0),
             expose_routing_headers: false,
             dashboard_key: None,
+            request_log: None,
             end_user_header: Some(HeaderName::from_static("x-client-user")),
             end_user_salt: Some(Arc::from(SALT)),
             end_user_from_body: from_body,

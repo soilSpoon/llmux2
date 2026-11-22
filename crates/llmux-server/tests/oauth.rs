@@ -160,3 +160,54 @@ async fn oauth_startup_rejects_failed_or_empty_token_responses_without_leaking_s
         assert!(!error.contains("client-secret"));
     }
 }
+
+#[tokio::test]
+async fn unopenable_request_log_fails_build_before_credential_refresh() {
+    let secrets = tempfile::tempdir().unwrap();
+    let refresh = secrets.path().join("refresh");
+    let client = secrets.path().join("client");
+    fs::write(&refresh, "original").unwrap();
+    fs::write(&client, "gateway-key").unwrap();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let endpoint_hits = hits.clone();
+    let upstream = TestServer::start(Router::new().route("/token", post(move || {
+        let hits = endpoint_hits.clone();
+        async move {
+            hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Json(json!({"access_token":"access","token_type":"Bearer","expires_in":3600,"refresh_token":"rotated"}))
+        }
+    }))).await.unwrap();
+    // OpenOptions creates the file but not missing parents, so this open fails.
+    let request_log = secrets.path().join("missing").join("requests.jsonl");
+    let text = format!(
+        r#"
+[server]
+client_keys = ["file:{}"]
+request_log = "{}"
+[[credentials]]
+id = "oauth"
+kind = "oauth"
+provider = "openai_compat"
+token_url = "{}/token"
+client_id = "client-id"
+refresh_token = "file:{}"
+[[models]]
+name = "model"
+[[models.deployments]]
+id = "deployment"
+credential = "oauth"
+base_url = "{}/v1"
+upstream_model = "upstream"
+"#,
+        client.display(),
+        request_log.display(),
+        upstream.url(),
+        refresh.display(),
+        upstream.url()
+    );
+    llmux_server::app(RuntimeConfig::parse(&text).unwrap())
+        .await
+        .expect_err("build must fail on an unopenable request log");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(fs::read_to_string(&refresh).unwrap(), "original");
+}

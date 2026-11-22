@@ -37,6 +37,8 @@ pub struct ServerConfig {
     pub drain_grace: Duration,
     pub expose_routing_headers: bool,
     pub dashboard_key: Option<Arc<str>>,
+    /// Append-only JSONL file for per-request routing records.
+    pub request_log: Option<PathBuf>,
     /// Inbound header whose value is hashed into the end-user id. `None` disables the feature.
     pub end_user_header: Option<HeaderName>,
     /// Secret mixed into the end-user hash. Present only when `end_user_header` is set.
@@ -151,6 +153,7 @@ struct RawServer {
     drain_grace_ms: u64,
     expose_routing_headers: bool,
     dashboard_key: Option<String>,
+    request_log: Option<PathBuf>,
     end_user_header: Option<String>,
     end_user_salt: Option<String>,
     end_user_from_body: Option<bool>,
@@ -168,6 +171,7 @@ impl Default for RawServer {
             drain_grace_ms: 2_000,
             expose_routing_headers: true,
             dashboard_key: None,
+            request_log: None,
             end_user_header: None,
             end_user_salt: None,
             end_user_from_body: None,
@@ -712,6 +716,7 @@ impl RawConfig {
                 drain_grace: Duration::from_millis(server.drain_grace_ms),
                 expose_routing_headers: server.expose_routing_headers,
                 dashboard_key,
+                request_log: server.request_log,
                 end_user_header: end_user.header,
                 end_user_salt: end_user.salt,
                 end_user_from_body: end_user.from_body,
@@ -1387,6 +1392,22 @@ refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
                 .to_string()
                 .contains("max_context must be positive"));
         }
+    }
+
+    #[test]
+    fn request_log_path_parses_and_defaults_absent() {
+        let base = config(REQUIRED);
+        let loaded = RuntimeConfig::parse(&base.replace(
+            "[server]",
+            "[server]\nrequest_log = \"/var/log/llmux/requests.jsonl\"",
+        ))
+        .unwrap();
+        assert_eq!(
+            loaded.server.request_log.as_deref(),
+            Some(Path::new("/var/log/llmux/requests.jsonl"))
+        );
+        let loaded = RuntimeConfig::parse(&base).unwrap();
+        assert!(loaded.server.request_log.is_none());
     }
 
     #[test]

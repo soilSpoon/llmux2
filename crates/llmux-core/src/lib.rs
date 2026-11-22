@@ -2,6 +2,7 @@
 
 mod limits;
 mod machine;
+mod request_log;
 mod stats;
 
 #[cfg(test)]
@@ -23,6 +24,8 @@ use llmux_types::{
     SseCommitment, Support, UpstreamError,
 };
 use machine::{Built, Effect, Event, Outcome, Phase, State};
+pub use request_log::RequestLog;
+use request_log::RequestRecord;
 use stats::{AttemptStats, SkipReason};
 pub use stats::{CatchAllStats, DeploymentStats, FallbackStats};
 use std::{
@@ -47,6 +50,8 @@ pub enum InitError {
     UnknownProvider(Arc<str>),
     #[error("deployment has no credential source")]
     MissingCredential,
+    #[error("cannot open request log: {0}")]
+    RequestLog(std::io::Error),
 }
 
 #[derive(Debug, Error)]
@@ -170,6 +175,7 @@ pub struct Executor {
     /// Shared with the server so a refresh is visible without rebuilding the executor.
     devin_catalog: Arc<LiveModels>,
     http: HttpClient,
+    request_log: Option<RequestLog>,
 }
 
 impl Executor {
@@ -212,10 +218,14 @@ impl Executor {
         limits
     }
 
+    /// `request_log` must already be open: the server opens it before starting
+    /// credential sources so a bad path fails the build before they can rotate
+    /// refresh tokens.
     pub fn new(
         cfg: Arc<RuntimeConfig>,
         registry: &ProviderRegistry,
         credentials: &HashMap<Arc<str>, Arc<dyn CredentialSource>>,
+        request_log: Option<RequestLog>,
     ) -> Result<Self, InitError> {
         Self::validate(&cfg, registry, &credentials.keys().cloned().collect())?;
         let mut disabled = HashMap::<Arc<str>, Arc<AtomicBool>>::new();
@@ -327,6 +337,7 @@ impl Executor {
             credentials: disabled,
             devin_catalog: Arc::new(LiveModels::default()),
             http: builder.build(connector),
+            request_log,
         })
     }
 
@@ -407,15 +418,44 @@ impl Executor {
         req: GatewayRequest,
     ) -> Result<RoutedResponse, RoutedError> {
         let mut trace = RouteTrace::default();
-        self.route(req, &mut trace)
-            .await
-            .map_err(|error| RoutedError {
-                deployment: trace
-                    .last_attempted
-                    .map(|idx| self.cfg.deployments[idx].id.clone()),
-                attempts: trace.attempts,
-                error,
+        let started = Instant::now();
+        let request_id = req.request_id.0.clone();
+        let model = req.model.clone();
+        let result = self.route(req, &mut trace).await;
+        // A middle-out context rejection is a probe: the server truncates and
+        // retries under the same request ID, so logging it would double-count
+        // one client request.
+        let preliminary = matches!(
+            result,
+            Err(GatewayError::ContextLengthExceeded {
+                middle_out: true,
+                ..
             })
+        );
+        if let Some(log) = self.request_log.as_ref().filter(|_| !preliminary) {
+            let dep = trace.last_attempted.map(|idx| &self.cfg.deployments[idx]);
+            log.record(&RequestRecord {
+                ts_ms: request_log::now_ms(),
+                request_id: &request_id,
+                model: &model,
+                deployment: dep.map(|dep| dep.id.as_ref()),
+                provider: dep.map(|dep| dep.provider.0.as_ref()),
+                attempts: trace.attempts,
+                latency_ms: started.elapsed().as_millis() as u64,
+                outcome: if result.is_ok() { "routed" } else { "error" },
+                error_kind: result.as_ref().err().map(request_log::error_kind),
+                quota_remaining: trace
+                    .last_attempted
+                    .map(|idx| self.bindings[idx].limits.remaining(Instant::now())),
+            });
+        }
+        result.map_err(|error| RoutedError {
+            deployment: trace
+                .last_attempted
+                .map(|idx| self.cfg.deployments[idx].id.clone()),
+            attempts: trace.attempts,
+            error,
+        })
     }
 
     async fn route(
