@@ -43,9 +43,7 @@ pub(super) fn identity<'a>(connection: &'a Value, nodes: &'a [Value]) -> &'a str
 
 fn replacement(provider: &str) -> Option<&'static str> {
     match provider {
-        "cloudflare-playground" | "cfp" | "duckduckgo-web" | "ddgw" => {
-            Some(SESSION_FALLBACK)
-        }
+        "cloudflare-playground" | "cfp" | "duckduckgo-web" | "ddgw" => Some(SESSION_FALLBACK),
         _ => None,
     }
 }

@@ -371,6 +371,7 @@ mod tests {
             max_output_tokens: None,
             context_overflow: None,
             request_id: RequestId("r".into()),
+            end_user: None,
         }
     }
 
@@ -389,6 +390,7 @@ mod tests {
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(10),
             max_context: None,
+            expires_at: None,
         }
     }
 }
