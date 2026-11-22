@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DeploymentIdx(pub u32);
@@ -46,6 +49,9 @@ pub enum ChatRequestField {
     ReasoningEffort,
     Logprobs,
     TopLogprobs,
+    Temperature,
+    TopP,
+    TopK,
 }
 
 #[derive(Debug)]
@@ -65,6 +71,9 @@ pub struct Deployment {
     pub timeout: Duration,
     /// Context window in tokens (prompt plus completion); `None` is unchecked.
     pub max_context: Option<u32>,
+    /// When this deployment stops being eligible, for time-limited offers.
+    /// `None` means it never expires.
+    pub expires_at: Option<SystemTime>,
 }
 
 /// What to do with a request that fits no deployment's context window.

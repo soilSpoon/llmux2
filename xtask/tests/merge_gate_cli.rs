@@ -50,7 +50,7 @@ impl Drop for Api {
 }
 fn fixture() -> Value {
     let sha = "a".repeat(40);
-    let checks = ["check", "pr-policy", "advisories", "coverage"]
+    let checks = ["check", "pr-policy", "advisories", "coverage", "tlc"]
         .iter()
         .map(|name| json!({"name":name,"status":"completed","conclusion":"success","head_sha":sha}))
         .collect::<Vec<_>>();
@@ -82,7 +82,7 @@ fn merge_gate_pass_and_failure_output_and_exit_codes() {
     let output = Api::new(&data, None).run("83");
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert_eq!(stdout.lines().count(), 4);
+    assert_eq!(stdout.lines().count(), 5);
     assert!(stdout.contains("Required check 'coverage' has no completed successful run"));
 }
 #[test]

@@ -522,3 +522,63 @@ fn deepseek_matching_also_applies_to_fallback_upstream_ids_but_not_catch_all() {
     }
     assert!(fallback_match);
 }
+
+mod anthropic_sampling {
+    use llmux_config::RuntimeConfig;
+    use llmux_types::ChatRequestField;
+    use serde_json::json;
+
+    #[test]
+    fn models_that_reject_sampling_parameters_import_with_strip_request_fields() {
+        let stripped = [
+            "claude-haiku-5-5",
+            "claude-haiku-5.5",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5",
+            "claude-opus-5-5",
+            "claude-opus-5.5",
+            "claude-fable-5-1",
+            "claude-fable-5.2",
+            "claude-fable-5",
+            "claude-opus-4-8",
+            "claude-opus-4.8",
+        ];
+        let kept = [
+            "claude-sonnet-4-6",
+            "claude-opus-4-7",
+            "claude-haiku-4-5",
+            "claude-sonnet-45",
+        ];
+        for (model, expected) in stripped
+            .iter()
+            .map(|m| (m, true))
+            .chain(kept.iter().map(|m| (m, false)))
+        {
+            let root = json!({
+                "providerConnections": [{"id":"claude","provider":"anthropic","authType":"apikey","apiKey":"synthetic-claude"}],
+                "combos": [{"name":"c","models":[format!("anthropic/{model}")]}],
+                "apiKeys": [{"key":"synthetic-client"}]
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let output = dir.path().join("out.toml");
+            llmux_import::import(&root.to_string(), &output, None).unwrap();
+            let config = RuntimeConfig::load(output).unwrap();
+            let dep = config
+                .deployments
+                .iter()
+                .find(|dep| dep.upstream_model.as_ref() == *model)
+                .unwrap_or_else(|| panic!("{model} not imported"));
+            assert_eq!(dep.provider.0.as_ref(), "anthropic");
+            let actual: &[ChatRequestField] = dep.strip_request_fields.as_ref();
+            if expected {
+                assert_eq!(
+                    actual,
+                    [ChatRequestField::Temperature, ChatRequestField::TopP],
+                    "{model}"
+                );
+            } else {
+                assert!(actual.is_empty(), "{model}");
+            }
+        }
+    }
+}

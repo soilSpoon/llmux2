@@ -10,6 +10,15 @@ pub const OPENAI_RESPONSES: &str = "openai_responses";
 /// Anthropic Messages API.
 pub const ANTHROPIC: &str = "anthropic";
 
+/// xAI OAuth at api.x.ai. Chat and Responses, selected per model.
+pub const XAI: &str = "xai";
+/// Antigravity Cloud Code `streamGenerateContent` with Google OAuth.
+pub const ANTIGRAVITY: &str = "antigravity";
+/// Devin CLI bridge: one `devin acp` child per request, spoken to over stdio.
+pub const DEVIN_ACP: &str = "devin_acp";
+/// Placeholder endpoint for deployments that have no network upstream.
+pub const DEVIN_ACP_BASE_URL: &str = "http://127.0.0.1/devin-acp";
+
 /// Header carrying the Anthropic API key at the upstream edge.
 pub const ANTHROPIC_KEY_HEADER: &str = "x-api-key";
 
@@ -23,11 +32,19 @@ mod tests {
         // Config, adapters and the importer compare on these strings; renaming
         // them is a breaking change, so pin the values.
         assert_eq!(
-            [OPENAI, OPENAI_COMPAT, OPENAI_RESPONSES, ANTHROPIC]
-                .into_iter()
-                .collect::<HashSet<_>>()
-                .len(),
-            4
+            [
+                OPENAI,
+                OPENAI_COMPAT,
+                OPENAI_RESPONSES,
+                ANTHROPIC,
+                XAI,
+                ANTIGRAVITY,
+                DEVIN_ACP
+            ]
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .len(),
+            7
         );
         assert_eq!(ANTHROPIC_KEY_HEADER, "x-api-key");
     }
