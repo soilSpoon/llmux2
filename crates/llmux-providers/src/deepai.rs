@@ -33,8 +33,9 @@ impl ProviderAdapter for DeepAi {
         &self.0
     }
 
-    /// The complete body is synthesized; only upstream response headers
-    /// carry a real request id.
+    /// The complete body is synthesized; headers (raw upstream headers, or the
+    /// `x-request-id` parse_response adds for a real job id) carry the only
+    /// trustworthy request id.
     fn upstream_request_id(&self, headers: &HeaderMap, _body: Option<&Bytes>) -> Option<Arc<str>> {
         header_request_id(headers)
     }
@@ -127,6 +128,14 @@ impl ProviderAdapter for DeepAi {
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
+        // The complete body is synthesized; surface a real upstream job id
+        // as a response header so upstream_request_id can record it without
+        // mistaking the fallback id for a provider one.
+        if let Some(job_id) = output["id"].as_str().filter(|id| !id.is_empty()) {
+            if let Ok(value) = HeaderValue::from_str(job_id) {
+                headers.insert("x-request-id", value);
+            }
+        }
         Ok(GatewayResponse::Complete {
             status: StatusCode::OK,
             headers,
@@ -342,6 +351,14 @@ mod tests {
                     },"finish_reason":"stop"}])
                     );
                     assert!(completion.get("usage").is_none());
+                    // The upstream job id must reach the request log even
+                    // though the body is synthesized.
+                    assert_eq!(
+                        adapter
+                            .upstream_request_id(&headers, Some(&body))
+                            .as_deref(),
+                        Some("job-123")
+                    );
                 }
                 "unauthorized" => assert!(matches!(
                     result,
