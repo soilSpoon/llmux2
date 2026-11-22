@@ -57,6 +57,10 @@ pub struct ImportOptions<'a> {
     pub nous_state: Option<&'a Path>,
     pub nous_models: Option<&'a Path>,
     pub omniroute_fallback: Option<OmniRouteFallback<'a>>,
+    /// Emitted `[server].listen` address; defaults to `127.0.0.1:8080`.
+    /// Scheduled re-imports must pass the deployed address — deploy rejects a
+    /// regenerated config whose listen differs from the installed one.
+    pub listen: Option<&'a str>,
     /// JSON list of dead route names (e.g. `llmux2-probe --dead-file` output).
     /// Listed models are dropped from the import instead of being advertised,
     /// their aliases are pruned, and with `--omniroute-fallback` they land in
@@ -397,6 +401,17 @@ fn unrestricted_client_key(key: &Value) -> bool {
 
 fn write_secret(dir: &Path, id: &str, secret: &str) -> Result<String, String> {
     let path = dir.join(id);
+    // Scheduled re-imports regenerate the same credentials into a shared
+    // secrets directory: an identical existing file is reused; a differing
+    // one (rotated by hand or a changed export) still fails closed.
+    if let Ok(existing) = fs::read_to_string(&path) {
+        if existing == secret {
+            return Ok(format!("file:{}", path.display()));
+        }
+        return Err(
+            "could not create secret file (existing files are never overwritten)".to_owned(),
+        );
+    }
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -875,12 +890,15 @@ pub fn import_with_options(
                 continue;
             }
         };
+        let source_id = string(c, "id");
         let mut header_refs = serde_json::Map::new();
         for (name, value) in headers {
-            let id = unique("upstream-header", &mut ids);
+            // Deterministic per connection+header name so a scheduled
+            // re-import resolves the same secret file; the `header-` prefix
+            // can never collide with `upstream-{source_id}` credential names.
+            let id = unique(&format!("header-{source_id}-{name}"), &mut ids);
             header_refs.insert(name, write_secret(&dir, &id, &value)?.into());
         }
-        let source_id = string(c, "id");
         if source_id.is_empty() || !source_ids.insert(source_id.to_owned()) {
             warnings.push(format!("{label}: skipped missing/duplicate connection id"));
             continue;
@@ -1470,7 +1488,7 @@ pub fn import_with_options(
             }
         }
     }
-    let config = json!({"server":{"listen":"127.0.0.1:8080","client_keys":client_keys},"credentials":credentials,"models":models});
+    let config = json!({"server":{"listen":options.listen.unwrap_or("127.0.0.1:8080"),"client_keys":client_keys},"credentials":credentials,"models":models});
     validation::validate(
         &config,
         client_count == 0,

@@ -153,6 +153,44 @@ upstream errors) never count toward dead.
 `--listen` defaults to the gateway's default `127.0.0.1:8080`; the shipped
 unit passes `127.0.0.1:8090` for the OCI slots.
 
+A separate low-rate sweep covers the whole catalog: `llmux2-sweep.timer`
+(daily) runs `llmux2-probe --sweep`, which probes every listed model once in
+a single run without moving the rotation cursor, using its own state file
+(`probe-sweep-state.json`) and writing the dead list to `dead-models.json`.
+One sweep sends one token-bearing request per advertised model, so keep its
+cadence low; the curated `--models` pin on `llmux2-probe.service` never
+builds streaks for the long tail — the sweep is what feeds `--dead-file`
+for the full catalog.
+
+`llmux2-prune.timer` (weekly) then re-runs the import with
+`--exclude-models dead-models.json` and deploys through `llmux2-deploy`, so
+dead routes stop being advertised without manual pruning. The service runs
+`llmux2-prune.sh` (installed alongside the binaries), which:
+
+- regenerates `llmux-next.toml` with the site's supplemental importer flags
+  sourced from `~/llmux2/import.env` as a bash array (`IMPORT_FLAGS=(--omniroute-fallback
+  … --nous-state …)` — the same arguments the original import used, so a
+  prune never shrinks the catalog);
+- passes the deployed slot's own `--listen` address read back from
+  `active.json` (deploy rejects a regenerated config on a different port);
+- removes only the stale candidate config — the shared `~/llmux2/secrets/`
+  directory is never deleted: the importer reuses identical secret files
+  and aborts on any that differ, so both slots always resolve the same
+  `file:` references;
+- deploys with `--canary 300` so a bad regenerated config never takes the
+  port alone;
+- skips the run entirely when no sweep output exists yet.
+
+Refresh the OmniRoute export before each run via an `ExecStartPre` drop-in
+on `llmux2-prune.service` (the export contains credentials). Deploy follows
+the normal slot-swap rules; rollback is a redeploy of the known-good config.
+
+```sh
+install -m 700 deploy/prune.sh "$HOME/llmux2/bin/llmux2-prune.sh"
+install -m 700 target/release/llmux-import "$HOME/llmux2/bin/"
+systemctl --user enable --now llmux2-sweep.timer llmux2-prune.timer
+```
+
 The probe reads the gateway client key from `--key-file`
 (`$HOME/llmux2/client.key`), prints a JSON report naming each check's status,
 latency and serving deployment, and exits 0 only when every probe passes;

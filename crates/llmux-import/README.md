@@ -528,5 +528,10 @@ Separately, upstream models that cannot serve chat-class endpoints — the
 reviewed non-chat table in `src/policy.rs` (`mistral-embed`,
 `codestral-embed`, `span-01-lite`) — are classified out of every combo leg at
 emit with a warning, and a combo left with no deployments is skipped as usual.
+
+`--listen HOST:PORT` sets the emitted `[server].listen` (default
+`127.0.0.1:8080`). Scheduled re-imports pass the deployed slot's address:
+`llmux2-deploy` refuses a regenerated config whose listen differs from the
+installed one. `deploy/prune.sh` reads it from `active.json`.
 An import therefore never advertises an embedding or typed-endpoint model as
 a chat route.

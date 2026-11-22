@@ -832,6 +832,56 @@ fn a_non_404_failure_resets_the_streak() {
 }
 
 #[test]
+fn sweep_probes_every_listed_model_without_moving_the_cursor() {
+    let home = Home::new();
+    let ok = || Reply::json(200, json!({"choices":[{"message":{"content":"ok"}}]}));
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        models_reply(),
+        ok(),
+        ok(),
+        ok(),
+        Reply::text(200, "ok"),
+        models_reply(),
+        ok(),
+    ]);
+    let output = listen_flag(&home, &gateway, &["--sweep"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(gateway.chat_models(), ["alpha", "beta", "gamma"]);
+    let state: Value = serde_json::from_str(&fs::read_to_string(home.state()).unwrap()).unwrap();
+    assert_eq!(state["next"], json!(0));
+    // A routine run afterwards still rotates from the untouched cursor.
+    let output = listen_flag(&home, &gateway, &[]);
+    assert_eq!(gateway.chat_models().last().unwrap(), "alpha");
+    assert_eq!(summary(&output)["dead"], json!([]));
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn sweep_rejects_a_pinned_model_list() {
+    let home = Home::new();
+    let output = home.run(&["--sweep", "--models", "alpha"]);
+    assert!(output.status.code().is_some_and(|code| code > 0));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--sweep"));
+}
+
+#[test]
+fn sweep_accumulates_streaks_toward_the_dead_list() {
+    let home = Home::new();
+    let dead = || Reply::json(404, json!({"error":{"code":"model_not_found"}}));
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        models_reply(),
+        dead(),
+        dead(),
+        dead(),
+    ]);
+    let output = listen_flag(&home, &gateway, &["--sweep", "--dead-after", "1"]);
+    assert_eq!(summary(&output)["dead"], json!(["alpha", "beta", "gamma"]));
+    stop.send(()).unwrap();
+}
+
+#[test]
 fn dead_file_writes_the_dead_model_list() {
     let home = Home::new();
     let dead_file = home.0.join("dead.json");

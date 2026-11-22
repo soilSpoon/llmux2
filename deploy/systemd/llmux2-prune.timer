@@ -1,0 +1,12 @@
+[Unit]
+Description=Re-import llmux2 config excluding swept dead routes, weekly
+
+[Timer]
+# Runs after the daily sweep's streak evidence has accumulated.
+OnBootSec=7200
+OnUnitActiveSec=604800
+AccuracySec=3600
+Unit=llmux2-prune.service
+
+[Install]
+WantedBy=timers.target

@@ -336,6 +336,23 @@ WHEN a model's last `--dead-after` probes all returned 404
 THEN it appears in the report's `dead` list and in `--dead-file`, so the next
 import drops it rather than advertising it in `/v1/models`.
 
+A dedicated low-rate sweep SHALL cover the whole catalog: `--sweep` SHALL
+probe every listed model once in a single run without moving the rotation
+cursor, and SHALL be rejected in combination with `--models`. The shipped
+`llmux2-sweep.timer` SHALL run it on its own state file, feeding
+`--dead-file`; `llmux2-prune.timer` SHALL re-run the import with
+`--exclude-models` on a schedule and deploy the regenerated config so dead
+routes are dropped without manual pruning. The scheduled import SHALL carry
+the site's supplemental importer options and the deployed slot's listen
+address, and SHALL never delete secrets the deployed config still
+references.
+
+#### Scenario: A full sweep finds the long tail
+
+WHEN `--sweep` runs against a catalog of N models
+THEN every listed model is probed exactly once and the rotation cursor is
+unchanged, so recurring probes keep their place.
+
 ### Requirement: Simple and extensible
 
 The codebase SHALL stay simple with low overhead, and be easy to extend and

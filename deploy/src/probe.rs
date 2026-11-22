@@ -27,10 +27,11 @@ struct Options {
     all_formats: bool,
     dead_after: usize,
     dead_file: Option<PathBuf>,
+    sweep: bool,
 }
 
 fn usage() -> &'static str {
-    "usage: llmux2-probe [-h] [--listen HOST:PORT] [--key-file PATH] [--state-file PATH] [--models a,b,c] [--per-run N] [--timeout SECS] [--all-formats] [--dead-after N] [--dead-file PATH]"
+    "usage: llmux2-probe [-h] [--listen HOST:PORT] [--key-file PATH] [--state-file PATH] [--models a,b,c] [--per-run N] [--timeout SECS] [--all-formats] [--dead-after N] [--dead-file PATH] [--sweep]"
 }
 fn display_args(args: &[OsString]) -> String {
     args.iter()
@@ -41,7 +42,7 @@ fn display_args(args: &[OsString]) -> String {
 fn parse(args: &[OsString]) -> std::result::Result<Option<Options>, String> {
     if args.first().is_some_and(|a| a == "-h" || a == "--help") {
         println!(
-            "{}\n\nSynthetic probes for the running llmux2 gateway.\n\nProbes /healthz and /v1/models on every run, then exercises\n--per-run canonical models (default 1) through /v1/chat/completions,\nrotating through the sorted model list across runs. The rotation\ncursor lives in --state-file, which also accumulates each model's\nconsecutive failure streak; a model whose last --dead-after probes\nfailed with 404 (default 2) is reported as dead, and --dead-file\nwrites those names as a JSON list for llmux-import --exclude-models.\nPrints a JSON report; exit 0 when every probe passes, 1 on any failure.",
+            "{}\n\nSynthetic probes for the running llmux2 gateway.\n\nProbes /healthz and /v1/models on every run, then exercises\n--per-run canonical models (default 1) through /v1/chat/completions,\nrotating through the sorted model list across runs. The rotation\ncursor lives in --state-file, which also accumulates each model's\nconsecutive failure streak; a model whose last --dead-after probes\nfailed with 404 (default 2) is reported as dead, and --dead-file\nwrites those names as a JSON list for llmux-import --exclude-models.\n--sweep probes every listed model once in the same run without moving\nthe rotation cursor; it cannot be combined with --models.\nPrints a JSON report; exit 0 when every probe passes, 1 on any failure.",
             usage()
         );
         return Ok(None);
@@ -60,6 +61,7 @@ fn parse(args: &[OsString]) -> std::result::Result<Option<Options>, String> {
         all_formats: false,
         dead_after: 2,
         dead_file: None,
+        sweep: false,
     };
     let mut index = 0;
     while index < args.len() {
@@ -128,6 +130,15 @@ fn parse(args: &[OsString]) -> std::result::Result<Option<Options>, String> {
             "--dead-file" => {
                 options.dead_file = Some(take(&mut index, flag)?.into());
             }
+            "--sweep" => {
+                if inline.is_some() {
+                    return Err(format!(
+                        "unrecognized arguments: {}",
+                        display_args(&args[index..])
+                    ));
+                }
+                options.sweep = true;
+            }
             _ => {
                 return Err(format!(
                     "unrecognized arguments: {}",
@@ -136,6 +147,9 @@ fn parse(args: &[OsString]) -> std::result::Result<Option<Options>, String> {
             }
         }
         index += 1;
+    }
+    if options.sweep && options.models.is_some() {
+        return Err("unrecognized arguments: --sweep cannot be combined with --models".to_string());
     }
     Ok(Some(options))
 }
@@ -567,7 +581,12 @@ fn run(options: &Options) -> Result<bool> {
     let selected: Vec<String> = match &options.models {
         Some(models) => models.clone(),
         None => {
-            if listed.is_empty() || options.per_run == 0 {
+            if options.sweep {
+                // A sweep probes every advertised route in one run; the
+                // rotation cursor is untouched so routine probes keep
+                // their place.
+                listed.clone()
+            } else if listed.is_empty() || options.per_run == 0 {
                 Vec::new()
             } else {
                 let next = state["next"].as_u64().unwrap_or(0) as usize % listed.len();
