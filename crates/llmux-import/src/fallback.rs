@@ -243,10 +243,12 @@ pub(super) fn ensure_session_models(
         if name.is_empty() || name.contains('*') || is_excluded(excluded, name) {
             continue;
         }
-        if let Some(model) = models
-            .iter_mut()
-            .find(|model| string(model, "name") == name)
-        {
+        if let Some(model) = models.iter_mut().find(|model| {
+            string(model, "name") == name
+                || array(model, "aliases")
+                    .iter()
+                    .any(|alias| alias.as_str() == Some(name.as_str()))
+        }) {
             let deployments = model["deployments"]
                 .as_array()
                 .ok_or("imported model has no deployments")?;

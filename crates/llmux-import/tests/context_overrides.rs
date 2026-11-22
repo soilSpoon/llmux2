@@ -209,6 +209,55 @@ fn invalid_raw_rows_and_duplicate_overrides_warn_and_preserve_the_first_valid_li
 }
 
 #[test]
+fn deepai_overrides_apply_to_native_text_deployments_when_a_custom_node_owns_the_prefix() {
+    let root = json!({
+        "providerConnections":[
+            {"id":"native","provider":"deepai","authType":"apikey","apiKey":"synthetic-deepai"},
+            {"id":"code","provider":"custom-deepai","authType":"apikey","apiKey":"synthetic-sidecar"}
+        ],
+        "providerNodes":[{"id":"custom-deepai","prefix":"deepai","type":"openai-compatible","apiType":"chat","baseUrl":"http://127.0.0.1:8790/deepai/v1"}],
+        "combos":[{"name":"text","models":["deepai/text-generator","deepai/example-code"]}],
+        "apiKeys":[{"key":"synthetic-client"}],
+        "modelContextOverrides":[
+            {"provider":"deepai","modelId":"text-generator","realContext":4096},
+            {"provider":"custom-deepai","modelId":"example-code","realContext":8192}
+        ]
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let config = RuntimeConfig::load(&output).unwrap();
+    let model = &config.models[config.model_names["text"]];
+    let limits: Vec<(String, Option<u32>)> = model
+        .deployments
+        .iter()
+        .map(|idx| {
+            let dep = &config.deployments[idx.0 as usize];
+            (dep.upstream_model.to_string(), dep.max_context)
+        })
+        .collect();
+    assert_eq!(
+        limits,
+        vec![
+            ("text-generator".to_owned(), Some(4096)),
+            ("example-code".to_owned(), Some(8192))
+        ]
+    );
+    let native = &config.deployments[model.deployments[0].0 as usize];
+    assert_eq!(native.provider.0.as_ref(), "deepai");
+    assert_eq!(
+        config.deployments[model.deployments[1].0 as usize]
+            .provider
+            .0
+            .as_ref(),
+        "openai_compat"
+    );
+    assert!(report.warnings.iter().any(
+        |w| w == "context overrides: 2 applied, 0 ignored (no imported deployment), 0 invalid"
+    ));
+}
+
+#[test]
 fn context_overrides_do_not_constrain_the_omniroute_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("out.toml");

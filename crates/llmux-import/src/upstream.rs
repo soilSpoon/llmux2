@@ -75,6 +75,25 @@ pub(super) fn canonical_provider(provider: &str, nodes: &[Value]) -> ProviderIde
         .unwrap_or_else(|| ProviderIdentity::builtin(provider))
 }
 
+// A custom node can claim the `deepai` prefix while the native text models keep
+// routing through the builtin deepai deployment, so a provider+model pair and a
+// context override must resolve to the same identity.
+pub(super) fn canonical_for_model(
+    provider: &str,
+    model: &str,
+    nodes: &[Value],
+) -> ProviderIdentity {
+    let canonical = canonical_provider(provider, nodes);
+    if provider == KIND_DEEPAI
+        && DEEPAI_TEXT_MODELS.contains(&model)
+        && matches!(&canonical, ProviderIdentity::Custom(id) if id != provider)
+    {
+        ProviderIdentity::builtin(provider)
+    } else {
+        canonical
+    }
+}
+
 pub(super) fn model_id<'a>(raw: &'a str, provider: &ProviderIdentity, nodes: &[Value]) -> &'a str {
     let node = nodes
         .iter()
@@ -136,12 +155,8 @@ pub(super) fn model_target<'a>(
     } else {
         model
     };
-    let canonical = if resolved.is_empty()
-        && provider == KIND_DEEPAI
-        && DEEPAI_TEXT_MODELS.contains(&model)
-        && matches!(&canonical, ProviderIdentity::Custom(id) if id != provider)
-    {
-        ProviderIdentity::builtin(provider)
+    let canonical = if resolved.is_empty() {
+        canonical_for_model(provider, model, nodes)
     } else {
         canonical
     };

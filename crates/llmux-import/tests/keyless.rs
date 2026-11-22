@@ -513,6 +513,13 @@ fn skip_precedence_is_explicit_and_replacement_warnings_are_static() {
             "pass --omniroute-fallback and --omniroute-key",
         ),
         (
+            "ddgw",
+            "apikey",
+            "",
+            "",
+            "pass --omniroute-fallback and --omniroute-key",
+        ),
+        (
             "custom-deepai",
             "apikey",
             "test-key",
