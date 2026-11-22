@@ -6,14 +6,15 @@ use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use llmux_types::{
-    parse_devin_models, provider, AuthMaterial, BuildError, Deployment, DevinModel, GatewayRequest,
-    GatewayResponse, InboundFormat, ProviderAdapter, ProviderKind, SseEvent, Support,
-    UpstreamError,
+    header_request_id, parse_devin_models, provider, AuthMaterial, BuildError, Deployment,
+    DevinModel, GatewayRequest, GatewayResponse, InboundFormat, ProviderAdapter, ProviderKind,
+    SseEvent, Support, UpstreamError,
 };
 use serde_json::{json, Value};
 use std::{
     path::PathBuf,
     process::Stdio,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -417,6 +418,13 @@ impl ProviderAdapter for DevinAcp {
         &self.kind
     }
 
+    /// Complete bodies are synthesized locally (`chatcmpl-devin-{secs}` ids are
+    /// gateway-generated and not unique per request); only headers could carry
+    /// a real request id.
+    fn upstream_request_id(&self, headers: &HeaderMap, _body: Option<&Bytes>) -> Option<Arc<str>> {
+        header_request_id(headers)
+    }
+
     fn supports(&self, inbound: InboundFormat) -> Support {
         match inbound {
             InboundFormat::OpenAiChat => Support::Passthrough,
@@ -560,6 +568,19 @@ impl DevinAcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synthesized_completion_id_is_not_an_upstream_request_id() {
+        let adapter = DevinAcp::new(DevinAcpConfig {
+            binary: PathBuf::from("devin"),
+            home: PathBuf::from("/nonexistent"),
+            turn_timeout: Duration::from_secs(120),
+        });
+        let body = Bytes::from(completion("swe-2-high", "hi", false).to_string());
+        assert!(adapter
+            .upstream_request_id(&HeaderMap::new(), Some(&body))
+            .is_none());
+    }
 
     #[test]
     fn summary_wrapper_is_stripped_only_when_it_wraps_everything() {
