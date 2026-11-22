@@ -28,7 +28,12 @@ Production hosts SHALL NOT require Python or Cargo for deployment or recovery.
 The tools SHALL serialize through the same deployment lock, use private atomic
 file replacement, preserve the source and installed configuration checks,
 observe seven stable unit samples at half-second intervals, and try health up
-to sixty times before stopping the old slot. The health probe SHALL use a
+to sixty times before stopping the old slot. Deployment SHALL accept an
+optional `--canary SECONDS` window: after the new slot is stable and healthy,
+both slots SHALL keep running and share the SO_REUSEPORT listener while the
+tool verifies the new unit keeps the same PID with zero restarts for the whole
+window before the old slot stops. A canary failure SHALL stop the new slot and
+leave the old slot serving. The health probe SHALL use a
 two-second TCP connect/read timeout and accept only HTTP 200 whose first up-to-three
 decoded body bytes equal exactly `ok`, respecting Content-Length and chunked
 framing. systemctl and configuration checks SHALL have 130- and 120-second
@@ -39,6 +44,13 @@ deadlines respectively.
 WHEN the new slot fails to start, remain stable, or become healthy
 THEN deployment SHALL stop the new slot and leave the old slot unchanged,
 reporting cleanup failures separately.
+
+#### Scenario: Canary window aborts before handoff
+
+WHEN deployment runs with `--canary SECONDS` and the new slot restarts, stops,
+or changes PID during that window
+THEN the old slot SHALL remain active and recorded, and the new slot SHALL be
+stopped.
 
 #### Scenario: Recovery and late handoff errors
 
