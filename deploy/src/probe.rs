@@ -25,10 +25,12 @@ struct Options {
     per_run: usize,
     timeout: Duration,
     all_formats: bool,
+    dead_after: usize,
+    dead_file: Option<PathBuf>,
 }
 
 fn usage() -> &'static str {
-    "usage: llmux2-probe [-h] [--listen HOST:PORT] [--key-file PATH] [--state-file PATH] [--models a,b,c] [--per-run N] [--timeout SECS] [--all-formats]"
+    "usage: llmux2-probe [-h] [--listen HOST:PORT] [--key-file PATH] [--state-file PATH] [--models a,b,c] [--per-run N] [--timeout SECS] [--all-formats] [--dead-after N] [--dead-file PATH]"
 }
 fn display_args(args: &[OsString]) -> String {
     args.iter()
@@ -39,7 +41,7 @@ fn display_args(args: &[OsString]) -> String {
 fn parse(args: &[OsString]) -> std::result::Result<Option<Options>, String> {
     if args.first().is_some_and(|a| a == "-h" || a == "--help") {
         println!(
-            "{}\n\nSynthetic probes for the running llmux2 gateway.\n\nProbes /healthz and /v1/models on every run, then exercises\n--per-run canonical models (default 1) through /v1/chat/completions,\nrotating through the sorted model list across runs. The rotation\ncursor lives in --state-file. Prints a JSON report; exit 0 when every\nprobe passes, 1 on any failure.",
+            "{}\n\nSynthetic probes for the running llmux2 gateway.\n\nProbes /healthz and /v1/models on every run, then exercises\n--per-run canonical models (default 1) through /v1/chat/completions,\nrotating through the sorted model list across runs. The rotation\ncursor lives in --state-file, which also accumulates each model's\nconsecutive failure streak; a model whose last --dead-after probes\nfailed with 404 (default 2) is reported as dead, and --dead-file\nwrites those names as a JSON list for llmux-import --exclude-models.\nPrints a JSON report; exit 0 when every probe passes, 1 on any failure.",
             usage()
         );
         return Ok(None);
@@ -56,6 +58,8 @@ fn parse(args: &[OsString]) -> std::result::Result<Option<Options>, String> {
         per_run: 1,
         timeout: Duration::from_secs(30),
         all_formats: false,
+        dead_after: 2,
+        dead_file: None,
     };
     let mut index = 0;
     while index < args.len() {
@@ -111,6 +115,18 @@ fn parse(args: &[OsString]) -> std::result::Result<Option<Options>, String> {
                     ));
                 }
                 options.all_formats = true;
+            }
+            "--dead-after" => {
+                options.dead_after = take(&mut index, flag)?
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| {
+                        "argument --dead-after: expected a positive integer".to_string()
+                    })?;
+            }
+            "--dead-file" => {
+                options.dead_file = Some(take(&mut index, flag)?.into());
             }
             _ => {
                 return Err(format!(
@@ -544,16 +560,16 @@ fn run(options: &Options) -> Result<bool> {
     });
     let explicit = options.models.is_some();
     let mut pending_next = None;
+    let mut state: Value = fs::read_to_string(&options.state_file)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| json!({"next": 0}));
     let selected: Vec<String> = match &options.models {
         Some(models) => models.clone(),
         None => {
             if listed.is_empty() || options.per_run == 0 {
                 Vec::new()
             } else {
-                let state: Value = fs::read_to_string(&options.state_file)
-                    .ok()
-                    .and_then(|text| serde_json::from_str(&text).ok())
-                    .unwrap_or_else(|| json!({"next": 0}));
                 let next = state["next"].as_u64().unwrap_or(0) as usize % listed.len();
                 let count = options.per_run.min(listed.len());
                 pending_next = Some((next + count) % listed.len());
@@ -563,6 +579,7 @@ fn run(options: &Options) -> Result<bool> {
             }
         }
     };
+    let mut failures = state["failures"].as_object().cloned().unwrap_or_default();
     for model in &selected {
         let name = format!("chat:{model}");
         let start = Instant::now();
@@ -586,8 +603,40 @@ fn run(options: &Options) -> Result<bool> {
             .as_ref()
             .map(|r| (200..300).contains(&r.status) && usable("chat", &r.body))
             .unwrap_or(false);
-        checks.push(entry(&name, start, result, ok, "chat", !explicit));
+        let entry = entry(&name, start, result, ok, "chat", !explicit);
+        if entry["skipped"].is_string() {
+            // Key-restricted models leave no evidence either way.
+        } else if ok || entry["status"].as_u64() != Some(404) {
+            // Successes and transient failures alike break the consecutive
+            // 404 streak; only deterministic 404s accumulate.
+            failures.remove(model);
+        } else {
+            let count = failures
+                .get(model)
+                .and_then(|failure| failure["count"].as_u64())
+                .unwrap_or(0)
+                + 1;
+            failures.insert(
+                model.clone(),
+                json!({
+                    "count": count,
+                    "status": 404,
+                }),
+            );
+        }
+        checks.push(entry);
     }
+    // A route is dead only after consecutive deterministic 404 failures:
+    // transient cooldowns and credit outages never prune an advertised model.
+    let mut dead: Vec<String> = failures
+        .iter()
+        .filter(|(_, failure)| {
+            failure["count"].as_u64().unwrap_or(0) >= options.dead_after as u64
+                && failure["status"].as_u64() == Some(404)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    dead.sort();
     if options.all_formats {
         let candidates: Vec<String> = options
             .models
@@ -640,16 +689,35 @@ fn run(options: &Options) -> Result<bool> {
     }
     // Advance the rotation cursor only after this run's probes ran, so a
     // crash mid-run retries the same models instead of skipping them.
-    if let Some(next) = pending_next {
+    // Failure streaks persist alongside the cursor so a later run keeps
+    // accumulating evidence for the dead-route list.
+    if pending_next.is_some() || !selected.is_empty() {
+        state["next"] =
+            json!(pending_next.unwrap_or_else(|| { state["next"].as_u64().unwrap_or(0) as usize }));
+        state["failures"] = Value::Object(failures);
         // A cursor that cannot be saved must not hide this run's results:
         // report it as its own failed check and still print the report.
         if let Err(error) = atomic_write(
             &options.state_file,
-            |file| file.write_all(json!({"next": next}).to_string().as_bytes()),
+            |file| file.write_all(state.to_string().as_bytes()),
             0o600,
         ) {
             checks.push(record(
                 "rotation-state",
+                Instant::now(),
+                Err(Box::new(error)),
+                false,
+            ));
+        }
+    }
+    if let Some(dead_file) = &options.dead_file {
+        if let Err(error) = atomic_write(
+            dead_file,
+            |file| file.write_all(json!(dead).to_string().as_bytes()),
+            0o600,
+        ) {
+            checks.push(record(
+                "dead-file",
                 Instant::now(),
                 Err(Box::new(error)),
                 false,
@@ -663,6 +731,7 @@ fn run(options: &Options) -> Result<bool> {
             "ok": ok,
             "listen": options.listen,
             "checks": checks,
+            "dead": dead,
         }))?
     );
     Ok(ok)

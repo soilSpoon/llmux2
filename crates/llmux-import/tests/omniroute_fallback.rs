@@ -128,6 +128,140 @@ fn fallback_is_last_and_codex_routes_are_excluded() {
 }
 
 #[test]
+fn exclude_models_drops_dead_routes_and_their_aliases() {
+    let mut dead_list = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+    std::io::Write::write_all(
+        &mut dead_list,
+        br#"["public","mapped-owner","owner-alias","owner"]"#,
+    )
+    .unwrap();
+    let mut root = fixture();
+    // A live combo with a disabled reference to the dead "owner" must still be
+    // advertised: usable:false legs never expand, so they are not dead legs.
+    root["combos"].as_array_mut().unwrap().push(json!({
+        "id":"surv","name":"survives","models":["openai/first",{"kind":"combo-ref","comboName":"owner","usable":false}]
+    }));
+    // An alias pointing straight at a combo that only collapses during emit.
+    root["modelAliases"]["ghost"] = json!("nested-owner");
+    let (dir, result) = run(
+        &root,
+        &[
+            "--omniroute-fallback",
+            "http://127.0.0.1:20128/v1",
+            "--omniroute-key",
+            "KEY_REF",
+            "--exclude-models",
+            dead_list.path().to_str().unwrap(),
+        ],
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("public") && stderr.contains("dropped"),
+        "{stderr}"
+    );
+    let cfg =
+        RuntimeConfig::parse(&fs::read_to_string(dir.path().join("out.toml")).unwrap()).unwrap();
+    for gone in [
+        "public",
+        "public-alias",
+        "mapped-owner",
+        "owner-alias",
+        "owner",
+    ] {
+        assert!(!cfg.model_names.contains_key(gone), "{gone}");
+    }
+    // A dropped route is never served again: it lands in the catch-all
+    // exclusion list, and aliases resolving to it (public-alias) or into a
+    // dropped mapping are pruned too. A nested combo whose only leg is the
+    // excluded "owner" collapses to no deployments and dies with it — and the
+    // "chain" alias into it never attaches.
+    for collapsed in ["nested-owner", "chain"] {
+        assert!(!cfg.model_names.contains_key(collapsed), "{collapsed}");
+    }
+    for excluded in [
+        "public",
+        "public-alias",
+        "mapped-owner",
+        "owner-alias",
+        "owner",
+        "nested-owner",
+    ] {
+        assert!(
+            cfg.catch_all_exclude.contains(&excluded.to_string()),
+            "{excluded}"
+        );
+    }
+    // The catch-all still serves, with the dead names excluded. The disabled
+    // reference on "survives" does not count as a dead leg.
+    assert!(cfg.catch_all.is_some());
+    assert!(!cfg.catch_all_exclude.contains(&"*".to_string()));
+    assert!(cfg.model_names.contains_key("survives"));
+    // An alias into a combo that collapsed during emit is unreachable too.
+    assert!(!cfg.model_names.contains_key("ghost"));
+    assert!(cfg.catch_all_exclude.contains(&"ghost".to_string()));
+}
+
+#[test]
+fn exclude_models_rejects_malformed_lists_without_writing_config() {
+    for body in [r#"["ok", 1]"#, r#"{"not":"a list"}"#, "not json", r#"[""]"#] {
+        let mut dead_list = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        std::io::Write::write_all(&mut dead_list, body.as_bytes()).unwrap();
+        let (dir, result) = run(
+            &fixture(),
+            &[
+                "--omniroute-fallback",
+                "http://127.0.0.1:20128/v1",
+                "--omniroute-key",
+                "KEY_REF",
+                "--exclude-models",
+                dead_list.path().to_str().unwrap(),
+            ],
+        );
+        assert!(!result.status.success(), "{body}");
+        assert!(!dir.path().join("out.toml").exists(), "{body}");
+    }
+}
+
+#[test]
+fn non_chat_models_are_never_emitted_as_chat_routes() {
+    let mut root = fixture();
+    root["combos"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"emb","name":"embed-only","models":["openai/mistral-embed"]}));
+    root["combos"].as_array_mut().unwrap().push(
+        json!({"id":"mix","name":"mixed","models":["openai/first","openai/codestral-embed","openai/span-01-lite"]}),
+    );
+    let (dir, result) = run(&root, &[]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("embed-only") && stderr.contains("non-chat"),
+        "{stderr}"
+    );
+    // A combo whose every leg is non-chat disappears from /v1/models; a mixed
+    // combo keeps only its chat legs.
+    let cfg =
+        RuntimeConfig::parse(&fs::read_to_string(dir.path().join("out.toml")).unwrap()).unwrap();
+    assert!(!cfg.model_names.contains_key("embed-only"));
+    let upstreams: Vec<_> = cfg.models[cfg.model_names["mixed"]]
+        .deployments
+        .iter()
+        .map(|idx| cfg.deployments[idx.0 as usize].upstream_model.as_ref())
+        .collect();
+    assert_eq!(upstreams, ["first"]);
+}
+
+#[test]
 fn rejects_unrepresentable_codex_mapping_without_writing_config() {
     for pattern in ["private-?", "private-*-suffix", "private-**"] {
         let mut root = fixture();

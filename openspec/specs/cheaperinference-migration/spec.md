@@ -605,3 +605,30 @@ THEN the fallback leg remains, with its `omniroute-fallback-*` id and a priority
 
 WHEN two models each use the same connection and upstream model
 THEN each model keeps its own deployment.
+
+### Requirement: Dead and non-chat routes are never advertised
+
+`/v1/models` SHALL list only models that can be served. The importer SHALL
+accept `--exclude-models PATH`, a JSON array of model names (the shape
+`llmux2-probe --dead-file` writes), and SHALL skip each listed name during
+emit: its model entry, combo legs, and aliases resolving to it SHALL be
+dropped with a warning, and with `--omniroute-fallback` the names SHALL join
+the catch-all `exclude` set. Malformed or unreadable lists SHALL abort the
+import before any output is written.
+
+Upstream model IDs that cannot serve chat-completions-class endpoints —
+embedding or typed-endpoint models listed in `src/policy.rs`'s reviewed
+non-chat table — SHALL be classified out of every combo leg at emit, with a
+warning; a combo left with no deployments SHALL be skipped as usual.
+
+#### Scenario: Dead route dropped at import
+
+WHEN a probe-confirmed dead model is listed in `--exclude-models`
+THEN its name and aliases never reach `/v1/models`, and the catch-all cannot
+serve it under another name.
+
+#### Scenario: Embedding model classified out
+
+WHEN a combo leg names a reviewed non-chat upstream model
+THEN that leg is not emitted; a combo with only non-chat legs is not
+advertised at all.

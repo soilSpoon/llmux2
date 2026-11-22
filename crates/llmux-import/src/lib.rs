@@ -57,6 +57,11 @@ pub struct ImportOptions<'a> {
     pub nous_state: Option<&'a Path>,
     pub nous_models: Option<&'a Path>,
     pub omniroute_fallback: Option<OmniRouteFallback<'a>>,
+    /// JSON list of dead route names (e.g. `llmux2-probe --dead-file` output).
+    /// Listed models are dropped from the import instead of being advertised,
+    /// their aliases are pruned, and with `--omniroute-fallback` they land in
+    /// the catch-all's `exclude` so the wildcard never serves them again.
+    pub exclude_models: Option<&'a Path>,
 }
 
 #[derive(Clone, Copy)]
@@ -422,6 +427,43 @@ struct Expander<'a> {
     remaining_steps: usize,
     exhausted: bool,
     policy: &'a policy::Policy,
+    dead: &'a HashSet<String>,
+}
+
+fn references_dead(
+    combos: &HashMap<String, Value>,
+    name: &str,
+    dead: &HashSet<String>,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if !visited.insert(name.to_owned()) {
+        return false;
+    }
+    let Some(combo) = combos.get(name) else {
+        return false;
+    };
+    for step in array(combo, "models") {
+        if step["usable"] == false {
+            continue;
+        }
+        let raw = step
+            .as_str()
+            .unwrap_or_else(|| string(step, "model"))
+            .trim();
+        let target = if string(step, "kind") == "combo-ref" {
+            string(step, "comboName")
+        } else if combos.contains_key(raw) {
+            raw
+        } else {
+            ""
+        };
+        if !target.is_empty()
+            && (dead.contains(target) || references_dead(combos, target, dead, visited))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 impl Expander<'_> {
@@ -481,6 +523,12 @@ impl Expander<'_> {
                 None
             };
             if let Some(target) = reference {
+                if self.dead.contains(target) {
+                    self.warnings.push(format!(
+                        "combo {name} step {index}: skipped dead reference {target}"
+                    ));
+                    continue;
+                }
                 self.warnings.push(format!("combo {name} step {index}: expanded nested combo {target} inline; nested routing policy is not preserved"));
                 self.expand(target, stack, out);
                 continue;
@@ -672,6 +720,25 @@ pub fn import_with_options(
     options: &ImportOptions<'_>,
 ) -> Result<ImportReport, String> {
     let policy = policy::Policy::load(options)?;
+    let mut dead: HashSet<String> = match options.exclude_models {
+        Some(path) => serde_json::from_str::<Vec<String>>(
+            &fs::read_to_string(path)
+                .map_err(|e| format!("could not read --exclude-models {}: {e}", path.display()))?,
+        )
+        .ok()
+        .and_then(|list| {
+            list.iter()
+                .all(|name| !name.is_empty() && !name.contains('*'))
+                .then(|| list.into_iter().collect())
+        })
+        .ok_or_else(|| {
+            format!(
+                "--exclude-models {} must be a JSON array of nonempty model names",
+                path.display()
+            )
+        })?,
+        None => HashSet::new(),
+    };
     let nous = match (options.nous_state, options.nous_models) {
         (None, None) => None,
         (Some(state), Some(models)) => Some(nous::Nous::load(state, models)?),
@@ -1057,6 +1124,7 @@ pub fn import_with_options(
                     remaining_steps: 1024,
                     exhausted: false,
                     policy: &policy,
+                    dead: &dead,
                 }
                 .expand(target, &mut Vec::new(), &mut deployments);
                 if deployments.is_empty() {
@@ -1094,7 +1162,7 @@ pub fn import_with_options(
             }
         }
     }
-    let (aliases, mut synthetic, unavailable_aliases) = aliases::prepare(
+    let (mut aliases, mut synthetic, unavailable_aliases) = aliases::prepare(
         &root,
         &combos,
         &combo_ids,
@@ -1105,6 +1173,15 @@ pub fn import_with_options(
             .openrouter_replacements
             .then_some(&unavailable_combos),
     );
+    // Aliases into a dead route die with it and join the exclusion set so the
+    // catch-all cannot resurrect them either.
+    aliases.retain(|alias, target| {
+        let keep = !dead.contains(alias) && !dead.contains(target);
+        if !keep {
+            dead.insert(alias.clone());
+        }
+        keep
+    });
     direct.extend(direct::collect(&synthetic, nodes, &connections));
     for (name, model) in direct {
         let official = policy.openrouter_replacements
@@ -1127,6 +1204,12 @@ pub fn import_with_options(
     context.reset_usage();
     let mut deployment_ids = HashSet::new();
     for name in order {
+        if dead.contains(&name) {
+            warnings.push(format!(
+                "model {name}: dropped dead route listed in --exclude-models"
+            ));
+            continue;
+        }
         let lookup = if synthetic.contains_key(&name) {
             &synthetic
         } else {
@@ -1152,6 +1235,7 @@ pub fn import_with_options(
             remaining_steps: 1024,
             exhausted: false,
             policy: &policy,
+            dead: &dead,
         }
         .expand(&name, &mut Vec::new(), &mut deployments);
         morph::order(&name, &mut deployments, &connections, nodes, &mut warnings);
@@ -1180,6 +1264,7 @@ pub fn import_with_options(
                 remaining_steps: 1,
                 exhausted: false,
                 policy: &policy,
+                dead: &dead,
             }
             .expand(&name, &mut Vec::new(), &mut free);
             xplabs::place(&name, &mut deployments, free, &connections, &mut warnings);
@@ -1205,6 +1290,7 @@ pub fn import_with_options(
                     remaining_steps: 1024,
                     exhausted: false,
                     policy: &policy,
+                    dead: &dead,
                 }
                 .expand(&name, &mut Vec::new(), &mut deployments);
             }
@@ -1214,8 +1300,26 @@ pub fn import_with_options(
                 fields.remove("_bridge_replacement");
             }
         }
+        let mut nonchat = Vec::new();
+        deployments.retain(|dep| {
+            let chat = !policy::NON_CHAT_MODELS.contains(&string(dep, "upstream_model"));
+            if !chat {
+                nonchat.push(string(dep, "upstream_model").to_owned());
+            }
+            chat
+        });
+        for model in nonchat {
+            warnings.push(format!(
+                "combo {name}: dropped non-chat model {model} (no chat endpoint)"
+            ));
+        }
         if deployments.is_empty() {
             warnings.push(format!("combo {name}: skipped: no deployments"));
+            // A combo that collapsed entirely into dead references is dead
+            // itself: the catch-all must not serve its name either.
+            if references_dead(lookup, &name, &dead, &mut HashSet::new()) {
+                dead.insert(name.clone());
+            }
             continue;
         }
         for (i, dep) in deployments.iter_mut().enumerate() {
@@ -1224,6 +1328,15 @@ pub fn import_with_options(
         }
         models.push(json!({"name":name,"aliases":[],"deployments":deployments}));
     }
+    // Combos that collapsed during emit can leave aliases pointing at them:
+    // sweep again so those names also join the catch-all exclusion set.
+    aliases.retain(|alias, target| {
+        let keep = !dead.contains(alias) && !dead.contains(target);
+        if !keep {
+            dead.insert(alias.clone());
+        }
+        keep
+    });
     aliases::attach(&mut models, aliases, &mut warnings);
     context.report(&mut warnings);
     if let (Some(options), Some(exclusions)) = (fallback, fallback_exclusions) {
@@ -1231,6 +1344,8 @@ pub fn import_with_options(
         credentials.push(
             json!({"id":credential,"kind":"api_key","provider":"openai_compat","key":options.key}),
         );
+        let mut exclusions = exclusions.clone();
+        exclusions.extend(dead.iter().cloned());
         let session_excluded = exclusions.clone();
         fallback::append(
             &mut models,
@@ -1261,7 +1376,8 @@ pub fn import_with_options(
             })
             .map(str::to_owned)
             .collect();
-        let added = nous.models(&credential, &taken, &mut deployment_ids, &mut warnings);
+        let mut added = nous.models(&credential, &taken, &mut deployment_ids, &mut warnings);
+        added.retain(|model| !dead.contains(string(model, "name")));
         if !added.is_empty() {
             credentials.push(nous.credential(&credential));
             models.extend(added);

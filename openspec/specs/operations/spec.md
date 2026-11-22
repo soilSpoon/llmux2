@@ -322,6 +322,20 @@ WHEN healthz, the models route, or a probed model returns a non-2xx answer
 THEN the run exits 1 and the JSON report names the failing check with its
 status, so the failed unit is visible in the journal.
 
+The state file SHALL also accumulate a consecutive-failure streak per probed
+model; a success clears it, and a key-restricted model leaves no evidence
+either way. A model whose streak reaches `--dead-after` (default 2) of status
+404 — a deterministic upstream refusal — SHALL be listed under `dead` in the
+report, and `--dead-file PATH` SHALL write those names as a JSON array for
+`llmux-import --exclude-models`. Transient statuses such as 429 cooldowns or
+502 upstream errors SHALL never count toward dead.
+
+#### Scenario: A persistently dead route is dropped at the source
+
+WHEN a model's last `--dead-after` probes all returned 404
+THEN it appears in the report's `dead` list and in `--dead-file`, so the next
+import drops it rather than advertising it in `/v1/models`.
+
 ### Requirement: Simple and extensible
 
 The codebase SHALL stay simple with low overhead, and be easy to extend and

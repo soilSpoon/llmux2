@@ -219,6 +219,7 @@ fn status_line(status: u16) -> &'static str {
         400 => "400 Bad Request",
         401 => "401 Unauthorized",
         403 => "403 Forbidden",
+        404 => "404 Not Found",
         429 => "429 Too Many Requests",
         503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
@@ -715,6 +716,160 @@ fn killed_probe_does_not_advance_the_rotation_cursor() {
         "rotation cursor advanced before the probes completed"
     );
     stop.send(()).unwrap();
+}
+
+#[test]
+fn consecutive_404s_mark_a_model_dead_after_the_threshold() {
+    let home = Home::new();
+    let dead = || Reply::json(404, json!({"error":{"code":"model_not_found"}}));
+    let ok = || Reply::json(200, json!({"choices":[{"message":{"content":"ok"}}]}));
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        models_reply(),
+        dead(), // run 1: alpha 404
+        Reply::text(200, "ok"),
+        models_reply(),
+        ok(), // run 2: beta ok
+        Reply::text(200, "ok"),
+        models_reply(),
+        ok(), // run 3: gamma ok
+        Reply::text(200, "ok"),
+        models_reply(),
+        dead(), // run 4: alpha 404 again
+    ]);
+    for (model, code, dead_count) in [
+        ("alpha", 1, 0),
+        ("beta", 0, 0),
+        ("gamma", 0, 0),
+        ("alpha", 1, 1),
+    ] {
+        let output = listen_flag(&home, &gateway, &[]);
+        assert_eq!(output.status.code(), Some(code), "{model}");
+        assert_eq!(gateway.chat_models().last().unwrap(), model);
+        let report = summary(&output);
+        assert_eq!(report["dead"].as_array().unwrap().len(), dead_count);
+        if dead_count == 1 {
+            assert_eq!(report["dead"], json!(["alpha"]));
+        }
+    }
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn a_success_clears_the_failure_streak() {
+    let home = Home::new();
+    let dead = || Reply::json(404, json!({"error":{"code":"model_not_found"}}));
+    let ok = || Reply::json(200, json!({"choices":[{"message":{"content":"ok"}}]}));
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        models_reply(),
+        dead(),
+        Reply::text(200, "ok"),
+        models_reply(),
+        dead(),
+        Reply::text(200, "ok"),
+        models_reply(),
+        ok(),
+    ]);
+    for (code, expected) in [(1, 0), (1, 1), (0, 0)] {
+        let output = listen_flag(&home, &gateway, &["--models", "alpha"]);
+        assert_eq!(output.status.code(), Some(code));
+        let report = summary(&output);
+        let dead_list: Vec<_> = report["dead"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(Value::as_str)
+            .collect();
+        assert_eq!(dead_list.len(), expected, "{:?}", report["dead"]);
+        if expected == 1 {
+            assert_eq!(dead_list, [Some("alpha")]);
+        }
+    }
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn transient_statuses_never_count_as_dead() {
+    let home = Home::new();
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        models_reply(),
+        Reply::json(429, json!({"error":{"message":"cooldown"}})),
+        Reply::text(200, "ok"),
+        models_reply(),
+        Reply::json(502, json!({"error":{"message":"upstream_error"}})),
+    ]);
+    for _ in 0..2 {
+        let output = listen_flag(&home, &gateway, &["--models", "alpha", "--dead-after", "1"]);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(summary(&output)["dead"], json!([]));
+    }
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn a_non_404_failure_resets_the_streak() {
+    let home = Home::new();
+    let dead = || Reply::json(404, json!({"error":{"code":"model_not_found"}}));
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        models_reply(),
+        Reply::json(429, json!({"error":{"message":"cooldown"}})),
+        Reply::text(200, "ok"),
+        models_reply(),
+        dead(),
+        Reply::text(200, "ok"),
+        models_reply(),
+        dead(),
+    ]);
+    // 429 then 404 is one consecutive 404, not two: the streak must not fire.
+    for expected in [0, 0, 1] {
+        let output = listen_flag(&home, &gateway, &["--models", "alpha"]);
+        assert_eq!(summary(&output)["dead"].as_array().unwrap().len(), expected);
+    }
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn dead_file_writes_the_dead_model_list() {
+    let home = Home::new();
+    let dead_file = home.0.join("dead.json");
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        models_reply(),
+        Reply::json(404, json!({"error":{"code":"model_not_found"}})),
+    ]);
+    let output = listen_flag(
+        &home,
+        &gateway,
+        &[
+            "--models",
+            "alpha",
+            "--dead-after",
+            "1",
+            "--dead-file",
+            dead_file.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(summary(&output)["dead"], json!(["alpha"]));
+    let written: Value = serde_json::from_str(&fs::read_to_string(dead_file).unwrap()).unwrap();
+    assert_eq!(written, json!(["alpha"]));
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn dead_after_rejects_zero_and_nonnumeric_values() {
+    let home = Home::new();
+    for args in [
+        vec!["--dead-after", "0"],
+        vec!["--dead-after", "abc"],
+        vec!["--dead-after=-1"],
+    ] {
+        let output = home.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
 }
 
 #[test]
