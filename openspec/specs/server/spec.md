@@ -51,12 +51,21 @@ accepted; send a data: URL` before any upstream call. Optional
 or a native Anthropic base64 image whose decoded payload exceeds the limit
 with 413. The check SHALL live in one inbound validation step, not in each
 adapter. `allow` with no limit SHALL preserve previous image handling.
+Tool definitions and output-format schemas SHALL NOT be inspected as image
+inputs; image blocks in message content, including nested tool results,
+remain subject to the policy.
 
 #### Scenario: Remote URL rejected
 
 WHEN `remote_images = "reject"` and a chat message contains an https
 `image_url`
 THEN the client receives 400 and the upstream is not called.
+
+#### Scenario: URL examples in a schema are permitted
+
+WHEN a tool or output-format schema contains an `image_url` example, but
+the request has no disallowed image input
+THEN the image policy lets the request proceed without changing the schema.
 
 #### Scenario: Inline image over the cap
 

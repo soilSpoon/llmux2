@@ -208,6 +208,30 @@ async fn body_user_is_hashed_when_the_header_is_absent() {
 }
 
 #[tokio::test]
+async fn image_policy_forwards_url_examples_in_tool_schemas() {
+    let fixture = Fixture::start().await;
+    let schema = json!({
+        "type":"object",
+        "properties":{"image_url":{"type":"string"}},
+        "examples":[{"image_url":"https://example.com/example.png"}],
+    });
+    let (status, _, body) = fixture
+        .send(
+            "/v1/chat/completions",
+            &[],
+            json!({
+                "model":"assistant",
+                "messages":[{"role":"user","content":"Find an image"}],
+                "tools":[{"type":"function","function":{"name":"search","parameters":schema}}]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fixture.calls(), 1);
+    assert_eq!(fixture.last()["tools"][0]["input_schema"], schema);
+}
+
+#[tokio::test]
 async fn remote_images_and_oversized_data_urls_never_call_upstream() {
     let fixture = Fixture::start().await;
     let (status, headers, body) = fixture
