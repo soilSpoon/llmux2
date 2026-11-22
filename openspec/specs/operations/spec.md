@@ -342,7 +342,10 @@ cursor, and SHALL be rejected in combination with `--models`. The shipped
 `llmux2-sweep.timer` SHALL run it on its own state file, feeding
 `--dead-file`; `llmux2-prune.timer` SHALL re-run the import with
 `--exclude-models` on a schedule and deploy the regenerated config so dead
-routes are dropped without manual pruning.
+routes are dropped without manual pruning. The scheduled import SHALL carry
+the site's supplemental importer options and the deployed slot's listen
+address, and SHALL never delete secrets the deployed config still
+references.
 
 #### Scenario: A full sweep finds the long tail
 

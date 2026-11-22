@@ -148,6 +148,30 @@ fn dump_json_columns_fail_closed_and_empty_dump_is_rejected() {
 }
 
 #[test]
+fn listen_overrides_the_emitted_server_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("llmux.toml");
+    llmux_import::import_with_options(
+        DB_FIXTURE,
+        &output,
+        None,
+        &llmux_import::ImportOptions {
+            listen: Some("127.0.0.1:8090"),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        RuntimeConfig::load(&output)
+            .unwrap()
+            .server
+            .listen
+            .to_string(),
+        "127.0.0.1:8090"
+    );
+}
+
+#[test]
 fn imports_and_validates_real_config() {
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("llmux.toml");

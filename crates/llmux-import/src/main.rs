@@ -16,6 +16,7 @@ fn run() -> Result<(), String> {
     let mut fallback = None;
     let mut key = None;
     let mut excluded = None;
+    let mut listen = None;
     let mut workers_rpm: Option<u32> = None;
     let mut args = env::args_os().skip(1);
     while let Some(arg) = args.next() {
@@ -55,8 +56,9 @@ fn run() -> Result<(), String> {
             Some("--omniroute-fallback") => &mut fallback,
             Some("--omniroute-key") => &mut key,
             Some("--exclude-models") => &mut excluded,
+            Some("--listen") => &mut listen,
             _ => return Err(
-                "usage: llmux-import --input export.json --output llmux.toml [--secrets-dir DIR] [--cloudflare-account-id-file PATH --cloudflare-token-file PATH] [--workers-ai-models PATH] [--kilo-free-models PATH] [--kilo-key-file PATH] [--devin-models PATH] [--nous-state PATH --nous-models PATH] [--openrouter-replacements] [--workers-ai-rpm RPM] [--omniroute-fallback BASE_URL --omniroute-key SECRET_REF] [--exclude-models PATH]"
+                "usage: llmux-import --input export.json --output llmux.toml [--secrets-dir DIR] [--cloudflare-account-id-file PATH --cloudflare-token-file PATH] [--workers-ai-models PATH] [--kilo-free-models PATH] [--kilo-key-file PATH] [--devin-models PATH] [--nous-state PATH --nous-models PATH] [--openrouter-replacements] [--workers-ai-rpm RPM] [--omniroute-fallback BASE_URL --omniroute-key SECRET_REF] [--exclude-models PATH] [--listen HOST:PORT]"
                     .into(),
             ),
         };
@@ -90,6 +92,7 @@ fn run() -> Result<(), String> {
         openrouter_replacements: replacements,
         workers_ai_rpm: workers_rpm,
         omniroute_fallback: fallback,
+        listen: listen.as_deref().and_then(|p| p.to_str()),
         exclude_models: excluded.as_deref(),
     };
     let report =

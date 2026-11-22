@@ -57,6 +57,10 @@ pub struct ImportOptions<'a> {
     pub nous_state: Option<&'a Path>,
     pub nous_models: Option<&'a Path>,
     pub omniroute_fallback: Option<OmniRouteFallback<'a>>,
+    /// Emitted `[server].listen` address; defaults to `127.0.0.1:8080`.
+    /// Scheduled re-imports must pass the deployed address — deploy rejects a
+    /// regenerated config whose listen differs from the installed one.
+    pub listen: Option<&'a str>,
     /// JSON list of dead route names (e.g. `llmux2-probe --dead-file` output).
     /// Listed models are dropped from the import instead of being advertised,
     /// their aliases are pruned, and with `--omniroute-fallback` they land in
@@ -1470,7 +1474,7 @@ pub fn import_with_options(
             }
         }
     }
-    let config = json!({"server":{"listen":"127.0.0.1:8080","client_keys":client_keys},"credentials":credentials,"models":models});
+    let config = json!({"server":{"listen":options.listen.unwrap_or("127.0.0.1:8080"),"client_keys":client_keys},"credentials":credentials,"models":models});
     validation::validate(
         &config,
         client_count == 0,

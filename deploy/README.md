@@ -163,14 +163,27 @@ builds streaks for the long tail — the sweep is what feeds `--dead-file`
 for the full catalog.
 
 `llmux2-prune.timer` (weekly) then re-runs the import with
-`--exclude-models dead-models.json`, regenerating `llmux-next.toml` and
-deploying it through `llmux2-deploy` so dead routes stop being advertised
-without manual pruning. Refresh the OmniRoute export before each run via an
-`ExecStartPre` drop-in on `llmux2-prune.service` (the export contains
-credentials). Deploy follows the normal slot-swap rules; rollback is a
-redeploy of the known-good config.
+`--exclude-models dead-models.json` and deploys through `llmux2-deploy`, so
+dead routes stop being advertised without manual pruning. The service runs
+`llmux2-prune.sh` (installed alongside the binaries), which:
+
+- regenerates `llmux-next.toml` with the site's supplemental importer flags
+  read from `~/llmux2/import.flags` (one argument per line — the same
+  `--omniroute-fallback`, `--nous-*`, `--kilo-*`, … arguments the original
+  import used, so a prune never shrinks the catalog);
+- passes the deployed slot's own `--listen` address read back from
+  `active.json` (deploy rejects a regenerated config on a different port);
+- removes only the stale candidate config — the shared `~/llmux2/secrets/`
+  directory is never deleted since the importer skips existing secret
+  files and both slots share them;
+- skips the run entirely when no sweep output exists yet.
+
+Refresh the OmniRoute export before each run via an `ExecStartPre` drop-in
+on `llmux2-prune.service` (the export contains credentials). Deploy follows
+the normal slot-swap rules; rollback is a redeploy of the known-good config.
 
 ```sh
+install -m 700 deploy/prune.sh "$HOME/llmux2/bin/llmux2-prune.sh"
 install -m 700 target/release/llmux-import "$HOME/llmux2/bin/"
 systemctl --user enable --now llmux2-sweep.timer llmux2-prune.timer
 ```

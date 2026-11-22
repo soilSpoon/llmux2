@@ -1,14 +1,11 @@
 [Unit]
 Description=Regenerate llmux2 config without dead routes and deploy it
-# Requires the OmniRoute export refreshed before each run; refresh it via an
-# ExecStartPre drop-in on this service (the export contains credentials).
+# Requires ~/llmux2/import.flags carrying the site's supplemental importer
+# arguments and an ExecStartPre drop-in that refreshes export.json (the
+# export contains credentials).
 
 [Service]
 Type=oneshot
 WorkingDirectory=%h/llmux2
-# The importer never overwrites existing output; clear the stale candidate
-# and its secrets so each run regenerates cleanly.
-ExecStartPre=/bin/rm -rf %h/llmux2/llmux-next.toml %h/llmux2/secrets-next
-ExecStart=%h/llmux2/bin/llmux-import --input %h/llmux2/export.json --output %h/llmux2/llmux-next.toml --secrets-dir %h/llmux2/secrets-next --exclude-models %h/llmux2/dead-models.json
-ExecStart=%h/llmux2/bin/llmux2-deploy deploy --config %h/llmux2/llmux-next.toml
+ExecStart=/bin/bash %h/llmux2/bin/llmux2-prune.sh
 UMask=0077
