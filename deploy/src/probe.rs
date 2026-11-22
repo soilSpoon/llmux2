@@ -14,6 +14,7 @@ use std::{
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 const MAX_BODY: u64 = 1_048_576;
 const PROMPT: &str = "Reply with the single word: ok";
+const TOKEN_LIMIT: u64 = 16;
 
 #[derive(Debug)]
 struct Options {
@@ -575,7 +576,7 @@ fn run(options: &Options) -> Result<bool> {
                 &json!({
                     "model": model,
                     "messages": [{"role": "user", "content": PROMPT}],
-                    "max_tokens": 1,
+                    "max_tokens": TOKEN_LIMIT,
                     "stream": false,
                 })
                 .to_string(),
@@ -597,13 +598,13 @@ fn run(options: &Options) -> Result<bool> {
             (
                 "responses",
                 "/v1/responses",
-                json!({"input": PROMPT, "max_output_tokens": 16}),
+                json!({"input": PROMPT, "max_output_tokens": TOKEN_LIMIT}),
             ),
             (
                 "anthropic",
                 "/v1/messages",
                 json!({
-                    "max_tokens": 1,
+                    "max_tokens": TOKEN_LIMIT,
                     "messages": [{"role": "user", "content": PROMPT}],
                 }),
             ),
