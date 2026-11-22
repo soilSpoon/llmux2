@@ -46,11 +46,16 @@ impl Http {
         serde_json::from_slice(&bytes).map_err(|_| Error::Http)
     }
 
-    async fn response(&self, url: &Url, form: Option<String>) -> Result<(StatusCode, Bytes)> {
+    pub(crate) async fn response(
+        &self,
+        url: &Url,
+        form: Option<String>,
+    ) -> Result<(StatusCode, Bytes)> {
         validate_url(url)?;
         let mut request = Request::builder()
             .uri(url.as_str())
-            .header(header::ACCEPT, "application/json");
+            .header(header::ACCEPT, "application/json")
+            .header(header::USER_AGENT, llmux_types::USER_AGENT);
         let body = if let Some(form) = form {
             request = request
                 .method("POST")

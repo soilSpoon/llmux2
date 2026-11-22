@@ -264,7 +264,7 @@ fn imports_horde_anonymous_and_keyed_and_kilo_keyed() {
     let report = import_with_free_kilo(&root, &output);
     assert_eq!(
         (report.models, report.deployments, report.credentials),
-        (16, 26, 4)
+        (16, 23, 4)
     );
     let config = RuntimeConfig::load(&output).unwrap();
     for (name, expected_model, expected_url) in [
@@ -309,6 +309,16 @@ fn imports_horde_anonymous_and_keyed_and_kilo_keyed() {
             .count(),
         2
     );
+    for name in [
+        "aihorde/aphrodite/vendor/test",
+        "aihorde/google/test",
+        "aihorde/koboldcpp/test",
+    ] {
+        assert!(
+            warnings.contains(&format!("{name}: dropped 1 duplicate deployment")),
+            "{warnings}"
+        );
+    }
     let text = fs::read_to_string(output).unwrap();
     for secret in [
         "0000000000",
@@ -352,7 +362,7 @@ fn skip_precedence_is_explicit_and_replacement_warnings_are_static() {
             "no-auth",
             "",
             "",
-            "replace with a Cloudflare Workers AI account API token",
+            "pass --omniroute-fallback and --omniroute-key",
         ),
         (
             "custom-cf",
@@ -366,14 +376,7 @@ fn skip_precedence_is_explicit_and_replacement_warnings_are_static() {
             "apikey",
             "",
             "",
-            "no official replacement; dropped",
-        ),
-        (
-            "custom-deepai",
-            "apikey",
-            "test-key",
-            "deepai",
-            "no official replacement; dropped",
+            "pass --omniroute-fallback and --omniroute-key",
         ),
         (
             "custom-hms",

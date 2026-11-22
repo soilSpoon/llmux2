@@ -40,7 +40,10 @@ const ANTHROPIC_SSE: &str = concat!(
 #[derive(Clone, Copy)]
 enum Reply {
     Ok,
+    Exhausted,
     Limit,
+    Timeout,
+    NotFound(&'static str),
     Image,
     Document,
     BrokenStream,
@@ -66,8 +69,23 @@ impl Upstream {
 
     fn limited(&self) -> Option<Response> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        matches!(self.reply, Reply::Limit)
-            .then(|| (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "30")]).into_response())
+        match self.reply {
+            Reply::Limit => {
+                Some((StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "30")]).into_response())
+            }
+            Reply::Timeout => Some(StatusCode::REQUEST_TIMEOUT.into_response()),
+            Reply::NotFound(code) => Some(
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "type":"error",
+                        "error":{"type":"not_found_error","code":code,"message":"Model unavailable"}
+                    })),
+                )
+                    .into_response(),
+            ),
+            _ => None,
+        }
     }
 }
 
@@ -118,7 +136,7 @@ async fn messages(State(up): State<Arc<Upstream>>, headers: HeaderMap, body: Byt
         }
         return ([(header::CONTENT_TYPE, "text/event-stream")], ANTHROPIC_SSE).into_response();
     }
-    Json(json!({
+    let mut response = Json(json!({
         "id": "msg_1",
         "type": "message",
         "role": "assistant",
@@ -127,7 +145,18 @@ async fn messages(State(up): State<Arc<Upstream>>, headers: HeaderMap, body: Byt
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 3, "output_tokens": 4},
     }))
-    .into_response()
+    .into_response();
+    if matches!(up.reply, Reply::Exhausted) {
+        response.headers_mut().insert(
+            "anthropic-ratelimit-requests-remaining",
+            "0".parse().unwrap(),
+        );
+        response.headers_mut().insert(
+            "anthropic-ratelimit-requests-reset",
+            "2099-01-01T00:00:00Z".parse().unwrap(),
+        );
+    }
+    response
 }
 
 async fn chat(State(up): State<Arc<Upstream>>, headers: HeaderMap, body: Bytes) -> Response {
@@ -334,6 +363,27 @@ fn check_route(response: &Response, deployment: &str, attempts: &str) {
 }
 
 #[tokio::test]
+async fn anthropic_reset_header_skips_an_exhausted_deployment() {
+    let fixture = Fixture::start((Reply::Exhausted, 0), (Reply::Ok, 10)).await;
+    let payload = json!({
+        "model":"assistant","max_tokens":4096,"system":"Be brief",
+        "messages":[{"role":"user","content":[{"type":"text","text":"Hello"}]}]
+    });
+    for expected in ["claude", "gpt"] {
+        let (response, _) = fixture
+            .send_to(
+                "/v1/messages",
+                header::AUTHORIZATION,
+                "Bearer test-client",
+                payload.clone(),
+            )
+            .await;
+        check_route(&response, expected, "1");
+    }
+    assert_eq!(fixture.counts(), [1, 1]);
+}
+
+#[tokio::test]
 async fn native_messages_authentication_and_passthrough() {
     let fixture = Fixture::start((Reply::Ok, 0), (Reply::Ok, 10)).await;
     let mut payload = json!({
@@ -416,6 +466,49 @@ async fn native_messages_forwards_anthropic_protocol_headers() {
         .await;
     check_route(&response, "gpt", "1");
     assert_eq!(fixture.counts(), [0, 1]);
+}
+
+#[tokio::test]
+async fn anthropic_http_408_fails_over() {
+    let fixture = Fixture::start((Reply::Timeout, 0), (Reply::Ok, 10)).await;
+    let (response, text) = fixture.request(false).await;
+    check_route(&response, "gpt", "2");
+    assert!(text.contains("Hi from OpenAI"));
+    assert_eq!(fixture.counts(), [1, 1]);
+}
+
+#[tokio::test]
+async fn only_explicit_anthropic_model_not_found_fails_over() {
+    for code in ["not_found", "model_not_found"] {
+        let fixture = Fixture::start((Reply::NotFound(code), 0), (Reply::Ok, 10)).await;
+        let (response, text) = fixture.request(false).await;
+        if code == "model_not_found" {
+            check_route(&response, "gpt", "2");
+            assert!(text.contains("Hi from OpenAI"));
+            assert_eq!(fixture.counts(), [1, 1]);
+        } else {
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(fixture.counts(), [1, 0]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_anthropic_model_not_found_uses_the_chat_error_envelope() {
+    let fixture = Fixture::start(
+        (Reply::NotFound("model_not_found"), 10),
+        (Reply::NotFound("model_not_found"), 0),
+    )
+    .await;
+    let (response, text) = fixture.request(false).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(fixture.counts(), [1, 1]);
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap(),
+        json!({
+            "error":{"type":"not_found_error","code":"model_not_found","message":"Model unavailable","param":null}
+        })
+    );
 }
 
 #[tokio::test]
@@ -718,4 +811,228 @@ upstream_model = "claude"
         err.to_string(),
         "no registered adapter for provider anthropik"
     );
+}
+
+struct Sampling {
+    bodies: std::sync::Mutex<Vec<Value>>,
+    reject: &'static [&'static str],
+}
+
+async fn sampling_messages(State(up): State<Arc<Sampling>>, body: Bytes) -> Response {
+    let request: Value = serde_json::from_slice(&body).unwrap();
+    up.bodies.lock().unwrap().push(request.clone());
+    for field in up.reject {
+        if request.get(field).is_some() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "type":"error",
+                    "error":{"type":"invalid_request_error","message":format!("`{field}` is deprecated for this model.")}
+                })),
+            )
+                .into_response();
+        }
+    }
+    Json(json!({
+        "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-upstream",
+        "content": [{"type": "text", "text": "Hi from Claude"}],
+        "stop_reason": "end_turn", "usage": {"input_tokens": 3, "output_tokens": 4},
+    }))
+    .into_response()
+}
+
+struct SamplingFixture {
+    upstream: Arc<Sampling>,
+    gateway: TestServer,
+    _server: TestServer,
+    _secrets: TempDir,
+}
+
+impl SamplingFixture {
+    async fn start(reject: &'static [&'static str], strip: &str) -> Self {
+        let upstream = Arc::new(Sampling {
+            bodies: Default::default(),
+            reject,
+        });
+        let server = TestServer::start(
+            Router::new()
+                .route("/v1/messages", post(sampling_messages))
+                .with_state(upstream.clone()),
+        )
+        .await
+        .unwrap();
+        let secrets = tempfile::tempdir().unwrap();
+        for key in ["test-anthropic", "test-client"] {
+            fs::write(secrets.path().join(key), format!("{key}\n")).unwrap();
+        }
+        let base = secrets.path().display();
+        let config = format!(
+            r#"
+[server]
+client_keys = ["file:{base}/test-client"]
+request_timeout_ms = 4000
+
+[[credentials]]
+id = "claude-key"
+kind = "api_key"
+provider = "anthropic"
+key = "file:{base}/test-anthropic"
+
+[[models]]
+name = "assistant"
+
+[[models.deployments]]
+id = "claude"
+credential = "claude-key"
+base_url = "{}/v1"
+upstream_model = "claude-upstream"
+{strip}
+"#,
+            server.url()
+        );
+        let gateway = TestServer::start(
+            llmux_server::app(RuntimeConfig::parse(&config).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        Self {
+            upstream,
+            gateway,
+            _server: server,
+            _secrets: secrets,
+        }
+    }
+
+    async fn post(&self, path: &str, payload: Value) -> (StatusCode, HeaderMap, String) {
+        let request = Request::post(format!("{}{path}", self.gateway.url()))
+            .header(header::AUTHORIZATION, "Bearer test-client")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(payload.to_string())))
+            .unwrap();
+        let response = Client::builder(TokioExecutor::new())
+            .build_http()
+            .request(request)
+            .await
+            .unwrap();
+        let (parts, body) = response.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        (
+            parts.status,
+            parts.headers,
+            String::from_utf8(bytes.to_vec()).unwrap(),
+        )
+    }
+
+    fn bodies(&self) -> Vec<Value> {
+        self.upstream.bodies.lock().unwrap().clone()
+    }
+}
+
+fn sampling_payloads() -> [(&'static str, Value); 2] {
+    [
+        (
+            "/v1/chat/completions",
+            json!({"model":"assistant","temperature":0.7,"top_p":0.9,"top_k":5,"messages":[{"role":"user","content":"Hello"}]}),
+        ),
+        (
+            "/v1/messages",
+            json!({"model":"assistant","max_tokens":16,"temperature":0.7,"top_p":0.9,"top_k":5,"messages":[{"role":"user","content":"Hello"}]}),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn strip_request_fields_removes_sampling_parameters_on_both_anthropic_paths() {
+    let fixture = SamplingFixture::start(
+        &[],
+        r#"strip_request_fields = ["temperature", "top_p", "top_k"]"#,
+    )
+    .await;
+    for (path, payload) in sampling_payloads() {
+        let (status, headers, _) = fixture.post(path, payload).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(headers["x-llmux-attempts"], "1");
+    }
+    let bodies = fixture.bodies();
+    assert_eq!(bodies.len(), 2);
+    for body in bodies {
+        for field in ["temperature", "top_p", "top_k"] {
+            assert!(body.get(field).is_none(), "{field} reached upstream");
+        }
+        assert_eq!(body["model"], "claude-upstream");
+    }
+}
+
+#[tokio::test]
+async fn deprecated_sampling_parameters_are_dropped_and_retried_on_the_same_deployment() {
+    let fixture = SamplingFixture::start(&["temperature", "top_p"], "").await;
+    for (path, payload) in sampling_payloads() {
+        let (status, headers, body) = fixture.post(path, payload).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert_eq!(headers["x-llmux-deployment"], "claude");
+        assert_eq!(headers["x-llmux-attempts"], "1");
+    }
+    let bodies = fixture.bodies();
+    assert_eq!(bodies.len(), 6);
+    for (sent, native) in bodies.chunks(3).zip([false, true]) {
+        assert!(sent[0].get("temperature").is_some());
+        assert!(sent[1].get("temperature").is_none() && sent[1].get("top_p").is_some());
+        assert!(sent[2].get("top_p").is_none());
+        if native {
+            assert_eq!(sent[2]["top_k"], 5, "unrelated fields must survive");
+        }
+        assert_eq!(sent[2]["messages"], sent[0]["messages"]);
+    }
+}
+
+#[tokio::test]
+async fn deprecated_sampling_repairs_consume_upstream_request_quota() {
+    for (path, payload) in sampling_payloads() {
+        let limited =
+            SamplingFixture::start(&["temperature"], "quota = { rpm = 1, concurrent = 1 }").await;
+        let (status, headers, body) = limited.post(path, payload.clone()).await;
+        assert_eq!(limited.bodies().len(), 1, "{path}: no quota for a repair");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert!(body.contains("is deprecated for this model"));
+        assert_eq!(headers["x-llmux-attempts"], "1");
+
+        let allowed =
+            SamplingFixture::start(&["temperature"], "quota = { rpm = 2, concurrent = 1 }").await;
+        let (status, headers, body) = allowed.post(path, payload.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert_eq!(headers["x-llmux-attempts"], "1");
+        assert_eq!(allowed.bodies().len(), 2);
+
+        let (status, _, _) = allowed.post(path, payload).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{path}");
+        assert_eq!(allowed.bodies().len(), 2, "{path}: both sends were charged");
+    }
+}
+
+#[tokio::test]
+async fn deprecated_parameter_retry_serves_chat_requests() {
+    let fixture = SamplingFixture::start(&["temperature"], "").await;
+    let (status, _, body) = fixture
+        .post(
+            "/v1/chat/completions",
+            json!({"model":"assistant","temperature":0.2,"messages":[{"role":"user","content":"Hello"}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fixture.bodies().len(), 2);
+}
+
+#[tokio::test]
+async fn unrelated_bad_requests_are_not_retried() {
+    let fixture = SamplingFixture::start(&["max_tokens"], "").await;
+    let (status, _, _) = fixture
+        .post(
+            "/v1/messages",
+            json!({"model":"assistant","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(fixture.bodies().len(), 1);
 }

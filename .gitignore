@@ -1,3 +1,5 @@
 /target/
 /llmux.toml
 /.env
+tla/states/
+tla/*_TTrace_*

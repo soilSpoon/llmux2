@@ -16,6 +16,7 @@ llmux-providers.workspace = true
 llmux-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 subtle.workspace = true
 tokio = { workspace = true, features = ["signal", "io-util", "sync"] }
 uuid.workspace = true

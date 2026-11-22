@@ -467,7 +467,8 @@ async fn streaming_commits_before_completion_and_never_replays() {
                 let chunks = stream::unfold(0, move |i| { let g = g.clone(); async move {
                     let data = match i {
                         0 => format!("event: response.created\ndata: {}\n\n", json!({"type":"response.created","response":{"id":"resp_test","model":"upstream"}})),
-                        1 => { g.acquire().await.unwrap().forget(); "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"subscription_sharing_usage_limit_exceeded\"}}}\n\n".to_owned() },
+                        1 => "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n".to_owned(),
+                        2 => { g.acquire().await.unwrap().forget(); "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"subscription_sharing_usage_limit_exceeded\"}}}\n\n".to_owned() },
                         _ => return None,
                     };
                     Some((Ok::<_, Infallible>(Bytes::from(data)),i+1))
@@ -532,6 +533,7 @@ priority = 1
             .unwrap()
             .unwrap()
             .to_bytes();
+        assert!(String::from_utf8_lossy(&tail).contains("Hello"));
         assert!(String::from_utf8(tail.to_vec())
             .unwrap()
             .contains("stream_broken"));

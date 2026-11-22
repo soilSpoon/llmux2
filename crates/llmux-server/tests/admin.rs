@@ -147,6 +147,8 @@ async fn status_deployments_models_and_credentials() {
     assert_eq!(dep["model"], "shared");
     assert_eq!(dep["provider"], "openai_compat");
     assert_eq!(dep["disabled"], false);
+    assert_eq!(dep["expired"], false);
+    assert!(dep["expires_at_unix"].is_null());
 
     let url = format!("{}/admin/models", gateway.url());
     let (status, body) = call(&client, "GET", &url, Some("admin-key"), None).await;
@@ -164,6 +166,36 @@ async fn status_deployments_models_and_credentials() {
     assert_eq!(cred["disabled"], false);
     assert_eq!(cred["quota"]["rpm"], 10);
     assert!(cred.get("key").is_none(), "never return secret material");
+}
+
+#[tokio::test]
+async fn deployments_report_expiry() {
+    env();
+    let upstream = upstream().await;
+    let config = config(&upstream.url()).replace(
+        "upstream_model = \"test\"",
+        "expires_at = 2099-01-01T00:00:00Z\nupstream_model = \"test\"",
+    );
+    let gateway = TestServer::start(
+        llmux_server::app(RuntimeConfig::parse(&config).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let client = Client::builder(TokioExecutor::new()).build_http();
+    let (status, body) = call(
+        &client,
+        "GET",
+        &format!("{}/admin/deployments", gateway.url()),
+        Some("admin-key"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let dep = &body["deployments"][0];
+    assert_eq!(dep["expired"], false);
+    assert_eq!(dep["expires_at_unix"], json!(4070908800u64));
 }
 
 #[tokio::test]
