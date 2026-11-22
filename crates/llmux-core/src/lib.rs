@@ -548,9 +548,9 @@ impl Executor {
                                     Outcome::Refreshable {
                                         can_refresh: binding.auth.is_some()
                                             && *refreshable
-                                            && dep.expires_at.is_none_or(|end| {
-                                                SystemTime::now() < end
-                                            }),
+                                            && dep
+                                                .expires_at
+                                                .is_none_or(|end| SystemTime::now() < end),
                                     }
                                 }
                                 Err(GatewayError::Client(UpstreamError::RateLimited {
@@ -627,8 +627,7 @@ impl Executor {
                                 (Outcome::AuthFatal, _) => {
                                     // An expired deployment must not poison the
                                     // credential's shared disabled flag.
-                                    if dep.expires_at.is_none_or(|end| SystemTime::now() < end)
-                                    {
+                                    if dep.expires_at.is_none_or(|end| SystemTime::now() < end) {
                                         binding.disabled.store(true, Ordering::Relaxed);
                                     }
                                 }

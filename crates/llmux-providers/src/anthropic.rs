@@ -1237,6 +1237,7 @@ mod tests {
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(10),
             max_context: None,
+            expires_at: None,
         };
         for (format, body) in [
             (
@@ -1325,6 +1326,7 @@ mod tests {
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(10),
             max_context: None,
+            expires_at: None,
         };
         let hash = "31ca399bfc61dac0b442a6bef7c00cd06cf9682c11b9192fb26a918b4a9130f8";
         let raw = "raw-client-SHOULD-NOT-LEAK";

@@ -744,7 +744,6 @@ fn invalid(message: &str) -> ConfigError {
     ConfigError::Invalid(message.to_owned())
 }
 
-<<<<<<< HEAD
 struct EndUserSettings {
     header: Option<HeaderName>,
     salt: Option<Arc<str>>,

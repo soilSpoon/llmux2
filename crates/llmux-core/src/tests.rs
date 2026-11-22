@@ -509,6 +509,7 @@ async fn retry_after_excludes_a_deployment_that_does_not_have_the_model() {
             ..Default::default()
         },
         false,
+        [None; 3],
     )
     .await;
     drop(executor.bindings[2].limits.admit(1).unwrap());
