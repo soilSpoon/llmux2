@@ -105,6 +105,7 @@ impl ProviderAdapter for Xai {
             quota: dep.quota,
             timeout: dep.timeout,
             max_context: dep.max_context,
+            expires_at: dep.expires_at,
         };
         if responses(&model) {
             let mut request = OpenAiResponses::new()
@@ -171,6 +172,7 @@ mod tests {
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(30),
             max_context: None,
+            expires_at: None,
         }
     }
 

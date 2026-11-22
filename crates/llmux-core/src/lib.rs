@@ -398,6 +398,7 @@ impl Executor {
                 let binding = &self.bindings[index(idx)];
                 if binding.disabled.load(Ordering::Relaxed)
                     || binding.adapter.supports(req.format) == Support::No
+                    || dep.expires_at.is_some_and(|end| SystemTime::now() >= end)
                 {
                     continue;
                 }
@@ -435,11 +436,19 @@ impl Executor {
                 let dep = &self.cfg.deployments[idx];
                 let binding = &self.bindings[idx];
                 let support = binding.adapter.supports(req.format);
+                if binding.disabled.load(Ordering::Relaxed)
+                    || support == Support::No
+                    || !fits(dep)
+                    || dep.expires_at.is_some_and(|end| SystemTime::now() >= end)
+                {
+                    continue;
+                }
                 let now = Instant::now();
                 machine.select();
                 let mut event = if binding.disabled.load(Ordering::Relaxed)
                     || support == Support::No
                     || !fits(dep)
+                    || dep.expires_at.is_some_and(|end| SystemTime::now() >= end)
                 {
                     Event::Ineligible
                 } else if support != Support::Convert
@@ -535,8 +544,13 @@ impl Executor {
                             event = Event::Result(match &result {
                                 Ok(_) => Outcome::Success,
                                 Err(GatewayError::Client(UpstreamError::Auth { refreshable })) => {
+                                    // Expired deployments never retry.
                                     Outcome::Refreshable {
-                                        can_refresh: binding.auth.is_some() && *refreshable,
+                                        can_refresh: binding.auth.is_some()
+                                            && *refreshable
+                                            && dep
+                                                .expires_at
+                                                .is_none_or(|end| SystemTime::now() < end),
                                     }
                                 }
                                 Err(GatewayError::Client(UpstreamError::RateLimited {
@@ -611,7 +625,11 @@ impl Executor {
                             drop(permit.take());
                             match (outcome, result) {
                                 (Outcome::AuthFatal, _) => {
-                                    binding.disabled.store(true, Ordering::Relaxed);
+                                    // An expired deployment must not poison the
+                                    // credential's shared disabled flag.
+                                    if dep.expires_at.is_none_or(|end| SystemTime::now() < end) {
+                                        binding.disabled.store(true, Ordering::Relaxed);
+                                    }
                                 }
                                 (
                                     _,
@@ -677,7 +695,10 @@ impl Executor {
             .deployments
             .iter()
             .filter(|idx| !incompatible.contains(&index(**idx)))
-            .filter(|idx| fits(&self.cfg.deployments[index(**idx)]))
+            .filter(|idx| {
+                let dep = &self.cfg.deployments[index(**idx)];
+                fits(dep) && dep.expires_at.is_none_or(|end| SystemTime::now() < end)
+            })
             .map(|idx| &self.bindings[index(*idx)])
             .filter(|binding| {
                 !binding.disabled.load(Ordering::Relaxed)

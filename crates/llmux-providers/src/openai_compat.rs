@@ -1120,6 +1120,7 @@ mod tests {
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(5),
             max_context: None,
+            expires_at: None,
             fallback: false,
         };
         let client = Client::builder(TokioExecutor::new()).build_http();
@@ -1341,6 +1342,7 @@ mod tests {
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(5),
             max_context: None,
+            expires_at: None,
             fallback: false,
         };
         let req = GatewayRequest {
@@ -1900,6 +1902,7 @@ mod tests {
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(5),
             max_context: None,
+            expires_at: None,
             fallback: false,
         };
         let send = |adapter: &OpenAiCompat, dep: &Deployment| {
