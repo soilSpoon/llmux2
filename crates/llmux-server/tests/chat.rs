@@ -35,7 +35,9 @@ enum Reply {
     NegotiatedStream(Value),
     WithoutGatewayControls,
     InlineUsageStream,
-    ResponseStream { complete: bool },
+    ResponseStream {
+        complete: bool,
+    },
     AbortStream,
     EmptyStream,
     GatedStream(Arc<Semaphore>),
@@ -45,6 +47,8 @@ enum Reply {
     StructuredBadRequest(Value),
     ContextLength,
     HtmlPayloadTooLarge,
+    /// Raw `text/event-stream` body, after the usual request assertions.
+    Sse(Arc<str>),
 }
 
 struct Mock {
@@ -171,6 +175,10 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
         Reply::StructuredBadRequest(payload) => (StatusCode::BAD_REQUEST, Json(payload)).into_response(),
         Reply::HtmlPayloadTooLarge => (
             StatusCode::PAYLOAD_TOO_LARGE, axum::response::Html("<h1>Proxy error</h1>"),
+        ).into_response(),
+        Reply::Sse(body) => (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            body.to_string(),
         ).into_response(),
     }
 }
@@ -1435,4 +1443,131 @@ async fn middle_out_truncation_is_opt_in_and_reported() {
     assert_eq!(response.headers()["x-llmux-dropped-messages"], "2");
     assert_eq!(response.headers()["x-llmux-deployment"], "d2");
     assert_eq!(fixture.counts(), [0, 1]);
+}
+
+const KEEPALIVE_FRAME: &str = "data: {\"id\":\"chatcmpl-keepalive\",\"object\":\"chat.completion.chunk\",\"model\":\"gemini-3-flash\",\"choices\":[]}\n\n";
+const RATE_LIMIT_FRAME: &str = "data: {\"error\":{\"message\":\"antigravity/gemini-3-flash: rate limit - [429]: Antigravity refused this exact request with 429 RESOURCE_EXHAUSTED\",\"type\":\"rate_limit_error\",\"code\":429}}\n\n";
+
+fn sse(body: &str) -> Reply {
+    Reply::Sse(Arc::from(body))
+}
+
+fn three_keepalives_then_rate_limit() -> Reply {
+    sse(&format!(
+        "{KEEPALIVE_FRAME}{KEEPALIVE_FRAME}{KEEPALIVE_FRAME}{RATE_LIMIT_FRAME}"
+    ))
+}
+
+#[tokio::test]
+async fn stream_keepalive_then_rate_limit_frame_fails_over() {
+    let fixture = Fixture::start(
+        [three_keepalives_then_rate_limit(), Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture.request("test-client", "alias", true).await;
+    check_route(&response, "d2", "2");
+    assert_eq!(
+        body(response).await,
+        "data: {\"id\":\"chunk-1\"}\n\ndata: [DONE]\n\n"
+    );
+    assert_eq!(fixture.counts(), [1, 1]);
+
+    let again = fixture.request("test-client", "alias", true).await;
+    check_route(&again, "d2", "1");
+    drop(body(again).await);
+    assert_eq!(
+        fixture.counts(),
+        [1, 2],
+        "the deployment that streamed a 429 frame must cool down"
+    );
+}
+
+#[tokio::test]
+async fn stream_error_after_content_is_not_retried() {
+    let fixture = Fixture::start(
+        [
+            sse(&format!(
+                "{KEEPALIVE_FRAME}data: {{\"id\":\"chatcmpl-1\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"Hi\"}},\"finish_reason\":\"stop\"}}]}}\n\n{RATE_LIMIT_FRAME}"
+            )),
+            Reply::Complete,
+        ],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture.request("test-client", "alias", true).await;
+    check_route(&response, "d1", "1");
+    assert_eq!(
+        body(response).await,
+        concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"error\":{\"message\":\"Upstream stream ended unexpectedly\",\"type\":\"upstream_error\",\"param\":null,\"code\":\"stream_broken\"}}\n\n",
+        )
+    );
+    assert_eq!(fixture.counts(), [1, 0]);
+
+    let again = fixture.request("test-client", "alias", true).await;
+    check_route(&again, "d2", "1");
+    drop(body(again).await);
+    assert_eq!(fixture.counts(), [1, 1]);
+}
+
+#[tokio::test]
+async fn stream_keepalives_before_content_are_dropped_and_later_ones_forwarded() {
+    let fixture = Fixture::start(
+        [
+            sse(concat!(
+                "data: {\"id\":\"chatcmpl-keepalive\",\"object\":\"chat.completion.chunk\",\"model\":\"gemini-3-flash\",\"choices\":[]}\n\n",
+                "data: {\"id\":\"chatcmpl-keepalive\",\"object\":\"chat.completion.chunk\",\"model\":\"gemini-3-flash\",\"choices\":[]}\n\n",
+                "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+                "data: {\"id\":\"chatcmpl-keepalive-after\",\"choices\":[]}\n\n",
+                "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            )),
+            Reply::Complete,
+        ],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture.request("test-client", "alias", true).await;
+    check_route(&response, "d1", "1");
+    // Leading keepalives are not a committing event and are dropped. Frames after
+    // the first content chunk, including a later keepalive, are forwarded unchanged.
+    assert_eq!(
+        body(response).await,
+        concat!(
+            "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl-keepalive-after\",\"choices\":[]}\n\n",
+            "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        )
+    );
+    assert_eq!(fixture.counts(), [1, 0]);
+}
+
+#[tokio::test]
+async fn stream_error_frames_on_every_deployment_return_classified_429() {
+    let failing = three_keepalives_then_rate_limit();
+    let fixture = Fixture::start(
+        [failing.clone(), failing],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture.request("test-client", "alias", true).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_ne!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let payload: Value = serde_json::from_str(&body(response).await).unwrap();
+    assert_eq!(payload["error"]["code"], "rate_limit_exceeded");
+    assert_eq!(payload["error"]["type"], "rate_limit_error");
+    assert_eq!(fixture.counts(), [1, 1]);
 }
