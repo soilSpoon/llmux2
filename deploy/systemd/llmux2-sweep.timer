@@ -1,0 +1,11 @@
+[Unit]
+Description=Sweep all llmux2 routes daily for dead upstreams
+
+[Timer]
+OnBootSec=3600
+OnUnitActiveSec=86400
+AccuracySec=600
+Unit=llmux2-sweep.service
+
+[Install]
+WantedBy=timers.target
