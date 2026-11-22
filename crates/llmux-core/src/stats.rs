@@ -87,9 +87,10 @@ pub(crate) enum SkipReason {
     AdmissionLimited,
     UnsupportedConversion,
     UpstreamUnavailable,
+    Expired,
 }
 
-const SKIP_REASONS: [&str; 7] = [
+const SKIP_REASONS: [&str; 8] = [
     "disabled",
     "unsupported_format",
     "context_length",
@@ -97,6 +98,7 @@ const SKIP_REASONS: [&str; 7] = [
     "admission_limited",
     "unsupported_conversion",
     "upstream_unavailable",
+    "expired",
 ];
 
 fn snapshot_counts<const N: usize>(
@@ -130,6 +132,8 @@ pub struct DeploymentStats<'a> {
     provider: &'a str,
     priority: i32,
     disabled: bool,
+    expired: bool,
+    expires_at_unix: Option<u64>,
     cooldown_ms: Option<u64>,
     rpm_limit: Option<u32>,
     concurrency_limit: Option<u32>,
@@ -179,6 +183,14 @@ impl AttemptStats {
             provider: &dep.provider.0,
             priority: dep.priority,
             disabled,
+            expired: dep
+                .expires_at
+                .is_some_and(|end| std::time::SystemTime::now() >= end),
+            expires_at_unix: dep.expires_at.and_then(|end| {
+                end.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|span| span.as_secs())
+            }),
             cooldown_ms,
             rpm_limit: dep.quota.rpm,
             concurrency_limit: dep.quota.concurrent,

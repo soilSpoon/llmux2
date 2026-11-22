@@ -11,6 +11,7 @@ Operability and the engineering standards the project holds itself to.
 The gateway SHALL count failures and skips per deployment in its authenticated
 deployment stats using fixed class and reason names, without provider error
 bodies, account identifiers, or request data.
+An expired deployment gets the `expired` skip reason, not a failed attempt.
 
 #### Scenario: A routed request fails
 

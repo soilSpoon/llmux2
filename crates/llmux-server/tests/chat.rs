@@ -1464,6 +1464,40 @@ async fn converted_requests_record_unsupported_conversion_and_admission_skips() 
 }
 
 #[tokio::test]
+async fn expired_deployment_skip_is_attributed_without_an_attempt() {
+    let fixture = Fixture::start_with_options(
+        [Reply::Complete, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "expires_at = 2000-01-01T00:00:00Z",
+        4,
+        true,
+        true,
+    )
+    .await;
+    let response = fixture.request("test-client", "shared", false).await;
+    check_route(&response, "d2", "1");
+    assert_eq!(fixture.counts(), [0, 1]);
+    assert_eq!(fixture.skip_reasons("d1").await, json!({"expired":1}));
+
+    let response = fixture
+        .post(
+            "/v1/chat/completions",
+            "test-client",
+            r#"{
+        "model":"shared","messages":[{"role":"user","content":"Hello"}],"max_tokens":200000
+    }"#,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(fixture.counts(), [0, 1]);
+    assert_eq!(fixture.skip_reasons("d1").await, json!({"expired":2}));
+    assert_eq!(
+        fixture.skip_reasons("d2").await,
+        json!({"context_length":1})
+    );
+}
+
+#[tokio::test]
 async fn context_precheck_skips_small_deployments_and_rejects_without_upstream() {
     let fixture = Fixture::start_with_options(
         [Reply::Complete, Reply::Complete],

@@ -114,11 +114,18 @@ impl Binding {
         }
     }
 
-    fn skip_reason(&self, support: Support, fits: bool) -> Option<SkipReason> {
+    fn skip_reason(
+        &self,
+        support: Support,
+        fits: bool,
+        expires_at: Option<SystemTime>,
+    ) -> Option<SkipReason> {
         if self.disabled.load(Ordering::Relaxed) {
             Some(SkipReason::Disabled)
         } else if support == Support::No {
             Some(SkipReason::UnsupportedFormat)
+        } else if expires_at.is_some_and(|end| SystemTime::now() >= end) {
+            Some(SkipReason::Expired)
         } else if !fits {
             Some(SkipReason::ContextLength)
         } else {
@@ -457,6 +464,7 @@ impl Executor {
                 let binding = &self.bindings[index(idx)];
                 if binding.disabled.load(Ordering::Relaxed)
                     || binding.adapter.supports(req.format) == Support::No
+                    || dep.expires_at.is_some_and(|end| SystemTime::now() >= end)
                 {
                     continue;
                 }
@@ -470,9 +478,10 @@ impl Executor {
                 if self.cfg.server.dashboard_key.is_some() {
                     for &idx in &model.deployments {
                         let binding = &self.bindings[index(idx)];
+                        let dep = &self.cfg.deployments[index(idx)];
                         let support = binding.adapter.supports(req.format);
                         if let Some(reason) =
-                            binding.skip_reason(support, fits(&self.cfg.deployments[index(idx)]))
+                            binding.skip_reason(support, fits(dep), dep.expires_at)
                         {
                             binding.record_skip(reason);
                         }
@@ -507,7 +516,7 @@ impl Executor {
                 let support = binding.adapter.supports(req.format);
                 let now = Instant::now();
                 machine.select();
-                let mut skip_reason = binding.skip_reason(support, fits(dep));
+                let mut skip_reason = binding.skip_reason(support, fits(dep), dep.expires_at);
                 let mut event = if skip_reason.is_some() {
                     Event::Ineligible
                 } else if support != Support::Convert
@@ -624,8 +633,13 @@ impl Executor {
                             event = Event::Result(match &result {
                                 Ok(_) => Outcome::Success,
                                 Err(GatewayError::Client(UpstreamError::Auth { refreshable })) => {
+                                    // Expired deployments never retry.
                                     Outcome::Refreshable {
-                                        can_refresh: binding.auth.is_some() && *refreshable,
+                                        can_refresh: binding.auth.is_some()
+                                            && *refreshable
+                                            && dep
+                                                .expires_at
+                                                .is_none_or(|end| SystemTime::now() < end),
                                     }
                                 }
                                 Err(GatewayError::Client(UpstreamError::RateLimited {
@@ -700,7 +714,11 @@ impl Executor {
                             drop(permit.take());
                             match (outcome, result) {
                                 (Outcome::AuthFatal, _) => {
-                                    binding.disabled.store(true, Ordering::Relaxed);
+                                    // An expired deployment must not poison the
+                                    // credential's shared disabled flag.
+                                    if dep.expires_at.is_none_or(|end| SystemTime::now() < end) {
+                                        binding.disabled.store(true, Ordering::Relaxed);
+                                    }
                                 }
                                 (
                                     _,
@@ -766,7 +784,10 @@ impl Executor {
             .deployments
             .iter()
             .filter(|idx| !incompatible.contains(&index(**idx)))
-            .filter(|idx| fits(&self.cfg.deployments[index(**idx)]))
+            .filter(|idx| {
+                let dep = &self.cfg.deployments[index(**idx)];
+                fits(dep) && dep.expires_at.is_none_or(|end| SystemTime::now() < end)
+            })
             .map(|idx| &self.bindings[index(*idx)])
             .filter(|binding| {
                 !binding.disabled.load(Ordering::Relaxed)
