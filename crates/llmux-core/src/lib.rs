@@ -750,14 +750,22 @@ impl Executor {
         match response {
             GatewayResponse::Complete { .. } if !req.stream => Ok(response),
             GatewayResponse::Stream(mut events) if req.stream => {
-                // Commit downstream headers only once a complete upstream event is available.
-                let first = events
-                    .next()
-                    .await
-                    .ok_or(GatewayError::Client(UpstreamError::StreamBroken {
-                        bytes_sent: 0,
-                    }))?
-                    .map_err(GatewayError::Client)?;
+                // Commit on a real chunk or [DONE], not on an OpenAI-compat
+                // keepalive. Drop those before commit so a later error frame
+                // fails the attempt. The caller's attempt deadline (request
+                // timeout intersected with the deployment timeout) bounds the wait.
+                let first = loop {
+                    match events.next().await {
+                        Some(Ok(event)) if !event.commits() => continue,
+                        Some(Ok(event)) => break event,
+                        Some(Err(err)) => return Err(GatewayError::Client(err)),
+                        None => {
+                            return Err(GatewayError::Client(UpstreamError::StreamBroken {
+                                bytes_sent: 0,
+                            }))
+                        }
+                    }
+                };
                 let idle_timeout = self.cfg.server.request_timeout.min(dep.timeout);
                 let cooldown = (self.cfg.cooldown.default, self.cfg.cooldown.max);
                 let events = stream::unfold(

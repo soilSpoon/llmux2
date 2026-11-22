@@ -1,8 +1,10 @@
 ------------------------- MODULE StreamLifecycle -------------------------
 (* Streaming lifecycle of Executor::attempt + hold_permit. Setup ends when the
-   first complete event arrives; from then on bytes are committed to the client
-   and the only retry-free exits are end, idle timeout, upstream error, or
-   client disconnect. The permit lives as long as the stream value. *)
+   first committing event arrives (content, a tool call, a finish reason, usage,
+   or [DONE] — not an OpenAI-compat keepalive). From then on bytes are committed
+   to the client and the only retry-free exits are end, idle timeout, upstream
+   error, or client disconnect. An error during Setup fails the attempt so the
+   router can try the next deployment. The permit lives as long as the stream value. *)
 EXTENDS Naturals
 VARIABLES state, committed, permit, retried, cooldownHint
 vars == <<state, committed, permit, retried, cooldownHint>>

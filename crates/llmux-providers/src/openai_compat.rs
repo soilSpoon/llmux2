@@ -1,6 +1,7 @@
 use crate::{messages, responses, sse};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use futures_util::StreamExt;
 use http::{
     header::{self, HeaderMap, HeaderName, HeaderValue},
     Method, Request, Response, StatusCode, Uri,
@@ -8,9 +9,9 @@ use http::{
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use llmux_types::{
-    AuthError, AuthMaterial, BuildError, ChatRequestField, CredentialSource, Deployment,
+    AuthError, AuthMaterial, BoxStream, BuildError, ChatRequestField, CredentialSource, Deployment,
     GatewayRequest, GatewayResponse, InboundFormat, LimitObservation, ProviderAdapter,
-    ProviderKind, Support, UpstreamError,
+    ProviderKind, SseEvent, Support, UpstreamError,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -577,7 +578,7 @@ impl ProviderAdapter for OpenAiCompat {
             if !is_sse {
                 return Err(bad_gateway());
             }
-            let stream = sse::decode(body);
+            let stream = without_stream_errors(parts.headers.clone(), sse::decode(body));
             if req.format == InboundFormat::AnthropicMessages {
                 return Ok(GatewayResponse::Stream(messages::stream(stream)));
             }
@@ -943,6 +944,74 @@ fn embedded_error(body: &Bytes, headers: &HeaderMap, now: SystemTime) -> Option<
     Some(classify_error_details(
         status, headers, bounded, now, &details,
     ))
+}
+
+fn without_stream_errors(
+    headers: HeaderMap,
+    mut stream: BoxStream<'static, Result<SseEvent, UpstreamError>>,
+) -> BoxStream<'static, Result<SseEvent, UpstreamError>> {
+    Box::pin(async_stream::try_stream! {
+        let now = SystemTime::now();
+        while let Some(event) = stream.next().await {
+            let event = event?;
+            if let Some(error) = stream_frame_error(&event.data, &headers, now) {
+                Err(error)?;
+            }
+            yield event;
+        }
+    })
+}
+
+/// An SSE data frame with an `error` object and no non-empty `choices`.
+///
+/// Classification matches [`embedded_error`]: a 429 payload is rate limited
+/// (including a `Retry-After` hint from the response headers), a quota marker
+/// is quota exhausted, and an explicit client status stays terminal. A frame
+/// with no classifiable client status is a server error so the attempt can
+/// fail over instead of committing an empty 200.
+fn stream_frame_error(data: &str, headers: &HeaderMap, now: SystemTime) -> Option<UpstreamError> {
+    if data == sse::DONE {
+        return None;
+    }
+    let bytes = data.as_bytes();
+    if memchr::memmem::find(bytes, b"error").is_none() && !bytes.contains(&b'\\') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    if value
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|choices| !choices.is_empty())
+    {
+        return None;
+    }
+    let error = value.get("error")?;
+    if !error.is_object() {
+        return None;
+    }
+    let body = Bytes::from(serde_json::to_vec(&serde_json::json!({"error": error})).ok()?);
+    let classified = embedded_error(&body, headers, now).unwrap_or_else(bad_gateway);
+    Some(match classified {
+        UpstreamError::BadRequest { status, .. }
+            if status == StatusCode::BAD_REQUEST && explicit_error_status(error).is_none() =>
+        {
+            bad_gateway()
+        }
+        other => other,
+    })
+}
+
+fn explicit_error_status(error: &serde_json::Value) -> Option<StatusCode> {
+    ["status", "status_code", "code"].iter().find_map(|key| {
+        let value = error.get(*key)?;
+        let number = value
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .or_else(|| value.as_str()?.parse().ok())?;
+        StatusCode::from_u16(number)
+            .ok()
+            .filter(|status| status.is_client_error() || status.is_server_error())
+    })
 }
 
 pub(crate) fn bad_gateway() -> UpstreamError {
@@ -1465,6 +1534,65 @@ mod tests {
                 assert_eq!(stored.len(), MAX_ERROR_BYTES);
                 assert_eq!(stored, body.slice(..MAX_ERROR_BYTES));
             }
+        }
+    }
+
+    #[test]
+    fn stream_error_frames_use_embedded_error_classification() {
+        let now = SystemTime::UNIX_EPOCH;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("3"));
+        let rate_limited = stream_frame_error(
+            r#"{"id":"chatcmpl-keepalive","choices":[],"error":{"message":"rate limit - [429]: RESOURCE_EXHAUSTED","type":"rate_limit_error","code":429}}"#,
+            &headers,
+            now,
+        )
+        .unwrap();
+        assert!(
+            matches!(rate_limited, UpstreamError::RateLimited { retry_after: Some(wait) } if wait == Duration::from_secs(3))
+        );
+        assert!(matches!(
+            stream_frame_error(
+                r#"{"error":{"message":"quota exhausted","type":"insufficient_quota"}}"#,
+                &HeaderMap::new(),
+                now,
+            )
+            .unwrap(),
+            UpstreamError::QuotaExhausted { .. }
+        ));
+        assert!(matches!(
+            stream_frame_error(
+                r#"{"error":{"message":"upstream exploded","type":"server_error"}}"#,
+                &HeaderMap::new(),
+                now,
+            )
+            .unwrap(),
+            UpstreamError::Server {
+                status: StatusCode::BAD_GATEWAY
+            }
+        ));
+        assert!(matches!(
+            stream_frame_error(
+                r#"{"error":{"status":400,"message":"bad input","type":"invalid_request_error"}}"#,
+                &HeaderMap::new(),
+                now,
+            )
+            .unwrap(),
+            UpstreamError::BadRequest {
+                status: StatusCode::BAD_REQUEST,
+                ..
+            }
+        ));
+        for raw in [
+            r#"{"id":"chatcmpl-keepalive","object":"chat.completion.chunk","choices":[]}"#,
+            r#"{"choices":[{"delta":{"content":"Hi"}}],"error":{"code":429}}"#,
+            "[DONE]",
+            r#"{"id":"chunk-1"}"#,
+        ] {
+            assert!(
+                stream_frame_error(raw, &HeaderMap::new(), now).is_none(),
+                "{raw}"
+            );
         }
     }
 

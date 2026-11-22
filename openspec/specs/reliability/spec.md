@@ -42,13 +42,39 @@ THEN it targets the same deployment and counts as one HTTP attempt toward routin
 
 ### Requirement: Stream commitment
 
+The gateway SHALL commit a streaming response only on a frame that carries
+content, a tool call, a finish reason, or usage, or on `[DONE]`. An
+OpenAI-compatible keepalive (`choices` empty, and none of those fields) SHALL
+NOT commit. Keepalives before that frame are dropped; keepalives after it are
+forwarded. The wait for a committing frame is bounded by the existing request
+and deployment timeouts.
+
 Once a streaming response has been committed, the gateway
 SHALL NOT retry that request on another deployment.
+
+#### Scenario: Keepalives then content
+
+WHEN an OpenAI-compatible stream sends keepalive chunks and then a content chunk
+THEN the client receives the content chunk and any later keepalive, and does not
+receive the keepalives that preceded the first committing frame.
 
 #### Scenario: Mid-stream failure surfaces
 
 WHEN the upstream fails after content events were already forwarded
 THEN the error is surfaced to the client instead of restarting elsewhere.
+
+#### Scenario: An error frame before commit fails over
+
+WHEN an OpenAI-compatible upstream answers HTTP 200 `text/event-stream` and,
+before any committing frame, sends an SSE data frame whose JSON has an `error`
+object and no non-empty `choices`
+THEN the gateway classifies that frame the same way as a non-streaming embedded
+error (a 429 payload is rate limited, including a `Retry-After` hint from the
+response headers; a quota marker is quota exhausted; an explicit client status
+stays terminal; otherwise it is a server error) and tries the next eligible
+deployment within the attempt budget. The failing deployment receives the same
+cooldown as a non-stream error of that class. If every deployment fails that
+way, the client receives the classified error, not an empty 200 stream.
 
 ### Requirement: Cooldowns
 
