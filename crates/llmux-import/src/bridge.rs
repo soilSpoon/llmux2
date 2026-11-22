@@ -115,8 +115,12 @@ const DEEPAI: &[replacements::Route] = &[
     // Export glm-5.3-flash combo: Numes z-ai/glm-5.3-flash:free; imported unsuffixed ID too.
     ("glm-5.3-flash", "numes", "z-ai/glm-5.3-flash"),
     // Export mimo-v2.6-flash combo declares these two IDs for the same Flash model.
+    // FLAGGED: Numes 404s `xiaomi/mimo-v2.6-flash` (only the unofficial
+    // deepai-code pod bridge served it, and unofficial bridges are excluded);
+    // the deployment emits but the upstream does not serve it.
     ("mimo-2.6-flash", "numes", "xiaomi/mimo-v2.6-flash"),
     // Export mimo-v2.6-pro combo declares these two IDs for the same Pro model.
+    // FLAGGED: same dead upstream as mimo-v2.6-flash.
     ("mimo-2.6-pro", "numes", "xiaomi/mimo-v2.6-pro"),
     // Export minimax-m3.1-flash combo; same M3.1 Flash existing Numes deployment.
     ("minimax-m3.1-flash", "numes", "minimax/minimax-m3.1-flash"),

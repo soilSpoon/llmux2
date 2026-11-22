@@ -373,6 +373,196 @@ fn bridge_targets_reject_anonymous_inactive_and_lookalike_endpoints() {
     }
 }
 
+fn cfpd_fixture() -> Value {
+    json!({
+        "apiKeys":[{"key":"synthetic-client"}],
+        "providerNodes":[
+            {"id":"openai-compatible-chat-cfp-direct","prefix":"cloudflare-direct","type":"openai-compatible","baseUrl":"http://127.0.0.1:8790/cfp/v1"},
+            {"id":"openai-compatible-numes","prefix":"numes","type":"openai-compatible","baseUrl":"https://api.numes.ai/api/v1"}
+        ],
+        "providerConnections":[
+            {"id":"cfp-direct","provider":"openai-compatible-chat-cfp-direct","authType":"apikey","apiKey":"synthetic-cfp-direct"},
+            {"id":"numes","provider":"openai-compatible-numes","authType":"apikey","apiKey":"synthetic-numes"},
+            {"id":"morph","provider":"morph","authType":"apikey","apiKey":"synthetic-morph"}
+        ],
+        "combos":[
+            {"name":"kimi-k3.1-pro","models":[
+                "cfpd/moonshotai/kimi-k3.1-pro",
+                "numes/moonshotai/kimi-k3.1-pro"
+            ]},
+            {"name":"kimi-direct","models":["cloudflare-direct/moonshotai/kimi-k3.1-pro"]}
+        ]
+    })
+}
+
+#[test]
+fn kimi_secondary_appends_reviewed_morph_behind_declared_numes() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.toml");
+    llmux_import::import_with_options(
+        &cfpd_fixture().to_string(),
+        &out,
+        Some(&dir.path().join("secrets")),
+        &ImportOptions {
+            openrouter_replacements: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let config = RuntimeConfig::load(out).unwrap();
+    let model = &config.models[*config.model_names.get("kimi-k3.1-pro").unwrap()];
+    let deps: Vec<_> = model
+        .deployments
+        .iter()
+        .map(|i| &config.deployments[i.0 as usize])
+        .collect();
+    assert_eq!(deps.len(), 2);
+    // Free-first: declared numes leg stays primary; paid morph is the fallback.
+    assert_eq!(deps[0].upstream_model.as_ref(), "moonshotai/kimi-k3.1-pro");
+    assert_eq!(deps[0].base_url.host(), Some("api.numes.ai"));
+    assert_eq!(deps[1].upstream_model.as_ref(), "morph-kimik31");
+    assert_eq!(deps[1].base_url.host(), Some("api.morphllm.com"));
+    assert_eq!(deps[1].credential.as_ref(), "upstream-morph");
+    // The unreachable cfpd leg emits nothing; no seeded cfpd models.
+    assert!(!config
+        .model_names
+        .contains_key("cfpd/moonshotai/kimi-k3.1-pro"));
+    // kimi-direct combo is not a reviewed route target: its keyed cfpd
+    // sidecar leg imports at loopback as usual, with no morph appended.
+    let direct = &config.models[*config.model_names.get("kimi-direct").unwrap()];
+    let direct_deps: Vec<_> = direct
+        .deployments
+        .iter()
+        .map(|i| &config.deployments[i.0 as usize])
+        .collect();
+    assert_eq!(direct_deps.len(), 1);
+    assert_eq!(
+        direct_deps[0].upstream_model.as_ref(),
+        "moonshotai/kimi-k3.1-pro"
+    );
+    assert_eq!(
+        direct_deps[0].base_url.to_string(),
+        "http://127.0.0.1:8790/cfp/v1"
+    );
+}
+
+#[test]
+fn kimi_secondary_is_opt_in_and_needs_reviewed_keyed_morph() {
+    // Reviewed secondary routes are gated on --openrouter-replacements: flag
+    // off appends nothing even with an eligible morph connection; flag on
+    // still fails closed without one.
+    for (replacements, morph_present, expected_len) in
+        [(false, true, 1), (true, false, 1), (true, true, 2)]
+    {
+        let mut root = cfpd_fixture();
+        if !morph_present {
+            root["providerConnections"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|c| c["id"] != "morph");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.toml");
+        llmux_import::import_with_options(
+            &root.to_string(),
+            &out,
+            Some(&dir.path().join("secrets")),
+            &ImportOptions {
+                openrouter_replacements: replacements,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let config = RuntimeConfig::load(out).unwrap();
+        let model = &config.models[*config.model_names.get("kimi-k3.1-pro").unwrap()];
+        let deps: Vec<_> = model
+            .deployments
+            .iter()
+            .map(|i| &config.deployments[i.0 as usize])
+            .collect();
+        assert_eq!(
+            deps.len(),
+            expected_len,
+            "replacements={replacements} morph={morph_present}"
+        );
+        assert_eq!(deps[0].upstream_model.as_ref(), "moonshotai/kimi-k3.1-pro");
+        assert_eq!(deps[0].base_url.host(), Some("api.numes.ai"));
+        assert_eq!(
+            deps.iter()
+                .any(|d| d.upstream_model.as_ref() == "morph-kimik31"),
+            replacements && morph_present
+        );
+    }
+    // A custom node reusing the `morph` prefix cannot stand in for the
+    // reviewed builtin key: the builtin route is builtin-only.
+    let mut root = cfpd_fixture();
+    root["providerNodes"].as_array_mut().unwrap().push(
+        json!({"id":"morph-custom","prefix":"morph","type":"openai-compatible","baseUrl":"https://api.morphllm.com/v1"}),
+    );
+    root["providerConnections"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|c| c["id"] != "morph");
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.toml");
+    llmux_import::import_with_options(
+        &root.to_string(),
+        &out,
+        Some(&dir.path().join("secrets")),
+        &ImportOptions {
+            openrouter_replacements: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let config = RuntimeConfig::load(out).unwrap();
+    let model = &config.models[*config.model_names.get("kimi-k3.1-pro").unwrap()];
+    assert!(
+        !model.deployments.iter().any(|i| {
+            config.deployments[i.0 as usize].upstream_model.as_ref() == "morph-kimik31"
+        }),
+        "custom-morph-shadow"
+    );
+    for mode in ["anonymous", "unofficial-url", "inactive"] {
+        let mut root = cfpd_fixture();
+        for c in root["providerConnections"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .filter(|c| c["id"] == "morph")
+        {
+            match mode {
+                "anonymous" => {
+                    c["authType"] = json!("none");
+                    c["apiKey"] = Value::Null;
+                }
+                "inactive" => c["isActive"] = json!(false),
+                _ => c["providerSpecificData"] = json!({"baseUrl":"https://unofficial.example/v1"}),
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.toml");
+        llmux_import::import_with_options(
+            &root.to_string(),
+            &out,
+            Some(&dir.path().join("secrets")),
+            &ImportOptions {
+                openrouter_replacements: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let config = RuntimeConfig::load(out).unwrap();
+        let model = &config.models[*config.model_names.get("kimi-k3.1-pro").unwrap()];
+        assert!(
+            !model.deployments.iter().any(|i| {
+                config.deployments[i.0 as usize].upstream_model.as_ref() == "morph-kimik31"
+            }),
+            "{mode}"
+        );
+    }
+}
+
 #[test]
 fn custom_duckduckgo_identity_does_not_inherit_builtin_replacements() {
     let mut root = fixture();

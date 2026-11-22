@@ -23,14 +23,18 @@ fn check(root: &Value, expected: &[&str], fallback: bool) -> Vec<String> {
     let fallback_key = dir.path().join("fallback-key");
     std::fs::write(&fallback_key, "synthetic-fallback").unwrap();
     let fallback_reference = format!("file:{}", fallback_key.display());
-    let report = llmux_import::import_with_fallback(
+    let report = llmux_import::import_with_options(
         &root.to_string(),
         &output,
         None,
-        fallback.then_some(llmux_import::OmniRouteFallback {
-            base_url: "https://fallback.example/v1",
-            key: &fallback_reference,
-        }),
+        &llmux_import::ImportOptions {
+            openrouter_replacements: true,
+            omniroute_fallback: fallback.then_some(llmux_import::OmniRouteFallback {
+                base_url: "https://fallback.example/v1",
+                key: &fallback_reference,
+            }),
+            ..Default::default()
+        },
     );
     if expected.is_empty() {
         assert_eq!(
@@ -126,6 +130,19 @@ fn reviewed_secondary_appends_once_after_existing_legs_and_before_fallback() {
     assert!(warnings
         .iter()
         .any(|warning| warning == "gpt-6-luna: dropped 1 duplicate deployment"));
+    // Opt-in only: without --openrouter-replacements an eligible connection
+    // still appends nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    llmux_import::import(&fixture().to_string(), &output, None).unwrap();
+    let config = RuntimeConfig::load(&output).unwrap();
+    let model = &config.models[*config.model_names.get("gpt-6-luna").unwrap()];
+    let actual: Vec<_> = model
+        .deployments
+        .iter()
+        .map(|i| config.deployments[i.0 as usize].base_url.to_string())
+        .collect();
+    assert_eq!(actual, [PRIMARY]);
 }
 
 #[test]

@@ -1175,7 +1175,7 @@ pub fn import_with_options(
             xplabs::place(&name, &mut deployments, free, &connections, &mut warnings);
         }
         devin::free_first(&mut deployments, &connections, policy.devin_free.as_ref());
-        if combos.contains_key(&name) {
+        if policy.openrouter_replacements && combos.contains_key(&name) {
             let steps = secondary::steps(
                 &name,
                 strategy,

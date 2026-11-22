@@ -229,13 +229,20 @@ declared position.
   prefix, the combo is unreviewed or billed, or the combo uses round-robin
 - **THEN** the combo's deployments are unchanged
 
-### Requirement: Reviewed Respan secondary routes
-For the existing source combo `gpt-6-luna`, the importer SHALL append the
+### Requirement: Reviewed secondary routes
+With `--openrouter-replacements`, for the existing source combo `gpt-6-luna`, the importer SHALL append the
 ordered upstream IDs `gpt-6-luna`, `openai/gpt-6-luna`, and
 `perplexity/gpt-6-luna` after surviving source legs, using one active, usable
 API-key custom openai_compat connection whose node prefix is `respan` and whose
 normalized endpoint is exactly `https://api.respan.ai/api/v1`. This reviewed
-tuple follows OCI verification of Responses JSON and SSE. Azure OpenAI, Azure
+tuple follows OCI verification of Responses JSON and SSE. For the existing
+source combo `kimi-k3.1-pro`, the importer SHALL append `morph-kimik31` after
+surviving source legs using one active, usable API-key builtin `morph`
+connection whose endpoint is exactly `https://api.morphllm.com/v1`; a builtin
+reviewed secondary needs no provider node, and free-first routing keeps the
+declared numes leg primary. This reviewed tuple follows OCI verification that
+the pod-internal `cfpd` sidecar is unreachable from the llmux2 host and that
+Morph serves the Kimi traffic. Azure OpenAI, Azure
 Foundry and Bedrock variants SHALL NOT be added by this policy.
 The importer SHALL use the first eligible connection in existing priority
 order, skip each upstream ID already deployed on that endpoint, preserve source
@@ -254,6 +261,10 @@ config SHALL roll back that part or all of this policy.
 #### Scenario: Unavailable or already declared route
 - **WHEN** the reviewed connection is unavailable or an ID already exists on the reviewed endpoint
 - **THEN** no unavailable or duplicate deployment is added
+
+#### Scenario: Opt-in flag absent
+- **WHEN** `--openrouter-replacements` is absent, even with an eligible reviewed connection
+- **THEN** no secondary route is appended and the combo's source legs are unchanged
 
 ### Requirement: Gemini OpenAI endpoint parameter compatibility
 
