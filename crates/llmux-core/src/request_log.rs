@@ -28,6 +28,15 @@ pub struct QuotaRemaining {
     pub concurrent: Option<u32>,
 }
 
+/// One upstream send: the deployment and provider it hit, and `routed` when it
+/// served the response or the failure kind when it did not.
+#[derive(Serialize)]
+pub struct AttemptLeg {
+    pub deployment: Box<str>,
+    pub provider: Box<str>,
+    pub outcome: &'static str,
+}
+
 #[derive(Serialize)]
 pub struct RequestRecord<'a> {
     pub ts_ms: u64,
@@ -46,6 +55,8 @@ pub struct RequestRecord<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_request_id: Option<&'a str>,
     pub attempts: usize,
+    /// Every upstream send, in order — the legs a failover otherwise hides.
+    pub legs: Vec<AttemptLeg>,
     pub latency_ms: u64,
     pub outcome: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -138,17 +149,22 @@ pub fn error_kind(error: &GatewayError) -> &'static str {
         GatewayError::ContextLengthExceeded { .. } => "context_length_exceeded",
         GatewayError::AllCandidatesExhausted { .. } => "all_candidates_exhausted",
         GatewayError::Internal => "internal",
-        GatewayError::Client(err) => match err.kind() {
-            ErrorKind::RateLimited => "rate_limited",
-            ErrorKind::QuotaExhausted => "quota_exhausted",
-            ErrorKind::Auth => "auth",
-            ErrorKind::BadRequest => "bad_request",
-            ErrorKind::ContextLength => "context_length",
-            ErrorKind::ServerError => "server_error",
-            ErrorKind::Timeout => "timeout",
-            ErrorKind::ConnectError => "connect_error",
-            ErrorKind::StreamBroken => "stream_broken",
-        },
+        GatewayError::Client(err) => upstream_error_kind(err),
+    }
+}
+
+/// The same vocabulary for an upstream error seen mid-attempt.
+pub fn upstream_error_kind(error: &llmux_types::UpstreamError) -> &'static str {
+    match error.kind() {
+        ErrorKind::RateLimited => "rate_limited",
+        ErrorKind::QuotaExhausted => "quota_exhausted",
+        ErrorKind::Auth => "auth",
+        ErrorKind::BadRequest => "bad_request",
+        ErrorKind::ContextLength => "context_length",
+        ErrorKind::ServerError => "server_error",
+        ErrorKind::Timeout => "timeout",
+        ErrorKind::ConnectError => "connect_error",
+        ErrorKind::StreamBroken => "stream_broken",
     }
 }
 
@@ -179,6 +195,18 @@ mod tests {
                 image_count: 2,
                 upstream_request_id: Some("msg_01Xy"),
                 attempts: i + 1,
+                legs: vec![
+                    AttemptLeg {
+                        deployment: "dep-a".into(),
+                        provider: "openai_compat".into(),
+                        outcome: "rate_limited",
+                    },
+                    AttemptLeg {
+                        deployment: "dep".into(),
+                        provider: "openai_compat".into(),
+                        outcome: "routed",
+                    },
+                ],
                 latency_ms: 42,
                 outcome: "routed",
                 error_kind: None,
@@ -201,6 +229,13 @@ mod tests {
             assert_eq!(parsed["outcome"], "routed");
             assert_eq!(parsed["quota_remaining"]["rpm"], 9);
             assert!(parsed.get("error_kind").is_none());
+            assert_eq!(
+                parsed["legs"],
+                serde_json::json!([
+                    {"deployment": "dep-a", "provider": "openai_compat", "outcome": "rate_limited"},
+                    {"deployment": "dep", "provider": "openai_compat", "outcome": "routed"},
+                ])
+            );
         }
     }
 
@@ -218,6 +253,7 @@ mod tests {
             image_count: 0,
             upstream_request_id: None,
             attempts: 4,
+            legs: Vec::new(),
             latency_ms: 1000,
             outcome: "error",
             error_kind: Some("rate_limited"),
@@ -252,6 +288,7 @@ mod tests {
             image_count: 0,
             upstream_request_id: None,
             attempts: 1,
+            legs: Vec::new(),
             latency_ms: 1,
             outcome: "routed",
             error_kind: None,

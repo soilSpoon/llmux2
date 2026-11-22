@@ -127,7 +127,13 @@ object per routed request as a JSONL line. Each record SHALL carry the
 timestamp, request ID, requested model, last-attempted deployment ID and
 provider, attempt count, total latency, the outcome (`routed` or `error`),
 the failure kind on errors, and the remaining RPM/concurrency headroom of
-the last-attempted deployment. Each record SHALL also carry a fingerprint of
+the last-attempted deployment. Each record SHALL also carry a `legs` list
+with one entry per upstream send, in send order — including each body
+repaired and resent to the same deployment — naming that leg's
+deployment ID and provider and its outcome — `routed` when the leg served
+the response, otherwise the failure kind — so failover legs that the
+last-attempted fields hide stay visible. An attempt whose request could
+not be built SHALL leave no leg. Each record SHALL also carry a fingerprint of
 the gateway client key used (a `key_<16 hex>` hash keyed by the configured
 key set, never the key itself), the count of image inputs in the inbound
 request, and — when the upstream supplies one — the provider-side request ID
@@ -141,6 +147,10 @@ unset, no file is written.
 #### Scenario: Failed request still recorded
 - WHEN a request exhausts every candidate
 - THEN the record names the last-attempted deployment, the attempt count and `all_candidates_exhausted`.
+
+#### Scenario: Failover legs recorded
+- WHEN a request fails over from one deployment to another
+- THEN `legs` lists both sends in order — the failed leg's deployment, provider and failure kind, then the serving leg's with `routed`.
 
 #### Scenario: Provider flag traced by upstream ID
 - WHEN an upstream response carries `anthropic-request-id`, `x-request-id` or `request-id`, or a provider-owned body carries `id` or `request_id` (including in an error body)

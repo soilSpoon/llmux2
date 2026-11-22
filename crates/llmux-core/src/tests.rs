@@ -34,6 +34,7 @@ impl CredentialSource for Credential {
 struct Adapter {
     kind: ProviderKind,
     errors: Mutex<VecDeque<UpstreamError>>,
+    build_errors: Mutex<VecDeque<BuildError>>,
     observed: Mutex<Option<LimitObservation>>,
     status: Arc<std::sync::atomic::AtomicU16>,
     stream_errors: Mutex<VecDeque<UpstreamError>>,
@@ -66,6 +67,9 @@ impl ProviderAdapter for Adapter {
         dep: &Deployment,
         auth: &AuthMaterial,
     ) -> Result<Request<Bytes>, BuildError> {
+        if let Some(error) = self.build_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
         if req.format == InboundFormat::AnthropicMessages
             && (req.body == "document" || req.body == "image" && dep.idx == DeploymentIdx(2))
         {
@@ -191,6 +195,7 @@ async fn fixture_full(
     let adapter = Arc::new(Adapter {
         kind: ProviderKind("test".into()),
         errors: Mutex::new(errors.into()),
+        build_errors: Mutex::new(VecDeque::new()),
         observed: Mutex::new(None),
         status,
         stream_errors: Mutex::new(VecDeque::new()),
@@ -1321,6 +1326,177 @@ async fn request_log_records_each_request() {
     assert_eq!(lines[0]["upstream_request_id"], "req_fixture_1");
     assert!(lines[1].get("upstream_request_id").is_none());
     assert_eq!(lines[2]["upstream_request_id"], "req_fixture_1");
+}
+
+#[tokio::test(start_paused = true)]
+async fn request_log_lists_every_attempt_leg() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, _adapter, _, _server) = fixture_full(
+        vec![UpstreamError::RateLimited {
+            retry_after: Some(Duration::from_secs(1)),
+        }],
+        false,
+        [Some(1024); 3],
+        &[("model", &[0, 2])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+    )
+    .await;
+
+    let response = executor.execute(request()).await.unwrap();
+    assert_eq!(response.deployment.as_ref(), "dep2");
+    assert_eq!(response.attempts, 2);
+    drop(executor);
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1);
+    let record = &lines[0];
+    // The record names the serving deployment as before; the legs list keeps
+    // the failed leg's provider and deployment too.
+    assert_eq!(record["outcome"], "routed");
+    assert_eq!(record["deployment"], "dep2");
+    assert_eq!(record["attempts"], 2);
+    assert_eq!(
+        record["legs"],
+        serde_json::json!([
+            {"deployment": "dep0", "provider": "test", "outcome": "rate_limited"},
+            {"deployment": "dep2", "provider": "test", "outcome": "routed"},
+        ])
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn request_log_omits_legs_when_nothing_was_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, _adapter, _, _server) = fixture_full(
+        vec![UpstreamError::RateLimited {
+            retry_after: Some(Duration::from_secs(60)),
+        }],
+        false,
+        [Some(1024); 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+    )
+    .await;
+
+    assert!(matches!(
+        executor.execute(request()).await,
+        Err(GatewayError::AllCandidatesExhausted { .. })
+    ));
+    // dep0 is now cooling past the request deadline's budget: the next request
+    // makes no upstream attempt at all.
+    assert!(matches!(
+        executor.execute(request()).await,
+        Err(GatewayError::AllCandidatesExhausted { .. })
+    ));
+    drop(executor);
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[1]["attempts"], 0);
+    assert!(lines[1].get("deployment").is_none());
+    assert_eq!(lines[1]["legs"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn request_log_lists_repair_resends_for_one_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, adapter, _, _server) = fixture_full(
+        vec![UpstreamError::BadRequest {
+            status: StatusCode::BAD_REQUEST,
+            body: Bytes::new(),
+        }],
+        false,
+        [Some(1024); 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+    )
+    .await;
+    // Repair without cooling dep0 itself.
+    *adapter.cool_on_repair.lock().unwrap() = Some(Arc::new(DeploymentLimits::new(
+        llmux_types::QuotaSpec::default(),
+    )));
+
+    let response = executor.execute(request()).await.unwrap();
+    assert_eq!(response.deployment.as_ref(), "dep0");
+    assert_eq!(response.attempts, 1);
+    assert_eq!(adapter.wire_calls.load(Ordering::Relaxed), 2);
+    drop(executor);
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(
+        lines[0]["legs"],
+        serde_json::json!([
+            {"deployment": "dep0", "provider": "test", "outcome": "bad_request"},
+            {"deployment": "dep0", "provider": "test", "outcome": "routed"},
+        ])
+    );
+}
+
+#[tokio::test]
+async fn request_log_omits_legs_when_the_build_never_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, adapter, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [Some(1024); 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+    )
+    .await;
+    adapter
+        .build_errors
+        .lock()
+        .unwrap()
+        .push_back(BuildError::InvalidAuth);
+
+    assert!(matches!(
+        executor.execute(request()).await,
+        Err(GatewayError::Internal)
+    ));
+    drop(executor);
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["attempts"], 1);
+    assert_eq!(lines[0]["error_kind"], "internal");
+    assert_eq!(lines[0]["legs"], serde_json::json!([]));
 }
 
 #[tokio::test]
