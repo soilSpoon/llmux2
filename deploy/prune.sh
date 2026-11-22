@@ -14,12 +14,12 @@ IMPORT_FLAGS=()
 # shellcheck source=/dev/null
 [[ -f "$dir/import.env" ]] && source "$dir/import.env"
 
+[[ -f "$dir/dead-models.json" ]] || { echo "llmux2-prune: no sweep output yet; nothing to do"; exit 0; }
+
 # The deploy gate rejects a config whose listen differs from the installed
 # one; read the deployed address back from active.json instead of hardcoding.
 listen="$(grep -o '"listen": *"[^"]*"' "$dir/active.json" | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
 [[ -n "$listen" ]] || { echo "llmux2-prune: no deployed listen in $dir/active.json" >&2; exit 1; }
-
-[[ -f "$dir/dead-models.json" ]] || { echo "llmux2-prune: no sweep output yet; nothing to do"; exit 0; }
 
 # Only the candidate config is removed: deploy atomically copies it to the
 # idle slot, and the shared secrets directory stays live — the importer

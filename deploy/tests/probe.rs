@@ -862,7 +862,8 @@ fn sweep_rejects_a_pinned_model_list() {
     let home = Home::new();
     let output = home.run(&["--sweep", "--models", "alpha"]);
     assert!(output.status.code().is_some_and(|code| code > 0));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("--sweep"));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("--sweep cannot be combined with --models"));
 }
 
 #[test]
