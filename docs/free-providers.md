@@ -623,10 +623,21 @@ key = "env:PACKET_API_KEY"
 name = "deepseek-v4.1-flash"
 capabilities = { stream = true, max_context = 131072 }
 [[models.deployments]]
-id = "packet"
+id = "packet-deepseek-v4.1-flash"
 credential = "packet-key"
 base_url = "https://api.packet.ai/v1"
 upstream_model = "nvidia/DeepSeek-V4.1-Flash-NVFP4"
+timeout_ms = 60000
+expires_at = 2026-12-16T23:59:59Z
+
+[[models]]
+name = "minimax-m3.1-flash"
+capabilities = { stream = true, max_context = 131072 }
+[[models.deployments]]
+id = "packet-minimax-m3.1-flash"
+credential = "packet-key"
+base_url = "https://api.packet.ai/v1"
+upstream_model = "MiniMaxAI/MiniMax-M3.1-Flash"
 timeout_ms = 60000
 expires_at = 2026-12-16T23:59:59Z
 ```
@@ -650,10 +661,31 @@ provider = "openai_compat"
 key = "env:OPENCODE_ZEN_API_KEY"
 
 [[models]]
+name = "deepseek-v4.1-flash"
+capabilities = { stream = true, max_context = 131072 }
+[[models.deployments]]
+id = "zen-deepseek-v4.1-flash"
+credential = "zen-key"
+base_url = "https://opencode.ai/inference/openai/v1"
+upstream_model = "deepseek-v4.1-flash-free"
+timeout_ms = 60000
+
+[[models]]
+name = "hy4-flash"
+capabilities = { stream = true, max_context = 1048576 }
+[[models.deployments]]
+id = "zen-hy4-flash"
+credential = "zen-key"
+base_url = "https://opencode.ai/inference/openai/v1"
+upstream_model = "hy4-flash-free"
+timeout_ms = 60000
+expires_at = 2026-11-30T23:59:59Z
+
+[[models]]
 name = "big-pickle"
 capabilities = { stream = true, max_context = 200000 }
 [[models.deployments]]
-id = "zen"
+id = "zen-big-pickle"
 credential = "zen-key"
 base_url = "https://opencode.ai/inference/openai/v1"
 upstream_model = "big-pickle"
@@ -681,7 +713,7 @@ key = "env:NVIDIA_API_KEY"
 name = "gemma-4-31b"
 capabilities = { stream = true }
 [[models.deployments]]
-id = "nvidia"
+id = "nvidia-gemma-4-31b"
 credential = "nvidia-key"
 base_url = "https://integrate.api.nvidia.com/v1"
 upstream_model = "google/gemma-4-31b-it"
@@ -710,7 +742,7 @@ key = "env:FREEMODEL_API_KEY"
 name = "claude-fable-5"
 capabilities = { stream = true, max_context = 1000000 }
 [[models.deployments]]
-id = "freemodel"
+id = "freemodel-claude-fable-5"
 credential = "freemodel-key"
 base_url = "https://freemodel.in/v1"
 upstream_model = "claude-fable-5"
