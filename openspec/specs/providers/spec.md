@@ -165,3 +165,34 @@ THEN it backs off and keeps polling until the device code expires, failing early
 only on a definitive OAuth error (`access_denied`, `expired_token`, or another
 OAuth `error` code). Errors name the HTTP status and the first 200 characters of
 the body, never the device code or tokens.
+
+### Requirement: Hashed end-user attribution
+
+When `[server] end_user_header` is set and the gateway has derived an end-user
+hash, the Anthropic adapter SHALL set `metadata.user_id` to that hash on both
+the OpenAI Chat conversion and the native Messages passthrough, overriding a
+client-supplied `user` or `metadata.user_id` and preserving other metadata
+fields on passthrough. An `openai` or `openai_compat` deployment SHALL set the
+Chat Completions `user` field to the same hash, then apply `strip_request_fields`,
+so a deployment that strips `user` does not send it. Other provider kinds SHALL
+NOT gain a `user` field from this feature. When no hash is present, adapters
+SHALL keep their previous behavior, including copying a client `user` into
+Anthropic `metadata.user_id`.
+
+#### Scenario: Hash overrides a client id
+
+WHEN a request carries an end-user hash and a client `user` or `metadata.user_id`
+THEN the Anthropic upstream receives the hash as `metadata.user_id` and an
+OpenAI-compatible upstream receives it as `user`, and neither body contains the
+raw identifier.
+
+#### Scenario: Stripped user field
+
+WHEN an `openai_compat` deployment lists `user` in `strip_request_fields`
+THEN the hashed `user` field is omitted from the upstream body.
+
+#### Scenario: No hash
+
+WHEN the end-user feature is off or the request has no identifier
+THEN Anthropic still copies a client `user` into `metadata.user_id` and does not
+invent one.

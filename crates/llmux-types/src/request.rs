@@ -24,6 +24,8 @@ pub struct GatewayRequest {
     /// Per-request override of the model's `context_overflow`.
     pub context_overflow: Option<crate::ContextOverflow>,
     pub request_id: RequestId,
+    /// Hashed end-user id for upstream abuse attribution. `None` keeps today's behavior.
+    pub end_user: Option<Arc<str>>,
 }
 
 pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + 'a>>;

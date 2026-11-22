@@ -84,6 +84,20 @@ impl Anthropic {
     }
 }
 
+fn set_metadata_user_id(body: Bytes, user_id: &str) -> Result<Bytes, BuildError> {
+    let mut value: Value = serde_json::from_slice(&body).map_err(|_| BuildError::InvalidBody)?;
+    let object = value.as_object_mut().ok_or(BuildError::InvalidBody)?;
+    let metadata = object.entry("metadata").or_insert_with(|| json!({}));
+    if !metadata.is_object() {
+        *metadata = json!({});
+    }
+    metadata
+        .as_object_mut()
+        .expect("metadata object")
+        .insert("user_id".into(), json!(user_id));
+    Ok(Bytes::from(value.to_string()))
+}
+
 fn string(value: &Value) -> Result<&str, BuildError> {
     value.as_str().ok_or(BuildError::InvalidBody)
 }
@@ -133,7 +147,7 @@ fn blocks(content: &Value) -> Result<Vec<Value>, BuildError> {
         .collect()
 }
 
-fn convert_request(body: &[u8], model: &str) -> Result<Bytes, BuildError> {
+fn convert_request(body: &[u8], model: &str, end_user: Option<&str>) -> Result<Bytes, BuildError> {
     let input: Value = serde_json::from_slice(body).map_err(|_| BuildError::InvalidBody)?;
     let mut messages: Vec<Value> = Vec::new();
     let mut system = Vec::new();
@@ -205,7 +219,9 @@ fn convert_request(body: &[u8], model: &str) -> Result<Bytes, BuildError> {
             return Err(BuildError::InvalidBody);
         };
     }
-    if let Some(user) = input.get("user") {
+    if let Some(user_id) = end_user {
+        out["metadata"] = json!({"user_id": user_id});
+    } else if let Some(user) = input.get("user") {
         out["metadata"] = json!({"user_id":user});
     }
     if let Some(tools) = input.get("tools") {
@@ -499,8 +515,18 @@ impl ProviderAdapter for Anthropic {
     ) -> Result<Request<Bytes>, BuildError> {
         let body = match self.supports(req.format) {
             Support::No => return Err(BuildError::UnsupportedFormat),
-            Support::Passthrough => rewrite_model(&req.body, crate::upstream_model(req, dep))?,
-            Support::Convert => convert_request(&req.body, crate::upstream_model(req, dep))?,
+            Support::Passthrough => {
+                let body = rewrite_model(&req.body, crate::upstream_model(req, dep))?;
+                match req.end_user.as_deref() {
+                    Some(user_id) => set_metadata_user_id(body, user_id)?,
+                    None => body,
+                }
+            }
+            Support::Convert => convert_request(
+                &req.body,
+                crate::upstream_model(req, dep),
+                req.end_user.as_deref(),
+            )?,
         };
         let body = strip_request_fields(body, &dep.strip_request_fields)?;
         let uri = endpoint_uri(&dep.base_url, "/messages")?;
@@ -722,7 +748,7 @@ mod tests {
     }
 
     fn converted(v: Value) -> Value {
-        serde_json::from_slice(&convert_request(v.to_string().as_bytes(), "claude").unwrap())
+        serde_json::from_slice(&convert_request(v.to_string().as_bytes(), "claude", None).unwrap())
             .unwrap()
     }
 
@@ -788,7 +814,8 @@ mod tests {
         }
         assert!(convert_request(
             br#"{"messages":[{"role":"assistant","content":"hello","tool_calls":{}}]}"#,
-            "m"
+            "m",
+            None
         )
         .is_err());
     }
@@ -833,11 +860,11 @@ mod tests {
             json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"file:///x"}}]}]}),
         ] {
             assert!(matches!(
-                convert_request(v.to_string().as_bytes(), "m"),
+                convert_request(v.to_string().as_bytes(), "m", None),
                 Err(BuildError::InvalidBody)
             ));
         }
-        assert!(convert_request(b"not json", "m").is_err());
+        assert!(convert_request(b"not json", "m", None).is_err());
     }
 
     #[test]
@@ -1105,6 +1132,7 @@ mod tests {
             max_output_tokens: None,
             context_overflow: None,
             request_id: RequestId("r".into()),
+            end_user: None,
         };
         dep.headers
             .insert("x-deployment", HeaderValue::from_static("static-value"));
@@ -1229,6 +1257,7 @@ mod tests {
                 max_output_tokens: None,
                 context_overflow: None,
                 request_id: RequestId("r".into()),
+                end_user: None,
             };
             let request = a
                 .build_request(&req, &dep, &AuthMaterial::None)
@@ -1276,5 +1305,79 @@ mod tests {
                 &rejection("`temperature` is deprecated for this model.")
             )
             .is_none());
+    }
+
+    #[test]
+    fn end_user_hash_overrides_client_user_id_on_convert_and_passthrough() {
+        let a = Anthropic::new(provider::ANTHROPIC);
+        let dep = Deployment {
+            headers: Default::default(),
+            fallback: false,
+            idx: DeploymentIdx(0),
+            id: "a".into(),
+            provider: a.kind().clone(),
+            credential: "key".into(),
+            base_url: "https://example.com/v1/".parse().unwrap(),
+            upstream_model: "claude".into(),
+            strip_request_fields: Box::new([llmux_types::ChatRequestField::Temperature]),
+            priority: 0,
+            quota: QuotaSpec::default(),
+            timeout: Duration::from_secs(10),
+            max_context: None,
+        };
+        let hash = "31ca399bfc61dac0b442a6bef7c00cd06cf9682c11b9192fb26a918b4a9130f8";
+        let raw = "raw-client-SHOULD-NOT-LEAK";
+        let build = |format, body: &str, end_user: Option<&str>| {
+            let req = GatewayRequest {
+                format,
+                model: "m".into(),
+                stream: false,
+                body: Bytes::from(body.to_owned()),
+                anthropic_headers: HeaderMap::new(),
+                est_input_tokens: 0,
+                max_output_tokens: None,
+                context_overflow: None,
+                request_id: RequestId("r".into()),
+                end_user: end_user.map(Arc::from),
+            };
+            let request = a
+                .build_request(&req, &dep, &AuthMaterial::None)
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+            serde_json::from_slice::<Value>(request.body()).unwrap()
+        };
+        let converted = build(
+            InboundFormat::OpenAiChat,
+            &format!(
+                r#"{{"model":"m","temperature":0.2,"user":"{raw}","messages":[{{"role":"user","content":"hi"}}]}}"#
+            ),
+            Some(hash),
+        );
+        assert_eq!(converted["metadata"]["user_id"], hash);
+        assert!(!converted.to_string().contains(raw));
+        assert!(converted.get("temperature").is_none());
+        assert!(converted.get("user").is_none());
+
+        let passed = build(
+            InboundFormat::AnthropicMessages,
+            &format!(
+                r#"{{"model":"alias","metadata":{{"user_id":"{raw}","account":"acme"}},"messages":[]}}"#
+            ),
+            Some(hash),
+        );
+        assert_eq!(passed["metadata"]["user_id"], hash);
+        assert!(!passed.to_string().contains(raw));
+        assert_eq!(passed["metadata"]["account"], "acme");
+        assert_eq!(passed["model"], "claude");
+
+        let kept = build(
+            InboundFormat::OpenAiChat,
+            &format!(
+                r#"{{"model":"m","user":"{raw}","messages":[{{"role":"user","content":"hi"}}]}}"#
+            ),
+            None,
+        );
+        assert_eq!(kept["metadata"]["user_id"], raw);
     }
 }
