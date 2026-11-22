@@ -296,3 +296,5 @@ impl<R: Runtime> Deployment<R> {
         Ok(idle.into())
     }
 }
+mod probe;
+pub use probe::probe_entry;

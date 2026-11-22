@@ -15,3 +15,7 @@ path = "src/bin/deploy.rs"
 [[bin]]
 name = "llmux2-guard"
 path = "src/bin/guard.rs"
+
+[[bin]]
+name = "llmux2-probe"
+path = "src/bin/probe.rs"

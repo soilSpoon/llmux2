@@ -94,3 +94,35 @@ outside the two slots (a subsequent deploy can overwrite the inactive slot).
 For a deliberate outage, first stop `llmux2-guard.timer`, then stop both slot
 units. To undo migration, stop the timer and both slots before re-enabling the
 old single-instance unit; that transition requires a maintenance window.
+
+## Synthetic route probes
+
+`llmux2-probe` exercises the running gateway like a client would. Every run
+checks `GET /healthz` and `GET /v1/models`, then sends a one-token
+`POST /v1/chat/completions` to `--per-run` canonical models (default 1),
+walking the sorted model list across runs via a cursor in
+`--state-file` (`$HOME/llmux2/probe-state.json`). Rotation keeps provider
+quota cost bounded: one synthetic request per interval instead of one per
+model. `--all-formats` additionally probes `/v1/responses` and `/v1/messages`
+once each with the first model, covering the other inbound wire formats.
+`--models a,b` pins an explicit set instead of rotating.
+
+`--listen` defaults to the gateway's default `127.0.0.1:8080`; the shipped
+unit passes `127.0.0.1:8090` for the OCI slots.
+
+The probe reads the gateway client key from `--key-file`
+(`$HOME/llmux2/client.key`), prints a JSON report naming each check's status,
+latency and serving deployment, and exits 0 only when every probe passes;
+a failed probe exits 1 and lands in the journal where the unit shows failed.
+Install with the other binaries and enable the timer:
+
+```sh
+install -m 700 target/release/llmux2-probe "$HOME/llmux2/bin/"
+systemctl --user daemon-reload
+systemctl --user enable --now llmux2-probe.timer
+journalctl --user -u llmux2-probe.service
+```
+
+Tune cadence with a timer drop-in and breadth with `--per-run`/`--models` in a
+service drop-in. Probes send real provider traffic (one token per model), so
+keep the total request rate well under the lowest provider RPM limit.
