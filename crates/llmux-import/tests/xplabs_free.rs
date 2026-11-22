@@ -111,7 +111,7 @@ fn free_xplabs_logprobs_route_leads_base_combo_and_follows_morph_in_fast_combo()
 }
 
 #[test]
-fn billed_xplabs_models_keep_their_declared_position() {
+fn billed_xplabs_models_are_dropped() {
     for (name, model) in [
         ("claude-haiku-5.5", "claude-haiku-5.5"),
         ("qwen3.8-27b", "qwen3.8-27b"),
@@ -119,13 +119,53 @@ fn billed_xplabs_models_keep_their_declared_position() {
     ] {
         let declared = format!("experlabs/{model}");
         let (actual, warnings) = routes(&fixture(name, json!(["paid/a", declared])));
-        assert_eq!(
-            actual,
-            [pair("https://paid.example/v1", "a"), pair(XPLABS, model)],
-            "{name}"
-        );
-        assert!(warnings.iter().all(|w| !w.contains("XPLabs")));
+        assert_eq!(actual, [pair("https://paid.example/v1", "a")], "{name}");
+        assert!(warnings
+            .iter()
+            .any(|w| w == &format!("combo {name}: dropped billed XPLabs route {model}")));
     }
+}
+
+#[test]
+fn billed_xplabs_leg_drops_in_round_robin_and_only_leg_combos() {
+    let mut root = fixture(
+        "claude-haiku-5.5",
+        json!(["experlabs/claude-haiku-5.5", "paid/a"]),
+    );
+    root["combos"][0]["strategy"] = "round-robin".into();
+    let (actual, warnings) = routes(&root);
+    assert_eq!(actual, [pair("https://paid.example/v1", "a")]);
+    assert!(warnings
+        .iter()
+        .any(|w| w.contains("dropped billed XPLabs route claude-haiku-5.5")));
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.toml");
+    let report = llmux_import::import_with_options(
+        &fixture("claude-haiku-5.5", json!(["experlabs/claude-haiku-5.5"])).to_string(),
+        &out,
+        None,
+        &ImportOptions::default(),
+    );
+    assert_eq!(
+        report.err().as_deref(),
+        Some("no importable models; no configuration written")
+    );
+    assert!(!out.exists());
+}
+
+#[test]
+fn free_xplabs_leg_in_a_billed_combo_survives() {
+    let (actual, warnings) = routes(&fixture(
+        "claude-haiku-5.5",
+        json!([
+            "experlabs/deepseek-v4.1-flash",
+            "experlabs/claude-haiku-5.5"
+        ]),
+    ));
+    assert_eq!(actual, [pair(XPLABS, "deepseek-v4.1-flash")]);
+    assert!(warnings
+        .iter()
+        .any(|w| w.contains("dropped billed XPLabs route claude-haiku-5.5")));
 }
 
 #[test]

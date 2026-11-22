@@ -1178,6 +1178,7 @@ pub fn import_with_options(
             .expand(&name, &mut Vec::new(), &mut free);
             xplabs::place(&name, &mut deployments, free, &connections, &mut warnings);
         }
+        xplabs::drop_billed(&name, &mut deployments, &mut warnings);
         devin::free_first(&mut deployments, &connections, policy.devin_free.as_ref());
         if policy.openrouter_replacements && combos.contains_key(&name) {
             let steps = secondary::steps(

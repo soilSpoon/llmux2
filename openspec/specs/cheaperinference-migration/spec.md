@@ -216,18 +216,24 @@ and endpoint SHALL be moved instead of duplicated, keeping its pinned
 connection, other legs SHALL keep their
 relative order, and a warning SHALL be emitted when the order changes. This
 follows OCI verification that these models cost 0 on the existing key and that
-XPLabs DeepSeek returns logprobs. XPLabs models OCI observed billing
-(`claude-haiku-5.5`, `qwen3.8-27b`, `deepseek-v4.1-flash-1017`) SHALL keep their
-declared position.
+XPLabs DeepSeek returns logprobs. Every XPLabs deployment whose model is not in
+the verified-free set SHALL be dropped with a warning, in every combo and
+strategy: the account is overdrawn, so billed models OCI observed
+(`claude-haiku-5.5`, `qwen3.8-27b`, `deepseek-v4.1-flash-1017`) must never be
+generated, and a combo left with no deployments is skipped.
 
 #### Scenario: Reviewed combo with an eligible XPLabs connection
 - **WHEN** a reviewed combo has paid legs and an eligible XPLabs connection exists
 - **THEN** the XPLabs model is priority 0 and the paid legs follow in order
 
+#### Scenario: Billed XPLabs leg
+- **WHEN** any combo contains an XPLabs leg whose model is not verified free
+- **THEN** that leg is dropped with a warning and other legs keep their order
+
 #### Scenario: Ineligible connection, unreviewed combo or round-robin
 - **WHEN** the XPLabs connection is inactive, unusable, OAuth, on another host or
-  prefix, the combo is unreviewed or billed, or the combo uses round-robin
-- **THEN** the combo's deployments are unchanged
+  prefix, or the combo is unreviewed
+- **THEN** no free route is placed, while billed legs are still dropped
 
 ### Requirement: Reviewed secondary routes
 With `--openrouter-replacements`, for the existing source combo `gpt-6-luna`, the importer SHALL append the

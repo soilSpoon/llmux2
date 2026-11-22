@@ -6,7 +6,7 @@ const PREFIX: &str = "experlabs";
 
 // OCI verified usage.cost 0 on the existing key for these models, and logprobs on DeepSeek
 // (Free tier: 10 RPM, 1M tokens/day shared). Haiku 5.5, Qwen3.8 27B and the 1017 model
-// were billed, so their declared legs keep their place. Reviewed combo -> XPLabs model id.
+// were billed, so only legs whose model is listed here survive. Reviewed combo -> XPLabs model id.
 const FREE: &[(&str, &str)] = &[
     ("gpt-6-luna", "gpt-6-luna"),
     ("deepseek-v4.1-flash", "deepseek-v4.1-flash"),
@@ -54,6 +54,31 @@ pub(super) fn step(
     let mut step = connection.provider.step(model);
     step["connectionId"] = json!(connection.source_id);
     Some(step)
+}
+
+/// Drops XPLabs deployments whose model is not verified free: the account is overdrawn, so
+/// billed legs (Haiku 5.5, Qwen3.8 27B, the 1017 model) must never be generated. Applies to
+/// every combo and strategy; a combo left with no deployments is skipped by the caller.
+pub(super) fn drop_billed(name: &str, deployments: &mut Vec<Value>, warnings: &mut Vec<String>) {
+    let mut dropped = Vec::new();
+    deployments.retain(|dep| {
+        let keep = dep["base_url"] != BASE_URL
+            || FREE
+                .iter()
+                .any(|(_, model)| dep["upstream_model"] == *model);
+        if !keep {
+            dropped.push(
+                dep["upstream_model"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+        keep
+    });
+    for model in dropped {
+        warnings.push(format!("combo {name}: dropped billed XPLabs route {model}"));
+    }
 }
 
 /// Places `free` first (after the verified Morph route in fast combos). Declared legs for the
