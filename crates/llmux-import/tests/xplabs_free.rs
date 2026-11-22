@@ -122,7 +122,7 @@ fn billed_xplabs_models_are_dropped() {
         assert_eq!(actual, [pair("https://paid.example/v1", "a")], "{name}");
         assert!(warnings
             .iter()
-            .any(|w| w == &format!("combo {name}: dropped billed XPLabs route {model}")));
+            .any(|w| w.contains(&format!("dropped billed XPLabs route {model}"))));
     }
 }
 
@@ -151,6 +151,60 @@ fn billed_xplabs_leg_drops_in_round_robin_and_only_leg_combos() {
         Some("no importable models; no configuration written")
     );
     assert!(!out.exists());
+}
+
+#[test]
+fn billed_only_target_blocks_mapped_openrouter_replacement() {
+    let mut root = fixture("ok", json!(["paid/a"]));
+    root["providerConnections"].as_array_mut().unwrap().push(
+        json!({"id":"anthropic","provider":"anthropic","authType":"apikey","apiKey":"synthetic-anthropic"}),
+    );
+    root["combos"].as_array_mut().unwrap().extend([
+        json!({"id":"billed","name":"claude-haiku-5.5","isActive":true,"models":["experlabs/claude-haiku-5.5"]}),
+        json!({"name":"openrouter/anthropic/claude-fable-5.2","models":["openai/unverified"]}),
+    ]);
+    root["modelComboMappings"] = json!([
+        {"pattern":"openrouter/anthropic/claude-fable-5.2","comboId":"billed","priority":100,"enabled":true}
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.toml");
+    let report = llmux_import::import_with_options(
+        &root.to_string(),
+        &out,
+        None,
+        &ImportOptions {
+            openrouter_replacements: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let config = RuntimeConfig::load(&out).unwrap();
+    // the billed-only target is unavailable, so the mapped openrouter combo keeps
+    // no reviewed replacement and emits nothing
+    for name in ["openrouter/anthropic/claude-fable-5.2", "claude-haiku-5.5"] {
+        assert!(!config.model_names.contains_key(name), "unexpected {name}");
+    }
+    assert!(config.model_names.contains_key("ok"));
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| { w == "combo openrouter/anthropic/claude-fable-5.2: skipped: no deployments" }));
+}
+
+#[test]
+fn dropped_billed_leg_never_consumes_a_context_override() {
+    let mut root = fixture(
+        "claude-haiku-5.5",
+        json!(["experlabs/claude-haiku-5.5", "paid/a"]),
+    );
+    root["modelContextOverrides"] = json!([
+        {"provider":"experlabs","modelId":"claude-haiku-5.5","realContext":131072},
+        {"provider":"paid","modelId":"a","realContext":65536},
+    ]);
+    let (_, warnings) = routes(&root);
+    assert!(warnings.iter().any(
+        |w| w == "context overrides: 1 applied, 1 ignored (no imported deployment), 0 invalid"
+    ));
 }
 
 #[test]

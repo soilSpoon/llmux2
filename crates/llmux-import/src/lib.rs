@@ -603,6 +603,12 @@ impl Expander<'_> {
                         continue;
                     }
                 };
+                if c.base_url == xplabs::BASE_URL && !xplabs::free_model(&model) {
+                    self.warnings.push(format!(
+                        "combo {name} step {index}: dropped billed XPLabs route {model}"
+                    ));
+                    continue;
+                }
                 let mut deployment = json!({"base_url":c.base_url,"upstream_model":model});
                 if bridge.is_some() {
                     deployment["_bridge_replacement"] = true.into();
@@ -1178,7 +1184,6 @@ pub fn import_with_options(
             .expand(&name, &mut Vec::new(), &mut free);
             xplabs::place(&name, &mut deployments, free, &connections, &mut warnings);
         }
-        xplabs::drop_billed(&name, &mut deployments, &mut warnings);
         devin::free_first(&mut deployments, &connections, policy.devin_free.as_ref());
         if policy.openrouter_replacements && combos.contains_key(&name) {
             let steps = secondary::steps(

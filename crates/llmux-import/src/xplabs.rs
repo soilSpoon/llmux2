@@ -56,29 +56,11 @@ pub(super) fn step(
     Some(step)
 }
 
-/// Drops XPLabs deployments whose model is not verified free: the account is overdrawn, so
-/// billed legs (Haiku 5.5, Qwen3.8 27B, the 1017 model) must never be generated. Applies to
-/// every combo and strategy; a combo left with no deployments is skipped by the caller.
-pub(super) fn drop_billed(name: &str, deployments: &mut Vec<Value>, warnings: &mut Vec<String>) {
-    let mut dropped = Vec::new();
-    deployments.retain(|dep| {
-        let keep = dep["base_url"] != BASE_URL
-            || FREE
-                .iter()
-                .any(|(_, model)| dep["upstream_model"] == *model);
-        if !keep {
-            dropped.push(
-                dep["upstream_model"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
-            );
-        }
-        keep
-    });
-    for model in dropped {
-        warnings.push(format!("combo {name}: dropped billed XPLabs route {model}"));
-    }
+/// Whether `model` on the XPLabs endpoint is verified free. Billed legs (Haiku 5.5, Qwen3.8
+/// 27B, the 1017 model) must never be generated while the account is overdrawn, so expansion
+/// drops them before limits, availability scans or ordering ever see them.
+pub(super) fn free_model(model: &str) -> bool {
+    FREE.iter().any(|(_, free)| *free == model)
 }
 
 /// Places `free` first (after the verified Morph route in fast combos). Declared legs for the
