@@ -17,6 +17,32 @@ replaying a consumer product's OAuth credentials. Codex and Morph are outside
 this research; Gemini credential mapping is being handled separately. Factory is
 excluded. No accounts were created and no paid inference was performed.
 
+## Temporary free offers (promotions that appear and expire)
+
+Promotions like XPLabs' 48-hour free windows recur: a provider lists a model at
+100% off for a short time, then it reverts to paid or disappears. Track them as
+deployments with `expires_at`, not as a separate list, so the same routing,
+limits and stats machinery covers them.
+
+- **Configure with an end time.** `expires_at = <RFC 3339 timestamp>` on
+  `[[models.deployments]]` makes the deployment permanently ineligible once the
+  promo ends — skipped like a disabled deployment, without consuming an attempt
+  or recording a failure — until config changes via `/admin/reload` or restart.
+  Use the provider's stated end time; when a promo lists none, pick a short
+  conservative expiry (e.g. a few days) and let the tracker extend it.
+- **Watch via `/admin/deployments`.** Each deployment reports `expires_at`
+  and `expired`, so a tracking job reads live state instead of parsing
+  `llmux.toml`. An external tracker (scheduled check of provider
+  pricing/model pages, or a human filing a change) adds the deployment, sets or
+  extends `expires_at`, and `POST /admin/reload`s — no restart, no downtime.
+- **Expiry is not the only signal.** Promos can also end by rate-limiting
+  harder or withdrawing the model; the existing cooldown and quota
+  observation path handles those and fails over, so `expires_at` only needs to
+  cover the announced end.
+- **Priority:** give promo deployments low `priority` (tried last) unless the
+  goal is to burn the free window first — the quota-expiry-first ordering
+  already prefers allowances that lapse sooner.
+
 ## Import gaps → replacements
 
 The dry-run counts are **group totals**, not per-provider counts: 43 bridge legs,

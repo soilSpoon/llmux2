@@ -6,6 +6,20 @@ Operability and the engineering standards the project holds itself to.
 
 ## Requirements
 
+### Requirement: Deployment attribution
+
+The gateway SHALL count failures and skips per deployment in its authenticated
+deployment stats using fixed class and reason names, without provider error
+bodies, account identifiers, or request data.
+An expired deployment gets the `expired` skip reason, not a failed attempt.
+
+#### Scenario: A routed request fails
+
+WHEN a request fails after at least one deployment was attempted
+THEN the gateway reports the final attempted deployment and total attempts
+on the error response only when routing headers are enabled. A request that
+fails before any deployment is attempted does not receive routing headers.
+
 ### Requirement: Standalone slot deployment tools
 
 The non-default `llmux2-ops` workspace package SHALL build standalone
@@ -122,8 +136,6 @@ existing environment inputs and success/failure exit codes.
 AND the non-default `xtask` workspace member SHALL expose one binary with a
 module per tool, independent of gateway crates.
 
-||||||| parent of d4d160c (Add authenticated /admin management API with hot config reload)
-=======
 ### Requirement: Management over one shared core
 
 Operators SHALL be able to inspect and control the running gateway through an

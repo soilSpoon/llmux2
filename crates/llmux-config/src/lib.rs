@@ -1,9 +1,9 @@
 //! Parse and validate an immutable MVP routing configuration.
 
-use http::Uri;
+use http::{HeaderName, Uri};
 use llmux_types::{
     provider, CanonicalModel, Capabilities, ChatRequestField, ContextOverflow, Deployment,
-    DeploymentIdx, ErrorKind, ProviderKind, QuotaSpec,
+    DeploymentIdx, ErrorKind, NousState, ProviderKind, QuotaSpec,
 };
 use serde::Deserialize;
 use std::{
@@ -12,7 +12,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use thiserror::Error;
 
@@ -37,6 +37,24 @@ pub struct ServerConfig {
     pub drain_grace: Duration,
     pub expose_routing_headers: bool,
     pub dashboard_key: Option<Arc<str>>,
+    /// Inbound header whose value is hashed into the end-user id. `None` disables the feature.
+    pub end_user_header: Option<HeaderName>,
+    /// Secret mixed into the end-user hash. Present only when `end_user_header` is set.
+    pub end_user_salt: Option<Arc<str>>,
+    /// When the header is absent, hash the OpenAI `user` body field. Default true if the header is set.
+    pub end_user_from_body: bool,
+    pub remote_images: RemoteImages,
+    /// Decoded byte cap for inline `data:` and Anthropic base64 images. `None` is unlimited.
+    pub max_image_bytes: Option<u64>,
+}
+
+/// Whether chat requests may carry an http(s) image URL.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteImages {
+    #[default]
+    Allow,
+    Reject,
 }
 
 pub struct RoutingConfig {
@@ -66,6 +84,7 @@ pub struct RuntimeConfig {
     pub cooldown: CooldownConfig,
     pub api_keys: HashMap<Arc<str>, ApiKey>,
     pub oauth: HashMap<Arc<str>, OAuthCredential>,
+    pub nous: HashMap<Arc<str>, NousPortalCredential>,
     /// Quotas shared by every deployment that uses the credential.
     pub credential_quotas: HashMap<Arc<str>, QuotaSpec>,
     pub credential_meta: HashMap<Arc<str>, CredentialMeta>,
@@ -85,6 +104,12 @@ pub struct OAuthCredential {
     pub scopes: Option<Vec<String>>,
     pub resource: Option<String>,
     pub refresh_token_path: Option<PathBuf>,
+    pub refresh_skew: Duration,
+    pub request_timeout: Duration,
+}
+
+pub struct NousPortalCredential {
+    pub state_path: PathBuf,
     pub refresh_skew: Duration,
     pub request_timeout: Duration,
 }
@@ -126,6 +151,11 @@ struct RawServer {
     drain_grace_ms: u64,
     expose_routing_headers: bool,
     dashboard_key: Option<String>,
+    end_user_header: Option<String>,
+    end_user_salt: Option<String>,
+    end_user_from_body: Option<bool>,
+    remote_images: RemoteImages,
+    max_image_bytes: Option<u64>,
 }
 
 impl Default for RawServer {
@@ -138,6 +168,11 @@ impl Default for RawServer {
             drain_grace_ms: 2_000,
             expose_routing_headers: true,
             dashboard_key: None,
+            end_user_header: None,
+            end_user_salt: None,
+            end_user_from_body: None,
+            remote_images: RemoteImages::Allow,
+            max_image_bytes: None,
         }
     }
 }
@@ -198,6 +233,15 @@ enum RawCredential {
         #[serde(default)]
         quota: QuotaSpec,
     },
+    NousPortal {
+        id: String,
+        provider: String,
+        state_file: String,
+        refresh_skew_ms: Option<u64>,
+        request_timeout_ms: Option<u64>,
+        #[serde(default)]
+        quota: QuotaSpec,
+    },
 }
 
 #[derive(Deserialize)]
@@ -236,6 +280,7 @@ struct RawDeployment {
     quota: QuotaSpec,
     timeout_ms: Option<u64>,
     max_context: Option<u32>,
+    expires_at: Option<toml::value::Datetime>,
 }
 
 #[derive(Deserialize)]
@@ -280,6 +325,11 @@ impl RawConfig {
                 "server.dashboard_key must differ from server.client_keys",
             ));
         }
+        let end_user = end_user_settings(&server)?;
+        let max_image_bytes = match server.max_image_bytes {
+            Some(0) => return Err(invalid("max_image_bytes must be positive")),
+            other => other,
+        };
         if routing.max_attempts == 0 {
             return Err(invalid("routing.max_attempts must be positive"));
         }
@@ -305,6 +355,7 @@ impl RawConfig {
         let mut credential_meta = HashMap::new();
         let mut api_keys = HashMap::new();
         let mut oauth = HashMap::new();
+        let mut nous = HashMap::new();
         let mut credential_quotas = HashMap::new();
         for credential in credentials {
             let (id, provider, quota) = match &credential {
@@ -315,6 +366,12 @@ impl RawConfig {
                     ..
                 }
                 | RawCredential::Oauth {
+                    id,
+                    provider,
+                    quota,
+                    ..
+                }
+                | RawCredential::NousPortal {
                     id,
                     provider,
                     quota,
@@ -340,7 +397,10 @@ impl RawConfig {
                 id.clone(),
                 CredentialMeta {
                     provider: provider.clone(),
-                    oauth: matches!(credential, RawCredential::Oauth { .. }),
+                    oauth: matches!(
+                        credential,
+                        RawCredential::Oauth { .. } | RawCredential::NousPortal { .. }
+                    ),
                 },
             );
             if quota != QuotaSpec::default() {
@@ -353,6 +413,34 @@ impl RawConfig {
                         ApiKey {
                             provider,
                             key: resolve_secret(&key)?,
+                        },
+                    );
+                }
+                RawCredential::NousPortal {
+                    state_file,
+                    refresh_skew_ms,
+                    request_timeout_ms,
+                    ..
+                } => {
+                    let state_path = PathBuf::from(&state_file);
+                    if state_file.is_empty() || !state_path.is_absolute() {
+                        return Err(invalid("nous_portal state_file must be an absolute path"));
+                    }
+                    if NousState::load(&state_path).is_err() {
+                        return Err(invalid("nous_portal state_file is missing or unreadable; run `llmux-login nous` to sign in and create it"));
+                    }
+                    let refresh_skew_ms = refresh_skew_ms.unwrap_or(120_000);
+                    if refresh_skew_ms > MAX_TIMEOUT_MS {
+                        return Err(invalid(
+                            "nous_portal refresh_skew_ms must be at most 86400000",
+                        ));
+                    }
+                    nous.insert(
+                        id,
+                        NousPortalCredential {
+                            state_path,
+                            refresh_skew: Duration::from_millis(refresh_skew_ms),
+                            request_timeout: timeout(request_timeout_ms.unwrap_or(30_000))?,
                         },
                     );
                 }
@@ -503,7 +591,10 @@ impl RawConfig {
                 }
                 let provider = match (&dep.auth, &dep.credential, &dep.provider) {
                     (Some(DeploymentAuth::None), None, Some(provider))
-                        if matches!(provider.as_str(), provider::OPENAI | provider::OPENAI_COMPAT) =>
+                        if matches!(
+                            provider.as_str(),
+                            provider::OPENAI | provider::OPENAI_COMPAT | provider::DEVIN_ACP
+                        ) =>
                     {
                         ProviderKind(provider.as_str().into())
                     }
@@ -522,15 +613,29 @@ impl RawConfig {
                 {
                     return Err(invalid("OAuth openai_responses models require allowed_keys for the owner's gateway keys"));
                 }
-                if !dep.strip_request_fields.is_empty()
-                    && !matches!(
-                        provider.0.as_ref(),
-                        provider::OPENAI | provider::OPENAI_COMPAT
-                    )
-                {
-                    return Err(invalid(
-                        "strip_request_fields requires openai or openai_compat",
-                    ));
+                if !dep.strip_request_fields.is_empty() {
+                    match provider.0.as_ref() {
+                        provider::OPENAI | provider::OPENAI_COMPAT => {}
+                        provider::ANTHROPIC
+                            if dep.strip_request_fields.iter().all(|field| {
+                                matches!(
+                                    field,
+                                    ChatRequestField::Temperature
+                                        | ChatRequestField::TopP
+                                        | ChatRequestField::TopK
+                                )
+                            }) => {}
+                        provider::ANTHROPIC => {
+                            return Err(invalid(
+                                "strip_request_fields on anthropic accepts only temperature, top_p and top_k",
+                            ))
+                        }
+                        _ => {
+                            return Err(invalid(
+                                "strip_request_fields requires openai, openai_compat or anthropic",
+                            ))
+                        }
+                    }
                 }
                 let base_url = dep
                     .base_url
@@ -538,6 +643,10 @@ impl RawConfig {
                     .or_else(|| {
                         (provider.0.as_ref() == provider::OPENAI_RESPONSES)
                             .then_some("https://api.openai.com/v1")
+                    })
+                    .or_else(|| {
+                        (provider.0.as_ref() == provider::DEVIN_ACP)
+                            .then_some(provider::DEVIN_ACP_BASE_URL)
                     })
                     .ok_or_else(|| invalid("deployment requires base_url"))?;
                 if dep.upstream_model.is_empty() {
@@ -561,6 +670,7 @@ impl RawConfig {
                         .map_err(|_| invalid("too many deployments"))?,
                 );
                 candidates.push(idx);
+                let expires_at = dep.expires_at.map(|stamp| expiry(&id, stamp)).transpose()?;
                 deployments.push(Deployment {
                     headers: deployment_headers(
                         dep.headers,
@@ -579,6 +689,7 @@ impl RawConfig {
                     quota: dep.quota,
                     timeout: timeout(dep.timeout_ms.unwrap_or(server.request_timeout_ms))?,
                     max_context: dep.max_context.or(model.capabilities.max_context),
+                    expires_at,
                 });
             }
 
@@ -601,6 +712,11 @@ impl RawConfig {
                 drain_grace: Duration::from_millis(server.drain_grace_ms),
                 expose_routing_headers: server.expose_routing_headers,
                 dashboard_key,
+                end_user_header: end_user.header,
+                end_user_salt: end_user.salt,
+                end_user_from_body: end_user.from_body,
+                remote_images: server.remote_images,
+                max_image_bytes,
             },
             routing: RoutingConfig {
                 max_attempts: routing.max_attempts,
@@ -612,6 +728,7 @@ impl RawConfig {
             },
             api_keys,
             oauth,
+            nous,
             credential_meta,
             model_names,
             catch_all,
@@ -625,6 +742,87 @@ impl RawConfig {
 
 fn invalid(message: &str) -> ConfigError {
     ConfigError::Invalid(message.to_owned())
+}
+
+struct EndUserSettings {
+    header: Option<HeaderName>,
+    salt: Option<Arc<str>>,
+    from_body: bool,
+}
+
+fn end_user_settings(server: &RawServer) -> Result<EndUserSettings, ConfigError> {
+    let header = match server.end_user_header.as_deref() {
+        None => None,
+        Some(name) if name.is_empty() || name.trim().is_empty() => {
+            return Err(invalid(
+                "end_user_header must be a nonempty HTTP header name",
+            ));
+        }
+        Some(name) => Some(end_user_header_name(name)?),
+    };
+    let salt = match (&header, server.end_user_salt.as_deref()) {
+        (None, None) => None,
+        (None, Some(_)) => return Err(invalid("end_user_salt requires end_user_header")),
+        (Some(_), None | Some("")) => {
+            return Err(invalid(
+                "end_user_salt is required when end_user_header is set and must be a nonempty env: or file: secret",
+            ));
+        }
+        (Some(_), Some(reference)) => Some(resolve_secret(reference).map_err(|err| {
+            invalid(&format!(
+                "end_user_salt must be a nonempty env: or file: secret ({err})"
+            ))
+        })?),
+    };
+    let from_body = match (header.is_some(), server.end_user_from_body) {
+        (false, Some(_)) => return Err(invalid("end_user_from_body requires end_user_header")),
+        (false, None) => false,
+        (true, None) => true,
+        (true, Some(value)) => value,
+    };
+    Ok(EndUserSettings {
+        header,
+        salt,
+        from_body,
+    })
+}
+
+fn end_user_header_name(name: &str) -> Result<HeaderName, ConfigError> {
+    let name = HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| invalid("end_user_header must be a valid HTTP header name"))?;
+    if matches!(
+        name.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "x-api-key"
+            | "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+    ) {
+        return Err(invalid(
+            "end_user_header cannot be a credential, cookie, or hop-by-hop header",
+        ));
+    }
+    Ok(name)
+}
+
+fn expiry(deployment: &str, stamp: toml::value::Datetime) -> Result<SystemTime, ConfigError> {
+    let text = stamp.to_string();
+    let parsed = time::OffsetDateTime::parse(&text, &time::format_description::well_known::Rfc3339)
+        .map_err(|_| {
+            invalid(&format!(
+                "deployment {deployment} expires_at must be an RFC 3339 timestamp"
+            ))
+        })?;
+    let seconds: u64 = parsed.unix_timestamp().try_into().map_err(|_| {
+        invalid(&format!(
+            "deployment {deployment} expires_at is out of range"
+        ))
+    })?;
+    Ok(SystemTime::UNIX_EPOCH + Duration::new(seconds, parsed.nanosecond()))
 }
 
 fn required_oauth(value: Option<String>, field: &str) -> Result<String, ConfigError> {
@@ -838,6 +1036,44 @@ mod tests {
             assert!(
                 super::RuntimeConfig::parse(&config(auth)).is_err(),
                 "{auth}"
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_expiry_parses_and_bad_timestamps_are_rejected() {
+        let base = config(REQUIRED);
+        let parsed = RuntimeConfig::parse(&base.replace(
+            "upstream_model = \"upstream\"",
+            "expires_at = 2030-01-01T00:00:00Z\nupstream_model = \"upstream\"",
+        ))
+        .expect("RFC 3339 expiry");
+        assert!(parsed.deployments[0].expires_at.is_some());
+        let fractional = RuntimeConfig::parse(&base.replace(
+            "upstream_model = \"upstream\"",
+            "expires_at = 2030-01-01T00:00:00.900Z\nupstream_model = \"upstream\"",
+        ))
+        .expect("fractional RFC 3339 expiry");
+        assert_eq!(
+            fractional.deployments[0]
+                .expires_at
+                .unwrap()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .subsec_millis(),
+            900
+        );
+        assert!(RuntimeConfig::parse(&base).unwrap().deployments[0]
+            .expires_at
+            .is_none());
+        for value in ["\"soon\"", "2030-01-01", "\"2030-01-01 00:00:00\""] {
+            assert!(
+                RuntimeConfig::parse(&base.replace(
+                    "upstream_model = \"upstream\"",
+                    &format!("expires_at = {value}\nupstream_model = \"upstream\""),
+                ))
+                .is_err(),
+                "accepted expires_at = {value}"
             );
         }
     }
@@ -1151,5 +1387,136 @@ refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
                 .to_string()
                 .contains("max_context must be positive"));
         }
+    }
+
+    #[test]
+    fn strip_request_fields_on_anthropic_accepts_only_sampling_parameters() {
+        let base = |provider: &str, fields: &str| {
+            std::env::set_var("LLMUX_CONFIG_OAUTH_TEST_SECRET", "test-secret");
+            format!(
+                r#"
+[server]
+client_keys = ["env:LLMUX_CONFIG_OAUTH_TEST_SECRET"]
+[[credentials]]
+id = "key"
+kind = "api_key"
+provider = "{provider}"
+key = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET"
+[[models]]
+name = "model"
+[[models.deployments]]
+id = "deployment"
+credential = "key"
+base_url = "https://example.com/v1"
+upstream_model = "upstream"
+strip_request_fields = {fields}
+"#
+            )
+        };
+        let loaded =
+            RuntimeConfig::parse(&base("anthropic", r#"["temperature", "top_p", "top_k"]"#))
+                .unwrap();
+        assert_eq!(
+            loaded.deployments[0].strip_request_fields.as_ref(),
+            [
+                ChatRequestField::Temperature,
+                ChatRequestField::TopP,
+                ChatRequestField::TopK
+            ]
+        );
+        assert!(RuntimeConfig::parse(&base("anthropic", r#"["temperature", "seed"]"#)).is_err());
+        assert!(RuntimeConfig::parse(&base("xai", r#"["temperature"]"#)).is_err());
+        assert!(RuntimeConfig::parse(&base("openai", r#"["seed", "temperature"]"#)).is_ok());
+    }
+
+    #[test]
+    fn end_user_and_image_policy_config_is_off_by_default_and_rejects_bad_values() {
+        std::env::set_var("LLMUX_CONFIG_OAUTH_TEST_SECRET", "test-secret");
+        std::env::set_var("LLMUX_END_USER_SALT_TEST", "salt-one");
+        std::env::set_var("LLMUX_END_USER_EMPTY_TEST", "");
+        let base = r#"
+[server]
+client_keys = ["env:LLMUX_CONFIG_OAUTH_TEST_SECRET"]
+[[credentials]]
+id = "key"
+kind = "api_key"
+provider = "anthropic"
+key = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET"
+[[models]]
+name = "model"
+[[models.deployments]]
+id = "deployment"
+credential = "key"
+base_url = "https://example.com/v1"
+upstream_model = "upstream"
+"#;
+        let plain = RuntimeConfig::parse(base).unwrap();
+        assert!(plain.server.end_user_header.is_none());
+        assert!(plain.server.end_user_salt.is_none());
+        assert!(!plain.server.end_user_from_body);
+        assert_eq!(plain.server.remote_images, RemoteImages::Allow);
+        assert!(plain.server.max_image_bytes.is_none());
+
+        let with = |extra: &str| {
+            base.replace(
+                "client_keys = [\"env:LLMUX_CONFIG_OAUTH_TEST_SECRET\"]\n",
+                &format!("client_keys = [\"env:LLMUX_CONFIG_OAUTH_TEST_SECRET\"]\n{extra}\n"),
+            )
+        };
+        let enabled = RuntimeConfig::parse(&with(
+            "end_user_header = \"X-Client-User\"\nend_user_salt = \"env:LLMUX_END_USER_SALT_TEST\"\nremote_images = \"reject\"\nmax_image_bytes = 8",
+        ))
+        .unwrap();
+        assert_eq!(
+            enabled.server.end_user_header.unwrap().as_str(),
+            "x-client-user"
+        );
+        assert_eq!(enabled.server.end_user_salt.unwrap().as_ref(), "salt-one");
+        assert!(enabled.server.end_user_from_body);
+        assert_eq!(enabled.server.remote_images, RemoteImages::Reject);
+        assert_eq!(enabled.server.max_image_bytes, Some(8));
+
+        let body_off = RuntimeConfig::parse(&with(
+            "end_user_header = \"x-client-user\"\nend_user_salt = \"env:LLMUX_END_USER_SALT_TEST\"\nend_user_from_body = false",
+        ))
+        .unwrap();
+        assert!(!body_off.server.end_user_from_body);
+
+        let literal = "super-secret-salt-value";
+        let err = RuntimeConfig::parse(&with(&format!(
+            "end_user_header = \"x-client-user\"\nend_user_salt = \"{literal}\""
+        )))
+        .map(|_| ())
+        .unwrap_err();
+        assert!(!err.to_string().contains(literal));
+        for extra in [
+            "end_user_header = \"x-client-user\"",
+            "end_user_salt = \"env:LLMUX_END_USER_SALT_TEST\"",
+            "end_user_from_body = true",
+            "end_user_header = \"\"",
+            "end_user_header = \"authorization\"\nend_user_salt = \"env:LLMUX_END_USER_SALT_TEST\"",
+            "end_user_header = \"x-client-user\"\nend_user_salt = \"env:LLMUX_END_USER_EMPTY_TEST\"",
+            "max_image_bytes = 0",
+            "remote_images = \"drop\"",
+        ] {
+            assert!(RuntimeConfig::parse(&with(extra)).is_err(), "{extra}");
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "llmux-end-user-salt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "file-salt\n").unwrap();
+        let loaded = RuntimeConfig::parse(&with(&format!(
+            "end_user_header = \"x-client-user\"\nend_user_salt = \"file:{}\"",
+            path.display()
+        )))
+        .unwrap();
+        assert_eq!(loaded.server.end_user_salt.unwrap().as_ref(), "file-salt");
+        std::fs::remove_file(path).unwrap();
     }
 }

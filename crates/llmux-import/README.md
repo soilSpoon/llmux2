@@ -53,10 +53,13 @@ are sanitized and deduplicated. If there are no client keys, set
 
 Built-ins: openai, anthropic, openrouter, groq, deepseek (`ds` step alias),
 mistral, xai, together, fireworks, cerebras, gemini, morph, aihorde, kilo, kilocode.
-One reviewed Antigravity route is imported through existing Gemini API-key
+Two reviewed Antigravity routes are imported through existing Gemini API-key
 connections: `antigravity/gemini-3-flash` uses `gemini-3-flash-preview`, verified
 by the operator using Gemini `models.list` on OCI
 (https://ai.google.dev/api/models#method:-models.list).
+`antigravity/gemini-3.1-flash-lite` uses the GA `gemini-3.1-flash-lite`:
+OCI verified all five Gemini keys list it and `generateContent` returned 200
+with that `modelVersion`. Both routes receive Gemini's `seed`/`user` stripping.
 The direct name, aliases, and combo legs use all eligible built-in Gemini
 connections in priority order. Antigravity source connection pins/allowlists
 cannot transfer to Gemini and are replaced with that eligible set, with a warning;
@@ -95,14 +98,21 @@ not be misrepresented as total context windows. No capability/output enforcement
 is added. With no context rows, deployment limits remain unchanged. To roll back,
 regenerate with the previous importer or omit the context override table.
 
+### Anthropic sampling parameters
+
+`anthropic` deployments whose upstream model is `claude-<family>-5…` or
+`claude-opus-4-8…` (`.` or `-` separators) import with
+`strip_request_fields = ["temperature", "top_p"]`, because Anthropic rejects
+those fields for these models. Older Claude models are unchanged.
+
 ### Provider parameter compatibility
 
 Deployments with a DeepSeek upstream model ID set
 `strip_request_fields = ["seed", "user", "safety_identifier", "reasoning.effort"]`
 using the core per-deployment option on `openai` and `openai_compat` adapters,
 independent of the connection provider or public combo name. Other adapters,
-including `anthropic-compatible` nodes, import without field stripping because
-the core does not support it on those protocols.
+including `anthropic-compatible` nodes, import without DeepSeek field stripping
+because those protocols do not carry those fields.
 After routing-prefix stripping, matching is case-insensitive:
 the final model segment starts with `deepseek-` and has a nonempty suffix, or a
 preceding vendor segment is exactly `deepseek` or `deepseek-ai`. This includes
@@ -164,6 +174,37 @@ OmniRoute's original order. Other combo names/models/endpoints are unchanged.
 No logprobs fields are stripped. An enabled OmniRoute fallback remains last.
 To roll back, remove the reviewed
 Morph endpoint exception and combo-order policy before regenerating config.
+
+Free XPLabs (Experiential Labs) routes go first in the reviewed combos
+`gpt-6-luna`, `deepseek-v4.1-flash` and `deepseek-v4.1-flash-fast` (after Morph
+in the fast combo), using the active API-key connection of the custom
+`experlabs` node at `https://api.experientiallabs.ai/v1`. A declared leg for the
+same model moves instead of duplicating. OCI saw `usage.cost` 0 for both models
+and logprobs on DeepSeek; the Free tier allows 10 RPM and 1M tokens/day shared,
+so a 429 falls through to the next leg. Billed XPLabs models (Haiku 5.5,
+Qwen3.8 27B, the 1017 model) keep their declared position. Round-robin combos and
+other names are unchanged.
+
+The existing source combo `gpt-6-luna` also has a reviewed Respan secondary
+policy. After its surviving source legs (Experlabs stays first), the importer
+appends `gpt-6-luna`, `openai/gpt-6-luna`, and `perplexity/gpt-6-luna`, in that
+order, on one active API-key custom OpenAI-compatible connection with prefix
+`respan` and normalized base URL `https://api.respan.ai/api/v1`. OCI verified
+Responses JSON and SSE on this reviewed direct route. Azure OpenAI, Azure
+Foundry, and Bedrock variants are not included. Missing, inactive, OAuth,
+anonymous, Codex, wrong-protocol and wrong-endpoint connections are ineligible.
+The first eligible connection in existing connection-priority order is used;
+this does not rotate across keys. Each upstream ID already present on that
+endpoint is skipped. Existing legs retain their order, appended legs receive
+consecutive priorities, and optional OmniRoute fallback remains last.
+No primary is synthesized for an empty/missing combo. Round-robin combos are
+unchanged with a warning because equal priorities cannot express a secondary.
+Normal endpoint normalization applies (trailing slash and `/chat/completions`
+suffix removal), including connection-level base URL overrides. No live model
+discovery or credential values are included in the generated config/warnings.
+To roll back an individual route, remove its model ID from `secondary.rs`;
+remove the reviewed row to disable all three, then regenerate config.
+
 Gemini uses Google's documented OpenAI-compatible endpoint
 `https://generativelanguage.googleapis.com/v1beta/openai`, not OmniRoute's native
 Gemini protocol endpoint. See https://ai.google.dev/gemini-api/docs/openai.
@@ -186,8 +227,33 @@ are normalized to its official chat facade; other Horde roots are rejected.
 
 Skip precedence is: unusable/inactive, replacement policy, auth/key validation,
 then provider/URL validation (including loopback). Without explicit Workers AI
-opt-in, Cloudflare direct/playground connections remain skipped with an official replacement hint;
-DuckDuckGo/DeepAI bridges are dropped without an official replacement. HMS uses
+opt-in, Cloudflare Playground stays skipped with an official replacement hint:
+it has no key-based HTTP API (the live executor is a headless browser TLS
+fingerprint). Cloudflare direct (`cloudflare-direct`/`cfpd`) and DeepAI Code
+(`deepai`/`deepai-code`) import as `openai_compat` when the export has a
+baseUrl and a valid API key, including the reviewed loopback proxies
+`http://127.0.0.1:8790/cfp/v1` and `http://127.0.0.1:8790/deepai/v1`. A
+DeepAI or Cloudflare-direct row with no key and no baseUrl is still dropped.
+DuckDuckGo and Cloudflare Playground have no native adapter. Their skip
+warning names `--omniroute-fallback` and `--omniroute-key`. With both flags,
+each of their export model ids, alias prefixes, and combos that use them gets
+an OmniRoute fallback deployment last, with the same upstream model id.
+Other loopback URLs stay skipped.
+xAI OAuth (`xai-oauth`/`xao`), Codex OAuth (`codex`/`cx`), and Antigravity
+OAuth import when the export has a refresh token and a client id. A missing
+refresh token or client id skips that row with a counted warning and does not
+panic. Client secrets are copied only when the export contains one; none are
+invented. xAI refreshes at `https://auth.x.ai/oauth2/token` and serves
+`https://api.x.ai/v1`. Codex refreshes at `https://auth.openai.com/oauth/token`,
+serves `https://chatgpt.com/backend-api/codex` through `openai_responses`, and
+is limited to the imported gateway keys. Antigravity also requires a project
+id, refreshes at `https://oauth2.googleapis.com/token`, and serves
+`https://daily-cloudcode-pa.googleapis.com` with the same model id. The
+reviewed Gemini rewrite still applies only when no complete Antigravity OAuth
+connection was imported. Factory is excluded because its organization is
+deactivated. Augment (`auggie`) and Z.AI (`zcode`) are excluded because those
+accounts are not being recharged. Inactive `lmarena` and `uncloseai` rows stay
+out. HMS uses
 the compatible-node header support above. Hints identify custom nodes
 by their provider prefix and contain only fixed documentation URLs, never
 connection-supplied URLs. Anonymous connections still pass provider/URL validation.
@@ -406,7 +472,8 @@ Anonymous connections use the same credential-free deployment mechanism.
 Combo and alias names (including unavailable winning mappings) reserve their
 names; direct collisions are skipped with deterministic warnings. Direct entries
 never participate in real combo-reference lookup or consume its expansion budget.
-Codex is excluded, and existing connection/provider exclusion rules still apply.
+Imported Codex OAuth connections are included and restricted to the imported
+gateway keys. Factory, Augment, and Z.AI stay excluded.
 
 No model catalog is invented or fetched. Node `models_path` values are discovery
 paths, not model IDs; excluded-model lists are not positive catalogs. Provider
@@ -420,9 +487,9 @@ importer does not invent an unbounded model catalog. Wildcard alias names,
 automatic catalog aliases, provider-scoped aliases, and settings-based aliases
 are not imported. Unsupported or malformed entries produce warnings.
 
-Not imported: OAuth/token/cookie auth, encrypted credentials, unsupported
+Not imported: cookie and browser-session auth, encrypted credentials, unsupported
 providers/protocols (including custom Responses/custom-JSON nodes), custom chat
-paths/headers, wildcard models, per-key policies, shared
+paths, wildcard models, per-key policies, shared
 account quotas, global priority, runtime state, and combo config/transforms.
 Only unrestricted active gateway keys are imported. Keys with model/connection/
 combo/endpoint/scope restrictions, schedules, expiry/revocation, bans, rate/session/

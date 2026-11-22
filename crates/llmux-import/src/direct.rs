@@ -28,9 +28,7 @@ pub(super) fn collect(
                 continue;
             };
             let node = nodes.iter().find(|node| matches!(&provider, upstream::ProviderIdentity::Custom(id) if id == string(node, "id")));
-            if provider.is_builtin("codex")
-                || node.is_some_and(|node| string(node, "prefix") == "codex")
-                || model.contains(['*', '?'])
+            if model.contains(['*', '?'])
                 || model.chars().any(char::is_whitespace)
                 || !connections
                     .iter()

@@ -38,22 +38,73 @@ THEN the row is skipped with a warning.
 
 ### Requirement: Reviewed Antigravity Gemini replacement
 
-The importer SHALL map only antigravity/gemini-3-flash to
-gemini-3-flash-preview on all eligible built-in Gemini API-key connections in
+The importer SHALL map antigravity/gemini-3-flash to
+gemini-3-flash-preview and antigravity/gemini-3.1-flash-lite to the GA
+gemini-3.1-flash-lite on all eligible built-in Gemini API-key connections in
 priority order, preserving aliases and combo references. Source Antigravity
 connection restrictions SHALL be replaced by the eligible Gemini set with a
-warning. Antigravity OAuth connections SHALL remain skipped. Ordinary OmniRoute
+warning. An Antigravity OAuth connection that lacks a refresh token, client
+id, or project id SHALL remain skipped. A complete connection SHALL be imported
+as the native `antigravity` provider and SHALL serve the requested model id,
+not a rewritten Gemini id. The reviewed Gemini rewrite SHALL apply only when
+no complete Antigravity OAuth connection was imported. Ordinary OmniRoute
 fallback semantics SHALL apply after native deployments when enabled.
+No other Antigravity models SHALL be mapped. Both reviewed routes SHALL receive
+the Gemini endpoint's seed/user request-field stripping.
 
 #### Scenario: Reviewed Flash route
 
 WHEN a combo or alias resolves to antigravity/gemini-3-flash
 THEN it uses Gemini deployments followed by the optional OmniRoute fallback.
 
+#### Scenario: OCI-verified GA Flash Lite route
+
+WHEN a combo or alias resolves to antigravity/gemini-3.1-flash-lite
+THEN it uses gemini-3.1-flash-lite on eligible Gemini connections in priority
+order, strips seed/user, and appends the optional OmniRoute fallback last.
+OCI verified all five keys list the GA model and generateContent returns 200
+with modelVersion gemini-3.1-flash-lite.
+
 #### Scenario: No eligible Gemini connection
 
 WHEN no eligible Gemini API-key connection exists
 THEN no native replacement deployment is emitted and a warning explains why.
+
+### Requirement: Import live OAuth and keyed loopback bridges
+
+The importer SHALL import `xai-oauth`/`xao` as an `xai` OAuth credential
+refreshing at `https://auth.x.ai/oauth2/token` with deployments at
+`https://api.x.ai/v1`. It SHALL import `codex`/`cx` as `openai_responses` at
+`https://chatgpt.com/backend-api/codex`, refreshing at
+`https://auth.openai.com/oauth/token`, and SHALL restrict those models to the
+imported gateway keys. It SHALL import a complete Antigravity OAuth connection
+at `https://daily-cloudcode-pa.googleapis.com` without rewriting the model id.
+A missing refresh token or client id SHALL skip that row with a counted
+warning and SHALL NOT panic. The importer SHALL NOT invent a client secret.
+A keyed OpenAI-compatible `deepai`/`deepai-code` or `cloudflare-direct`/`cfpd`
+node with a baseUrl SHALL import as `openai_compat` at that baseUrl, including
+loopback. DuckDuckGo and Cloudflare Playground have no native adapter. Without
+`--omniroute-fallback` and `--omniroute-key`, their skip warning SHALL name
+those flags. With both flags, each of their model ids SHALL get an OmniRoute
+fallback deployment last, with that same upstream model id. Factory, Augment,
+and Z.AI SHALL remain excluded.
+
+#### Scenario: xAI OAuth token URL
+
+WHEN an `xai-oauth` connection has a refresh token and client id
+THEN the generated credential refreshes at `https://auth.x.ai/oauth2/token`
+AND the deployment base URL is `https://api.x.ai/v1`
+AND the refresh token is not written into the configuration or warnings.
+
+#### Scenario: Missing refresh token
+
+WHEN an `xai-oauth` connection has no refresh token
+THEN import skips that row with a missing-refresh-token warning and continues.
+
+#### Scenario: DeepAI Code loopback
+
+WHEN a DeepAI Code node has a valid API key and `http://127.0.0.1:8790/deepai/v1`
+THEN its deployment uses `openai_compat` at that URL and the same model id.
 
 ### Requirement: Custom provider headers
 
@@ -100,6 +151,24 @@ THEN no DeepSeek field stripping is added, even on a DeepSeek provider connectio
 WHEN a DeepSeek upstream model uses an anthropic-compatible node
 THEN the deployment imports successfully without strip_request_fields.
 
+### Requirement: Anthropic sampling parameter compatibility
+
+The importer SHALL set `strip_request_fields = ["temperature", "top_p"]` on
+anthropic adapter deployments whose upstream model leaf, with `.` and `-`
+treated alike and case ignored, is `claude-<family>-5…` (for example
+`claude-sonnet-5-5`, `claude-haiku-5.5`, `claude-fable-5-1`) or `claude-opus-4-8…`.
+Older Claude models, such as `claude-sonnet-4-6`, SHALL import unchanged.
+
+#### Scenario: Claude 5 deployment
+
+WHEN a combo expands onto `anthropic/claude-sonnet-5-5`
+THEN the generated deployment loads with `temperature` and `top_p` stripped.
+
+#### Scenario: Older Claude model
+
+WHEN the upstream model is `claude-sonnet-4-6`
+THEN no field stripping is added.
+
 ### Requirement: Reviewed Morph official migration and logprobs order
 The importer SHALL migrate only built-in Morph loopback connection overrides to
 `https://api.morphllm.com/v1`, warning about the reviewed endpoint substitution.
@@ -125,6 +194,56 @@ logprobs, reorder unrelated combos, or replace the optional final fallback.
 #### Scenario: Unreviewed model or combo
 - **WHEN** the Morph model or combo name is not reviewed, or either leg is absent
 - **THEN** no reviewed logprobs-order policy is applied
+
+### Requirement: Reviewed free XPLabs routes first
+For the reviewed source combos `gpt-6-luna`, `deepseek-v4.1-flash` and
+`deepseek-v4.1-flash-fast`, the importer SHALL place one deployment of the
+matching Experiential Labs (XPLabs) model (`gpt-6-luna` or
+`deepseek-v4.1-flash`) first, pinned to an active, usable API-key connection of
+the custom `experlabs` node at `https://api.experientiallabs.ai/v1`. In the fast
+combo it SHALL follow the verified Morph route. A declared leg for the same model
+and endpoint SHALL be moved instead of duplicated, keeping its pinned
+connection, other legs SHALL keep their
+relative order, and a warning SHALL be emitted when the order changes. This
+follows OCI verification that these models cost 0 on the existing key and that
+XPLabs DeepSeek returns logprobs. XPLabs models OCI observed billing
+(`claude-haiku-5.5`, `qwen3.8-27b`, `deepseek-v4.1-flash-1017`) SHALL keep their
+declared position.
+
+#### Scenario: Reviewed combo with an eligible XPLabs connection
+- **WHEN** a reviewed combo has paid legs and an eligible XPLabs connection exists
+- **THEN** the XPLabs model is priority 0 and the paid legs follow in order
+
+#### Scenario: Ineligible connection, unreviewed combo or round-robin
+- **WHEN** the XPLabs connection is inactive, unusable, OAuth, on another host or
+  prefix, the combo is unreviewed or billed, or the combo uses round-robin
+- **THEN** the combo's deployments are unchanged
+
+### Requirement: Reviewed Respan secondary routes
+For the existing source combo `gpt-6-luna`, the importer SHALL append the
+ordered upstream IDs `gpt-6-luna`, `openai/gpt-6-luna`, and
+`perplexity/gpt-6-luna` after surviving source legs, using one active, usable
+API-key custom openai_compat connection whose node prefix is `respan` and whose
+normalized endpoint is exactly `https://api.respan.ai/api/v1`. This reviewed
+tuple follows OCI verification of Responses JSON and SSE. Azure OpenAI, Azure
+Foundry and Bedrock variants SHALL NOT be added by this policy.
+The importer SHALL use the first eligible connection in existing priority
+order, skip each upstream ID already deployed on that endpoint, preserve source
+leg order and assign consecutive priorities before optional OmniRoute fallback.
+It SHALL NOT use Codex, OAuth or anonymous connections, synthesize a primary for
+an empty/missing combo, or augment unrelated combos. Round-robin combos SHALL
+remain unchanged with a warning. Normal upstream endpoint normalization SHALL
+apply, including connection overrides; generated config and warnings SHALL NOT
+contain credential values. Removing an ID or the reviewed row and regenerating
+config SHALL roll back that part or all of this policy.
+
+#### Scenario: Reviewed secondary follows Experlabs
+- **WHEN** a non-round-robin Luna combo has surviving legs and an eligible Respan connection
+- **THEN** the missing reviewed IDs are appended in declared order on one connection, before fallback
+
+#### Scenario: Unavailable or already declared route
+- **WHEN** the reviewed connection is unavailable or an ID already exists on the reviewed endpoint
+- **THEN** no unavailable or duplicate deployment is added
 
 ### Requirement: Gemini OpenAI endpoint parameter compatibility
 
@@ -330,7 +449,8 @@ THEN no replacement deployment is generated.
 #### Scenario: Opt-in and explicit fallback
 
 WHEN the flag is absent
-THEN bridges retain their previous skipped behavior.
+THEN a keyed OpenAI-compatible bridge with a baseUrl is imported at that URL,
+and DuckDuckGo stays dropped because it has no key-based HTTP API.
 WHEN explicit OmniRoute fallback is configured
 THEN it follows the normal last-deployment and Codex exclusion policy; bridge
 replacement introduces no new fallback bypass.
@@ -383,3 +503,69 @@ THEN removing their opt-in flags restores the previous replacement-only or
 source-routing behavior. Keyed Kilo remains fail-closed without pricing
 metadata; batch replacements are synchronous and preserve neither batch
 scheduling nor batch discounts.
+
+### Requirement: Collapse duplicate deployment legs
+
+After a model's deployments are assembled, including per-deployment headers,
+`strip_request_fields`, context and quota fields, and an optional OmniRoute
+fallback leg, the importer SHALL drop a later leg that repeats an earlier leg
+of that same model. Identity is the credential id, `upstream_model`,
+`base_url`, per-deployment `headers`, `strip_request_fields`, `max_context`,
+`quota`, and `timeout_ms`. Missing and empty header, strip, or quota values
+are the same. A known `max_context` is not the same as a missing one, and two
+different limits are not duplicates, so a request that fits only the larger
+window still has a route. Header `file:` references are compared by the file
+bytes when the file can be read at import time; an unreadable reference is
+compared as the reference string. The kept leg is the one with the lowest
+priority, then the earlier source position. The importer SHALL NOT collapse
+legs across models.
+It SHALL emit one warning per affected model naming how many legs were dropped,
+and that warning SHALL NOT contain credential values.
+
+Surviving non-fallback ids SHALL be renumbered to a contiguous
+`<sanitized-model>-0` .. `<sanitized-model>-N` sequence, using the existing id
+sanitizer so ids stay unique. Priorities SHALL be rewritten to `0..N` in that
+kept order, except that a round-robin combo's equal native priorities stay
+equal. An `omniroute-fallback-*` leg, including the catch-all, SHALL keep its
+id and SHALL be dropped only when it is itself a duplicate of an earlier leg.
+Its priority SHALL remain strictly greater than every surviving native leg of
+that model, and contiguous with them. Models with no duplicate legs SHALL be
+left unchanged.
+
+#### Scenario: Repeated connection in one combo
+
+WHEN one connection is listed in several steps of the same combo for the same upstream model
+THEN that model has one deployment for the connection, its id and priority start at zero, and one warning names the model and how many legs were dropped.
+
+#### Scenario: Same endpoint, different credentials
+
+WHEN two connections share a base URL but use different credentials
+THEN both deployments are kept, even if each connection is listed more than once.
+
+#### Scenario: Headers or strip fields differ
+
+WHEN two legs share a credential, upstream model, and base URL but differ in headers or `strip_request_fields`
+THEN both are kept.
+
+#### Scenario: Different context windows stay routable
+
+WHEN two anonymous legs share an endpoint and upstream model but have context limits of 8192 and 32768
+THEN both limits survive
+AND a 20000-token request still has a deployment whose window fits it.
+
+#### Scenario: Identical header files are one leg
+
+WHEN two anonymous legs share an endpoint and their header files contain the same bytes
+THEN one deployment remains.
+WHEN a header file cannot be read at import time
+THEN its reference string is the identity, so a different unreadable path is not collapsed.
+
+#### Scenario: Fallback leg is not a native clone
+
+WHEN a model has duplicate native legs and one OmniRoute fallback
+THEN the fallback leg remains, with its `omniroute-fallback-*` id and a priority greater than every surviving native leg.
+
+#### Scenario: Same leg in two models
+
+WHEN two models each use the same connection and upstream model
+THEN each model keeps its own deployment.

@@ -35,14 +35,21 @@ enum Reply {
     NegotiatedStream(Value),
     WithoutGatewayControls,
     InlineUsageStream,
-    ResponseStream { complete: bool },
+    ResponseStream {
+        complete: bool,
+    },
     AbortStream,
     EmptyStream,
     GatedStream(Arc<Semaphore>),
     BadRequest,
+    Forbidden,
+    NotFound(&'static str),
+    EmbeddedModelNotFound,
     StructuredBadRequest(Value),
     ContextLength,
     HtmlPayloadTooLarge,
+    /// Raw `text/event-stream` body, after the usual request assertions.
+    Sse(Arc<str>),
 }
 
 struct Mock {
@@ -85,7 +92,12 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
             }
             response
         }
-        Reply::Limit(seconds) => (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, seconds.to_string())]).into_response(),
+        Reply::Limit(seconds) => (StatusCode::TOO_MANY_REQUESTS, [
+            ("retry-after", seconds.to_string()),
+            ("x-ratelimit-remaining-requests", "0".to_owned()),
+            ("x-ratelimit-reset-requests", "60s".to_owned()),
+        ]).into_response(),
+        Reply::Forbidden => StatusCode::FORBIDDEN.into_response(),
         Reply::Complete | Reply::ExpectedChatRequest(_) if request["stream"] == true => (
             [(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")],
             "data: {\"id\":\"chunk-1\"}\r\n\r\ndata: [DONE]\n\n",
@@ -162,9 +174,17 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
         Reply::BadRequest => (
             StatusCode::BAD_REQUEST, Json(json!({"error": {"message": "bad input"}})),
         ).into_response(),
+        Reply::NotFound(code) => (
+            StatusCode::NOT_FOUND, Json(json!({"error":{"message":"not found","code":code}})),
+        ).into_response(),
+        Reply::EmbeddedModelNotFound => Json(json!({"error":{"code":"model_not_found"}})).into_response(),
         Reply::StructuredBadRequest(payload) => (StatusCode::BAD_REQUEST, Json(payload)).into_response(),
         Reply::HtmlPayloadTooLarge => (
             StatusCode::PAYLOAD_TOO_LARGE, axum::response::Html("<h1>Proxy error</h1>"),
+        ).into_response(),
+        Reply::Sse(body) => (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            body.to_string(),
         ).into_response(),
     }
 }
@@ -206,6 +226,27 @@ impl Fixture {
         max_attempts: usize,
         fallback_on_429: bool,
         dashboard: bool,
+    ) -> Self {
+        Self::start_with_exposure(
+            first,
+            next,
+            primary_quota,
+            max_attempts,
+            fallback_on_429,
+            dashboard,
+            true,
+        )
+        .await
+    }
+
+    async fn start_with_exposure(
+        first: [Reply; 2],
+        next: [Reply; 2],
+        primary_quota: &str,
+        max_attempts: usize,
+        fallback_on_429: bool,
+        dashboard: bool,
+        expose_routing_headers: bool,
     ) -> Self {
         let [primary_first, secondary_first] = first;
         let [primary_next, secondary_next] = next;
@@ -258,6 +299,7 @@ impl Fixture {
 [server]
 client_keys = ["file:{base}/test-client"]
 request_timeout_ms = 4000
+expose_routing_headers = {expose_routing_headers}
 {dashboard}
 
 [routing]
@@ -319,6 +361,19 @@ priority = 0
             self.primary.calls.load(Ordering::Relaxed),
             self.secondary.calls.load(Ordering::Relaxed),
         ]
+    }
+
+    async fn skip_reasons(&self, id: &str) -> Value {
+        let response = self.get("/dashboard/stats", Some("test-dashboard")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let stats: Value = serde_json::from_str(&body(response).await).unwrap();
+        stats["deployments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap()["skip_reasons"]
+            .clone()
     }
 
     async fn request(&self, key: &str, model: &str, streaming: bool) -> Response<Body> {
@@ -760,6 +815,8 @@ async fn dashboard_reports_fallback_and_committed_stream_errors_without_exposing
     assert_eq!(rows[0]["id"], "d1");
     assert_eq!(rows[0]["routed"], 0);
     assert_eq!(rows[0]["failed_attempts"], 1);
+    assert_eq!(rows[0]["failure_classes"], json!({"rate_limited":1}));
+    assert_eq!(rows[0]["skip_reasons"], json!({"cooldown":1}));
     assert_eq!(rows[0]["rpm_limit"], 20);
     assert_eq!(rows[0]["in_flight"], 0);
     assert!(rows[0]["cooldown_ms"].as_u64().unwrap() > 0);
@@ -767,7 +824,44 @@ async fn dashboard_reports_fallback_and_committed_stream_errors_without_exposing
     assert_eq!(rows[1]["routed"], 2);
     assert_eq!(rows[1]["failed_attempts"], 0);
     assert_eq!(rows[1]["stream_errors"], 1);
+    assert_eq!(rows[1]["failure_classes"], json!({"stream_broken":1}));
     assert!(rows[1]["cooldown_ms"].is_null());
+}
+
+#[tokio::test]
+async fn gateway_error_headers_attribute_attempts_only_when_exposed() {
+    for expose in [true, false] {
+        let fixture = Fixture::start_with_exposure(
+            [Reply::Limit(5), Reply::BadRequest],
+            [Reply::Complete, Reply::Complete],
+            "",
+            4,
+            true,
+            false,
+            expose,
+        )
+        .await;
+        let response = fixture.request("test-client", "shared", false).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(fixture.counts(), [1, 1]);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-llmux-deployment")
+                .map(|v| v.to_str().unwrap()),
+            expose.then_some("d2")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-llmux-attempts")
+                .map(|v| v.to_str().unwrap()),
+            expose.then_some("2")
+        );
+        let unknown = fixture.request("test-client", "unknown", false).await;
+        assert!(!unknown.headers().contains_key("x-llmux-deployment"));
+        assert!(!unknown.headers().contains_key("x-llmux-attempts"));
+    }
 }
 
 #[tokio::test]
@@ -786,6 +880,76 @@ async fn responses_json_uses_alias_and_fails_over() {
     assert_eq!(output["status"], "completed");
     assert_eq!(output["output"][0]["content"][0]["text"], "Hello!");
     assert_eq!(fixture.counts(), [1, 1]);
+}
+
+#[tokio::test]
+async fn responses_sse_429_fails_over() {
+    let fixture = Fixture::start(
+        [Reply::Limit(60), Reply::ResponseStream { complete: true }],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture.responses("test-client", "alias", true).await;
+    check_route(&response, "d2", "2");
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    let text = body(response).await;
+    assert!(!text.contains("[DONE]"));
+    let events: Vec<_> = text.trim_end().split("\n\n").collect();
+    assert!(events[0]
+        .lines()
+        .any(|line| line == "event: response.created"));
+    assert!(events.iter().any(|event| {
+        event
+            .lines()
+            .any(|line| line == "event: response.output_text.delta")
+            && event.contains(r#""delta":"Hello!""#)
+    }));
+    let terminal = events.last().unwrap();
+    assert!(terminal
+        .lines()
+        .any(|line| line == "event: response.completed"));
+    let payload: Value = serde_json::from_str(
+        terminal
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["type"], "response.completed");
+    assert_eq!(payload["sequence_number"], events.len() - 1);
+    assert_eq!(payload["response"]["status"], "completed");
+    assert_eq!(
+        payload["response"]["output"][0]["content"][0]["text"],
+        "Hello!"
+    );
+    assert_eq!(fixture.counts(), [1, 1]);
+}
+
+#[tokio::test]
+async fn responses_json_skips_primary_during_429_cooldown() {
+    let fixture = Fixture::start(
+        [Reply::Limit(60), Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let first = fixture.responses("test-client", "alias", false).await;
+    check_route(&first, "d2", "2");
+    drop(body(first).await);
+    assert_eq!(fixture.counts(), [1, 1]);
+
+    let response = fixture.responses("test-client", "shared", false).await;
+    check_route(&response, "d2", "1");
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+    let output: Value = serde_json::from_str(&body(response).await).unwrap();
+    assert_eq!(output["object"], "response");
+    assert_eq!(output["status"], "completed");
+    assert_eq!(output["output"][0]["content"][0]["text"], "Hello!");
+    assert_eq!(fixture.counts(), [1, 2]);
 }
 
 #[tokio::test]
@@ -868,6 +1032,8 @@ async fn responses_rejects_invalid_requests_before_contacting_upstream() {
     ] {
         let response = fixture.post("/v1/responses", "test-client", payload).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!response.headers().contains_key("x-llmux-deployment"));
+        assert!(!response.headers().contains_key("x-llmux-attempts"));
         let payload: Value = serde_json::from_str(&body(response).await).unwrap();
         assert_eq!(payload["error"]["code"], "invalid_request_error");
     }
@@ -989,11 +1155,33 @@ async fn both_rate_limited_returns_earliest_retry_after() {
         let response = fixture.request("test-client", "shared", false).await;
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()[header::RETRY_AFTER], "5");
+        assert!(!response
+            .headers()
+            .contains_key("x-ratelimit-remaining-requests"));
+        assert!(!response
+            .headers()
+            .contains_key("x-ratelimit-reset-requests"));
         let error: Value = serde_json::from_str(&body(response).await).unwrap();
         assert_eq!(error["error"]["code"], "rate_limit_exceeded");
         assert_eq!(fixture.counts(), [1, 1]);
     }
     println!("both deployments returned 429: gateway returned 429 with earliest Retry-After: 5");
+}
+
+#[tokio::test]
+async fn retry_after_is_omitted_if_no_compatible_deployment_can_be_retried() {
+    let fixture = Fixture::start(
+        [Reply::Forbidden, Reply::Forbidden],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    for _ in 0..2 {
+        let response = fixture.request("test-client", "shared", false).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!response.headers().contains_key(header::RETRY_AFTER));
+    }
+    assert_eq!(fixture.counts(), [1, 1]);
 }
 
 #[tokio::test]
@@ -1092,6 +1280,46 @@ async fn never_retries_after_stream_event() {
     assert!(output.contains("\"code\":\"stream_broken\""));
     assert!(!output.contains("[DONE]"));
     assert_eq!(fixture.counts(), [1, 0]);
+}
+
+#[tokio::test]
+async fn only_explicit_upstream_model_not_found_fails_over() {
+    for stream in [false, true] {
+        for (reply, status) in [
+            (Reply::BadRequest, StatusCode::BAD_REQUEST),
+            (Reply::NotFound("not_found"), StatusCode::NOT_FOUND),
+            (Reply::NotFound("model_not_found"), StatusCode::OK),
+        ] {
+            let fixture = Fixture::start(
+                [reply, Reply::Complete],
+                [Reply::Complete, Reply::Complete],
+                "",
+            )
+            .await;
+            let response = fixture.request("test-client", "shared", stream).await;
+            assert_eq!(response.status(), status);
+            if status == StatusCode::OK {
+                check_route(&response, "d2", "2");
+            }
+            drop(body(response).await);
+            assert_eq!(fixture.counts(), [1, usize::from(status == StatusCode::OK)]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn embedded_upstream_model_not_found_fails_over() {
+    let fixture = Fixture::start(
+        [Reply::EmbeddedModelNotFound, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture.request("test-client", "shared", false).await;
+    check_route(&response, "d2", "2");
+    let payload: Value = serde_json::from_str(&body(response).await).unwrap();
+    assert_eq!(payload["id"], "vendor-secondary");
+    assert_eq!(fixture.counts(), [1, 1]);
 }
 
 #[tokio::test]
@@ -1209,10 +1437,13 @@ async fn non_json_upstream_error_preserves_status_and_returns_a_json_error() {
 
 #[tokio::test]
 async fn rpm_limit_skips_primary_without_sending_another_request() {
-    let fixture = Fixture::start(
+    let fixture = Fixture::start_with_options(
         [Reply::Complete, Reply::Complete],
         [Reply::Complete, Reply::Complete],
         "quota = { rpm = 1 }",
+        4,
+        true,
+        true,
     )
     .await;
     let first = fixture.request("test-client", "shared", false).await;
@@ -1220,14 +1451,89 @@ async fn rpm_limit_skips_primary_without_sending_another_request() {
     let fallback = fixture.request("test-client", "shared", false).await;
     check_route(&fallback, "d2", "1");
     assert_eq!(fixture.counts(), [1, 1]);
+    assert_eq!(
+        fixture.skip_reasons("d1").await,
+        json!({"admission_limited":1})
+    );
+}
+
+#[tokio::test]
+async fn converted_requests_record_unsupported_conversion_and_admission_skips() {
+    let fixture = Fixture::start_with_options(
+        [Reply::Complete, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "quota = { rpm = 1 }",
+        4,
+        true,
+        true,
+    )
+    .await;
+    let rejected = fixture.post("/v1/messages", "test-client", r#"{
+        "model":"shared","max_tokens":16,"messages":[{"role":"user","content":[
+            {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"AA=="}}
+        ]}]
+    }"#).await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(fixture.counts(), [0, 0]);
+
+    let first = fixture.responses("test-client", "shared", false).await;
+    check_route(&first, "d1", "1");
+    let fallback = fixture.responses("test-client", "shared", false).await;
+    check_route(&fallback, "d2", "1");
+    assert_eq!(fixture.counts(), [1, 1]);
+    assert_eq!(
+        fixture.skip_reasons("d1").await,
+        json!({"unsupported_conversion":1,"admission_limited":1})
+    );
+    assert_eq!(
+        fixture.skip_reasons("d2").await,
+        json!({"unsupported_conversion":1})
+    );
+}
+
+#[tokio::test]
+async fn expired_deployment_skip_is_attributed_without_an_attempt() {
+    let fixture = Fixture::start_with_options(
+        [Reply::Complete, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "expires_at = 2000-01-01T00:00:00Z",
+        4,
+        true,
+        true,
+    )
+    .await;
+    let response = fixture.request("test-client", "shared", false).await;
+    check_route(&response, "d2", "1");
+    assert_eq!(fixture.counts(), [0, 1]);
+    assert_eq!(fixture.skip_reasons("d1").await, json!({"expired":1}));
+
+    let response = fixture
+        .post(
+            "/v1/chat/completions",
+            "test-client",
+            r#"{
+        "model":"shared","messages":[{"role":"user","content":"Hello"}],"max_tokens":200000
+    }"#,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(fixture.counts(), [0, 1]);
+    assert_eq!(fixture.skip_reasons("d1").await, json!({"expired":2}));
+    assert_eq!(
+        fixture.skip_reasons("d2").await,
+        json!({"context_length":1})
+    );
 }
 
 #[tokio::test]
 async fn context_precheck_skips_small_deployments_and_rejects_without_upstream() {
-    let fixture = Fixture::start(
+    let fixture = Fixture::start_with_options(
         [Reply::Complete, Reply::Complete],
         [Reply::Complete, Reply::Complete],
         "max_context = 30",
+        4,
+        true,
+        true,
     )
     .await;
     let payload = |max_tokens: u32| {
@@ -1262,6 +1568,14 @@ async fn context_precheck_skips_small_deployments_and_rejects_without_upstream()
     assert!(message.contains("100000 tokens"), "{message}");
     assert!(message.contains("200000 requested"), "{message}");
     assert_eq!(fixture.counts(), calls);
+    assert_eq!(
+        fixture.skip_reasons("d1").await,
+        json!({"context_length":2})
+    );
+    assert_eq!(
+        fixture.skip_reasons("d2").await,
+        json!({"context_length":1})
+    );
 }
 
 #[tokio::test]
@@ -1319,4 +1633,151 @@ async fn middle_out_truncation_is_opt_in_and_reported() {
     assert_eq!(response.headers()["x-llmux-dropped-messages"], "2");
     assert_eq!(response.headers()["x-llmux-deployment"], "d2");
     assert_eq!(fixture.counts(), [0, 1]);
+}
+
+const KEEPALIVE_FRAME: &str = "data: {\"id\":\"chatcmpl-keepalive\",\"object\":\"chat.completion.chunk\",\"model\":\"gemini-3-flash\",\"choices\":[]}\n\n";
+const RATE_LIMIT_FRAME: &str = "data: {\"error\":{\"message\":\"antigravity/gemini-3-flash: rate limit - [429]: Antigravity refused this exact request with 429 RESOURCE_EXHAUSTED\",\"type\":\"rate_limit_error\",\"code\":429}}\n\n";
+const ROLE_FRAME: &str = "data: {\"id\":\"chatcmpl-role\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n";
+
+fn sse(body: &str) -> Reply {
+    Reply::Sse(Arc::from(body))
+}
+
+fn three_keepalives_then_rate_limit() -> Reply {
+    sse(&format!(
+        "{KEEPALIVE_FRAME}{KEEPALIVE_FRAME}{KEEPALIVE_FRAME}{RATE_LIMIT_FRAME}"
+    ))
+}
+
+#[tokio::test]
+async fn stream_keepalive_then_rate_limit_frame_fails_over() {
+    let fixture = Fixture::start(
+        [three_keepalives_then_rate_limit(), Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture.request("test-client", "alias", true).await;
+    check_route(&response, "d2", "2");
+    assert_eq!(
+        body(response).await,
+        "data: {\"id\":\"chunk-1\"}\n\ndata: [DONE]\n\n"
+    );
+    assert_eq!(fixture.counts(), [1, 1]);
+
+    let again = fixture.request("test-client", "alias", true).await;
+    check_route(&again, "d2", "1");
+    drop(body(again).await);
+    assert_eq!(
+        fixture.counts(),
+        [1, 2],
+        "the deployment that streamed a 429 frame must cool down"
+    );
+}
+
+#[tokio::test]
+async fn stream_role_preamble_then_rate_limit_fails_over() {
+    let content = "data: {\"id\":\"chatcmpl-role\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n";
+    let backup = format!("{ROLE_FRAME}{content}data: [DONE]\n\n");
+    let fixture = Fixture::start(
+        [
+            sse(&format!("{ROLE_FRAME}{RATE_LIMIT_FRAME}")),
+            sse(&backup),
+        ],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture.request("test-client", "alias", true).await;
+    check_route(&response, "d2", "2");
+    assert_eq!(body(response).await, backup);
+    assert_eq!(fixture.counts(), [1, 1]);
+}
+
+#[tokio::test]
+async fn stream_error_after_content_is_not_retried() {
+    let fixture = Fixture::start(
+        [
+            sse(&format!(
+                "{KEEPALIVE_FRAME}data: {{\"id\":\"chatcmpl-1\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"Hi\"}},\"finish_reason\":\"stop\"}}]}}\n\n{RATE_LIMIT_FRAME}"
+            )),
+            Reply::Complete,
+        ],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture.request("test-client", "alias", true).await;
+    check_route(&response, "d1", "1");
+    assert_eq!(
+        body(response).await,
+        concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"error\":{\"message\":\"Upstream stream ended unexpectedly\",\"type\":\"upstream_error\",\"param\":null,\"code\":\"stream_broken\"}}\n\n",
+        )
+    );
+    assert_eq!(fixture.counts(), [1, 0]);
+
+    let again = fixture.request("test-client", "alias", true).await;
+    check_route(&again, "d2", "1");
+    drop(body(again).await);
+    assert_eq!(fixture.counts(), [1, 1]);
+}
+
+#[tokio::test]
+async fn stream_keepalives_before_content_are_dropped_and_later_ones_forwarded() {
+    let fixture = Fixture::start(
+        [
+            sse(concat!(
+                "data: {\"id\":\"chatcmpl-keepalive\",\"object\":\"chat.completion.chunk\",\"model\":\"gemini-3-flash\",\"choices\":[]}\n\n",
+                "data: {\"id\":\"chatcmpl-keepalive\",\"object\":\"chat.completion.chunk\",\"model\":\"gemini-3-flash\",\"choices\":[]}\n\n",
+                "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+                "data: {\"id\":\"chatcmpl-keepalive-after\",\"choices\":[]}\n\n",
+                "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            )),
+            Reply::Complete,
+        ],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture.request("test-client", "alias", true).await;
+    check_route(&response, "d1", "1");
+    // Leading keepalives are not a committing event and are dropped. Frames after
+    // the first content chunk, including a later keepalive, are forwarded unchanged.
+    assert_eq!(
+        body(response).await,
+        concat!(
+            "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl-keepalive-after\",\"choices\":[]}\n\n",
+            "data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        )
+    );
+    assert_eq!(fixture.counts(), [1, 0]);
+}
+
+#[tokio::test]
+async fn stream_error_frames_on_every_deployment_return_classified_429() {
+    let failing = three_keepalives_then_rate_limit();
+    let fixture = Fixture::start(
+        [failing.clone(), failing],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture.request("test-client", "alias", true).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_ne!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let payload: Value = serde_json::from_str(&body(response).await).unwrap();
+    assert_eq!(payload["error"]["code"], "rate_limit_exceeded");
+    assert_eq!(payload["error"]["type"], "rate_limit_error");
+    assert_eq!(fixture.counts(), [1, 1]);
 }

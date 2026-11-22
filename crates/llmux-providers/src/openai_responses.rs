@@ -57,6 +57,7 @@ impl ProviderAdapter for OpenAiResponses {
             .header(header::ACCEPT, "text/event-stream")
             .body(Bytes::from(body.to_string()))?;
         request.headers_mut().extend(dep.headers.clone());
+        llmux_types::default_user_agent(request.headers_mut());
         apply_auth(
             request.headers_mut(),
             auth,
@@ -503,6 +504,7 @@ mod tests {
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(10),
             max_context: None,
+            expires_at: None,
         };
         dep.headers.insert(
             "x-deployment",
@@ -528,6 +530,7 @@ mod tests {
                 max_output_tokens: None,
                 context_overflow: None,
                 request_id: RequestId("r".into()),
+                end_user: None,
             };
             for (upstream, expected) in [("fixed", "fixed"), ("*", "vendor/New-ID")] {
                 dep.upstream_model = upstream.into();

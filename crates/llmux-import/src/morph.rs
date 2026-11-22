@@ -16,6 +16,20 @@ const LOGPROBS_COMBOS: &[&str] = &[
     "deepseek-v4.1-flash-1017-ultrafast",
 ];
 
+fn connection<'a>(dep: &Value, connections: &'a [Connection]) -> Option<&'a Connection> {
+    connections.iter().find(|c| {
+        c.credential
+            .as_deref()
+            .is_some_and(|id| id == string(dep, "credential"))
+    })
+}
+
+pub(super) fn is_verified(dep: &Value, connections: &[Connection]) -> bool {
+    string(dep, "upstream_model") == "morph-dsv41flash-1017"
+        && connection(dep, connections)
+            .is_some_and(|c| c.provider.is_builtin("morph") && c.base_url == OFFICIAL_URL)
+}
+
 pub(super) fn order(
     name: &str,
     deployments: &mut Vec<Value>,
@@ -26,19 +40,9 @@ pub(super) fn order(
     if !LOGPROBS_COMBOS.contains(&name) {
         return;
     }
-    let connection = |dep: &Value| {
-        connections.iter().find(|c| {
-            c.credential
-                .as_deref()
-                .is_some_and(|id| id == string(dep, "credential"))
-        })
-    };
+    let connection = |dep: &Value| connection(dep, connections);
     let vibe = upstream::canonical_provider("vibe", nodes);
-    let is_morph = |dep: &Value| {
-        string(dep, "upstream_model") == "morph-dsv41flash-1017"
-            && connection(dep)
-                .is_some_and(|c| c.provider.is_builtin("morph") && c.base_url == OFFICIAL_URL)
-    };
+    let is_morph = |dep: &Value| is_verified(dep, connections);
     if !deployments.iter().any(is_morph) {
         return;
     }
