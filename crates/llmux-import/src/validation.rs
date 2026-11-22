@@ -10,14 +10,14 @@ use std::{
 struct ValidationMarker(PathBuf);
 
 impl ValidationMarker {
-    fn create(dir: &Path) -> Result<Self, String> {
+    fn create(dir: &Path, name: &str) -> Result<Self, String> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-        let name = format!(
+        let file = format!(
             "validation-{}-{}",
             std::process::id(),
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         );
-        let path = dir.join(name);
+        let path = dir.join(file);
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -29,7 +29,9 @@ impl ValidationMarker {
             .open(&path)
             .map_err(|_| "could not create public validation file")?;
         let marker = Self(path);
-        file.write_all(b"public-validation-only")
+        // Contents must differ per reference: llmux-config resolves secrets
+        // by file contents, so identical bytes would compare equal.
+        file.write_all(format!("public-validation-only:{name}").as_bytes())
             .map_err(|_| "could not write public validation file")?;
         Ok(marker)
     }
@@ -53,7 +55,7 @@ fn substitute_env(
             let marker = match markers.get(reference) {
                 Some(marker) => marker,
                 None => {
-                    let marker = ValidationMarker::create(dir)?;
+                    let marker = ValidationMarker::create(dir, reference)?;
                     markers.entry(reference.clone()).or_insert(marker)
                 }
             };
@@ -76,33 +78,34 @@ fn substitute_env(
 
 pub(super) fn validate(config: &Value, dir: &Path, external: &[&str]) -> Result<(), String> {
     let mut config = config.clone();
-    let mut temporary = None;
+    let mut markers: HashMap<String, ValidationMarker> = HashMap::new();
     if !external.is_empty() {
-        let marker = ValidationMarker::create(dir)?;
-        let reference = format!("file:{}", marker.0.display());
         for credential in config["credentials"].as_array_mut().into_iter().flatten() {
-            if credential["key"]
+            if let Some(key) = credential["key"]
                 .as_str()
-                .is_some_and(|key| external.contains(&key))
+                .filter(|key| external.contains(key))
+                .map(str::to_owned)
             {
-                credential["key"] = reference.clone().into();
+                let marker = match markers.get(&key) {
+                    Some(marker) => marker,
+                    None => {
+                        let marker = ValidationMarker::create(dir, &key)?;
+                        markers.entry(key).or_insert(marker)
+                    }
+                };
+                credential["key"] = format!("file:{}", marker.0.display()).into();
             }
         }
-        temporary = Some(marker);
     }
-    let mut markers = HashMap::new();
     substitute_env(&mut config, dir, &mut markers)?;
-    let result = (|| {
+    (|| {
         let value = toml::Value::try_from(&config).map_err(|_| "could not encode configuration")?;
         let content = toml::to_string(&value).map_err(|_| "could not encode configuration")?;
         llmux_config::RuntimeConfig::parse(&content)
             .map(|_| ())
             .map_err(|_| "generated configuration failed llmux validation (check upstream URLs)")
-    })();
-    if let Some(marker) = temporary {
-        fs::remove_file(&marker.0).map_err(|_| "could not remove public validation file")?;
-    }
-    result.map_err(str::to_owned)
+    })()
+    .map_err(str::to_owned)
 }
 
 #[cfg(test)]
@@ -116,5 +119,18 @@ mod tests {
         let config = json!({"server":{"listen":"invalid"},"credentials":[],"models":[]});
         assert!(validate(&config, dir.path(), &[]).is_err());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn distinct_env_references_stay_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let deployment = json!({"id":"d","auth":"none","provider":"openai_compat","base_url":"http://127.0.0.1/","upstream_model":"m"});
+        // dashboard_key must differ from every client_keys entry, and a
+        // subset allowed_keys entry must still validate.
+        let ok = json!({"server":{"listen":"127.0.0.1:1","client_keys":["env:GATE"],"dashboard_key":"env:ADMIN"},"credentials":[],"models":[{"name":"m","allowed_keys":["env:GATE"],"deployments":[deployment.clone()]}]});
+        assert!(validate(&ok, dir.path(), &[]).is_ok());
+        // An allowed_keys entry naming a different env ref is not a subset.
+        let bad = json!({"server":{"listen":"127.0.0.1:1","client_keys":["env:GATE"]},"credentials":[],"models":[{"name":"m","allowed_keys":["env:ADMIN"],"deployments":[deployment]}]});
+        assert!(validate(&bad, dir.path(), &[]).is_err());
     }
 }
