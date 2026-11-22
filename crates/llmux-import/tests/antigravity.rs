@@ -1,5 +1,6 @@
 use llmux_config::RuntimeConfig;
 use llmux_import::{ImportOptions, OmniRouteFallback};
+use llmux_types::ChatRequestField;
 use serde_json::{json, Value};
 
 fn fixture() -> Value {
@@ -27,6 +28,15 @@ fn fixture() -> Value {
 
 #[test]
 fn reviewed_antigravity_model_routes_aliases_and_combos_through_gemini_with_fallback_last() {
+    assert_reviewed_route("gemini-3-flash", "gemini-3-flash-preview");
+}
+
+#[test]
+fn reviewed_flash_lite_routes_aliases_and_combos_through_gemini_with_fallback_last() {
+    assert_reviewed_route("gemini-3.1-flash-lite", "gemini-3.1-flash-lite");
+}
+
+fn assert_reviewed_route(source: &str, upstream: &str) {
     for fallback in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("out.toml");
@@ -40,9 +50,13 @@ fn reviewed_antigravity_model_routes_aliases_and_combos_through_gemini_with_fall
             }),
             ..Default::default()
         };
-        let report =
-            llmux_import::import_with_options(&fixture().to_string(), &output, None, &options)
-                .unwrap();
+        let report = llmux_import::import_with_options(
+            &fixture().to_string().replace("gemini-3-flash", source),
+            &output,
+            None,
+            &options,
+        )
+        .unwrap();
         assert!(report.warnings.iter().any(|warning| warning.contains("reviewed Antigravity replacement uses eligible Gemini connections instead of source connection restrictions")));
         let config = RuntimeConfig::load(&output).unwrap();
         for name in [
@@ -54,9 +68,10 @@ fn reviewed_antigravity_model_routes_aliases_and_combos_through_gemini_with_fall
             "chain",
             "ag-mapped",
         ] {
+            let name = name.replace("gemini-3-flash", source);
             let model = &config.models[*config
                 .model_names
-                .get(name)
+                .get(name.as_str())
                 .unwrap_or_else(|| panic!("missing {name}"))];
             let deps: Vec<_> = model
                 .deployments
@@ -67,7 +82,11 @@ fn reviewed_antigravity_model_routes_aliases_and_combos_through_gemini_with_fall
             assert_eq!(deps[0].credential.as_ref(), "upstream-fast", "{name}");
             assert_eq!(deps[1].credential.as_ref(), "upstream-slow", "{name}");
             for dep in &deps[..2] {
-                assert_eq!(dep.upstream_model.as_ref(), "gemini-3-flash-preview");
+                assert_eq!(dep.upstream_model.as_ref(), upstream);
+                assert_eq!(
+                    dep.strip_request_fields.as_ref(),
+                    &[ChatRequestField::Seed, ChatRequestField::User]
+                );
                 assert_eq!(
                     dep.base_url.to_string(),
                     "https://generativelanguage.googleapis.com/v1beta/openai"
@@ -117,6 +136,15 @@ fn unusable_or_malformed_source_steps_do_not_get_replacement_deployments() {
 
 #[test]
 fn reviewed_route_is_unavailable_without_an_eligible_gemini_connection() {
+    assert_unavailable_route("gemini-3-flash");
+}
+
+#[test]
+fn reviewed_flash_lite_is_unavailable_without_an_eligible_gemini_connection() {
+    assert_unavailable_route("gemini-3.1-flash-lite");
+}
+
+fn assert_unavailable_route(source: &str) {
     let mut root = fixture();
     root["providerConnections"]
         .as_array_mut()
@@ -124,7 +152,12 @@ fn reviewed_route_is_unavailable_without_an_eligible_gemini_connection() {
         .retain(|c| c["provider"] != "gemini" || c["id"] == "inactive" || c["id"] == "bad-url");
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("out.toml");
-    let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let report = llmux_import::import(
+        &root.to_string().replace("gemini-3-flash", source),
+        &output,
+        None,
+    )
+    .unwrap();
     let config = RuntimeConfig::load(output).unwrap();
     for name in [
         "antigravity/gemini-3-flash",
@@ -134,7 +167,12 @@ fn reviewed_route_is_unavailable_without_an_eligible_gemini_connection() {
         "chain",
         "ag-mapped",
     ] {
-        assert!(!config.model_names.contains_key(name), "{name}");
+        assert!(
+            !config
+                .model_names
+                .contains_key(name.replace("gemini-3-flash", source).as_str()),
+            "{name}"
+        );
     }
     assert!(report
         .warnings

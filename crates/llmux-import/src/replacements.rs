@@ -34,6 +34,10 @@ const ANTIGRAVITY_ROUTES: &[Route] = &[
     // Operator verified gemini-3-flash-preview via OCI Gemini models.list.
     // https://ai.google.dev/api/models#method:-models.list
     ("gemini-3-flash", "gemini", "gemini-3-flash-preview"),
+    // OCI verified all five Gemini keys list this GA model; generateContent returned
+    // 200 with modelVersion gemini-3.1-flash-lite (operator-provided verification).
+    // https://ai.google.dev/api/models#method:-models.list
+    ("gemini-3.1-flash-lite", "gemini", "gemini-3.1-flash-lite"),
 ];
 
 pub(super) fn matches(route: &Route, connection: &Connection) -> bool {

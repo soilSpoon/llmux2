@@ -226,6 +226,7 @@ impl Inner {
             .finish();
         let request = Request::post(self.uri.clone())
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::USER_AGENT, llmux_types::USER_AGENT)
             .body(Full::new(Bytes::from(body)))
             .map_err(|_| AuthError::RefreshFailed)?;
         let started = Instant::now();

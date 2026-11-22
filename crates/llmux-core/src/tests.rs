@@ -38,6 +38,9 @@ struct Adapter {
     status: Arc<std::sync::atomic::AtomicU16>,
     stream_errors: Mutex<VecDeque<UpstreamError>>,
     calls: Mutex<Vec<(Arc<str>, Arc<str>)>>,
+    cool_on_build: Mutex<Option<Arc<DeploymentLimits>>>,
+    cool_on_repair: Mutex<Option<Arc<DeploymentLimits>>>,
+    wire_calls: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -67,6 +70,9 @@ impl ProviderAdapter for Adapter {
             && (req.body == "document" || req.body == "image" && dep.idx == DeploymentIdx(2))
         {
             return Err(BuildError::UnsupportedConversion);
+        }
+        if let Some(limits) = self.cool_on_build.lock().unwrap().take() {
+            limits.cool_down(Duration::from_secs(30));
         }
         let AuthMaterial::Bearer(token) = auth else {
             panic!("expected bearer")
@@ -102,6 +108,12 @@ impl ProviderAdapter for Adapter {
             headers: HeaderMap::new(),
             body: Bytes::new(),
         })
+    }
+
+    fn repair_rejected(&self, _: &Bytes, _: &UpstreamError) -> Option<Bytes> {
+        let limits = self.cool_on_repair.lock().unwrap().take()?;
+        limits.cool_down(Duration::from_secs(30));
+        Some(Bytes::from_static(b"repaired"))
     }
 }
 
@@ -147,6 +159,7 @@ async fn fixture_with_models(
         Default::default(),
         false,
         None,
+        [None; 3],
     )
     .await
 }
@@ -162,10 +175,14 @@ async fn fixture_full(
     second_quota: llmux_types::QuotaSpec,
     split_routes: bool,
     request_log: Option<std::path::PathBuf>,
+    expiry: [Option<SystemTime>; 3],
 ) -> Fixture {
     let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
     let served_status = status.clone();
+    let wire_calls = Arc::new(AtomicUsize::new(0));
+    let received = wire_calls.clone();
     let server = llmux_testkit::TestServer::start(axum::Router::new().fallback(move || {
+        received.fetch_add(1, Ordering::Relaxed);
         let status = StatusCode::from_u16(served_status.load(Ordering::Relaxed)).unwrap();
         async move { (status, "ok") }
     }))
@@ -178,6 +195,9 @@ async fn fixture_full(
         status,
         stream_errors: Mutex::new(VecDeque::new()),
         calls: Mutex::new(Vec::new()),
+        cool_on_build: Mutex::new(None),
+        cool_on_repair: Mutex::new(None),
+        wire_calls,
     });
     let credential = Arc::new(Credential {
         refreshes: AtomicUsize::new(0),
@@ -211,6 +231,7 @@ async fn fixture_full(
             },
             timeout: Duration::from_secs(1),
             max_context: max_context[i as usize],
+            expires_at: expiry[i as usize],
         })
         .collect();
     let cfg = RuntimeConfig {
@@ -224,6 +245,11 @@ async fn fixture_full(
             expose_routing_headers: true,
             dashboard_key: None,
             request_log,
+            end_user_header: None,
+            end_user_salt: None,
+            end_user_from_body: false,
+            remote_images: llmux_config::RemoteImages::Allow,
+            max_image_bytes: None,
         },
         routing: llmux_config::RoutingConfig {
             max_attempts: 4,
@@ -237,6 +263,7 @@ async fn fixture_full(
         credential_quotas: HashMap::from([("second".into(), second_quota)]),
         credential_meta: HashMap::new(),
         oauth: HashMap::new(),
+        nous: HashMap::new(),
         catch_all: None,
         catch_all_exclude: Vec::new(),
         model_names: models
@@ -289,6 +316,7 @@ fn request() -> GatewayRequest {
         max_output_tokens: None,
         context_overflow: None,
         request_id: RequestId("test".into()),
+        end_user: None,
     }
 }
 
@@ -376,6 +404,61 @@ async fn failed_refresh_disables_credential() {
 }
 
 #[tokio::test]
+async fn expired_deployments_are_skipped() {
+    let (executor, adapter, _, _server) = fixture_full(
+        vec![],
+        false,
+        [None; 3],
+        &[("model", &[0, 1])],
+        Default::default(),
+        Default::default(),
+        false,
+        None,
+        [
+            Some(SystemTime::now() - Duration::from_secs(60)),
+            Some(SystemTime::now() + Duration::from_secs(3600)),
+            None,
+        ],
+    )
+    .await;
+    let response = executor.execute(request()).await.unwrap();
+    assert_eq!(response.deployment.as_ref(), "dep1");
+    assert_eq!(response.attempts, 1);
+    assert_eq!(
+        *adapter.calls.lock().unwrap(),
+        vec![("dep1".into(), "0".into())]
+    );
+}
+
+#[tokio::test]
+async fn exhaustion_retry_hint_ignores_expired_deployments() {
+    let (executor, _, _, _server) = fixture_full(
+        vec![UpstreamError::RateLimited {
+            retry_after: Some(Duration::from_secs(30)),
+        }],
+        false,
+        [None; 3],
+        &[("model", &[0, 1])],
+        Default::default(),
+        Default::default(),
+        false,
+        None,
+        [
+            None,
+            Some(SystemTime::now() - Duration::from_secs(60)),
+            None,
+        ],
+    )
+    .await;
+    let Err(GatewayError::AllCandidatesExhausted { retry_after, .. }) =
+        executor.execute(request()).await
+    else {
+        panic!("expected exhaustion")
+    };
+    assert!(retry_after.is_some_and(|wait| wait > Duration::from_secs(2)));
+}
+
+#[tokio::test]
 async fn transient_errors_fall_back() {
     for error in [
         UpstreamError::Server {
@@ -429,6 +512,78 @@ async fn exhaustion_after_transient_then_quota_returns_limits() {
 }
 
 #[tokio::test]
+async fn retry_after_excludes_a_deployment_that_does_not_have_the_model() {
+    let (executor, adapter, _, _server) = fixture_full(
+        vec![UpstreamError::ModelNotFound {
+            status: StatusCode::NOT_FOUND,
+            body: Bytes::new(),
+        }],
+        false,
+        [None; 3],
+        &[("model", &[0, 2])],
+        Default::default(),
+        llmux_types::QuotaSpec {
+            rpm: Some(1),
+            ..Default::default()
+        },
+        false,
+        None,
+        [None; 3],
+    )
+    .await;
+    drop(executor.bindings[2].limits.admit(1).unwrap());
+
+    let Err(GatewayError::AllCandidatesExhausted {
+        attempts,
+        retry_after,
+    }) = executor.execute(request()).await
+    else {
+        panic!("expected the backup's quota to block routing");
+    };
+    assert_eq!(attempts, 1);
+    assert_eq!(adapter.calls.lock().unwrap()[0].0.as_ref(), "dep0");
+    assert!(
+        retry_after.is_some_and(|wait| !wait.is_zero()),
+        "retry_after = {retry_after:?}"
+    );
+}
+
+#[tokio::test]
+async fn cooldown_before_repair_returns_original_rejection_without_resending() {
+    let rejection = Bytes::from_static(b"deprecated parameter");
+    let (executor, adapter, _, _server) = fixture_with_models(
+        vec![UpstreamError::BadRequest {
+            status: StatusCode::BAD_REQUEST,
+            body: rejection.clone(),
+        }],
+        false,
+        [None; 3],
+        &[("model", &[0])],
+        llmux_types::QuotaSpec {
+            rpm: Some(2),
+            ..Default::default()
+        },
+    )
+    .await;
+    adapter.status.store(400, Ordering::Relaxed);
+    *adapter.cool_on_repair.lock().unwrap() = Some(executor.bindings[0].limits.clone());
+
+    let result = executor.execute_attributed(request()).await;
+    assert_eq!(adapter.wire_calls.load(Ordering::Relaxed), 1);
+    let Err(error) = result else {
+        panic!("expected the original rejection");
+    };
+    assert_eq!(error.attempts, 1);
+    assert!(matches!(
+        error.error,
+        GatewayError::Client(UpstreamError::BadRequest {
+            status: StatusCode::BAD_REQUEST,
+            body,
+        }) if body == rejection
+    ));
+}
+
+#[tokio::test]
 async fn client_error_does_not_fall_back() {
     let (executor, adapter, _, _server) = fixture(
         vec![UpstreamError::BadRequest {
@@ -458,6 +613,16 @@ fn sized_request(prompt_tokens: u32, max_output_tokens: Option<u32>) -> GatewayR
         max_output_tokens,
         ..request()
     }
+}
+
+#[tokio::test]
+async fn twenty_thousand_token_request_routes_to_the_larger_window() {
+    let (executor, adapter, _, _server) =
+        fixture_with_context(vec![], false, [Some(8_192), Some(32_768), Some(8_192)]).await;
+    let response = executor.execute(sized_request(20_000, None)).await.unwrap();
+    assert_eq!(response.deployment.as_ref(), "dep1");
+    assert_eq!(response.attempts, 1);
+    assert_eq!(adapter.calls.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -524,7 +689,7 @@ async fn exhaustion_retry_hint_ignores_deployments_that_do_not_fit() {
     else {
         panic!("expected exhaustion")
     };
-    assert!(retry_after > Duration::from_secs(2));
+    assert!(retry_after.is_some_and(|wait| wait > Duration::from_secs(2)));
 }
 
 #[tokio::test]
@@ -731,6 +896,65 @@ async fn limit_error_after_stream_start_cools_down_the_deployment() {
 }
 
 #[tokio::test]
+async fn committed_stream_quota_cools_shared_credential_without_replay() {
+    for (error, expected) in [
+        (UpstreamError::QuotaExhausted { reset_at: None }, "dep2"),
+        (
+            UpstreamError::QuotaExhausted {
+                reset_at: Some(SystemTime::now() + Duration::from_secs(30)),
+            },
+            "dep2",
+        ),
+        (
+            UpstreamError::RateLimited {
+                retry_after: Some(Duration::from_secs(30)),
+            },
+            "dep1",
+        ),
+    ] {
+        let kind = error.kind();
+        let (executor, adapter, _, _server) = fixture_full(
+            Vec::new(),
+            false,
+            [None; 3],
+            &[("a", &[0, 2]), ("b", &[1, 2])],
+            Default::default(),
+            Default::default(),
+            true,
+            None,
+            [None; 3],
+        )
+        .await;
+        adapter.stream_errors.lock().unwrap().push_back(error);
+        let routed = executor
+            .execute(GatewayRequest {
+                model: "a".into(),
+                stream: true,
+                ..request()
+            })
+            .await
+            .unwrap();
+        assert_eq!(routed.deployment.as_ref(), "dep0");
+        let GatewayResponse::Stream(events) = routed.response else {
+            panic!("expected stream")
+        };
+        let events: Vec<_> = events.collect().await;
+        assert!(matches!(events.as_slice(), [Ok(_), Err(err)] if err.kind() == kind));
+        assert_eq!(adapter.calls.lock().unwrap().len(), 1, "no stream replay");
+
+        let next = executor
+            .execute(GatewayRequest {
+                model: "b".into(),
+                ..request()
+            })
+            .await
+            .unwrap();
+        assert_eq!(next.deployment.as_ref(), expected, "{kind:?}");
+        assert_eq!(adapter.calls.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
 async fn repeated_limit_errors_after_stream_start_back_off() {
     let (executor, adapter, _, _server) = fixture(Vec::new(), false).await;
     let streaming = || GatewayRequest {
@@ -795,7 +1019,7 @@ async fn conversion_rejection_distinguishes_rate_limited_compatible_deployments(
         assert!(matches!(
             executor.execute(messages(b"image")).await,
             Err(GatewayError::AllCandidatesExhausted { attempts: 0, retry_after })
-                if !retry_after.is_zero()
+                if retry_after.is_some_and(|wait| !wait.is_zero())
         ));
     }
 }
@@ -882,6 +1106,7 @@ async fn credential_quota_limits_the_credentials_deployments() {
         },
         false,
         None,
+        [None; 3],
     )
     .await;
     executor.execute(request()).await.unwrap();
@@ -903,6 +1128,7 @@ async fn exhausted_quota_cools_every_deployment_on_the_credential() {
         Default::default(),
         true,
         None,
+        [None; 3],
     )
     .await;
     let to = |model: &str| GatewayRequest {
@@ -938,6 +1164,7 @@ async fn credential_peers_cool_only_until_the_quota_resets() {
         Default::default(),
         true,
         None,
+        [None; 3],
     )
     .await;
     *adapter.observed.lock().unwrap() = Some(LimitObservation {
@@ -981,6 +1208,7 @@ async fn request_log_records_each_request() {
         Default::default(),
         false,
         Some(path.clone()),
+        [None; 3],
     )
     .await;
 
@@ -1032,4 +1260,27 @@ async fn request_log_records_each_request() {
     assert_eq!(lines[2]["attempts"], 1);
     assert!(lines[2]["latency_ms"].is_number());
     assert!(lines[2]["ts_ms"].is_number());
+}
+
+#[tokio::test]
+async fn convert_deployment_cooled_during_build_is_skipped_at_the_gate() {
+    let (executor, adapter, _, _server) = fixture_with_models(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("model", &[0, 2])],
+        Default::default(),
+    )
+    .await;
+    *adapter.cool_on_build.lock().unwrap() = Some(executor.bindings[0].limits.clone());
+    let result = executor
+        .execute(GatewayRequest {
+            format: InboundFormat::AnthropicMessages,
+            body: Bytes::from_static(b"plain"),
+            ..request()
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.deployment.as_ref(), "dep2");
+    assert_eq!(adapter.calls.lock().unwrap().len(), 2);
 }

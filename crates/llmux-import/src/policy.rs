@@ -20,6 +20,7 @@ pub(super) struct Policy {
     pub kilo_key: Option<String>,
     pub kilo_free: Option<HashSet<String>>,
     pub openrouter_replacements: bool,
+    pub devin_free: Option<HashSet<String>>,
 }
 
 fn reference(path: &Path) -> Result<String, String> {
@@ -34,7 +35,7 @@ fn reference(path: &Path) -> Result<String, String> {
     Ok(format!("file:{path}"))
 }
 
-fn zero(value: &Value) -> bool {
+pub(super) fn zero(value: &Value) -> bool {
     if let Some(number) = value.as_number() {
         return number.as_u64() == Some(0);
     }
@@ -125,6 +126,10 @@ impl Policy {
             kilo_free,
             kilo_key: options.kilo_key_file.map(reference).transpose()?,
             openrouter_replacements: options.openrouter_replacements,
+            devin_free: options
+                .devin_models
+                .map(crate::devin::free_models)
+                .transpose()?,
         })
     }
 

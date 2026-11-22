@@ -42,9 +42,13 @@ fn direct_alias_targets_do_not_consume_real_combo_expansion_budget() {
     let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
     let config = RuntimeConfig::load(output).unwrap();
     let model = &config.models[config.model_names["large"]];
-    assert_eq!(model.deployments.len(), 601);
-    let last = &config.deployments[model.deployments[600].0 as usize];
+    assert_eq!(model.deployments.len(), 2);
+    let last = &config.deployments[model.deployments[1].0 as usize];
     assert_eq!(last.upstream_model.as_ref(), "last");
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w == "large: dropped 599 duplicate deployments"));
     assert!(!report
         .warnings
         .iter()

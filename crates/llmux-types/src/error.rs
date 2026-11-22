@@ -14,6 +14,8 @@ pub enum UpstreamError {
     Auth { refreshable: bool },
     #[error("bad request")]
     BadRequest { status: StatusCode, body: Bytes },
+    #[error("model not found at deployment")]
+    ModelNotFound { status: StatusCode, body: Bytes },
     #[error("context too long")]
     ContextLength,
     #[error("server error ({status})")]
@@ -46,7 +48,7 @@ impl UpstreamError {
             Self::RateLimited { .. } => ErrorKind::RateLimited,
             Self::QuotaExhausted { .. } => ErrorKind::QuotaExhausted,
             Self::Auth { .. } => ErrorKind::Auth,
-            Self::BadRequest { .. } => ErrorKind::BadRequest,
+            Self::BadRequest { .. } | Self::ModelNotFound { .. } => ErrorKind::BadRequest,
             Self::ContextLength => ErrorKind::ContextLength,
             Self::Server { .. } => ErrorKind::ServerError,
             Self::Timeout => ErrorKind::Timeout,
