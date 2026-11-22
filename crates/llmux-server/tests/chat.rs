@@ -667,7 +667,9 @@ billing = "billed"
     assert_eq!(billed.calls.load(Ordering::Relaxed), 1);
 
     // With x-llmux-free-only the billed legs are never candidates: the dead
-    // free leg surfaces as an upstream failure instead of spending.
+    // free leg surfaces as the upstream's failure instead of spending. A
+    // skip is not dead evidence — only an upstream model-not-found is — so
+    // exhausted free legs keep their retryable status.
     let free_only = Request::post(format!("{}/v1/chat/completions", gateway.url()))
         .header(header::AUTHORIZATION, "Bearer test-client")
         .header(header::CONTENT_TYPE, "application/json")
@@ -683,11 +685,12 @@ billing = "billed"
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(billed.calls.load(Ordering::Relaxed), 1);
     assert!(free.calls.load(Ordering::Relaxed) >= 1);
 
-    // A model whose only legs are billed fallback legs resolves no free route.
+    // A model whose only legs are billed fallback legs has no free route:
+    // the probe sees exhaustion, not a dead-route 404.
     let only_fallback = Request::post(format!("{}/v1/chat/completions", gateway.url()))
         .header(header::AUTHORIZATION, "Bearer test-client")
         .header(header::CONTENT_TYPE, "application/json")
@@ -710,7 +713,7 @@ billing = "billed"
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(billed.calls.load(Ordering::Relaxed), 1);
 }
 

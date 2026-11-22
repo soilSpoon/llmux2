@@ -561,7 +561,9 @@ impl Executor {
                 let dep = &self.cfg.deployments[idx];
                 // A free-only probe never routes to a billed leg, so a sweep
                 // cannot spend on paid or quota-capped legs — including billed
-                // fallback legs a dying free leg would otherwise fall through to.
+                // fallback legs a dying free leg would otherwise fall through
+                // to. Skipping is not dead evidence: only an upstream's own
+                // model-not-found counts, so exhaustion stays a retryable 429.
                 if req.free_only && dep.billing == Billing::Billed {
                     continue;
                 }
@@ -815,12 +817,6 @@ impl Executor {
                     }
                 }
             }
-        }
-        // A free-only request that could not be served by a free leg resolves
-        // no route: never spend on billed legs, and report the model as
-        // unknown so the probe's 404 streaks can mark it dead.
-        if req.free_only {
-            return Err(GatewayError::UnknownModel);
         }
         if let Some(err) = last_transient {
             return Err(GatewayError::Client(err));

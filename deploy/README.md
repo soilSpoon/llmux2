@@ -165,8 +165,10 @@ skipped, derived from each emitted deployment's `billing` marker rather
 than a hand-kept list, so it can never spend on billed routes. OmniRoute
 fallback legs are billed (they forward to billed upstreams) but exempt
 from a model's `free` flag; sweep probes send `x-llmux-free-only`, under
-which billed legs are never candidates and a model with no usable free leg
-answers 404 and accumulates dead streaks. One sweep
+which billed legs are never candidates. Only an upstream's own
+model-not-found counts as dead evidence — a free-only request with no
+usable free leg answers 429, so cooling or rate-limited free legs and
+OmniRoute-only models are never pruned by the skip alone. One sweep
 sends one token-bearing request per free advertised model, so keep its
 cadence low; the curated `--models` pin on `llmux2-probe.service` never
 builds streaks for the long tail — the sweep is what feeds `--dead-file`

@@ -357,8 +357,10 @@ OmniRoute forwards to billed upstreams), `llmux-config` SHALL accept the
 marker defaulting to billed, and `/v1/models` SHALL report each model as
 `free` only when every non-fallback leg is free. Sweep requests carry
 `x-llmux-free-only`; under it the gateway SHALL never route to a billed
-leg and SHALL answer the probe 404 when no free leg can serve the model,
-so fallback-only models still accumulate dead streaks. `--sweep` SHALL
+leg. Only an upstream's own model-not-found SHALL count as dead evidence:
+a free-only request with no usable free leg (all billed, cooling, or
+rate limited) SHALL answer with exhaustion, so live models are never
+pruned by the skip alone. `--sweep` SHALL
 skip any listed model not marked `free` — a missing
 or unrecognized marker counts as billed — and record it as `skipped`. The shipped
 `llmux2-sweep.timer` SHALL run it on its own state file on a calendar
