@@ -485,6 +485,36 @@ fn kimi_secondary_needs_reviewed_keyed_morph_and_survives_flag_off() {
                 == replacements
         );
     }
+    // A custom node reusing the `morph` prefix cannot stand in for the
+    // reviewed builtin key: the builtin route is builtin-only.
+    let mut root = cfpd_fixture();
+    root["providerNodes"].as_array_mut().unwrap().push(
+        json!({"id":"morph-custom","prefix":"morph","type":"openai-compatible","baseUrl":"https://api.morphllm.com/v1"}),
+    );
+    root["providerConnections"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|c| c["id"] != "morph");
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.toml");
+    llmux_import::import_with_options(
+        &root.to_string(),
+        &out,
+        Some(&dir.path().join("secrets")),
+        &ImportOptions {
+            openrouter_replacements: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let config = RuntimeConfig::load(out).unwrap();
+    let model = &config.models[*config.model_names.get("kimi-k3.1-pro").unwrap()];
+    assert!(
+        !model.deployments.iter().any(|i| {
+            config.deployments[i.0 as usize].upstream_model.as_ref() == "morph-kimik31"
+        }),
+        "custom-morph-shadow"
+    );
     for mode in ["anonymous", "unofficial-url", "inactive"] {
         let mut root = cfpd_fixture();
         for c in root["providerConnections"]
