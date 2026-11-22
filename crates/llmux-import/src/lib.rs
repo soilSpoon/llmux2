@@ -61,6 +61,11 @@ pub struct ImportOptions<'a> {
     /// Scheduled re-imports must pass the deployed address — deploy rejects a
     /// regenerated config whose listen differs from the installed one.
     pub listen: Option<&'a str>,
+    /// Site overlay TOML merged into the emitted config before validation:
+    /// `[server]`/`[routing]` keys and extra `[[credentials]]`/`[[models]]`
+    /// the export does not carry. Scheduled re-imports must pass the site's
+    /// overlay or the regenerated config drops its local settings.
+    pub overlay: Option<&'a Path>,
     /// JSON list of dead route names (e.g. `llmux2-probe --dead-file` output).
     /// Listed models are dropped from the import instead of being advertised,
     /// their aliases are pruned, and with `--omniroute-fallback` they land in
@@ -699,6 +704,52 @@ impl Expander<'_> {
         }
         stack.pop();
     }
+}
+
+fn overlay_value(value: toml::Value) -> Result<Value, String> {
+    Ok(match value {
+        toml::Value::String(s) => Value::String(s),
+        toml::Value::Integer(n) => json!(n),
+        toml::Value::Float(f) => json!(f),
+        toml::Value::Boolean(b) => Value::Bool(b),
+        toml::Value::Datetime(d) => Value::String(d.to_string()),
+        toml::Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(overlay_value)
+                .collect::<Result<_, _>>()?,
+        ),
+        toml::Value::Table(table) => {
+            let mut object = serde_json::Map::new();
+            for (key, value) in table {
+                object.insert(key, overlay_value(value)?);
+            }
+            Value::Object(object)
+        }
+    })
+}
+
+fn merge_overlay(config: &mut Value, overlay: Value) -> Result<(), String> {
+    let (config, overlay) = match (config.as_object_mut(), overlay.as_object()) {
+        (Some(config), Some(overlay)) => (config, overlay),
+        _ => return Err("site overlay must be a TOML table".to_owned()),
+    };
+    for (key, value) in overlay {
+        match (config.get_mut(key), value) {
+            (Some(Value::Object(existing)), Value::Object(extra)) => {
+                for (inner, inner_value) in extra {
+                    existing.insert(inner.clone(), inner_value.clone());
+                }
+            }
+            (Some(Value::Array(existing)), Value::Array(extra)) => {
+                existing.extend(extra.iter().cloned());
+            }
+            (_, value) => {
+                config.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Writes a new configuration and exclusive secret files. Existing files are never overwritten.
@@ -1488,13 +1539,48 @@ pub fn import_with_options(
             }
         }
     }
-    let config = json!({"server":{"listen":options.listen.unwrap_or("127.0.0.1:8080"),"client_keys":client_keys},"credentials":credentials,"models":models});
-    validation::validate(
-        &config,
-        client_count == 0,
-        &dir,
-        &policy.external_references(),
-    )?;
+    let mut config = json!({"server":{"listen":options.listen.unwrap_or("127.0.0.1:8080"),"client_keys":client_keys},"credentials":credentials,"models":models});
+    if let Some(path) = options.overlay {
+        let overlay = overlay_value(
+            toml::from_str::<toml::Value>(
+                &fs::read_to_string(path)
+                    .map_err(|_| "could not read site overlay TOML".to_owned())?,
+            )
+            .map_err(|_| "invalid site overlay TOML".to_owned())?,
+        )?;
+        // An overlay [server].listen is a site choice when no --listen was
+        // passed, but it must never silently override the deployed address a
+        // scheduled re-import was told to keep.
+        if let (Some(expected), Some(actual)) =
+            (options.listen, overlay["server"]["listen"].as_str())
+        {
+            if actual != expected {
+                return Err(format!(
+                    "site overlay listen {actual} conflicts with --listen {expected}"
+                ));
+            }
+        }
+        merge_overlay(&mut config, overlay)?;
+        // Overlay models are routes too: drop the ones the sweep marked dead
+        // and shield their names from the catch-all.
+        if !dead.is_empty() {
+            if let Some(list) = config["models"].as_array_mut() {
+                list.retain(|model| !dead.contains(model["name"].as_str().unwrap_or("")));
+                for model in list.iter_mut() {
+                    if model["name"].as_str() == Some("*") {
+                        if let Some(exclude) = model["exclude"].as_array_mut() {
+                            for name in &dead {
+                                if !exclude.iter().any(|e| e.as_str() == Some(name)) {
+                                    exclude.push(json!(name));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    validation::validate(&config, &dir)?;
     let value = toml::Value::try_from(&config).map_err(|_| "could not encode configuration")?;
     let content = toml::to_string_pretty(&value).map_err(|_| "could not encode configuration")?;
     let mut file = OpenOptions::new()

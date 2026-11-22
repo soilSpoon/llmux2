@@ -353,9 +353,11 @@ cursor, and SHALL be rejected in combination with `--models`. The shipped
 `--dead-file`; `llmux2-prune.timer` SHALL re-run the import with
 `--exclude-models` on a schedule and deploy the regenerated config so dead
 routes are dropped without manual pruning. The scheduled import SHALL carry
-the site's supplemental importer options and the deployed slot's listen
-address, and SHALL never delete secrets the deployed config still
-references.
+the site's supplemental importer options, the deployed slot's listen
+address, and the site's overlay (`--overlay`, merging `[server]`/`[routing]`
+settings and site-added credentials/models), and SHALL never delete secrets
+the deployed config still references. The prune SHALL shred the credential
+export once the import consumed it and deploy the installed release binary.
 
 #### Scenario: A full sweep finds the long tail
 

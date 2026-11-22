@@ -156,14 +156,6 @@ impl Policy {
         })
     }
 
-    pub fn external_references(&self) -> Vec<&str> {
-        self.workers
-            .iter()
-            .map(|w| w.reference.as_str())
-            .chain(self.kilo_key.as_deref())
-            .collect()
-    }
-
     pub fn model(&self, policy: ModelPolicy, model: &str) -> Result<String, &'static str> {
         match policy {
             ModelPolicy::Any => Ok(model.to_owned()),
