@@ -19,7 +19,7 @@ use hyper_util::{
 use limits::{DeploymentLimits, Permit, Window};
 use llmux_config::RuntimeConfig;
 use llmux_types::{
-    provider, AuthMaterial, BuildError, ContextOverflow, CredentialSource, Deployment,
+    provider, AuthMaterial, Billing, BuildError, ContextOverflow, CredentialSource, Deployment,
     DeploymentIdx, ErrorKind, GatewayRequest, GatewayResponse, ProviderAdapter, ProviderRegistry,
     SseCommitment, Support, UpstreamError,
 };
@@ -559,6 +559,14 @@ impl Executor {
             for &idx in after.iter().chain(before) {
                 let idx = index(idx);
                 let dep = &self.cfg.deployments[idx];
+                // A free-only probe never routes to a billed leg, so a sweep
+                // cannot spend on paid or quota-capped legs — including billed
+                // fallback legs a dying free leg would otherwise fall through
+                // to. Skipping is not dead evidence: only an upstream's own
+                // model-not-found counts, so exhaustion stays a retryable 429.
+                if req.free_only && dep.billing == Billing::Billed {
+                    continue;
+                }
                 let binding = &self.bindings[idx];
                 let support = binding.adapter.supports(req.format);
                 let now = Instant::now();
@@ -824,7 +832,10 @@ impl Executor {
             .filter(|idx| !incompatible.contains(&index(**idx)))
             .filter(|idx| {
                 let dep = &self.cfg.deployments[index(**idx)];
-                fits(dep)
+                // Billed legs are never eligible under free_only, so they
+                // must not drive the retry delay either.
+                !(req.free_only && dep.billing == Billing::Billed)
+                    && fits(dep)
                     && dep.expires_at.is_none_or(|end| SystemTime::now() < end)
                     && !self.devin_upstream_missing(dep)
             })

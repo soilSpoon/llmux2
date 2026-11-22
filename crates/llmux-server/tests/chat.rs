@@ -534,6 +534,274 @@ async fn healthz_is_public() {
 }
 
 #[tokio::test]
+async fn free_only_probe_never_calls_billed_or_fallback_legs() {
+    let secrets = tempfile::tempdir().unwrap();
+    for key in ["test-primary", "test-secondary", "test-client"] {
+        fs::write(secrets.path().join(key), format!("{key}\n")).unwrap();
+    }
+    let base = secrets.path().display();
+    let billed = Arc::new(Mock {
+        key: "test-secondary",
+        model: "vendor-secondary",
+        first: Reply::Complete,
+        next: Reply::Complete,
+        calls: AtomicUsize::new(0),
+    });
+    let free = Arc::new(Mock {
+        key: "test-primary",
+        model: "vendor-primary",
+        first: Reply::Quota(None),
+        next: Reply::Quota(None),
+        calls: AtomicUsize::new(0),
+    });
+    let upstream = TestServer::start(
+        Router::new()
+            .route("/free/v1/chat/completions", post(mock_chat))
+            .with_state(free.clone()),
+    )
+    .await
+    .unwrap();
+    let billed_upstream = TestServer::start(
+        Router::new()
+            .route("/billed/v1/chat/completions", post(mock_chat))
+            .with_state(billed.clone()),
+    )
+    .await
+    .unwrap();
+    let config = format!(
+        r#"
+[server]
+client_keys = ["file:{base}/test-client"]
+request_timeout_ms = 4000
+expose_routing_headers = true
+
+[[credentials]]
+id = "primary"
+kind = "api_key"
+provider = "openai"
+key = "file:{base}/test-primary"
+
+[[credentials]]
+id = "secondary"
+kind = "api_key"
+provider = "openai_compat"
+key = "file:{base}/test-secondary"
+
+[[models]]
+name = "mixed"
+capabilities = {{ stream = true, max_context = 100000 }}
+
+[[models.deployments]]
+id = "d-free"
+credential = "primary"
+base_url = "{}/free/v1"
+upstream_model = "vendor-primary"
+priority = 0
+billing = "free"
+
+[[models.deployments]]
+id = "d-billed"
+credential = "secondary"
+base_url = "{}/billed/v1"
+upstream_model = "vendor-secondary"
+priority = 10
+billing = "billed"
+
+[[models.deployments]]
+id = "d-fallback"
+credential = "secondary"
+base_url = "{}/billed/v1"
+upstream_model = "vendor-secondary"
+priority = 20
+fallback = true
+billing = "billed"
+
+[[models]]
+name = "fallback-only"
+capabilities = {{ stream = true, max_context = 100000 }}
+
+[[models.deployments]]
+id = "d-fallback-only"
+credential = "secondary"
+base_url = "{}/billed/v1"
+upstream_model = "vendor-secondary"
+priority = 0
+fallback = true
+billing = "billed"
+
+[[models]]
+name = "free-mixed"
+capabilities = {{ stream = true, max_context = 100000 }}
+
+[[models.deployments]]
+id = "d2-free"
+credential = "primary"
+base_url = "{}/free/v1"
+upstream_model = "vendor-primary"
+priority = 0
+billing = "free"
+
+[[models.deployments]]
+id = "d2-fallback"
+credential = "secondary"
+base_url = "{}/billed/v1"
+upstream_model = "vendor-secondary"
+priority = 10
+fallback = true
+billing = "billed"
+"#,
+        upstream.url(),
+        billed_upstream.url(),
+        billed_upstream.url(),
+        billed_upstream.url(),
+        upstream.url(),
+        billed_upstream.url(),
+        base = base,
+    );
+    let gateway = TestServer::start(
+        llmux_server::app(RuntimeConfig::parse(&config).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let payload = json!({
+        "model": "mixed",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "vendor_option": {"model": "leave-me-alone"},
+    });
+    // Without the flag a dead free leg falls through to billed legs.
+    let request = Request::post(format!("{}/v1/chat/completions", gateway.url()))
+        .header(header::AUTHORIZATION, "Bearer test-client")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(payload.to_string())))
+        .unwrap();
+    let response = timeout(
+        Duration::from_secs(5),
+        Client::builder(TokioExecutor::new())
+            .build_http()
+            .request(request),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(billed.calls.load(Ordering::Relaxed), 1);
+
+    // With x-llmux-free-only the billed legs are never candidates: the dead
+    // free leg surfaces as the upstream's failure instead of spending. A
+    // skip is not dead evidence — only an upstream model-not-found is — so
+    // exhausted free legs keep their retryable status.
+    let free_only = Request::post(format!("{}/v1/chat/completions", gateway.url()))
+        .header(header::AUTHORIZATION, "Bearer test-client")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-llmux-free-only", "true")
+        .body(Full::new(Bytes::from(payload.to_string())))
+        .unwrap();
+    let response = timeout(
+        Duration::from_secs(5),
+        Client::builder(TokioExecutor::new())
+            .build_http()
+            .request(free_only),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    // Billed legs never shorten the retry delay for a free-only probe:
+    // the delay is the cooled free leg's own cooldown, not the billed 0.
+    let retry_after: u64 = response
+        .headers()
+        .get(header::RETRY_AFTER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(retry_after > 0);
+    assert_eq!(billed.calls.load(Ordering::Relaxed), 1);
+    assert!(free.calls.load(Ordering::Relaxed) >= 1);
+
+    // A model whose only legs are billed fallback legs has no free route:
+    // the probe sees exhaustion, not a dead-route 404.
+    let only_fallback = Request::post(format!("{}/v1/chat/completions", gateway.url()))
+        .header(header::AUTHORIZATION, "Bearer test-client")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-llmux-free-only", "true")
+        .body(Full::new(Bytes::from(
+            json!({
+                "model": "fallback-only",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "vendor_option": {"model": "leave-me-alone"},
+            })
+            .to_string(),
+        )))
+        .unwrap();
+    let response = timeout(
+        Duration::from_secs(5),
+        Client::builder(TokioExecutor::new())
+            .build_http()
+            .request(only_fallback),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(billed.calls.load(Ordering::Relaxed), 1);
+
+    // A malformed flag is rejected rather than silently permitting spend.
+    let malformed = Request::post(format!("{}/v1/chat/completions", gateway.url()))
+        .header(header::AUTHORIZATION, "Bearer test-client")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-llmux-free-only", "tru")
+        .body(Full::new(Bytes::from(payload.to_string())))
+        .unwrap();
+    let response = timeout(
+        Duration::from_secs(5),
+        Client::builder(TokioExecutor::new())
+            .build_http()
+            .request(malformed),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(billed.calls.load(Ordering::Relaxed), 1);
+
+    // /v1/models labels: a model needs at least one usable free leg to be
+    // advertised free — billed legs or fallbacks alone keep it billed.
+    let models: Request<Full<Bytes>> = Request::get(format!("{}/v1/models", gateway.url()))
+        .header(header::AUTHORIZATION, "Bearer test-client")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let response = timeout(
+        Duration::from_secs(5),
+        Client::builder(TokioExecutor::new())
+            .build_http()
+            .request(models),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = BodyExt::collect(response.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    let list: Value = serde_json::from_slice(&body).unwrap();
+    let labels: std::collections::HashMap<_, _> = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| (m["id"].as_str().unwrap(), m["billing"].as_str().unwrap()))
+        .collect();
+    assert_eq!(labels["mixed"], "billed");
+    assert_eq!(labels["fallback-only"], "billed");
+    assert_eq!(labels["free-mixed"], "free");
+}
+
+#[tokio::test]
 async fn model_discovery_lists_exact_routable_ids_and_requires_authentication() {
     let fixture = Fixture::start(
         [Reply::Complete, Reply::Complete],
@@ -550,8 +818,8 @@ async fn model_discovery_lists_exact_routable_ids_and_requires_authentication() 
     assert_eq!(
         list,
         json!({"object": "list", "data": [
-            {"id":"alias","object":"model","created":0,"owned_by":"llmux2"},
-            {"id":"shared","object":"model","created":0,"owned_by":"llmux2"}
+            {"id":"alias","object":"model","created":0,"owned_by":"llmux2","billing":"billed"},
+            {"id":"shared","object":"model","created":0,"owned_by":"llmux2","billing":"billed"}
         ]})
     );
     assert_eq!(fixture.counts(), [0, 0]);

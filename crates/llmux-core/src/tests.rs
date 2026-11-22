@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use http::{HeaderMap, Request, Response};
 use hyper::body::Incoming;
 use llmux_types::{
-    AuthError, AuthMaterial, BuildError, CanonicalModel, Capabilities, ContextOverflow,
+    AuthError, AuthMaterial, Billing, BuildError, CanonicalModel, Capabilities, ContextOverflow,
     InboundFormat, LimitObservation, ProviderKind, RequestId, SseEvent,
 };
 use std::{collections::VecDeque, sync::Mutex};
@@ -232,6 +232,7 @@ async fn fixture_full(
             timeout: Duration::from_secs(1),
             max_context: max_context[i as usize],
             expires_at: expiry[i as usize],
+            billing: Billing::Billed,
         })
         .collect();
     let cfg = RuntimeConfig {
@@ -326,6 +327,7 @@ fn request() -> GatewayRequest {
         end_user: None,
         client_key: Some("key_testfp".into()),
         image_count: 2,
+        free_only: false,
     }
 }
 

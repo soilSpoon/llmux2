@@ -113,6 +113,7 @@ struct Request {
     method: String,
     path: String,
     authorization: Option<String>,
+    free_only: bool,
     body: Value,
 }
 struct Gateway {
@@ -235,6 +236,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> Request {
         parts.next().unwrap().to_string(),
     );
     let mut authorization = None;
+    let mut free_only = false;
     let mut length = 0;
     loop {
         line.clear();
@@ -245,6 +247,9 @@ fn read_request(stream: &mut std::net::TcpStream) -> Request {
         if let Some((name, value)) = line.split_once(':') {
             if name.eq_ignore_ascii_case("authorization") {
                 authorization = Some(value.trim().to_string());
+            }
+            if name.eq_ignore_ascii_case("x-llmux-free-only") {
+                free_only = value.trim() == "true";
             }
             if name.eq_ignore_ascii_case("content-length") {
                 length = value.trim().parse().unwrap();
@@ -257,6 +262,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> Request {
         method,
         path,
         authorization,
+        free_only,
         body: serde_json::from_slice(&body).unwrap_or(Value::Null),
     }
 }
@@ -264,9 +270,9 @@ fn models_reply() -> Reply {
     Reply::json(
         200,
         json!({"object":"list","data":[
-            {"id":"beta","object":"model"},
-            {"id":"alpha","object":"model"},
-            {"id":"gamma","object":"model"}
+            {"id":"beta","object":"model","billing":"free"},
+            {"id":"alpha","object":"model","billing":"free"},
+            {"id":"gamma","object":"model","billing":"free"}
         ]}),
     )
 }
@@ -854,6 +860,66 @@ fn sweep_probes_every_listed_model_without_moving_the_cursor() {
     let output = listen_flag(&home, &gateway, &[]);
     assert_eq!(gateway.chat_models().last().unwrap(), "alpha");
     assert_eq!(summary(&output)["dead"], json!([]));
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn sweep_never_probes_a_billed_model() {
+    // The sweep must never spend on paid or quota-capped legs: only models
+    // the gateway advertises as `billing = "free"` are probed, and a missing
+    // or unrecognized marker counts as billed.
+    let home = Home::new();
+    let ok = || Reply::json(200, json!({"choices":[{"message":{"content":"ok"}}]}));
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        Reply::json(
+            200,
+            json!({"object":"list","data":[
+                {"id":"beta","object":"model","billing":"billed"},
+                {"id":"alpha","object":"model","billing":"free"},
+                {"id":"gamma","object":"model"}
+            ]}),
+        ),
+        ok(),
+        Reply::text(200, "{\"output\":[]}"),
+        Reply::text(200, "{\"content\":[{\"type\":\"text\"}]}"),
+    ]);
+    let output = listen_flag(&home, &gateway, &["--sweep", "--all-formats"]);
+    assert_eq!(output.status.code(), Some(0));
+    let probed: Vec<String> = gateway
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.path.starts_with("/v1/") && r.path != "/v1/models")
+        .filter_map(|r| r.body["model"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(probed, ["alpha", "alpha", "alpha"]);
+    // Every sweep probe carries x-llmux-free-only so the gateway never routes
+    // it to a billed leg (OmniRoute fallbacks included); the models listing
+    // itself is not a probe.
+    let probes: Vec<bool> = gateway
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.path.starts_with("/v1/") && r.path != "/v1/models")
+        .map(|r| r.free_only)
+        .collect();
+    assert!(probes.iter().all(|flag| *flag));
+    let report = summary(&output);
+    let skipped: Vec<_> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|check| {
+            check["name"]
+                .as_str()
+                .filter(|_| check["skipped"].is_string())
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(skipped, ["chat:beta", "chat:gamma"]);
     stop.send(()).unwrap();
 }
 

@@ -348,8 +348,24 @@ import drops it rather than advertising it in `/v1/models`.
 
 A dedicated low-rate sweep SHALL cover the whole catalog: `--sweep` SHALL
 probe every listed model once in a single run without moving the rotation
-cursor, and SHALL be rejected in combination with `--models`. The shipped
-`llmux2-sweep.timer` SHALL run it on its own state file, feeding
+cursor, and SHALL be rejected in combination with `--models`. The sweep
+SHALL never call a deployment that can bill or consume a shared quota: the
+importer SHALL mark each emitted deployment `billing = "free"` or
+`"billed"` (site-managed custom providers and verified-free legs are
+free; commercial, quota-capped, and OmniRoute fallback legs are billed —
+OmniRoute forwards to billed upstreams), `llmux-config` SHALL accept the
+marker defaulting to billed, and `/v1/models` SHALL report each model as
+`free` only when every non-fallback leg is free. Sweep requests carry
+`x-llmux-free-only`; under it the gateway SHALL never route to a billed
+leg. Only an upstream's own model-not-found SHALL count as dead evidence:
+a free-only request with no usable free leg (all billed, cooling, or
+rate limited) SHALL answer with exhaustion, so live models are never
+pruned by the skip alone. `--sweep` SHALL
+skip any listed model not marked `free` — a missing
+or unrecognized marker counts as billed — and record it as `skipped`. The shipped
+`llmux2-sweep.timer` SHALL run it on its own state file on a calendar
+schedule with randomized delay (enabling it SHALL never fire a sweep
+immediately), feeding
 `--dead-file`; `llmux2-prune.timer` SHALL re-run the import with
 `--exclude-models` on a schedule and deploy the regenerated config so dead
 routes are dropped without manual pruning. The scheduled import SHALL carry
@@ -362,7 +378,8 @@ export on every exit — success, failure, or abort — and deploy the installed
 #### Scenario: A full sweep finds the long tail
 
 WHEN `--sweep` runs against a catalog of N models
-THEN every listed model is probed exactly once and the rotation cursor is
+THEN every listed model marked `free` is probed exactly once, billed
+models are skipped without an upstream call, and the rotation cursor is
 unchanged, so recurring probes keep their place.
 
 ### Requirement: Simple and extensible

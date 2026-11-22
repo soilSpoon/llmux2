@@ -461,7 +461,7 @@ impl ProviderAdapter for Antigravity {
 mod tests {
     use super::*;
     use http::HeaderValue;
-    use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
+    use llmux_types::{Billing, DeploymentIdx, QuotaSpec, RequestId};
     use std::time::Duration;
 
     fn dep() -> Deployment {
@@ -482,6 +482,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             max_context: None,
             expires_at: None,
+            billing: Billing::Billed,
         }
     }
 
@@ -501,6 +502,7 @@ mod tests {
             end_user: None,
             client_key: None,
             image_count: 0,
+            free_only: false,
         };
         let built = adapter
             .build_request(
