@@ -427,6 +427,40 @@ struct Expander<'a> {
     remaining_steps: usize,
     exhausted: bool,
     policy: &'a policy::Policy,
+    dead: &'a HashSet<String>,
+}
+
+fn references_dead(
+    combos: &HashMap<String, Value>,
+    name: &str,
+    dead: &HashSet<String>,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if !visited.insert(name.to_owned()) {
+        return false;
+    }
+    let Some(combo) = combos.get(name) else {
+        return false;
+    };
+    for step in array(combo, "models") {
+        let raw = step
+            .as_str()
+            .unwrap_or_else(|| string(step, "model"))
+            .trim();
+        let target = if string(step, "kind") == "combo-ref" {
+            string(step, "comboName")
+        } else if combos.contains_key(raw) {
+            raw
+        } else {
+            ""
+        };
+        if !target.is_empty()
+            && (dead.contains(target) || references_dead(combos, target, dead, visited))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 impl Expander<'_> {
@@ -486,6 +520,12 @@ impl Expander<'_> {
                 None
             };
             if let Some(target) = reference {
+                if self.dead.contains(target) {
+                    self.warnings.push(format!(
+                        "combo {name} step {index}: skipped dead reference {target}"
+                    ));
+                    continue;
+                }
                 self.warnings.push(format!("combo {name} step {index}: expanded nested combo {target} inline; nested routing policy is not preserved"));
                 self.expand(target, stack, out);
                 continue;
@@ -1081,6 +1121,7 @@ pub fn import_with_options(
                     remaining_steps: 1024,
                     exhausted: false,
                     policy: &policy,
+                    dead: &dead,
                 }
                 .expand(target, &mut Vec::new(), &mut deployments);
                 if deployments.is_empty() {
@@ -1191,6 +1232,7 @@ pub fn import_with_options(
             remaining_steps: 1024,
             exhausted: false,
             policy: &policy,
+            dead: &dead,
         }
         .expand(&name, &mut Vec::new(), &mut deployments);
         morph::order(&name, &mut deployments, &connections, nodes, &mut warnings);
@@ -1219,6 +1261,7 @@ pub fn import_with_options(
                 remaining_steps: 1,
                 exhausted: false,
                 policy: &policy,
+                dead: &dead,
             }
             .expand(&name, &mut Vec::new(), &mut free);
             xplabs::place(&name, &mut deployments, free, &connections, &mut warnings);
@@ -1244,6 +1287,7 @@ pub fn import_with_options(
                     remaining_steps: 1024,
                     exhausted: false,
                     policy: &policy,
+                    dead: &dead,
                 }
                 .expand(&name, &mut Vec::new(), &mut deployments);
             }
@@ -1268,6 +1312,11 @@ pub fn import_with_options(
         }
         if deployments.is_empty() {
             warnings.push(format!("combo {name}: skipped: no deployments"));
+            // A combo that collapsed entirely into dead references is dead
+            // itself: the catch-all must not serve its name either.
+            if references_dead(lookup, &name, &dead, &mut HashSet::new()) {
+                dead.insert(name.clone());
+            }
             continue;
         }
         for (i, dep) in deployments.iter_mut().enumerate() {

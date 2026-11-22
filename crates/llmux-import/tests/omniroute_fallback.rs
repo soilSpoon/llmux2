@@ -132,7 +132,7 @@ fn exclude_models_drops_dead_routes_and_their_aliases() {
     let mut dead_list = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
     std::io::Write::write_all(
         &mut dead_list,
-        br#"["public","mapped-owner","owner-alias"]"#,
+        br#"["public","mapped-owner","owner-alias","owner"]"#,
     )
     .unwrap();
     let (dir, result) = run(
@@ -158,21 +158,39 @@ fn exclude_models_drops_dead_routes_and_their_aliases() {
     );
     let cfg =
         RuntimeConfig::parse(&fs::read_to_string(dir.path().join("out.toml")).unwrap()).unwrap();
-    for gone in ["public", "public-alias", "mapped-owner", "owner-alias"] {
+    for gone in [
+        "public",
+        "public-alias",
+        "mapped-owner",
+        "owner-alias",
+        "owner",
+    ] {
         assert!(!cfg.model_names.contains_key(gone), "{gone}");
     }
     // A dropped route is never served again: it lands in the catch-all
     // exclusion list, and aliases resolving to it (public-alias) or into a
-    // dropped mapping are pruned too.
-    for excluded in ["public", "public-alias", "mapped-owner", "owner-alias"] {
+    // dropped mapping are pruned too. A nested combo whose only leg is the
+    // excluded "owner" collapses to no deployments and dies with it — and the
+    // "chain" alias into it never attaches.
+    for collapsed in ["nested-owner", "chain"] {
+        assert!(!cfg.model_names.contains_key(collapsed), "{collapsed}");
+    }
+    for excluded in [
+        "public",
+        "public-alias",
+        "mapped-owner",
+        "owner-alias",
+        "owner",
+        "nested-owner",
+    ] {
         assert!(
             cfg.catch_all_exclude.contains(&excluded.to_string()),
             "{excluded}"
         );
     }
-    // Surviving models still work: nested-owner stays advertised, and the
-    // "chain" alias still resolves to it through the dropped owner-alias.
-    assert_eq!(cfg.model_names["chain"], cfg.model_names["nested-owner"]);
+    // The catch-all still serves, with the dead names excluded.
+    assert!(cfg.catch_all.is_some());
+    assert!(!cfg.catch_all_exclude.contains(&"*".to_string()));
 }
 
 #[test]

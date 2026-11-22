@@ -123,3 +123,38 @@ fn missing_state_or_listing_is_rejected_with_a_login_hint() {
     .unwrap();
     assert!(error.contains("together"));
 }
+
+#[test]
+fn exclude_models_drops_listed_catalog_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let listing = json!({"data":[
+        {"id":"vendor/paid-big","pricing":{"prompt":"0.000003","completion":"0.000015"}},
+        {"id":"vendor/zero-priced","pricing":{"prompt":"0","completion":"0.00"}}
+    ]});
+    let dead = dir.path().join("dead.json");
+    fs::write(&dead, "[\"nous/vendor/paid-big\"]").unwrap();
+    let models = dir.path().join("models.json");
+    fs::write(&models, listing.to_string()).unwrap();
+    let output = dir.path().join("out.toml");
+    llmux_import::import_with_options(
+        &root(),
+        &output,
+        None,
+        &ImportOptions {
+            nous_state: Some(&state),
+            nous_models: Some(&models),
+            exclude_models: Some(&dead),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let config = RuntimeConfig::load(&output).unwrap();
+    let names: Vec<_> = config
+        .models
+        .iter()
+        .filter(|m| m.name.starts_with("nous/"))
+        .map(|m| m.name.as_ref())
+        .collect();
+    assert_eq!(names, ["nous/vendor/zero-priced"]);
+}
