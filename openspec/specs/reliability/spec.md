@@ -116,6 +116,15 @@ latest future reset for an exhausted or unreported window is used. Invalid
 or stale resets are ignored, and resets are subject to the configured
 cooldown cap.
 
+#### Scenario: Anthropic rejects an account with insufficient credit
+
+WHEN Anthropic returns an HTTP 400 `invalid_request_error` beginning with
+`Your credit balance is too low to access the Anthropic API.`
+THEN the gateway treats it as credential quota exhaustion without an
+upstream reset hint. It applies the existing cooldown to deployments sharing
+the credential and tries the next eligible deployment if quota fallback is
+enabled. Other HTTP 400s retain their existing behavior.
+
 ### Requirement: Rate-limit avoidance
 
 The gateway SHALL reduce 429s proactively: secure additional paths, pace

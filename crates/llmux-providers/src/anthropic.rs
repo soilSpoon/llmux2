@@ -329,6 +329,14 @@ fn convert_response(v: &Value) -> Value {
 fn client_error(status: StatusCode, body: Bytes, convert: bool) -> UpstreamError {
     let value = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
     let details = &value["error"];
+    if status == StatusCode::BAD_REQUEST
+        && details["type"] == "invalid_request_error"
+        && details["message"].as_str().is_some_and(|message| {
+            message.starts_with("Your credit balance is too low to access the Anthropic API.")
+        })
+    {
+        return UpstreamError::QuotaExhausted { reset_at: None };
+    }
     let model_not_found = crate::openai_compat::is_model_not_found(status, details);
     if !model_not_found
         && matches!(status.as_u16(), 400 | 413)
