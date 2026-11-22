@@ -988,6 +988,30 @@ async fn deprecated_sampling_parameters_are_dropped_and_retried_on_the_same_depl
 }
 
 #[tokio::test]
+async fn deprecated_sampling_repairs_consume_upstream_request_quota() {
+    for (path, payload) in sampling_payloads() {
+        let limited =
+            SamplingFixture::start(&["temperature"], "quota = { rpm = 1, concurrent = 1 }").await;
+        let (status, headers, body) = limited.post(path, payload.clone()).await;
+        assert_eq!(limited.bodies().len(), 1, "{path}: no quota for a repair");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert!(body.contains("is deprecated for this model"));
+        assert_eq!(headers["x-llmux-attempts"], "1");
+
+        let allowed =
+            SamplingFixture::start(&["temperature"], "quota = { rpm = 2, concurrent = 1 }").await;
+        let (status, headers, body) = allowed.post(path, payload.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert_eq!(headers["x-llmux-attempts"], "1");
+        assert_eq!(allowed.bodies().len(), 2);
+
+        let (status, _, _) = allowed.post(path, payload).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{path}");
+        assert_eq!(allowed.bodies().len(), 2, "{path}: both sends were charged");
+    }
+}
+
+#[tokio::test]
 async fn deprecated_parameter_retry_serves_chat_requests() {
     let fixture = SamplingFixture::start(&["temperature"], "").await;
     let (status, _, body) = fixture

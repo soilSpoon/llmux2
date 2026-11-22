@@ -619,7 +619,7 @@ impl Executor {
                             result = match upstream {
                                 Ok(Ok(upstream)) => timeout_at(
                                     attempt_deadline,
-                                    self.attempt(&req, dep, binding, upstream),
+                                    self.attempt(&req, dep, binding, upstream, needed),
                                 )
                                 .await
                                 .unwrap_or(timed_out),
@@ -813,6 +813,7 @@ impl Executor {
         dep: &Deployment,
         binding: &Binding,
         upstream: Request<Bytes>,
+        needed: u64,
     ) -> Result<GatewayResponse, GatewayError> {
         let response = match binding.adapter.invoke(req, dep).await {
             Some(local) => local.map_err(GatewayError::Client)?,
@@ -840,6 +841,9 @@ impl Executor {
                             else {
                                 return Err(GatewayError::Client(error));
                             };
+                            if !binding.limits.admit_repair(needed) {
+                                return Err(GatewayError::Client(error));
+                            }
                             upstream = Request::from_parts(parts, repaired);
                             repairs += 1;
                         }

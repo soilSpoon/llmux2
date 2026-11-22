@@ -57,8 +57,10 @@ this model`` unless the value is the default. The Anthropic adapter SHALL accept
 `strip_request_fields` limited to `temperature`, `top_p` and `top_k` and omit
 them from the upstream body on both the OpenAI Chat conversion and the native
 Messages passthrough. When an upstream still answers such a 400 for a field
-that was sent, the adapter SHALL remove only that field and resend the same
-deployment's request, and SHALL log which field was dropped. The retry SHALL NOT
+that was sent, the adapter SHALL remove only that field and log which field was
+dropped. The gateway SHALL resend to the same deployment only if its cooldown
+and deployment and credential quotas allow another upstream request. If they
+do not, it SHALL return the original 400. The retry SHALL NOT
 move to another deployment, so the served model never changes, and SHALL NOT
 apply to any other 400.
 
@@ -71,6 +73,7 @@ and other fields are untouched.
 #### Scenario: Deprecation rejection heals
 
 WHEN the upstream answers 400 `` `temperature` is deprecated for this model``
+and quota allows another upstream request
 THEN the same deployment is retried once without `temperature`, and the client
 receives that retry's response.
 

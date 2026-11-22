@@ -39,6 +39,8 @@ struct Adapter {
     stream_errors: Mutex<VecDeque<UpstreamError>>,
     calls: Mutex<Vec<(Arc<str>, Arc<str>)>>,
     cool_on_build: Mutex<Option<Arc<DeploymentLimits>>>,
+    cool_on_repair: Mutex<Option<Arc<DeploymentLimits>>>,
+    wire_calls: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -107,6 +109,12 @@ impl ProviderAdapter for Adapter {
             body: Bytes::new(),
         })
     }
+
+    fn repair_rejected(&self, _: &Bytes, _: &UpstreamError) -> Option<Bytes> {
+        let limits = self.cool_on_repair.lock().unwrap().take()?;
+        limits.cool_down(Duration::from_secs(30));
+        Some(Bytes::from_static(b"repaired"))
+    }
 }
 
 type Fixture = (
@@ -169,7 +177,10 @@ async fn fixture_full(
 ) -> Fixture {
     let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
     let served_status = status.clone();
+    let wire_calls = Arc::new(AtomicUsize::new(0));
+    let received = wire_calls.clone();
     let server = llmux_testkit::TestServer::start(axum::Router::new().fallback(move || {
+        received.fetch_add(1, Ordering::Relaxed);
         let status = StatusCode::from_u16(served_status.load(Ordering::Relaxed)).unwrap();
         async move { (status, "ok") }
     }))
@@ -183,6 +194,8 @@ async fn fixture_full(
         stream_errors: Mutex::new(VecDeque::new()),
         calls: Mutex::new(Vec::new()),
         cool_on_build: Mutex::new(None),
+        cool_on_repair: Mutex::new(None),
+        wire_calls,
     });
     let credential = Arc::new(Credential {
         refreshes: AtomicUsize::new(0),
@@ -527,6 +540,41 @@ async fn retry_after_excludes_a_deployment_that_does_not_have_the_model() {
         retry_after.is_some_and(|wait| !wait.is_zero()),
         "retry_after = {retry_after:?}"
     );
+}
+
+#[tokio::test]
+async fn cooldown_before_repair_returns_original_rejection_without_resending() {
+    let rejection = Bytes::from_static(b"deprecated parameter");
+    let (executor, adapter, _, _server) = fixture_with_models(
+        vec![UpstreamError::BadRequest {
+            status: StatusCode::BAD_REQUEST,
+            body: rejection.clone(),
+        }],
+        false,
+        [None; 3],
+        &[("model", &[0])],
+        llmux_types::QuotaSpec {
+            rpm: Some(2),
+            ..Default::default()
+        },
+    )
+    .await;
+    adapter.status.store(400, Ordering::Relaxed);
+    *adapter.cool_on_repair.lock().unwrap() = Some(executor.bindings[0].limits.clone());
+
+    let result = executor.execute_attributed(request()).await;
+    assert_eq!(adapter.wire_calls.load(Ordering::Relaxed), 1);
+    let Err(error) = result else {
+        panic!("expected the original rejection");
+    };
+    assert_eq!(error.attempts, 1);
+    assert!(matches!(
+        error.error,
+        GatewayError::Client(UpstreamError::BadRequest {
+            status: StatusCode::BAD_REQUEST,
+            body,
+        }) if body == rejection
+    ));
 }
 
 #[tokio::test]

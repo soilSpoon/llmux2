@@ -155,7 +155,19 @@ impl DeploymentLimits {
         } else {
             Permit(None, None)
         };
+        if !self.charge_windows(tokens, Instant::now()) {
+            return None;
+        }
+        permit.1 = probe.1.take();
+        Some(permit)
+    }
+
+    pub fn admit_repair(&self, tokens: u64) -> bool {
         let now = Instant::now();
+        self.cooldown_until(now).is_none() && self.charge_windows(tokens, now)
+    }
+
+    fn charge_windows(&self, tokens: u64, now: Instant) -> bool {
         let mut windows: Vec<_> = self
             .windows
             .iter()
@@ -164,7 +176,7 @@ impl DeploymentLimits {
         for (window, used) in &windows {
             let cost = window.unit.cost(tokens);
             if used.total > 0 && used.total + cost > window.max {
-                return None;
+                return false;
             }
         }
         for (window, used) in &mut windows {
@@ -174,8 +186,7 @@ impl DeploymentLimits {
                 used.total += cost;
             }
         }
-        permit.1 = probe.1.take();
-        Some(permit)
+        true
     }
 }
 
