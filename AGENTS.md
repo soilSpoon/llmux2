@@ -54,8 +54,8 @@ Each standard above pairs with the mechanism that makes it fail before merge. A 
 | Rule | Enforced by | Level |
 | --- | --- | --- |
 | Format and lint clean | `cargo fmt --check`, `clippy -D warnings` in CI `check` job | CI |
-| Tests pass | `cargo test --locked --workspace` and the bench/scripts/dashboard suites in CI `check` job | CI |
-| `crates/*/src` changes need test evidence or `Test exemption:` | `pr-policy` job (`scripts/pr_policy.py`) | CI |
+| Tests pass | `cargo test --locked --workspace --doc` and `node --test crates/llmux-server/tests/dashboard.cjs` in the `check` job; workspace unit/integration tests via `cargo llvm-cov nextest --locked --workspace` in the `coverage` job | CI |
+| `crates/*/src` changes need test evidence or `Test exemption:` | `pr-policy` job (`cargo xtask pr-policy`) | CI |
 | PR template sections non-empty | `pr-policy` job | CI |
 | Workspace line coverage never drops | `coverage` job vs `.github/coverage-floor` | CI |
 | Required plugins pinned to reviewed commits | `.devin/config.json` requiredPlugins SHAs | Config |
@@ -66,8 +66,8 @@ Each standard above pairs with the mechanism that makes it fail before merge. A 
 | Synthetic credentials only; no credential values in errors, logs, or config | Review checklist row | Review/docs |
 | Provider-specific behavior stays out of the routing core | Adapter contract + review | Review/docs |
 | No speculative dependencies, unbounded work, or unrelated cleanup | Review checklist | Review/docs |
-| Merges only through the gate with passing checks and reviews | `scripts/merge_gate.py` + `.github/rulesets/main.json` + `.github/merge-policy.json` | CI/gate |
-| Independent verifier marker per head SHA | `llmux-verify:v1` comment check in merge gate | CI/gate |
+| Merges only through the gate with passing checks and reviews | `cargo xtask merge-gate <n>` + `.github/rulesets/main.json` + `.github/merge-policy.json` | CI/gate |
+| Independent verifier marker per head SHA | `llmux-verify:v1` comment check in `cargo xtask merge-gate` | CI/gate |
 
 
 ## Compound what was learned
