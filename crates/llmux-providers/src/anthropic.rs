@@ -354,6 +354,9 @@ fn client_error(status: StatusCode, body: Bytes, convert: bool) -> UpstreamError
         if model_not_found {
             error["code"] = details["code"].clone();
         }
+        if let Some(request_id) = value.get("request_id") {
+            error["request_id"] = request_id.clone();
+        }
         Bytes::from(json!({"error": error}).to_string())
     } else {
         body
@@ -1175,6 +1178,8 @@ mod tests {
             context_overflow: None,
             request_id: RequestId("r".into()),
             end_user: None,
+            client_key: None,
+            image_count: 0,
         };
         dep.headers
             .insert("x-deployment", HeaderValue::from_static("static-value"));
@@ -1301,6 +1306,8 @@ mod tests {
                 context_overflow: None,
                 request_id: RequestId("r".into()),
                 end_user: None,
+                client_key: None,
+                image_count: 0,
             };
             let request = a
                 .build_request(&req, &dep, &AuthMaterial::None)
@@ -1383,6 +1390,8 @@ mod tests {
                 context_overflow: None,
                 request_id: RequestId("r".into()),
                 end_user: end_user.map(Arc::from),
+                client_key: None,
+                image_count: 0,
             };
             let request = a
                 .build_request(&req, &dep, &AuthMaterial::None)

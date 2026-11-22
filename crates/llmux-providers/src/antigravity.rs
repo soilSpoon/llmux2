@@ -12,10 +12,12 @@ use futures_util::StreamExt;
 use http::{header, HeaderMap, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use llmux_types::{
-    provider, AuthMaterial, BoxStream, BuildError, Deployment, GatewayRequest, GatewayResponse,
-    InboundFormat, ProviderAdapter, ProviderKind, SseEvent, Support, UpstreamError,
+    header_request_id, provider, AuthMaterial, BoxStream, BuildError, Deployment, GatewayRequest,
+    GatewayResponse, InboundFormat, ProviderAdapter, ProviderKind, SseEvent, Support,
+    UpstreamError,
 };
 use serde_json::{json, Map, Value};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 const PROJECT: &str = "x-llmux-project";
@@ -354,6 +356,12 @@ impl ProviderAdapter for Antigravity {
         &self.0
     }
 
+    /// The complete body is synthesized with a fixed placeholder id; only
+    /// upstream response headers carry a real request id.
+    fn upstream_request_id(&self, headers: &HeaderMap, _body: Option<&Bytes>) -> Option<Arc<str>> {
+        header_request_id(headers)
+    }
+
     fn supports(&self, inbound: InboundFormat) -> Support {
         match inbound {
             InboundFormat::OpenAiChat
@@ -491,6 +499,8 @@ mod tests {
             context_overflow: None,
             request_id: RequestId("req".into()),
             end_user: None,
+            client_key: None,
+            image_count: 0,
         };
         let built = adapter
             .build_request(

@@ -4,11 +4,13 @@ use bytes::Bytes;
 use http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use llmux_types::{
+    header_request_id,
     provider::{DEEPAI as KIND_DEEPAI, DEEPAI_KEY_HEADER, DEEPAI_TEXT_MODELS},
     AuthMaterial, BuildError, Deployment, GatewayRequest, GatewayResponse, InboundFormat,
     ProviderAdapter, ProviderKind, Support, UpstreamError,
 };
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct DeepAi(ProviderKind);
@@ -29,6 +31,13 @@ impl DeepAi {
 impl ProviderAdapter for DeepAi {
     fn kind(&self) -> &ProviderKind {
         &self.0
+    }
+
+    /// The complete body is synthesized; headers (raw upstream headers, or the
+    /// `x-request-id` parse_response adds for a real job id) carry the only
+    /// trustworthy request id.
+    fn upstream_request_id(&self, headers: &HeaderMap, _body: Option<&Bytes>) -> Option<Arc<str>> {
+        header_request_id(headers)
     }
 
     fn supports(&self, inbound: InboundFormat) -> Support {
@@ -119,6 +128,18 @@ impl ProviderAdapter for DeepAi {
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
+        // The complete body is synthesized; surface a real upstream job id
+        // as a response header so upstream_request_id can record it without
+        // mistaking the fallback id for a provider one. A real request-id
+        // header on the upstream response stays authoritative, so skip the
+        // stamped header then.
+        if header_request_id(&parts.headers).is_none() {
+            if let Some(job_id) = output["id"].as_str().filter(|id| !id.is_empty()) {
+                if let Ok(value) = HeaderValue::from_str(job_id) {
+                    headers.insert("x-request-id", value);
+                }
+            }
+        }
         Ok(GatewayResponse::Complete {
             status: StatusCode::OK,
             headers,
@@ -274,6 +295,11 @@ mod tests {
                     "text=success" => {
                         Json(json!({"id":"job-123","output":"completed text"})).into_response()
                     }
+                    "text=hdr" => (
+                        [("x-request-id", "hdr_req_1")],
+                        Json(json!({"id":"job-9","output":"done"})),
+                    )
+                        .into_response(),
                     "text=image" => {
                         Json(json!({"id":"job-123","output_url":"https://example.com/a.png"}))
                             .into_response()
@@ -300,6 +326,7 @@ mod tests {
         let client = Client::builder(TokioExecutor::new()).build_http();
         for text in [
             "success",
+            "hdr",
             "image",
             "nontext",
             "invalid",
@@ -334,6 +361,24 @@ mod tests {
                     },"finish_reason":"stop"}])
                     );
                     assert!(completion.get("usage").is_none());
+                    // The upstream job id must reach the request log even
+                    // though the body is synthesized.
+                    assert_eq!(
+                        adapter
+                            .upstream_request_id(&headers, Some(&body))
+                            .as_deref(),
+                        Some("job-123")
+                    );
+                }
+                "hdr" => {
+                    // A real upstream request-id header stays authoritative:
+                    // the synthesized headers must not shadow it with the
+                    // body's job id.
+                    let GatewayResponse::Complete { headers, body, .. } = result.unwrap() else {
+                        panic!("expected a complete response");
+                    };
+                    assert!(headers.get("x-request-id").is_none());
+                    assert!(adapter.upstream_request_id(&headers, Some(&body)).is_none());
                 }
                 "unauthorized" => assert!(matches!(
                     result,
@@ -372,6 +417,8 @@ mod tests {
             context_overflow: None,
             request_id: RequestId("r".into()),
             end_user: None,
+            client_key: None,
+            image_count: 0,
         }
     }
 

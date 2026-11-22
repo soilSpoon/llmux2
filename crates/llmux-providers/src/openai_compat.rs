@@ -1144,6 +1144,8 @@ mod tests {
                 context_overflow: None,
                 request_id: RequestId("r".into()),
                 end_user: None,
+                client_key: None,
+                image_count: 0,
             };
             let upstream = adapter
                 .build_request(&req, &deployment, &AuthMaterial::None)
@@ -1356,6 +1358,8 @@ mod tests {
             context_overflow: None,
             request_id: RequestId("r".into()),
             end_user: None,
+            client_key: None,
+            image_count: 0,
         };
         let build = |dep: &Deployment| {
             adapter
@@ -1888,6 +1892,8 @@ mod tests {
             context_overflow: None,
             request_id: RequestId("r".into()),
             end_user: Some(hash.into()),
+            client_key: None,
+            image_count: 0,
         };
         let deployment = |kind: &str, strip: &[ChatRequestField]| Deployment {
             headers: Default::default(),

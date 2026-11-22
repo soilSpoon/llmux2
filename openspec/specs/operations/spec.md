@@ -127,14 +127,24 @@ object per routed request as a JSONL line. Each record SHALL carry the
 timestamp, request ID, requested model, last-attempted deployment ID and
 provider, attempt count, total latency, the outcome (`routed` or `error`),
 the failure kind on errors, and the remaining RPM/concurrency headroom of
-the last-attempted deployment. Optional fields SHALL be omitted rather than
-written as null, and the file SHALL be created on startup, failing startup
-when it cannot be opened. Records SHALL contain no credentials or request
-bodies. When `server.request_log` is unset, no file is written.
+the last-attempted deployment. Each record SHALL also carry a fingerprint of
+the gateway client key used (a `key_<16 hex>` hash keyed by the configured
+key set, never the key itself), the count of image inputs in the inbound
+request, and — when the upstream supplies one — the provider-side request ID
+(such as an Anthropic `msg_`/`req_` ID) so a provider flag can be matched by
+ID rather than timestamp alone. Optional fields SHALL be omitted rather than
+written as null, and the file SHALL be
+created on startup, failing startup when it cannot be opened. Records SHALL
+contain no credentials or request bodies. When `server.request_log` is
+unset, no file is written.
 
 #### Scenario: Failed request still recorded
 - WHEN a request exhausts every candidate
 - THEN the record names the last-attempted deployment, the attempt count and `all_candidates_exhausted`.
+
+#### Scenario: Provider flag traced by upstream ID
+- WHEN an upstream response carries `anthropic-request-id`, `x-request-id` or `request-id`, or a provider-owned body carries `id` or `request_id` (including in an error body)
+- THEN the record includes it as `upstream_request_id`, on success and on failure, preferring the header id when both differ.
 
 #### Scenario: No attempts made
 - WHEN every candidate is cooling or limited before any attempt

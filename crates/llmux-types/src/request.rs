@@ -26,6 +26,10 @@ pub struct GatewayRequest {
     pub request_id: RequestId,
     /// Hashed end-user id for upstream abuse attribution. `None` keeps today's behavior.
     pub end_user: Option<Arc<str>>,
+    /// Fingerprint of the gateway client key used; never the key itself.
+    pub client_key: Option<Arc<str>>,
+    /// Number of image inputs found in the inbound body.
+    pub image_count: u32,
 }
 
 pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + 'a>>;

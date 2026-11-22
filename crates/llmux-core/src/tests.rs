@@ -184,7 +184,7 @@ async fn fixture_full(
     let server = llmux_testkit::TestServer::start(axum::Router::new().fallback(move || {
         received.fetch_add(1, Ordering::Relaxed);
         let status = StatusCode::from_u16(served_status.load(Ordering::Relaxed)).unwrap();
-        async move { (status, "ok") }
+        async move { (status, [("request-id", "req_fixture_1")], "ok") }
     }))
     .await
     .unwrap();
@@ -324,6 +324,8 @@ fn request() -> GatewayRequest {
         context_overflow: None,
         request_id: RequestId("test".into()),
         end_user: None,
+        client_key: Some("key_testfp".into()),
+        image_count: 2,
     }
 }
 
@@ -1308,6 +1310,50 @@ async fn request_log_records_each_request() {
     assert_eq!(lines[2]["attempts"], 1);
     assert!(lines[2]["latency_ms"].is_number());
     assert!(lines[2]["ts_ms"].is_number());
+    // Client key, image inputs and the provider request id are recorded on
+    // every record that reached an upstream.
+    for line in &lines {
+        assert_eq!(line["client_key"], "key_testfp");
+        assert_eq!(line["image_count"], 2);
+    }
+    assert_eq!(lines[0]["upstream_request_id"], "req_fixture_1");
+    assert!(lines[1].get("upstream_request_id").is_none());
+    assert_eq!(lines[2]["upstream_request_id"], "req_fixture_1");
+}
+
+#[tokio::test]
+async fn request_log_prefers_response_header_over_error_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, _adapter, _, _server) = fixture_full(
+        vec![UpstreamError::BadRequest {
+            status: StatusCode::BAD_REQUEST,
+            body: Bytes::from_static(br#"{"request_id":"req_body_9"}"#),
+        }],
+        false,
+        [Some(1024); 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+    )
+    .await;
+
+    assert!(matches!(
+        executor.execute(request()).await,
+        Err(GatewayError::Client(UpstreamError::BadRequest { .. }))
+    ));
+    drop(executor);
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["upstream_request_id"], "req_fixture_1");
 }
 
 #[tokio::test]

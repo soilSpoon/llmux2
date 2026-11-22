@@ -36,6 +36,7 @@ use llmux_types::{
     ProviderRegistry, RequestId, UpstreamError,
 };
 use serde_json::{json, value::RawValue, Value};
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, convert::Infallible, error::Error, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 
@@ -280,14 +281,15 @@ async fn messages(State(state): State<Arc<AppState>>, request: Request) -> Respo
 
 async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) -> Response {
     let active = state.active.load();
-    if !authorized_for_format(request.headers(), &active.config.server.client_keys, format) {
+    let client_key = matched_key(request.headers(), &active.config.server.client_keys, format);
+    if client_key.is_none() {
         return unauthorized();
     }
     if catalog::has_devin(&active.config) {
         state.catalog.kick();
     }
     let start = state.dashboard.as_ref().map(|_| std::time::Instant::now());
-    let response = execute_authorized(&active, request, format).await;
+    let response = execute_authorized(&active, request, format, client_key).await;
     if let (Some(dashboard), Some(start)) = (&state.dashboard, start) {
         dashboard.record_response(response.status(), start.elapsed());
     }
@@ -306,7 +308,12 @@ fn unauthorized() -> Response {
     response
 }
 
-async fn execute_authorized(active: &Active, request: Request, format: InboundFormat) -> Response {
+async fn execute_authorized(
+    active: &Active,
+    request: Request,
+    format: InboundFormat,
+    client_key: Option<Arc<str>>,
+) -> Response {
     let context_overflow = match request.headers().get(CONTEXT_OVERFLOW_HEADER) {
         None => None,
         Some(value) => match value.to_str().ok().and_then(ContextOverflow::from_name) {
@@ -359,6 +366,7 @@ async fn execute_authorized(active: &Active, request: Request, format: InboundFo
         format,
         context_overflow,
         end_user.clone(),
+        client_key,
     )
     .await;
     policy::attach_end_user(response, end_user.as_deref())
@@ -371,6 +379,7 @@ async fn route_request(
     format: InboundFormat,
     context_overflow: Option<ContextOverflow>,
     end_user: Option<Arc<str>>,
+    client_key: Option<Arc<str>>,
 ) -> Response {
     let Ok(metadata) = RequestMetadata::parse(&body, format) else {
         return error(
@@ -427,6 +436,9 @@ async fn route_request(
             }
         }
     }
+    // The record describes the inbound request; a middle-out retry sends a
+    // truncated body but must not shrink the logged image count.
+    let image_count = policy::count_images(upstream_body.as_ref());
     let request = |body: Bytes, prompt_bytes: u64| GatewayRequest {
         format,
         model: model.clone(),
@@ -434,10 +446,12 @@ async fn route_request(
         est_input_tokens: u32::try_from(prompt_bytes.div_ceil(4)).unwrap_or(u32::MAX),
         max_output_tokens: metadata.max_output_tokens,
         context_overflow,
+        image_count,
         body,
         anthropic_headers: anthropic_headers.clone(),
         request_id: request_id.clone(),
         end_user: end_user.clone(),
+        client_key: client_key.clone(),
     };
 
     let mut dropped = 0;
@@ -553,13 +567,57 @@ fn add_routing_headers(response: &mut Response, deployment: Option<&str>, attemp
 }
 
 fn authorized_for_format(headers: &HeaderMap, keys: &[Arc<str>], format: InboundFormat) -> bool {
-    if format == InboundFormat::AnthropicMessages && !headers.contains_key(header::AUTHORIZATION) {
+    matched_key(headers, keys, format).is_some()
+}
+
+/// Constant-time scan that also returns which key matched, so the request log
+/// can attribute the call by key fingerprint rather than the secret itself.
+fn matched_key(headers: &HeaderMap, keys: &[Arc<str>], format: InboundFormat) -> Option<Arc<str>> {
+    let presented: Vec<u8> = if format == InboundFormat::AnthropicMessages
+        && !headers.contains_key(header::AUTHORIZATION)
+    {
         let mut values = headers.get_all(ANTHROPIC_KEY_HEADER).iter();
-        return values
+        let first = values.next()?;
+        if values.next().is_some() {
+            return None;
+        }
+        first.as_bytes().to_vec()
+    } else {
+        let mut auth = headers.get_all(header::AUTHORIZATION).iter();
+        let value = auth
             .next()
-            .is_some_and(|value| values.next().is_none() && matches_key(value.as_bytes(), keys));
-    }
-    authorized(headers, keys)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.split_once(' '))?;
+        if auth.next().is_some() || !value.0.eq_ignore_ascii_case("bearer") {
+            return None;
+        }
+        value.1.trim_start_matches(' ').as_bytes().to_vec()
+    };
+    keys.iter()
+        .find(|key| bool::from(key.as_bytes().ct_eq(&presented)))
+        .map(|key| {
+            // Pepper the fingerprint with a hash of the configured key set so
+            // a log reader cannot confirm a guessed low-entropy key without
+            // knowing every configured key. Keys are hashed sorted so a
+            // reload that only reorders them keeps the same fingerprints.
+            let mut ordered: Vec<&Arc<str>> = keys.iter().collect();
+            ordered.sort();
+            let mut pepper = Sha256::new();
+            for configured in ordered {
+                pepper.update(configured.as_bytes());
+                pepper.update([0]);
+            }
+            let pepper = pepper.finalize();
+            let mut hasher = Sha256::new();
+            hasher.update(pepper);
+            hasher.update(key.as_bytes());
+            let digest = hasher.finalize();
+            let mut fingerprint = String::from("key_");
+            for byte in &digest[..8] {
+                fingerprint.push_str(&format!("{byte:02x}"));
+            }
+            Arc::from(fingerprint)
+        })
 }
 
 fn without_gateway_routing_fields(body: &[u8]) -> Option<Bytes> {
@@ -739,4 +797,24 @@ fn json_body(status: StatusCode, body: Body) -> Response {
         body,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_fingerprint_survives_key_reorder() {
+        let keys: Vec<Arc<str>> = vec!["sk-alpha".into(), "sk-beta".into()];
+        let mut reordered = keys.clone();
+        reordered.reverse();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-beta"),
+        );
+        let before = matched_key(&headers, &keys, InboundFormat::OpenAiChat);
+        let after = matched_key(&headers, &reordered, InboundFormat::OpenAiChat);
+        assert_eq!(before, after);
+    }
 }
