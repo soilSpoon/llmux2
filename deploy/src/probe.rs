@@ -94,11 +94,13 @@ fn parse(args: &[OsString]) -> std::result::Result<Option<Options>, String> {
                     .map_err(|_| "argument --per-run: invalid value".to_string())?
             }
             "--timeout" => {
-                options.timeout = Duration::from_secs_f64(
-                    take(&mut index, flag)?
-                        .parse()
-                        .map_err(|_| "argument --timeout: invalid value".to_string())?,
-                )
+                let seconds: f64 = take(&mut index, flag)?
+                    .parse()
+                    .map_err(|_| "argument --timeout: invalid value".to_string())?;
+                options.timeout = Duration::try_from_secs_f64(seconds)
+                    .ok()
+                    .filter(|timeout| !timeout.is_zero())
+                    .ok_or_else(|| "argument --timeout: invalid value".to_string())?;
             }
             "--all-formats" => {
                 if inline.is_some() {
@@ -169,7 +171,8 @@ fn read_body(
                     "response body exceeds probe limit",
                 ));
             }
-            Read::by_ref(reader).take(length).read_to_end(&mut body)?;
+            body.resize(length as usize, 0);
+            reader.read_exact(&mut body)?;
         }
         None => {
             Read::by_ref(reader)
@@ -186,6 +189,114 @@ fn read_body(
     Ok(body)
 }
 
+fn timed_out() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "probe request deadline exceeded",
+    )
+}
+
+fn budget(deadline: Instant) -> std::io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(timed_out());
+    }
+    Ok(remaining)
+}
+
+fn connect(
+    addresses: impl Iterator<Item = std::net::SocketAddr>,
+    deadline: Instant,
+) -> std::io::Result<TcpStream> {
+    let mut last_error = None;
+    for address in addresses {
+        match TcpStream::connect_timeout(&address, budget(deadline)?.min(Duration::from_secs(10))) {
+            Ok(stream) => return Ok(stream),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(timed_out())
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no addresses")))
+}
+
+fn write_all(stream: &TcpStream, mut data: &[u8], deadline: Instant) -> std::io::Result<()> {
+    let mut stream = stream;
+    while !data.is_empty() {
+        stream.set_write_timeout(Some(budget(deadline)?))?;
+        let written = match stream.write(data) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(timed_out())
+            }
+            other => other?,
+        };
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to write probe request",
+            ));
+        }
+        data = &data[written..];
+    }
+    Ok(())
+}
+
+struct DeadlineReader {
+    reader: BufReader<TcpStream>,
+    deadline: Instant,
+}
+impl Read for DeadlineReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reader
+            .get_ref()
+            .set_read_timeout(Some(budget(self.deadline)?))?;
+        match self.reader.read(buf) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                Err(timed_out())
+            }
+            other => other,
+        }
+    }
+}
+impl BufRead for DeadlineReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.reader
+            .get_ref()
+            .set_read_timeout(Some(budget(self.deadline)?))?;
+        match self.reader.fill_buf() {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                Err(timed_out())
+            }
+            other => other,
+        }
+    }
+    fn consume(&mut self, amount: usize) {
+        self.reader.consume(amount)
+    }
+}
+
 fn request(
     listen: &str,
     method: &str,
@@ -195,13 +306,12 @@ fn request(
     timeout: Duration,
 ) -> Result<Response> {
     use std::net::ToSocketAddrs;
-    let mut addresses = listen.to_socket_addrs()?;
-    let address = addresses
-        .next()
-        .ok_or_else(|| format!("'{listen}' resolved to no addresses"))?;
-    let mut stream = TcpStream::connect_timeout(&address, timeout.min(Duration::from_secs(10)))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    let deadline = Instant::now() + timeout;
+    let addresses: Vec<_> = listen.to_socket_addrs()?.collect();
+    if addresses.is_empty() {
+        return Err(format!("'{listen}' resolved to no addresses").into());
+    }
+    let stream = connect(addresses.into_iter(), deadline)?;
     let mut text = format!("{method} {path} HTTP/1.1\r\nHost: {listen}\r\nConnection: close\r\n");
     if let Some(key) = key {
         text += &format!("Authorization: Bearer {key}\r\n");
@@ -213,11 +323,14 @@ fn request(
         );
     }
     text += "\r\n";
-    stream.write_all(text.as_bytes())?;
+    write_all(&stream, text.as_bytes(), deadline)?;
     if let Some(body) = body {
-        stream.write_all(body.as_bytes())?;
+        write_all(&stream, body.as_bytes(), deadline)?;
     }
-    let mut reader = BufReader::new(stream);
+    let mut reader = DeadlineReader {
+        reader: BufReader::new(stream),
+        deadline,
+    };
     let mut line = String::new();
     Read::by_ref(&mut reader).take(65537).read_line(&mut line)?;
     let mut status_line = line.split_whitespace();
@@ -414,6 +527,7 @@ fn run(options: &Options) -> Result<bool> {
         other => record("models", start, other, ok),
     });
     let explicit = options.models.is_some();
+    let mut pending_next = None;
     let selected: Vec<String> = match &options.models {
         Some(models) => models.clone(),
         None => {
@@ -426,21 +540,10 @@ fn run(options: &Options) -> Result<bool> {
                     .unwrap_or_else(|| json!({"next": 0}));
                 let next = state["next"].as_u64().unwrap_or(0) as usize % listed.len();
                 let count = options.per_run.min(listed.len());
-                let selected: Vec<String> = (0..count)
+                pending_next = Some((next + count) % listed.len());
+                (0..count)
                     .map(|i| listed[(next + i) % listed.len()].clone())
-                    .collect();
-                atomic_write(
-                    &options.state_file,
-                    |file| {
-                        file.write_all(
-                            json!({"next": (next + count) % listed.len()})
-                                .to_string()
-                                .as_bytes(),
-                        )
-                    },
-                    0o600,
-                )?;
-                selected
+                    .collect()
             }
         }
     };
@@ -517,6 +620,15 @@ fn run(options: &Options) -> Result<bool> {
             }
         }
     }
+    // Advance the rotation cursor only after this run's probes ran, so a
+    // crash mid-run retries the same models instead of skipping them.
+    if let Some(next) = pending_next {
+        atomic_write(
+            &options.state_file,
+            |file| file.write_all(json!({"next": next}).to_string().as_bytes()),
+            0o600,
+        )?;
+    }
     let ok = checks.iter().all(|c| c["ok"] == true);
     println!(
         "{}",
@@ -548,5 +660,35 @@ pub fn probe_entry() -> i32 {
             eprintln!("{}\nllmux2-probe: error: {error}", usage());
             2
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn timeout_rejects_nonpositive_and_unrepresentable_values() {
+        for value in ["NaN", "inf", "-1", "0"] {
+            let args = [OsString::from("--timeout"), OsString::from(value)];
+            assert!(parse(&args).is_err(), "--timeout {value}");
+        }
+        let args = [OsString::from("--timeout"), OsString::from("5")];
+        let options = parse(&args).unwrap().unwrap();
+        assert_eq!(options.timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn connect_walks_addresses_until_one_accepts() {
+        let dead = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let live_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let live = live_listener.local_addr().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = connect([dead, live].into_iter(), deadline).unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), live);
     }
 }

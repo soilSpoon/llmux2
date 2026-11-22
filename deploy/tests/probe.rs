@@ -11,7 +11,7 @@ use std::{
         mpsc, Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 struct Home(PathBuf);
@@ -53,6 +53,9 @@ struct Reply {
     status: u16,
     headers: Vec<(String, String)>,
     body: String,
+    declared_length: Option<usize>,
+    hang: bool,
+    trickle: Option<Duration>,
 }
 impl Reply {
     fn json(status: u16, body: Value) -> Self {
@@ -60,6 +63,9 @@ impl Reply {
             status,
             headers: vec![("content-type".into(), "application/json".into())],
             body: body.to_string(),
+            declared_length: None,
+            hang: false,
+            trickle: None,
         }
     }
     fn text(status: u16, body: &str) -> Self {
@@ -67,6 +73,39 @@ impl Reply {
             status,
             headers: vec![],
             body: body.into(),
+            declared_length: None,
+            hang: false,
+            trickle: None,
+        }
+    }
+    fn truncated(body: &str, declared_length: usize) -> Self {
+        Self {
+            status: 200,
+            headers: vec![],
+            body: body.into(),
+            declared_length: Some(declared_length),
+            hang: false,
+            trickle: None,
+        }
+    }
+    fn hang() -> Self {
+        Self {
+            status: 200,
+            headers: vec![],
+            body: String::new(),
+            declared_length: None,
+            hang: true,
+            trickle: None,
+        }
+    }
+    fn trickle(status: u16, body: &str, interval: Duration) -> Self {
+        Self {
+            status,
+            headers: vec![],
+            body: body.into(),
+            declared_length: None,
+            hang: false,
+            trickle: Some(interval),
         }
     }
 }
@@ -100,16 +139,42 @@ impl Gateway {
                         .unwrap()
                         .pop_front()
                         .unwrap_or_else(|| Reply::text(500, "no scripted reply"));
+                    if reply.hang {
+                        // Never respond; poll stop so the test can shut down.
+                        for _ in 0..1200 {
+                            if stopped.try_recv().is_ok() {
+                                return;
+                            }
+                            thread::sleep(Duration::from_millis(25));
+                        }
+                        return;
+                    }
                     let mut response = format!("HTTP/1.1 {}\r\n", status_line(reply.status));
                     let mut headers = reply.headers;
-                    headers.push(("content-length".into(), reply.body.len().to_string()));
+                    headers.push((
+                        "content-length".into(),
+                        reply
+                            .declared_length
+                            .unwrap_or(reply.body.len())
+                            .to_string(),
+                    ));
                     headers.push(("connection".into(), "close".into()));
                     for (name, value) in headers {
                         response += &format!("{name}: {value}\r\n");
                     }
                     response += "\r\n";
                     response += &reply.body;
-                    stream.write_all(response.as_bytes()).unwrap();
+                    if let Some(interval) = reply.trickle {
+                        for byte in response.as_bytes() {
+                            if stream.write_all(&[*byte]).is_err() {
+                                break;
+                            }
+                            let _ = stream.flush();
+                            thread::sleep(interval);
+                        }
+                    } else {
+                        stream.write_all(response.as_bytes()).unwrap();
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if stopped.try_recv().is_ok() {
@@ -240,6 +305,22 @@ fn probe_help_and_argument_errors() {
     assert_eq!(output.status.code(), Some(2));
     let output = home.run(&["--timeout", "abc"]);
     assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn nonpositive_or_unrepresentable_timeout_is_an_argument_error() {
+    let home = Home::new();
+    for args in [
+        vec!["--timeout", "NaN"],
+        vec!["--timeout", "inf"],
+        vec!["--timeout=-1"],
+        vec!["--timeout", "0"],
+    ] {
+        let output = home.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
+    let output = home.run(&["--timeout", "5"]);
+    assert_eq!(output.status.code(), Some(1));
 }
 
 #[test]
@@ -526,4 +607,77 @@ fn empty_models_pin_is_an_argument_error() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--models"));
+}
+
+#[test]
+fn truncated_body_fails_the_health_check() {
+    let home = Home::new();
+    let (gateway, stop) = Gateway::start(vec![Reply::truncated("ok", 100)]);
+    let output = listen_flag(&home, &gateway, &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let report = summary(&output);
+    assert_eq!(report["checks"][0]["ok"], false);
+    assert!(report["checks"][0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("failed to fill whole buffer"));
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn trickling_response_still_fails_at_the_request_deadline() {
+    let home = Home::new();
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::trickle(200, "ok", Duration::from_millis(50)),
+        models_reply(),
+        Reply::json(200, json!({"choices":[{}]})),
+    ]);
+    let output = listen_flag(&home, &gateway, &["--timeout", "1"]);
+    assert_eq!(output.status.code(), Some(1));
+    let report = summary(&output);
+    assert_eq!(report["checks"][0]["ok"], false);
+    assert!(report["checks"][0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("deadline"));
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn killed_probe_does_not_advance_the_rotation_cursor() {
+    let home = Home::new();
+    let (gateway, stop) =
+        Gateway::start(vec![Reply::text(200, "ok"), models_reply(), Reply::hang()]);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_llmux2-probe"))
+        .args([
+            "--listen".into(),
+            gateway.listen.clone(),
+            "--key-file".into(),
+            home.key().to_string_lossy().into_owned(),
+            "--state-file".into(),
+            home.state().to_string_lossy().into_owned(),
+            "--timeout".into(),
+            "300".into(),
+        ])
+        .env("HOME", &home.0)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while gateway.paths().len() < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "probe never reached the chat probe"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    let _ = child.wait().unwrap();
+    let state = fs::read_to_string(home.state())
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    assert!(
+        state.as_ref().is_none_or(|s| s["next"].as_u64() == Some(0)),
+        "rotation cursor advanced before the probes completed"
+    );
+    stop.send(()).unwrap();
 }
