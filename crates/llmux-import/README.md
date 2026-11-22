@@ -527,7 +527,11 @@ input, not persisted state.
 Separately, upstream models that cannot serve chat-class endpoints — the
 reviewed non-chat table in `src/policy.rs` (`mistral-embed`,
 `codestral-embed`, `span-01-lite`) — are classified out of every combo leg at
-emit with a warning, and a combo left with no deployments is skipped as usual.
+emit with a warning, and a combo left with no deployments is skipped as
+usual. Matching is on the emitted id's leaf segment after stripping a
+`:variant` suffix, so gateway-routed ids like
+`openrouter/respan/span-01-lite[:free]` drop with `span-01-lite` while
+unrelated routed models are untouched.
 
 `--listen HOST:PORT` sets the emitted `[server].listen` (default
 `127.0.0.1:8080`). Scheduled re-imports pass the deployed slot's address:

@@ -237,6 +237,22 @@ fn non_chat_models_are_never_emitted_as_chat_routes() {
     root["combos"].as_array_mut().unwrap().push(
         json!({"id":"mix","name":"mixed","models":["openai/first","openai/codestral-embed","openai/span-01-lite"]}),
     );
+    // OpenRouter-routed ids keep their gateway path in `upstream_model`
+    // (`respan/...` legs resolve through the respan node to
+    // `openrouter/respan/span-01-lite[:free]`); the leaf is still a reviewed
+    // non-chat model, so those legs drop too.
+    root["providerNodes"].as_array_mut().unwrap().push(
+        json!({"id":"respan-node","prefix":"respan","type":"openai-compatible","apiType":"chat","baseUrl":"https://api.respan.ai/api/v1"}),
+    );
+    root["providerConnections"].as_array_mut().unwrap().push(
+        json!({"id":"respan-conn","provider":"respan-node","authType":"apikey","apiKey":"synthetic-respan"}),
+    );
+    root["combos"].as_array_mut().unwrap().push(
+        json!({"id":"routed","name":"routed","models":["respan/openrouter/respan/span-01-lite","respan/openrouter/respan/span-01-lite:free","respan/gpt-6-luna"]}),
+    );
+    root["combos"].as_array_mut().unwrap().push(
+        json!({"id":"routed-only","name":"routed-only","models":["respan/openrouter/respan/span-01-lite","respan/openrouter/respan/span-01-lite:free"]}),
+    );
     let (dir, result) = run(&root, &[]);
     assert!(
         result.status.success(),
@@ -248,17 +264,30 @@ fn non_chat_models_are_never_emitted_as_chat_routes() {
         stderr.contains("embed-only") && stderr.contains("non-chat"),
         "{stderr}"
     );
+    // Routed non-chat ids report their full emitted id, not just the leaf.
+    assert!(
+        stderr.contains("dropped non-chat model openrouter/respan/span-01-lite")
+            && stderr.contains("dropped non-chat model openrouter/respan/span-01-lite:free"),
+        "{stderr}"
+    );
     // A combo whose every leg is non-chat disappears from /v1/models; a mixed
     // combo keeps only its chat legs.
     let cfg =
         RuntimeConfig::parse(&fs::read_to_string(dir.path().join("out.toml")).unwrap()).unwrap();
     assert!(!cfg.model_names.contains_key("embed-only"));
+    assert!(!cfg.model_names.contains_key("routed-only"));
     let upstreams: Vec<_> = cfg.models[cfg.model_names["mixed"]]
         .deployments
         .iter()
         .map(|idx| cfg.deployments[idx.0 as usize].upstream_model.as_ref())
         .collect();
     assert_eq!(upstreams, ["first"]);
+    let routed: Vec<_> = cfg.models[cfg.model_names["routed"]]
+        .deployments
+        .iter()
+        .map(|idx| cfg.deployments[idx.0 as usize].upstream_model.as_ref())
+        .collect();
+    assert_eq!(routed, ["gpt-6-luna"]);
 }
 
 #[test]

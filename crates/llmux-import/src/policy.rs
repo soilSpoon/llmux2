@@ -248,10 +248,47 @@ const WORKERS: &[&str] = &[
 // respan endpoint-type rejection observed on OCI probe sweep 2026-11-22 (span-01-lite)
 pub(super) const NON_CHAT_MODELS: &[&str] = &["codestral-embed", "mistral-embed", "span-01-lite"];
 
+/// Whether an emitted upstream model id resolves to a reviewed non-chat
+/// model. Gateway-routed ids keep their routing path — e.g. a leg through
+/// the respan node emits `openrouter/respan/span-01-lite` — so the match is
+/// on the leaf segment, with any `:variant` suffix (`:free`, `:batch`)
+/// stripped. The non-chat property belongs to the model itself, so a routed
+/// `…/mistral-embed` drops too, while a different leaf (e.g.
+/// `openrouter/respan/span-01-lite-v2` or `openrouter/openai/gpt-4o`) is
+/// unaffected.
+pub(super) fn non_chat(model: &str) -> bool {
+    let leaf = model.rsplit('/').next().unwrap_or(model);
+    let leaf = leaf.split_once(':').map_or(leaf, |(base, _)| base);
+    NON_CHAT_MODELS.contains(&leaf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn non_chat_classification_matches_routed_leaf_and_variant() {
+        for id in [
+            "span-01-lite",
+            "openrouter/respan/span-01-lite",
+            "openrouter/respan/span-01-lite:free",
+            "mistral-embed",
+            "openrouter/mistralai/codestral-embed",
+        ] {
+            assert!(non_chat(id), "{id}");
+        }
+        for id in [
+            "",
+            "openrouter/openai/gpt-4o",
+            "openrouter/respan/span-01-lite-v2",
+            "span-01-lite-plus",
+            "openrouter/",
+            ":free",
+        ] {
+            assert!(!non_chat(id), "{id}");
+        }
+    }
 
     #[test]
     fn cost_metadata_is_exact_and_does_not_accept_float_underflow() {

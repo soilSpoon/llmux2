@@ -1371,7 +1371,7 @@ pub fn import_with_options(
         }
         let mut nonchat = Vec::new();
         deployments.retain(|dep| {
-            let chat = !policy::NON_CHAT_MODELS.contains(&string(dep, "upstream_model"));
+            let chat = !policy::non_chat(string(dep, "upstream_model"));
             if !chat {
                 nonchat.push(string(dep, "upstream_model").to_owned());
             }

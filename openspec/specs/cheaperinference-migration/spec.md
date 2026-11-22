@@ -619,7 +619,10 @@ import before any output is written.
 Upstream model IDs that cannot serve chat-completions-class endpoints —
 embedding or typed-endpoint models listed in `src/policy.rs`'s reviewed
 non-chat table — SHALL be classified out of every combo leg at emit, with a
-warning; a combo left with no deployments SHALL be skipped as usual.
+warning; a combo left with no deployments SHALL be skipped as usual. The
+match is on the emitted id's leaf segment with any `:variant` suffix
+(`:free`, `:batch`) stripped, so gateway-routed ids such as
+`openrouter/respan/span-01-lite` classify out with `span-01-lite`.
 
 #### Scenario: Dead route dropped at import
 
@@ -632,3 +635,7 @@ serve it under another name.
 WHEN a combo leg names a reviewed non-chat upstream model
 THEN that leg is not emitted; a combo with only non-chat legs is not
 advertised at all.
+WHEN a combo leg routes a reviewed non-chat model through a gateway, such
+that the emitted id keeps a routing path (for example
+`openrouter/respan/span-01-lite` or its `:free` variant)
+THEN that leg is not emitted either; unrelated routed models keep their legs.
