@@ -136,8 +136,6 @@ existing environment inputs and success/failure exit codes.
 AND the non-default `xtask` workspace member SHALL expose one binary with a
 module per tool, independent of gateway crates.
 
-||||||| parent of d4d160c (Add authenticated /admin management API with hot config reload)
-=======
 ### Requirement: Management over one shared core
 
 Operators SHALL be able to inspect and control the running gateway through an
