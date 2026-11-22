@@ -44,6 +44,7 @@ enum Reply {
     Limit,
     Timeout,
     NotFound(&'static str),
+    BadRequest(&'static str),
     Image,
     Document,
     BrokenStream,
@@ -80,6 +81,16 @@ impl Upstream {
                     Json(json!({
                         "type":"error",
                         "error":{"type":"not_found_error","code":code,"message":"Model unavailable"}
+                    })),
+                )
+                    .into_response(),
+            ),
+            Reply::BadRequest(message) => Some(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "type":"error",
+                        "error":{"type":"invalid_request_error","message":message}
                     })),
                 )
                     .into_response(),
@@ -491,6 +502,37 @@ async fn only_explicit_anthropic_model_not_found_fails_over() {
             assert_eq!(fixture.counts(), [1, 0]);
         }
     }
+}
+
+#[tokio::test]
+async fn anthropic_insufficient_credit_fails_over_but_invalid_request_does_not() {
+    let fixture = Fixture::start(
+        (Reply::BadRequest("messages: invalid input"), 0),
+        (Reply::Ok, 10),
+    )
+    .await;
+    let (response, _) = fixture.request(false).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(fixture.counts(), [1, 0]);
+
+    let fixture = Fixture::start(
+        (
+            Reply::BadRequest(
+                "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.",
+            ),
+            0,
+        ),
+        (Reply::Ok, 10),
+    )
+    .await;
+    let (response, text) = fixture.request(false).await;
+    check_route(&response, "gpt", "2");
+    assert!(text.contains("Hi from OpenAI"));
+    assert_eq!(fixture.counts(), [1, 1]);
+
+    let (response, _) = fixture.request(false).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(fixture.counts(), [1, 1]);
 }
 
 #[tokio::test]
