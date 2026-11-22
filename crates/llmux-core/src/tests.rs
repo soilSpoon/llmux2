@@ -504,6 +504,16 @@ fn sized_request(prompt_tokens: u32, max_output_tokens: Option<u32>) -> GatewayR
 }
 
 #[tokio::test]
+async fn twenty_thousand_token_request_routes_to_the_larger_window() {
+    let (executor, adapter, _, _server) =
+        fixture_with_context(vec![], false, [Some(8_192), Some(32_768), Some(8_192)]).await;
+    let response = executor.execute(sized_request(20_000, None)).await.unwrap();
+    assert_eq!(response.deployment.as_ref(), "dep1");
+    assert_eq!(response.attempts, 1);
+    assert_eq!(adapter.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn skips_deployments_whose_context_is_too_small() {
     let (executor, adapter, _, _server) =
         fixture_with_context(vec![], false, [Some(100), None, Some(1000)]).await;

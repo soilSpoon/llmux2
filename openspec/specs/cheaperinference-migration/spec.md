@@ -463,12 +463,18 @@ scheduling nor batch discounts.
 ### Requirement: Collapse duplicate deployment legs
 
 After a model's deployments are assembled, including per-deployment headers,
-`strip_request_fields`, and an optional OmniRoute fallback leg, the importer
-SHALL drop a later leg that repeats an earlier leg of that same model. Identity
-is the credential id, `upstream_model`, `base_url`, and the per-deployment
-`headers` and `strip_request_fields`. Missing and empty header or strip lists
-are the same. The kept leg is the one with the lowest priority, then the
-earlier source position. The importer SHALL NOT collapse legs across models.
+`strip_request_fields`, context and quota fields, and an optional OmniRoute
+fallback leg, the importer SHALL drop a later leg that repeats an earlier leg
+of that same model. Identity is the credential id, `upstream_model`,
+`base_url`, per-deployment `headers`, `strip_request_fields`, `max_context`,
+`quota`, and `timeout_ms`. Missing and empty header, strip, or quota values
+are the same. A known `max_context` is not the same as a missing one, and two
+different limits are not duplicates, so a request that fits only the larger
+window still has a route. Header `file:` references are compared by the file
+bytes when the file can be read at import time; an unreadable reference is
+compared as the reference string. The kept leg is the one with the lowest
+priority, then the earlier source position. The importer SHALL NOT collapse
+legs across models.
 It SHALL emit one warning per affected model naming how many legs were dropped,
 and that warning SHALL NOT contain credential values.
 
@@ -496,6 +502,19 @@ THEN both deployments are kept, even if each connection is listed more than once
 
 WHEN two legs share a credential, upstream model, and base URL but differ in headers or `strip_request_fields`
 THEN both are kept.
+
+#### Scenario: Different context windows stay routable
+
+WHEN two anonymous legs share an endpoint and upstream model but have context limits of 8192 and 32768
+THEN both limits survive
+AND a 20000-token request still has a deployment whose window fits it.
+
+#### Scenario: Identical header files are one leg
+
+WHEN two anonymous legs share an endpoint and their header files contain the same bytes
+THEN one deployment remains.
+WHEN a header file cannot be read at import time
+THEN its reference string is the identity, so a different unreadable path is not collapsed.
 
 #### Scenario: Fallback leg is not a native clone
 

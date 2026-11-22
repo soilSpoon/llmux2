@@ -217,3 +217,81 @@ fn fallback_leg_survives_native_dedupe_unless_it_is_itself_a_duplicate() {
     assert_eq!(catch_all.deployments.len(), 1);
     assert!(config.deployments[catch_all.deployments[0].0 as usize].fallback);
 }
+
+#[test]
+fn different_context_windows_on_the_same_anonymous_endpoint_both_survive() {
+    let root = json!({
+        "providerConnections":[
+            {"id":"small","provider":"kilo","authType":"none"},
+            {"id":"large","provider":"kilocode","authType":"none"}
+        ],
+        "combos":[{
+            "name":"windows",
+            "models":[
+                {"providerId":"kilo","model":"vendor/test","connectionId":"small"},
+                {"providerId":"kilocode","model":"vendor/test","connectionId":"large"}
+            ]
+        }],
+        "modelContextOverrides":[
+            {"provider":"kilo","modelId":"vendor/test","realContext":8192},
+            {"provider":"kilocode","modelId":"vendor/test","realContext":32768}
+        ],
+        "apiKeys":[{"key":"synthetic-client"}]
+    });
+    let (report, config) = import(&root);
+    let deployments = legs(&config, "windows");
+    assert_eq!(deployments.len(), 2);
+    assert_eq!(
+        deployments
+            .iter()
+            .map(|dep| dep.max_context)
+            .collect::<Vec<_>>(),
+        vec![Some(8192), Some(32768)]
+    );
+    assert_eq!(deployments[0].base_url, deployments[1].base_url);
+    assert!(deployments.iter().all(|dep| dep.credential.is_empty()));
+    let needed = 20_000u64;
+    assert!(
+        deployments.iter().any(|dep| dep
+            .max_context
+            .is_some_and(|limit| needed <= u64::from(limit))),
+        "a 20000-token request must still have a window"
+    );
+    assert!(!report
+        .warnings
+        .iter()
+        .any(|warning| warning.starts_with("windows: dropped")));
+}
+
+#[test]
+fn identical_header_files_collapse_to_one_leg() {
+    let root = json!({
+        "providerConnections":[
+            {"id":"a","provider":"kilo","authType":"none","providerSpecificData":{"customHeaders":{"X-Tenant":"synthetic-tenant"}}},
+            {"id":"b","provider":"kilo","authType":"none","providerSpecificData":{"customHeaders":{"X-Tenant":"synthetic-tenant"}}},
+            {"id":"c","provider":"kilo","authType":"none","providerSpecificData":{"customHeaders":{"X-Tenant":"other-tenant"}}}
+        ],
+        "combos":[{
+            "name":"headers",
+            "models":[
+                {"providerId":"kilo","model":"vendor/free","connectionId":"a"},
+                {"providerId":"kilo","model":"vendor/free","connectionId":"b"},
+                {"providerId":"kilo","model":"vendor/free","connectionId":"c"}
+            ]
+        }],
+        "apiKeys":[{"key":"synthetic-client"}]
+    });
+    let (report, config) = import(&root);
+    let deployments = legs(&config, "headers");
+    assert_eq!(deployments.len(), 2);
+    let mut values: Vec<_> = deployments
+        .iter()
+        .map(|dep| dep.headers["x-tenant"].to_str().unwrap().to_owned())
+        .collect();
+    values.sort();
+    assert_eq!(values, vec!["other-tenant", "synthetic-tenant"]);
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning == "headers: dropped 1 duplicate deployment"));
+}

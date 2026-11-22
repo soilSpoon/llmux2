@@ -141,13 +141,27 @@ fn anthropic_rejects_sampling(model: &str) -> bool {
         || matches!(parts.as_slice(), ["claude", "opus", "4", "8", ..])
 }
 
-fn deployment_identity(dep: &Value) -> (String, String, String, String, String) {
+fn deployment_identity(
+    dep: &Value,
+) -> (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+) {
     (
         string(dep, "credential").to_owned(),
         string(dep, "upstream_model").to_owned(),
         string(dep, "base_url").to_owned(),
-        identity_field(&dep["headers"]),
+        header_identity(&dep["headers"]),
         identity_field(&dep["strip_request_fields"]),
+        identity_field(&dep["max_context"]),
+        identity_field(&dep["quota"]),
+        identity_field(&dep["timeout_ms"]),
     )
 }
 
@@ -157,6 +171,37 @@ fn identity_field(value: &Value) -> String {
         Value::Object(map) if map.is_empty() => String::new(),
         Value::Array(items) if items.is_empty() => String::new(),
         other => other.to_string(),
+    }
+}
+
+fn header_identity(headers: &Value) -> String {
+    let Some(map) = headers.as_object() else {
+        return String::new();
+    };
+    if map.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<_> = map
+        .iter()
+        .map(|(name, value)| format!("{name}={}", header_material(value.as_str().unwrap_or(""))))
+        .collect();
+    parts.sort();
+    parts.join("\n")
+}
+
+/// A `file:` header reference is compared by the file bytes when that file can
+/// be read at import time. If it cannot be read, the reference string itself
+/// is the identity, so two unreadable paths are not treated as the same header.
+fn header_material(reference: &str) -> String {
+    let Some(path) = reference.strip_prefix("file:") else {
+        return reference.to_owned();
+    };
+    if path.is_empty() {
+        return reference.to_owned();
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => reference.to_owned(),
     }
 }
 
@@ -1341,5 +1386,47 @@ mod dedupe_tests {
         assert_eq!(deps[1]["id"], "omniroute-fallback-m");
         assert_eq!(deps[1]["priority"], 1);
         assert_eq!(warnings, vec!["m: dropped 2 duplicate deployments"]);
+    }
+
+    #[test]
+    fn routing_fields_and_unreadable_header_files_stay_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left");
+        let right = dir.path().join("right");
+        std::fs::write(&left, "same-bytes").unwrap();
+        std::fs::write(&right, "same-bytes").unwrap();
+        let missing_a = dir.path().join("missing-a");
+        let missing_b = dir.path().join("missing-b");
+        let mut models = vec![json!({
+            "name": "m",
+            "deployments": [
+                {"id":"m-0","credential":"","upstream_model":"u","base_url":"https://example.com/v1","priority":0,"max_context":8192,"headers":{"x-a": format!("file:{}", left.display())}},
+                {"id":"m-1","credential":"","upstream_model":"u","base_url":"https://example.com/v1","priority":1,"max_context":8192,"headers":{"x-a": format!("file:{}", right.display())}},
+                {"id":"m-2","credential":"","upstream_model":"u","base_url":"https://example.com/v1","priority":2,"max_context":32768},
+                {"id":"m-3","credential":"","upstream_model":"u","base_url":"https://example.com/v1","priority":3,"quota":{"rpm":1}},
+                {"id":"m-4","credential":"","upstream_model":"u","base_url":"https://example.com/v1","priority":4,"quota":{"rpm":2}},
+                {"id":"m-5","credential":"","upstream_model":"u","base_url":"https://example.com/v1","priority":5,"timeout_ms":1000},
+                {"id":"m-6","credential":"","upstream_model":"u","base_url":"https://example.com/v1","priority":6,"timeout_ms":2000},
+                {"id":"m-7","credential":"","upstream_model":"u","base_url":"https://example.com/v1","priority":7,"headers":{"x-a": format!("file:{}", missing_a.display())}},
+                {"id":"m-8","credential":"","upstream_model":"u","base_url":"https://example.com/v1","priority":8,"headers":{"x-a": format!("file:{}", missing_b.display())}}
+            ]
+        })];
+        let warnings = run(&mut models);
+        let deps = models[0]["deployments"].as_array().unwrap();
+        assert_eq!(deps.len(), 8);
+        assert!(deps.iter().any(|dep| dep["max_context"] == 8192));
+        assert!(deps.iter().any(|dep| dep["max_context"] == 32768));
+        assert!(deps.iter().any(|dep| dep["quota"]["rpm"] == 1));
+        assert!(deps.iter().any(|dep| dep["quota"]["rpm"] == 2));
+        assert!(deps.iter().any(|dep| dep["timeout_ms"] == 1000));
+        assert!(deps.iter().any(|dep| dep["timeout_ms"] == 2000));
+        let unread: Vec<_> = deps
+            .iter()
+            .filter_map(|dep| dep["headers"]["x-a"].as_str())
+            .filter(|value| value.contains("missing-"))
+            .collect();
+        assert_eq!(unread.len(), 2);
+        assert_ne!(unread[0], unread[1]);
+        assert_eq!(warnings, vec!["m: dropped 1 duplicate deployment"]);
     }
 }
