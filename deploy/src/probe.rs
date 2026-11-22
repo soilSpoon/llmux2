@@ -605,7 +605,9 @@ fn run(options: &Options) -> Result<bool> {
         let entry = entry(&name, start, result, ok, "chat", !explicit);
         if entry["skipped"].is_string() {
             // Key-restricted models leave no evidence either way.
-        } else if ok {
+        } else if ok || entry["status"].as_u64() != Some(404) {
+            // Successes and transient failures alike break the consecutive
+            // 404 streak; only deterministic 404s accumulate.
             failures.remove(model);
         } else {
             let count = failures
@@ -617,7 +619,7 @@ fn run(options: &Options) -> Result<bool> {
                 model.clone(),
                 json!({
                     "count": count,
-                    "status": entry["status"].as_u64().unwrap_or(0),
+                    "status": 404,
                 }),
             );
         }

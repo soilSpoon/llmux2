@@ -774,6 +774,29 @@ fn transient_statuses_never_count_as_dead() {
 }
 
 #[test]
+fn a_non_404_failure_resets_the_streak() {
+    let home = Home::new();
+    let dead = || Reply::json(404, json!({"error":{"code":"model_not_found"}}));
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        models_reply(),
+        Reply::json(429, json!({"error":{"message":"cooldown"}})),
+        Reply::text(200, "ok"),
+        models_reply(),
+        dead(),
+        Reply::text(200, "ok"),
+        models_reply(),
+        dead(),
+    ]);
+    // 429 then 404 is one consecutive 404, not two: the streak must not fire.
+    for expected in [0, 0, 1] {
+        let output = listen_flag(&home, &gateway, &["--models", "alpha"]);
+        assert_eq!(summary(&output)["dead"].as_array().unwrap().len(), expected);
+    }
+    stop.send(()).unwrap();
+}
+
+#[test]
 fn dead_file_writes_the_dead_model_list() {
     let home = Home::new();
     let dead_file = home.0.join("dead.json");
