@@ -135,8 +135,16 @@ fn exclude_models_drops_dead_routes_and_their_aliases() {
         br#"["public","mapped-owner","owner-alias","owner"]"#,
     )
     .unwrap();
+    let mut root = fixture();
+    // A live combo with a disabled reference to the dead "owner" must still be
+    // advertised: usable:false legs never expand, so they are not dead legs.
+    root["combos"].as_array_mut().unwrap().push(json!({
+        "id":"surv","name":"survives","models":["openai/first",{"kind":"combo-ref","comboName":"owner","usable":false}]
+    }));
+    // An alias pointing straight at a combo that only collapses during emit.
+    root["modelAliases"]["ghost"] = json!("nested-owner");
     let (dir, result) = run(
-        &fixture(),
+        &root,
         &[
             "--omniroute-fallback",
             "http://127.0.0.1:20128/v1",
@@ -188,9 +196,14 @@ fn exclude_models_drops_dead_routes_and_their_aliases() {
             "{excluded}"
         );
     }
-    // The catch-all still serves, with the dead names excluded.
+    // The catch-all still serves, with the dead names excluded. The disabled
+    // reference on "survives" does not count as a dead leg.
     assert!(cfg.catch_all.is_some());
     assert!(!cfg.catch_all_exclude.contains(&"*".to_string()));
+    assert!(cfg.model_names.contains_key("survives"));
+    // An alias into a combo that collapsed during emit is unreachable too.
+    assert!(!cfg.model_names.contains_key("ghost"));
+    assert!(cfg.catch_all_exclude.contains(&"ghost".to_string()));
 }
 
 #[test]

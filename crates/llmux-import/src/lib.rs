@@ -443,6 +443,9 @@ fn references_dead(
         return false;
     };
     for step in array(combo, "models") {
+        if step["usable"] == false {
+            continue;
+        }
         let raw = step
             .as_str()
             .unwrap_or_else(|| string(step, "model"))
@@ -1325,6 +1328,15 @@ pub fn import_with_options(
         }
         models.push(json!({"name":name,"aliases":[],"deployments":deployments}));
     }
+    // Combos that collapsed during emit can leave aliases pointing at them:
+    // sweep again so those names also join the catch-all exclusion set.
+    aliases.retain(|alias, target| {
+        let keep = !dead.contains(alias) && !dead.contains(target);
+        if !keep {
+            dead.insert(alias.clone());
+        }
+        keep
+    });
     aliases::attach(&mut models, aliases, &mut warnings);
     context.report(&mut warnings);
     if let (Some(options), Some(exclusions)) = (fallback, fallback_exclusions) {
