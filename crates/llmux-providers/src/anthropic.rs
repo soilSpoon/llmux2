@@ -627,7 +627,7 @@ impl ProviderAdapter for Anthropic {
             .find(|field| message.contains(&format!("`{field}` is deprecated for this model")))?;
         let mut payload = serde_json::from_slice::<Value>(body).ok()?;
         payload.as_object_mut()?.remove(field)?;
-        eprintln!("llmux: anthropic rejected `{field}` as deprecated for this model; retrying the same deployment without it");
+        eprintln!("llmux: anthropic rejected `{field}` as deprecated for this model; removed it from the repair payload");
         Some(Bytes::from(payload.to_string()))
     }
     fn observe_limits(&self, headers: &HeaderMap) -> Option<LimitObservation> {
