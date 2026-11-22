@@ -24,8 +24,9 @@ pub struct Thresholds {
     /// Alert when the share of failed attempts (failed_attempts +
     /// stream_errors) across new attempts since the last run exceeds this.
     pub failure_ratio: Option<f64>,
-    /// Minimum new attempts before `failure_ratio` applies (default 10).
-    pub min_attempts: u64,
+    /// Minimum new attempts before `failure_ratio` applies (default 10;
+    /// `0` disables the floor).
+    pub min_attempts: Option<u64>,
     /// Alert when more deployments are in cooldown than this count.
     pub max_cooldowns: Option<u32>,
     /// Alert when more deployments are disabled than this count.
@@ -51,11 +52,7 @@ impl Thresholds {
         }
     }
     fn min_attempts(&self) -> u64 {
-        if self.min_attempts == 0 {
-            10
-        } else {
-            self.min_attempts
-        }
+        self.min_attempts.unwrap_or(10)
     }
 }
 
@@ -193,27 +190,33 @@ pub fn check<M: Monitor>(
         Ok((200, body)) => {
             let body: Value = serde_json::from_slice(&body)
                 .map_err(|e| format!("invalid /admin/deployments response: {e}"))?;
-            let deployments: Vec<Value> =
-                body["deployments"].as_array().cloned().unwrap_or_default();
-            let state_path = root.join("alert-state.json");
-            let previous = fs::read(&state_path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-            alerts.extend(evaluate(
-                &deployments,
-                previous
-                    .as_ref()
-                    .and_then(|state| state["deployments"].as_object()),
-                thresholds,
-            ));
-            atomic_write(
-                &state_path,
-                |output| {
-                    serde_json::to_writer(&mut *output, &snapshot(&deployments))
-                        .map_err(io::Error::other)
-                },
-                0o600,
-            )?;
+            match body["deployments"].as_array() {
+                Some(deployments) => {
+                    let deployments = deployments.clone();
+                    let state_path = root.join("alert-state.json");
+                    let previous = fs::read(&state_path)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+                    alerts.extend(evaluate(
+                        &deployments,
+                        previous
+                            .as_ref()
+                            .and_then(|state| state["deployments"].as_object()),
+                        thresholds,
+                    ));
+                    atomic_write(
+                        &state_path,
+                        |output| {
+                            serde_json::to_writer(&mut *output, &snapshot(&deployments))
+                                .map_err(io::Error::other)
+                        },
+                        0o600,
+                    )?;
+                }
+                None => alerts.push(format!(
+                    "admin deployments check at {listen} returned no deployments array"
+                )),
+            }
         }
         Ok((status, _)) => alerts.push(format!(
             "admin deployments check at {listen} returned HTTP {status}"
@@ -268,7 +271,7 @@ mod tests {
     fn failure_ratio_uses_delta_and_window() {
         let mut thresholds = Thresholds {
             failure_ratio: Some(0.5),
-            min_attempts: 5,
+            min_attempts: Some(5),
             ..Default::default()
         };
         let now = [
@@ -296,7 +299,7 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].contains("10/10"));
         // Below the attempt window nothing fires.
-        thresholds.min_attempts = 20;
+        thresholds.min_attempts = Some(20);
         assert!(evaluate(&now, Some(&before), &thresholds).is_empty());
         // A counter reset skips the ratio and re-bases.
         let reset = [dep("a", 4, 1, 0, false, false)];
@@ -307,6 +310,19 @@ mod tests {
         assert!(evaluate(&mixed, Some(&before_mixed), &thresholds).is_empty());
         // No snapshot: no ratio at all.
         assert!(evaluate(&now, None, &thresholds).is_empty());
+    }
+
+    #[test]
+    fn min_attempts_zero_disables_the_floor() {
+        let thresholds = Thresholds {
+            failure_ratio: Some(0.5),
+            min_attempts: Some(0),
+            ..Default::default()
+        };
+        // 3/4 new attempts failed: 75% > 50% fires despite attempts < 10.
+        let now = [dep("a", 101, 3, 0, false, false)];
+        let before = prev(&[("a", 100, 0, 0)]);
+        assert_eq!(evaluate(&now, Some(&before), &thresholds).len(), 1);
     }
 
     #[test]

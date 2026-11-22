@@ -106,7 +106,7 @@ checks are skipped.
 listen = "127.0.0.1:8090"          # default: recorded active.json listen
 key_file = "/home/opc/llmux2/dashboard.key"  # bearer for /admin stats
 failure_ratio = 0.2                # new failures / new attempts per deployment
-min_attempts = 10                  # window floor for failure_ratio (default 10)
+min_attempts = 10                  # window floor for failure_ratio (default 10; 0 disables it)
 max_cooldowns = 2                  # more than this many cooling deployments
 max_disabled = 0                   # any disabled deployment alerts
 ```

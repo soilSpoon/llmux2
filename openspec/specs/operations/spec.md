@@ -81,8 +81,10 @@ reachability checks). An unset threshold disables its check. `failure_ratio`
 SHALL compare against the previous counter snapshot persisted atomically in
 `alert-state.json`, counting `failed_attempts` plus `stream_errors` over new
 attempts per deployment, and SHALL apply only when new attempts reach
-`min_attempts` (default 10). A counter decrease SHALL skip the ratio and
-re-base the snapshot. `llmux2-alert` SHALL NOT take the deployment lock.
+`min_attempts` (default 10; `0` disables the floor). A counter decrease in
+`routed`, `failed_attempts`, or `stream_errors` SHALL skip the ratio and
+re-base the snapshot. A 200 response without a `deployments` array SHALL alert
+and leave the snapshot untouched. `llmux2-alert` SHALL NOT take the deployment lock.
 
 #### Scenario: Breach reports and exits
 

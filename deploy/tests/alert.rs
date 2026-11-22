@@ -221,6 +221,21 @@ fn failure_ratio_alerts_on_delta_window_only() {
 }
 
 #[test]
+fn admin_response_without_deployments_alerts_and_keeps_baseline() {
+    let home = Home::new();
+    let gateway = Gateway::start(None, vec!["{}".to_string()]);
+    home.record(&gateway.listen);
+    home.state(
+        "{\"deployments\":{\"d1\":{\"routed\":5,\"failed_attempts\":0,\"stream_errors\":0}}}",
+    );
+    let output = home.run(&[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("deployments"));
+    // The unusable response must not overwrite the counter baseline.
+    assert!(home.saved_state().contains("\"routed\":5"));
+}
+
+#[test]
 fn counter_reset_skips_ratio_but_updates_baseline() {
     let home = Home::new();
     let gateway = Gateway::start(None, vec![deployments(&[("d1", 5, 0, 0, false, false)])]);
