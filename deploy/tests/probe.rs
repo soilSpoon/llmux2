@@ -681,3 +681,35 @@ fn killed_probe_does_not_advance_the_rotation_cursor() {
     );
     stop.send(()).unwrap();
 }
+
+#[test]
+fn unsavable_rotation_cursor_still_reports_probe_results() {
+    let home = Home::new();
+    let blocker = home.0.join("blocker");
+    fs::write(&blocker, "x").unwrap();
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        models_reply(),
+        Reply::json(200, json!({"choices":[{}]})),
+    ]);
+    let output = Command::new(env!("CARGO_BIN_EXE_llmux2-probe"))
+        .args([
+            "--listen",
+            &gateway.listen,
+            "--key-file",
+            &home.key().to_string_lossy(),
+            "--state-file",
+            &blocker.join("state.json").to_string_lossy(),
+        ])
+        .env("HOME", &home.0)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let report = summary(&output);
+    let checks = report["checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 4);
+    assert_eq!(checks[3]["name"], "rotation-state");
+    assert_eq!(checks[3]["ok"], false);
+    assert_eq!(checks[2]["ok"], true);
+    stop.send(()).unwrap();
+}

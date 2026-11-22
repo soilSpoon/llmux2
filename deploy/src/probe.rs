@@ -127,6 +127,7 @@ struct Response {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    peer: std::net::SocketAddr,
 }
 
 fn read_body(
@@ -212,14 +213,6 @@ fn connect(
     for address in addresses {
         match TcpStream::connect_timeout(&address, budget(deadline)?.min(Duration::from_secs(10))) {
             Ok(stream) => return Ok(stream),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) =>
-            {
-                return Err(timed_out())
-            }
             Err(error) => last_error = Some(error),
         }
     }
@@ -299,6 +292,7 @@ impl BufRead for DeadlineReader {
 
 fn request(
     listen: &str,
+    pin: Option<std::net::SocketAddr>,
     method: &str,
     path: &str,
     key: Option<&str>,
@@ -307,11 +301,17 @@ fn request(
 ) -> Result<Response> {
     use std::net::ToSocketAddrs;
     let deadline = Instant::now() + timeout;
-    let addresses: Vec<_> = listen.to_socket_addrs()?.collect();
+    // A pinned address is the one that already passed the health check; the
+    // key may go there only, never to an unverified sibling of `listen`.
+    let addresses: Vec<_> = match pin {
+        Some(address) => vec![address],
+        None => listen.to_socket_addrs()?.collect(),
+    };
     if addresses.is_empty() {
         return Err(format!("'{listen}' resolved to no addresses").into());
     }
     let stream = connect(addresses.into_iter(), deadline)?;
+    let peer = stream.peer_addr()?;
     let mut text = format!("{method} {path} HTTP/1.1\r\nHost: {listen}\r\nConnection: close\r\n");
     if let Some(key) = key {
         text += &format!("Authorization: Bearer {key}\r\n");
@@ -366,6 +366,7 @@ fn request(
         status,
         headers,
         body,
+        peer,
     })
 }
 
@@ -407,12 +408,21 @@ fn record(name: &str, start: Instant, result: Result<Response>, ok: bool) -> Val
 
 fn probe(
     options: &Options,
+    pin: Option<std::net::SocketAddr>,
     method: &str,
     path: &str,
     key: Option<&str>,
     body: Option<&str>,
 ) -> Result<Response> {
-    request(&options.listen, method, path, key, body, options.timeout)
+    request(
+        &options.listen,
+        pin,
+        method,
+        path,
+        key,
+        body,
+        options.timeout,
+    )
 }
 
 fn usable(format: &str, body: &[u8]) -> bool {
@@ -453,11 +463,15 @@ fn entry(
 fn run(options: &Options) -> Result<bool> {
     let mut checks = Vec::new();
     let start = Instant::now();
-    let health = probe(options, "GET", "/healthz", None, None).map(|response| {
+    let health = probe(options, None, "GET", "/healthz", None, None).map(|response| {
         let ok = (200..300).contains(&response.status) && response.body == b"ok";
         (ok, response)
     });
     let healthy = health.as_ref().map(|(ok, _)| *ok).unwrap_or(false);
+    let verified = health
+        .as_ref()
+        .ok()
+        .and_then(|(ok, response)| ok.then_some(response.peer));
     checks.push(match health {
         Ok((ok, response)) => record("healthz", start, Ok(response), ok),
         Err(error) => record("healthz", start, Err(error), false),
@@ -482,7 +496,7 @@ fn run(options: &Options) -> Result<bool> {
         return Err(format!("client key {} is empty", options.key_file.display()).into());
     }
     let start = Instant::now();
-    let models = probe(options, "GET", "/v1/models", Some(key), None);
+    let models = probe(options, verified, "GET", "/v1/models", Some(key), None);
     let mut listed: Vec<String> = Vec::new();
     let mut catalog_valid = false;
     if let Ok(response) = &models {
@@ -520,6 +534,7 @@ fn run(options: &Options) -> Result<bool> {
                     status: response.status,
                     headers: response.headers,
                     body: b"empty or malformed model catalog".to_vec(),
+                    peer: response.peer,
                 }),
                 false,
             )
@@ -552,6 +567,7 @@ fn run(options: &Options) -> Result<bool> {
         let start = Instant::now();
         let result = probe(
             options,
+            verified,
             "POST",
             "/v1/chat/completions",
             Some(key),
@@ -601,6 +617,7 @@ fn run(options: &Options) -> Result<bool> {
                 request_body["model"] = json!(model);
                 let result = probe(
                     options,
+                    verified,
                     "POST",
                     path,
                     Some(key),
@@ -623,11 +640,20 @@ fn run(options: &Options) -> Result<bool> {
     // Advance the rotation cursor only after this run's probes ran, so a
     // crash mid-run retries the same models instead of skipping them.
     if let Some(next) = pending_next {
-        atomic_write(
+        // A cursor that cannot be saved must not hide this run's results:
+        // report it as its own failed check and still print the report.
+        if let Err(error) = atomic_write(
             &options.state_file,
             |file| file.write_all(json!({"next": next}).to_string().as_bytes()),
             0o600,
-        )?;
+        ) {
+            checks.push(record(
+                "rotation-state",
+                Instant::now(),
+                Err(Box::new(error)),
+                false,
+            ));
+        }
     }
     let ok = checks.iter().all(|c| c["ok"] == true);
     println!(
