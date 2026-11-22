@@ -617,8 +617,7 @@ impl Expander<'_> {
                     deployment["headers"] = c.headers.clone();
                 }
                 if c.policy == policy::ModelPolicy::Workers {
-                    deployment["quota"] =
-                        json!({"rpm":self.policy.workers_rpm,"tpd":policy::WORKERS_TPD});
+                    deployment["quota"] = json!({"rpm":self.policy.workers_rpm});
                 }
                 if let Some(credential) = &c.credential {
                     deployment["credential"] = credential.clone().into();
@@ -741,8 +740,8 @@ pub fn import_with_options(
     let mut source_ids = HashSet::new();
     let workers_credential = policy.workers.as_ref().map(|workers| {
         let id = unique("workers-ai", &mut ids);
-        credentials.push(json!({"id":id,"kind":"api_key","provider":"openai_compat","key":workers.reference}));
-        warnings.push(format!("Workers AI deployments cap at rpm={} and tpd={} estimated tokens per deployment, NOT an account-wide neuron/daily spending cap; enforce free-only billing at Cloudflare", policy.workers_rpm, policy::WORKERS_TPD));
+        credentials.push(json!({"id":id,"kind":"api_key","provider":"openai_compat","key":workers.reference,"quota":{"tpd":policy::WORKERS_TPD}}));
+        warnings.push(format!("Workers AI deployments cap at rpm={} each and share one credential tpd={} estimated-token daily limit across the account, NOT an account-wide neuron/daily spending cap; enforce free-only billing at Cloudflare", policy.workers_rpm, policy::WORKERS_TPD));
         connections.push(Connection {headers:json!({}),source_id:"workers-ai-opt-in".into(),provider:upstream::ProviderIdentity::Builtin("workers-ai".into()),credential:Some(id.clone()),kind:"openai_compat".into(),base_url:workers.base_url.clone(),priority:i64::MAX,policy:policy::ModelPolicy::Workers});
         id
     });

@@ -355,7 +355,11 @@ fn workers_options_compose_with_explicit_omniroute_fallback() {
     let last = &config.deployments[model.deployments[1].0 as usize];
     assert_eq!(first.upstream_model.as_ref(), "@cf/openai/gpt-oss-20b");
     assert_eq!(first.quota.rpm, Some(30));
-    assert_eq!(first.quota.tpd, Some(60_000));
+    assert_eq!(first.quota.tpd, None);
+    assert_eq!(
+        config.credential_quotas[first.credential.as_ref()].tpd,
+        Some(60_000)
+    );
     assert_eq!(last.upstream_model.as_ref(), "workers");
     assert_eq!(last.base_url.to_string(), "http://127.0.0.1:20128/v1");
     assert!(last.priority > first.priority);
@@ -699,8 +703,19 @@ fn workers_opt_in_maps_bridges_and_fails_closed_for_unknown_deprecated_and_paid_
             "https://api.cloudflare.com/client/v4/accounts/0123456789abcdef0123456789abcdef/ai/v1"
         );
         assert_eq!(dep.quota.rpm, Some(30));
-        assert_eq!(dep.quota.tpd, Some(60_000));
+        assert_eq!(dep.quota.tpd, None);
         assert!(!dep.credential.is_empty());
+    }
+    // The daily cap is shared across every Workers AI deployment on the
+    // account, not per deployment: all five share one credential quota.
+    let mut workers = config.credential_quotas.iter().collect::<Vec<_>>();
+    assert_eq!(workers.len(), 1);
+    let (id, quota) = workers.pop().unwrap();
+    assert_eq!(quota.tpd, Some(60_000));
+    for i in 0..5 {
+        let model = &config.models[config.model_names[format!("cf-{i}").as_str()]];
+        let dep = &config.deployments[model.deployments[0].0 as usize];
+        assert_eq!(dep.credential, *id);
     }
     for name in ["unknown", "deprecated", "paid"] {
         assert!(!config.model_names.contains_key(name));
@@ -1007,7 +1022,11 @@ fn workers_quota_rpm_is_configurable_and_needs_the_cloudflare_opt_in() {
     let model = &config.models[config.model_names["workers"]];
     let dep = &config.deployments[model.deployments[0].0 as usize];
     assert_eq!(dep.quota.rpm, Some(12));
-    assert_eq!(dep.quota.tpd, Some(60_000));
+    assert_eq!(dep.quota.tpd, None);
+    assert_eq!(
+        config.credential_quotas[dep.credential.as_ref()].tpd,
+        Some(60_000)
+    );
 
     let result = run(&root, dir.path(), &[("--workers-ai-rpm", Path::new("12"))]);
     assert!(!result.status.success());

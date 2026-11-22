@@ -376,15 +376,16 @@ retired upstream IDs.
 `rpm`, `rpd`, `tpm`, `tpd`, and concurrency limits, but request/token counts cannot
 enforce Cloudflare's model-dependent free neuron allowance. Imported Workers AI
 deployments carry `quota.rpm = 30` (configurable with `--workers-ai-rpm`, which
-requires the Cloudflare opt-in) plus a hard `quota.tpd = 60000` cap on estimated
-input tokens. The daily cap is sized so a day of admitted input with output
-(including hidden reasoning tokens) up to 5x larger stays under the documented
-10,000-neuron free daily allowance at the most expensive allowed model's rates
-(60,000 × (0.018182 + 5 × 0.027273) ≈ 9,273 neurons). These are **per
-deployment**, not per account: combos, direct names, and failover can multiply
-usage, and outputs above 5x input can still pass the allowance. They do not
-guarantee zero charges or stop daily allowance exhaustion. Use a Workers Free
-account/no paid overage at Cloudflare and monitor its account-wide allowance.
+requires the Cloudflare opt-in), and the shared `workers-ai` credential carries
+a hard `quota.tpd = 60000` cap on estimated input tokens that binds across
+every deployment on the account. The daily cap is sized so a day of admitted
+input with output (including hidden reasoning tokens) up to 5x larger stays
+under the documented 10,000-neuron free daily allowance at the most expensive
+allowed model's rates (60,000 × (0.018182 + 5 × 0.027273) ≈ 9,273 neurons).
+The rpm cap is **per deployment** (combos, direct names, and failover can
+multiply bursts), and the shared tpd still cannot guarantee zero charges:
+outputs above 5x input can pass the allowance. Use a Workers Free account/no
+paid overage at Cloudflare and monitor its account-wide allowance.
 See https://developers.cloudflare.com/workers-ai/platform/pricing/.
 
 Keyed Kilo routes now fail closed unless `--kilo-free-models` supplies a saved

@@ -20,8 +20,9 @@ pub(super) struct External {
 /// overridable with `--workers-ai-rpm`.
 pub(super) const WORKERS_DEFAULT_RPM: u32 = 30;
 
-/// Hard daily cap on estimated input tokens for imported Workers AI
-/// deployments. Sized so a day of worst-case billed usage stays under the
+/// Hard daily cap on estimated input tokens for the shared Workers AI
+/// credential, bound across every deployment on the account. Sized so a day
+/// of worst-case billed usage stays under the
 /// documented 10,000-neuron free daily allowance even when output (including
 /// hidden reasoning tokens) is 5x the admitted input: the most expensive
 /// allowed model bills 27,273 neurons/M output tokens, and
