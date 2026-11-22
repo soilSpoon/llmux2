@@ -186,7 +186,8 @@ Qwen3.8 27B, the 1017 model) keep their declared position. Round-robin combos an
 other names are unchanged.
 
 The existing source combo `gpt-6-luna` also has a reviewed Respan secondary
-policy. After its surviving source legs (Experlabs stays first), the importer
+policy, opt-in via `--openrouter-replacements`. After its surviving source
+legs (Experlabs stays first), the importer
 appends `gpt-6-luna`, `openai/gpt-6-luna`, and `perplexity/gpt-6-luna`, in that
 order, on one active API-key custom OpenAI-compatible connection with prefix
 `respan` and normalized base URL `https://api.respan.ai/api/v1`. OCI verified

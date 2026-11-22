@@ -447,10 +447,15 @@ fn kimi_secondary_appends_reviewed_morph_behind_declared_numes() {
 }
 
 #[test]
-fn kimi_secondary_needs_reviewed_keyed_morph_and_survives_flag_off() {
-    for replacements in [false, true] {
+fn kimi_secondary_is_opt_in_and_needs_reviewed_keyed_morph() {
+    // Reviewed secondary routes are gated on --openrouter-replacements: flag
+    // off appends nothing even with an eligible morph connection; flag on
+    // still fails closed without one.
+    for (replacements, morph_present, expected_len) in
+        [(false, true, 1), (true, false, 1), (true, true, 2)]
+    {
         let mut root = cfpd_fixture();
-        if replacements {
+        if !morph_present {
             root["providerConnections"]
                 .as_array_mut()
                 .unwrap()
@@ -475,14 +480,17 @@ fn kimi_secondary_needs_reviewed_keyed_morph_and_survives_flag_off() {
             .iter()
             .map(|i| &config.deployments[i.0 as usize])
             .collect();
-        assert_eq!(deps.len(), if replacements { 1 } else { 2 });
+        assert_eq!(
+            deps.len(),
+            expected_len,
+            "replacements={replacements} morph={morph_present}"
+        );
         assert_eq!(deps[0].upstream_model.as_ref(), "moonshotai/kimi-k3.1-pro");
         assert_eq!(deps[0].base_url.host(), Some("api.numes.ai"));
-        assert!(
-            !deps
-                .iter()
-                .any(|d| d.upstream_model.as_ref() == "morph-kimik31")
-                == replacements
+        assert_eq!(
+            deps.iter()
+                .any(|d| d.upstream_model.as_ref() == "morph-kimik31"),
+            replacements && morph_present
         );
     }
     // A custom node reusing the `morph` prefix cannot stand in for the
@@ -534,7 +542,16 @@ fn kimi_secondary_needs_reviewed_keyed_morph_and_survives_flag_off() {
         }
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out.toml");
-        llmux_import::import(&root.to_string(), &out, None).unwrap();
+        llmux_import::import_with_options(
+            &root.to_string(),
+            &out,
+            Some(&dir.path().join("secrets")),
+            &ImportOptions {
+                openrouter_replacements: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let config = RuntimeConfig::load(out).unwrap();
         let model = &config.models[*config.model_names.get("kimi-k3.1-pro").unwrap()];
         assert!(

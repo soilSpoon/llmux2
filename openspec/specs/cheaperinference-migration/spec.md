@@ -230,7 +230,7 @@ declared position.
 - **THEN** the combo's deployments are unchanged
 
 ### Requirement: Reviewed secondary routes
-For the existing source combo `gpt-6-luna`, the importer SHALL append the
+With `--openrouter-replacements`, for the existing source combo `gpt-6-luna`, the importer SHALL append the
 ordered upstream IDs `gpt-6-luna`, `openai/gpt-6-luna`, and
 `perplexity/gpt-6-luna` after surviving source legs, using one active, usable
 API-key custom openai_compat connection whose node prefix is `respan` and whose
@@ -261,6 +261,10 @@ config SHALL roll back that part or all of this policy.
 #### Scenario: Unavailable or already declared route
 - **WHEN** the reviewed connection is unavailable or an ID already exists on the reviewed endpoint
 - **THEN** no unavailable or duplicate deployment is added
+
+#### Scenario: Opt-in flag absent
+- **WHEN** `--openrouter-replacements` is absent, even with an eligible reviewed connection
+- **THEN** no secondary route is appended and the combo's source legs are unchanged
 
 ### Requirement: Gemini OpenAI endpoint parameter compatibility
 
