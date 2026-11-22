@@ -832,7 +832,10 @@ impl Executor {
             .filter(|idx| !incompatible.contains(&index(**idx)))
             .filter(|idx| {
                 let dep = &self.cfg.deployments[index(**idx)];
-                fits(dep)
+                // Billed legs are never eligible under free_only, so they
+                // must not drive the retry delay either.
+                !(req.free_only && dep.billing == Billing::Billed)
+                    && fits(dep)
                     && dep.expires_at.is_none_or(|end| SystemTime::now() < end)
                     && !self.devin_upstream_missing(dep)
             })

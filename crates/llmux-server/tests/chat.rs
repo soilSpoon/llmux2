@@ -686,6 +686,17 @@ billing = "billed"
     .unwrap()
     .unwrap();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    // Billed legs never shorten the retry delay for a free-only probe:
+    // the delay is the cooled free leg's own cooldown, not the billed 0.
+    let retry_after: u64 = response
+        .headers()
+        .get(header::RETRY_AFTER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(retry_after > 0);
     assert_eq!(billed.calls.load(Ordering::Relaxed), 1);
     assert!(free.calls.load(Ordering::Relaxed) >= 1);
 
@@ -714,6 +725,25 @@ billing = "billed"
     .unwrap()
     .unwrap();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(billed.calls.load(Ordering::Relaxed), 1);
+
+    // A malformed flag is rejected rather than silently permitting spend.
+    let malformed = Request::post(format!("{}/v1/chat/completions", gateway.url()))
+        .header(header::AUTHORIZATION, "Bearer test-client")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-llmux-free-only", "tru")
+        .body(Full::new(Bytes::from(payload.to_string())))
+        .unwrap();
+    let response = timeout(
+        Duration::from_secs(5),
+        Client::builder(TokioExecutor::new())
+            .build_http()
+            .request(malformed),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(billed.calls.load(Ordering::Relaxed), 1);
 }
 

@@ -421,9 +421,18 @@ async fn route_request(
         }
     }
 
-    let free_only = headers
-        .get(FREE_ONLY_HEADER)
-        .is_some_and(|value| value == "true");
+    let free_only = match headers.get(FREE_ONLY_HEADER) {
+        None => false,
+        Some(value) if value == "true" => true,
+        Some(value) if value == "false" => false,
+        Some(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "x-llmux-free-only must be true or false",
+            );
+        }
+    };
     let model: Arc<str> = Arc::from(metadata.model.as_ref());
     if active
         .config
