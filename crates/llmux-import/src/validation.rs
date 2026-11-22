@@ -53,55 +53,103 @@ fn marker_for<'a>(
     Ok(&markers[reference])
 }
 
-fn substitute_refs(
+fn substitute_ref(
+    reference: &mut String,
+    dir: &Path,
+    markers: &mut HashMap<String, ValidationMarker>,
+) -> Result<(), String> {
+    // References resolving here are left for llmux-config to resolve to
+    // their real values, so equality and validity match deploy-time
+    // semantics. Malformed or deterministically unreadable references
+    // fail now, exactly as deploy preflight would; only valid references
+    // absent on this host (an unset env var or a file living on the
+    // deploy host) get a marker.
+    let marker_needed = if let Some(name) = reference.strip_prefix("env:") {
+        if name.is_empty() {
+            return Err("empty env: reference in generated configuration".to_owned());
+        }
+        std::env::var_os(name).is_none()
+    } else if let Some(path) = reference.strip_prefix("file:") {
+        if path.is_empty() {
+            return Err("empty file: reference in generated configuration".to_owned());
+        }
+        match fs::read_to_string(path) {
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                return Err(format!("key file {path} is not valid UTF-8"));
+            }
+            Err(_) => true,
+        }
+    } else {
+        false
+    };
+    if marker_needed {
+        let marker = marker_for(dir, markers, reference)?;
+        *reference = format!("file:{}", marker.0.display());
+    }
+    Ok(())
+}
+
+fn each_string(
     value: &mut Value,
     dir: &Path,
     markers: &mut HashMap<String, ValidationMarker>,
 ) -> Result<(), String> {
     match value {
-        Value::String(reference) => {
-            // References resolving here are left for llmux-config to
-            // resolve to their real values, so equality and validity match
-            // deploy-time semantics. Malformed or deterministically
-            // unreadable references fail now, exactly as deploy preflight
-            // would; only valid references absent on this host (an unset
-            // env var or a file living on the deploy host) get a marker.
-            let marker_needed = if let Some(name) = reference.strip_prefix("env:") {
-                if name.is_empty() {
-                    return Err("empty env: reference in generated configuration".to_owned());
-                }
-                std::env::var_os(name).is_none()
-            } else if let Some(path) = reference.strip_prefix("file:") {
-                if path.is_empty() {
-                    return Err("empty file: reference in generated configuration".to_owned());
-                }
-                match fs::read_to_string(path) {
-                    Ok(_) => false,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                        return Err(format!("key file {path} is not valid UTF-8"));
-                    }
-                    Err(_) => true,
-                }
-            } else {
-                false
-            };
-            if marker_needed {
-                let marker = marker_for(dir, markers, reference)?;
-                *reference = format!("file:{}", marker.0.display());
-            }
-        }
+        Value::String(reference) => substitute_ref(reference, dir, markers),
         Value::Array(list) => {
             for item in list {
-                substitute_refs(item, dir, markers)?;
+                each_string(item, dir, markers)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn substitute_refs(
+    config: &mut Value,
+    dir: &Path,
+    markers: &mut HashMap<String, ValidationMarker>,
+) -> Result<(), String> {
+    // Only the fields llmux-config resolves as secrets or references:
+    // other strings (model names, aliases, URLs) are plain values.
+    if let Some(server) = config["server"].as_object_mut() {
+        for key in ["client_keys", "dashboard_key", "end_user_salt"] {
+            if let Some(field) = server.get_mut(key) {
+                each_string(field, dir, markers)?;
             }
         }
-        Value::Object(object) => {
-            for (_, item) in object.iter_mut() {
-                substitute_refs(item, dir, markers)?;
+    }
+    for credential in config["credentials"].as_array_mut().into_iter().flatten() {
+        if let Some(object) = credential.as_object_mut() {
+            for key in ["key", "refresh_token", "client_secret"] {
+                if let Some(field) = object.get_mut(key) {
+                    each_string(field, dir, markers)?;
+                }
             }
         }
-        _ => {}
+    }
+    for model in config["models"].as_array_mut().into_iter().flatten() {
+        if let Some(object) = model.as_object_mut() {
+            if let Some(field) = object.get_mut("allowed_keys") {
+                each_string(field, dir, markers)?;
+            }
+            if let Some(deployments) = object.get_mut("deployments") {
+                for deployment in deployments.as_array_mut().into_iter().flatten() {
+                    if let Some(headers) = deployment
+                        .as_object_mut()
+                        .and_then(|object| object.get_mut("headers"))
+                        .and_then(|headers| headers.as_object_mut())
+                    {
+                        for (_, header_value) in headers {
+                            each_string(header_value, dir, markers)?;
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -149,6 +197,16 @@ mod tests {
             std::env::remove_var("LLMUX_TEST_GATE_EQ");
             std::env::remove_var("LLMUX_TEST_OWNER_EQ");
         }
+    }
+
+    #[test]
+    fn non_secret_fields_are_not_treated_as_references() {
+        // aliases are plain names at runtime, so env:/file:-shaped
+        // strings there must not be resolved or rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let deployment = json!({"id":"d","auth":"none","provider":"openai_compat","base_url":"http://127.0.0.1/","upstream_model":"m"});
+        let config = json!({"server":{"listen":"127.0.0.1:1","client_keys":["env:GATE"]},"credentials":[],"models":[{"name":"m","aliases":["env:","file:"],"deployments":[deployment]}]});
+        assert!(validate(&config, dir.path()).is_ok());
     }
 
     #[test]
