@@ -42,6 +42,7 @@ enum Reply {
     EmptyStream,
     GatedStream(Arc<Semaphore>),
     BadRequest,
+    Forbidden,
     NotFound(&'static str),
     EmbeddedModelNotFound,
     StructuredBadRequest(Value),
@@ -91,7 +92,12 @@ async fn mock_chat(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: Byte
             }
             response
         }
-        Reply::Limit(seconds) => (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, seconds.to_string())]).into_response(),
+        Reply::Limit(seconds) => (StatusCode::TOO_MANY_REQUESTS, [
+            ("retry-after", seconds.to_string()),
+            ("x-ratelimit-remaining-requests", "0".to_owned()),
+            ("x-ratelimit-reset-requests", "60s".to_owned()),
+        ]).into_response(),
+        Reply::Forbidden => StatusCode::FORBIDDEN.into_response(),
         Reply::Complete | Reply::ExpectedChatRequest(_) if request["stream"] == true => (
             [(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")],
             "data: {\"id\":\"chunk-1\"}\r\n\r\ndata: [DONE]\n\n",
@@ -1149,11 +1155,33 @@ async fn both_rate_limited_returns_earliest_retry_after() {
         let response = fixture.request("test-client", "shared", false).await;
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()[header::RETRY_AFTER], "5");
+        assert!(!response
+            .headers()
+            .contains_key("x-ratelimit-remaining-requests"));
+        assert!(!response
+            .headers()
+            .contains_key("x-ratelimit-reset-requests"));
         let error: Value = serde_json::from_str(&body(response).await).unwrap();
         assert_eq!(error["error"]["code"], "rate_limit_exceeded");
         assert_eq!(fixture.counts(), [1, 1]);
     }
     println!("both deployments returned 429: gateway returned 429 with earliest Retry-After: 5");
+}
+
+#[tokio::test]
+async fn retry_after_is_omitted_if_no_compatible_deployment_can_be_retried() {
+    let fixture = Fixture::start(
+        [Reply::Forbidden, Reply::Forbidden],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    for _ in 0..2 {
+        let response = fixture.request("test-client", "shared", false).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!response.headers().contains_key(header::RETRY_AFTER));
+    }
+    assert_eq!(fixture.counts(), [1, 1]);
 }
 
 #[tokio::test]

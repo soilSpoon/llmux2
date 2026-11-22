@@ -111,6 +111,14 @@ The gateway SHALL reduce 429s proactively: secure additional paths, pace
 requests, and pre-empt deployments before their limits hit, rather than only
 reacting to errors.
 
+#### Scenario: Client retry timing on a synthesized 429
+
+WHEN the gateway cannot route a request and synthesizes a 429
+THEN it reports the earliest compatible deployment's known wait as a
+rounded-up `Retry-After` in seconds. Zero means a compatible deployment is
+ready now; when no wait can be determined the header is omitted. The gateway
+does not forward raw upstream account limit headers.
+
 #### Scenario: Pre-empt before the cap
 
 WHEN a deployment's remaining limit approaches zero

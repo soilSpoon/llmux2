@@ -614,7 +614,7 @@ fn gateway_error(err: GatewayError) -> Response {
         }
         GatewayError::AllCandidatesExhausted { retry_after, .. } => rate_limited(retry_after),
         GatewayError::Client(UpstreamError::RateLimited { retry_after, .. }) => {
-            rate_limited(retry_after.unwrap_or_default())
+            rate_limited(retry_after)
         }
         GatewayError::Client(
             UpstreamError::BadRequest { status, body }
@@ -643,16 +643,20 @@ fn gateway_error(err: GatewayError) -> Response {
     }
 }
 
-fn rate_limited(wait: Duration) -> Response {
-    let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+fn rate_limited(wait: Option<Duration>) -> Response {
     let mut response = error(
         StatusCode::TOO_MANY_REQUESTS,
         "rate_limit_exceeded",
         "No upstream currently available",
     );
-    response
-        .headers_mut()
-        .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+    if let Some(wait) = wait {
+        let seconds = wait
+            .as_secs()
+            .saturating_add(u64::from(wait.subsec_nanos() > 0));
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+    }
     response
 }
 

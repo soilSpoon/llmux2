@@ -437,7 +437,7 @@ async fn exhaustion_retry_hint_ignores_expired_deployments() {
     else {
         panic!("expected exhaustion")
     };
-    assert!(retry_after > Duration::from_secs(2));
+    assert!(retry_after.is_some_and(|wait| wait > Duration::from_secs(2)));
 }
 
 #[tokio::test]
@@ -524,7 +524,7 @@ async fn retry_after_excludes_a_deployment_that_does_not_have_the_model() {
     assert_eq!(attempts, 1);
     assert_eq!(adapter.calls.lock().unwrap()[0].0.as_ref(), "dep0");
     assert!(
-        retry_after > Duration::ZERO,
+        retry_after.is_some_and(|wait| !wait.is_zero()),
         "retry_after = {retry_after:?}"
     );
 }
@@ -635,7 +635,7 @@ async fn exhaustion_retry_hint_ignores_deployments_that_do_not_fit() {
     else {
         panic!("expected exhaustion")
     };
-    assert!(retry_after > Duration::from_secs(2));
+    assert!(retry_after.is_some_and(|wait| wait > Duration::from_secs(2)));
 }
 
 #[tokio::test]
@@ -906,7 +906,7 @@ async fn conversion_rejection_distinguishes_rate_limited_compatible_deployments(
         assert!(matches!(
             executor.execute(messages(b"image")).await,
             Err(GatewayError::AllCandidatesExhausted { attempts: 0, retry_after })
-                if !retry_after.is_zero()
+                if retry_after.is_some_and(|wait| !wait.is_zero())
         ));
     }
 }

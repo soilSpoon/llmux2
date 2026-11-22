@@ -365,7 +365,7 @@ async fn stale_devin_deployment_is_skipped_for_a_same_model_fallback() {
     let before = gateway.acp_log();
     let gone = gateway.chat("gone", Duration::from_secs(5)).await;
     assert_eq!(gone.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert!(gone.headers().contains_key(header::RETRY_AFTER));
+    assert!(!gone.headers().contains_key(header::RETRY_AFTER));
     let error: Value = serde_json::from_str(&body(gone).await).unwrap();
     assert_eq!(error["error"]["code"], "rate_limit_exceeded");
     assert_eq!(error["error"]["message"], "No upstream currently available");
