@@ -890,12 +890,14 @@ pub fn import_with_options(
                 continue;
             }
         };
+        let source_id = string(c, "id");
         let mut header_refs = serde_json::Map::new();
         for (name, value) in headers {
-            let id = unique("upstream-header", &mut ids);
+            // Deterministic per connection+header name so a scheduled
+            // re-import resolves the same secret file.
+            let id = unique(&format!("upstream-header-{source_id}-{name}"), &mut ids);
             header_refs.insert(name, write_secret(&dir, &id, &value)?.into());
         }
-        let source_id = string(c, "id");
         if source_id.is_empty() || !source_ids.insert(source_id.to_owned()) {
             warnings.push(format!("{label}: skipped missing/duplicate connection id"));
             continue;

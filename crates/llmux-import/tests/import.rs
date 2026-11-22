@@ -406,6 +406,40 @@ fn cli_reports_without_leaking_secrets() {
 }
 
 #[test]
+fn header_secret_names_are_stable_across_imports() {
+    let mut root: Value = serde_json::from_str(DB_FIXTURE).unwrap();
+    root["provider_nodes"][0]["custom_headers_json"] = json!(
+        "{\"X-Node\":\"synthetic-one\",\"X-Other\":\"synthetic-two\",\"X-Third\":\"synthetic-three\"}"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = dir.path().join("secrets");
+    llmux_import::import(
+        &root.to_string(),
+        &dir.path().join("one.toml"),
+        Some(&secrets),
+    )
+    .unwrap();
+    // Header secret filenames derive from connection+header name, so a
+    // re-import resolves the same files regardless of map iteration order.
+    llmux_import::import(
+        &root.to_string(),
+        &dir.path().join("two.toml"),
+        Some(&secrets),
+    )
+    .unwrap();
+    let names: Vec<String> = fs::read_dir(&secrets)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    for header in ["x-node", "x-other", "x-third"] {
+        assert!(
+            names.iter().any(|n| n.ends_with(header)),
+            "no secret named for {header}: {names:?}"
+        );
+    }
+}
+
+#[test]
 fn cli_listen_reaches_the_emitted_config() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("export.json");
