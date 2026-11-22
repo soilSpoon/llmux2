@@ -678,7 +678,7 @@ impl Expander<'_> {
                     continue;
                 }
                 let mut deployment = json!({"base_url":c.base_url,"upstream_model":model});
-                deployment["billing"] = if policy::billed(c) {
+                deployment["billing"] = if policy::billed(c, &model, self.policy) {
                     "billed".into()
                 } else {
                     "free".into()

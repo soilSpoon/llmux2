@@ -4,27 +4,32 @@ use serde_json::Value;
 use std::{collections::HashSet, fs, path::Path};
 
 /// Builtin provider identities whose legs never bill or hit a shared quota at
-/// probe rates: community/free endpoints and the local Devin session.
-/// Everything else a connection can reach is billed for sweep purposes —
-/// including Workers AI, whose daily account cap this traffic consumes.
-const FREE_PROVIDERS: &[&str] = &[
-    "aihorde",
-    "devin-cli-agentic",
-    "duckduckgo-web",
-    "github-models",
-    "nous",
-];
+/// probe rates: community/free endpoints. Everything else a connection can
+/// reach is billed for sweep purposes — including Workers AI, whose daily
+/// account cap this traffic consumes, and subscription portals like Nous and
+/// Devin's paid models.
+const FREE_PROVIDERS: &[&str] = &["aihorde", "duckduckgo-web", "github-models"];
 
 /// Whether the emitted leg can spend money or shared quota when probed.
 /// Custom (site-managed) providers are free; keyed legs against builtin
 /// providers bill, except reviewed free subsets (Kilo verified-free models,
-/// XPLabs free routes — billed XPLabs routes never reach this point).
-pub(super) fn billed(connection: &Connection) -> bool {
+/// XPLabs free routes — billed XPLabs routes never reach this point — and
+/// Devin models the free-models list names). Workers legs bill wherever they
+/// appear: a custom provider node claiming the Cloudflare prefix shares the
+/// same capped account.
+pub(super) fn billed(connection: &Connection, model: &str, policy: &Policy) -> bool {
+    if connection.policy == ModelPolicy::Workers {
+        return true;
+    }
     if connection.policy == ModelPolicy::KiloFree || connection.base_url == xplabs::BASE_URL {
         return false;
     }
     match &connection.provider {
         ProviderIdentity::Custom(_) => false,
+        ProviderIdentity::Builtin(id) if id == "devin-cli-agentic" => !policy
+            .devin_free
+            .as_ref()
+            .is_some_and(|free| free.contains(model)),
         ProviderIdentity::Builtin(id) => !FREE_PROVIDERS.contains(&id.as_str()),
     }
 }

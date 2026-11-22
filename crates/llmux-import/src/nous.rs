@@ -77,7 +77,7 @@ impl Nous {
             let deployment = unique(&format!("nous-{id}"), deployment_ids);
             models.push(json!({"name":name,"aliases":[],"deployments":[{
                 "id":deployment,"credential":credential,"base_url":NOUS_INFERENCE_URL,
-                "upstream_model":id,"priority":0,"billing":"free"}]}));
+                "upstream_model":id,"priority":0}]}));
         }
         models
     }

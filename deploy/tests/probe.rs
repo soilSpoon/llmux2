@@ -875,10 +875,20 @@ fn sweep_never_probes_a_billed_model() {
             ]}),
         ),
         ok(),
+        Reply::text(200, "{\"output\":[]}"),
+        Reply::text(200, "{\"content\":[{\"type\":\"text\"}]}"),
     ]);
-    let output = listen_flag(&home, &gateway, &["--sweep"]);
+    let output = listen_flag(&home, &gateway, &["--sweep", "--all-formats"]);
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(gateway.chat_models(), ["alpha"]);
+    let probed: Vec<String> = gateway
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.path.starts_with("/v1/") && r.path != "/v1/models")
+        .filter_map(|r| r.body["model"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(probed, ["alpha", "alpha", "alpha"]);
     let report = summary(&output);
     let skipped: Vec<_> = report["checks"]
         .as_array()

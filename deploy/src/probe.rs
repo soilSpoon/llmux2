@@ -680,6 +680,15 @@ fn run(options: &Options) -> Result<bool> {
             .clone()
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| listed.clone());
+        // The extra formats follow the same no-spend rule as the chat sweep.
+        let candidates: Vec<String> = if options.sweep {
+            candidates
+                .into_iter()
+                .filter(|model| free.contains(model))
+                .collect()
+        } else {
+            candidates
+        };
         for (format, path, body) in [
             (
                 "responses",
