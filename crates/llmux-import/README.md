@@ -377,12 +377,12 @@ retired upstream IDs.
 enforce Cloudflare's model-dependent free neuron allowance. Imported Workers AI
 deployments carry `quota.rpm = 30` (configurable with `--workers-ai-rpm`, which
 requires the Cloudflare opt-in), and the shared `workers-ai` credential carries
-a hard `quota.tpd = 9000` cap on estimated input tokens that binds across
+a hard `quota.tpd = 6500` cap on estimated input tokens that binds across
 every deployment on the account. The daily cap is sized so a day of admitted
 input with output (including hidden reasoning tokens) up to 5x larger stays
 under the documented 10,000-neuron free daily allowance at the most expensive
-allowed model's rates (llama-3.3-70b-fp8: 9,000 × (0.026668 + 5 × 0.204805) ≈
-9,456 neurons). The rpm cap is **per deployment** (combos, direct names, and
+allowed model's rates (qwen3.8-27b: 6,500 × (0.040909 + 5 × 0.290909) ≈
+9,720 neurons). The rpm cap is **per deployment** (combos, direct names, and
 failover can multiply bursts). Credential quotas are hard ceilings — a
 request whose estimate exceeds the remaining shared window is rejected even
 on an empty window, unlike deployment quotas, which admit one oversized
