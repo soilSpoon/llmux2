@@ -43,6 +43,10 @@ pub struct ImportOptions<'a> {
     pub cloudflare_account_id_file: Option<&'a Path>,
     pub cloudflare_token_file: Option<&'a Path>,
     pub workers_ai_models: Option<&'a Path>,
+    /// Optional per-minute request cap for imported Workers AI deployments;
+    /// defaults to `policy::WORKERS_DEFAULT_RPM` and requires the Cloudflare
+    /// opt-in. The hard daily token cap `policy::WORKERS_TPD` always applies.
+    pub workers_ai_rpm: Option<u32>,
     pub kilo_free_models: Option<&'a Path>,
     pub kilo_key_file: Option<&'a Path>,
     pub openrouter_replacements: bool,
@@ -613,7 +617,7 @@ impl Expander<'_> {
                     deployment["headers"] = c.headers.clone();
                 }
                 if c.policy == policy::ModelPolicy::Workers {
-                    deployment["quota"] = json!({"rpm":1});
+                    deployment["quota"] = json!({"rpm":self.policy.workers_rpm});
                 }
                 if let Some(credential) = &c.credential {
                     deployment["credential"] = credential.clone().into();
@@ -736,8 +740,8 @@ pub fn import_with_options(
     let mut source_ids = HashSet::new();
     let workers_credential = policy.workers.as_ref().map(|workers| {
         let id = unique("workers-ai", &mut ids);
-        credentials.push(json!({"id":id,"kind":"api_key","provider":"openai_compat","key":workers.reference}));
-        warnings.push("Workers AI uses rpm=1 per deployment, NOT an account-wide neuron/daily spending cap; enforce free-only billing at Cloudflare".into());
+        credentials.push(json!({"id":id,"kind":"api_key","provider":"openai_compat","key":workers.reference,"quota":{"tpd":policy::WORKERS_TPD}}));
+        warnings.push(format!("Workers AI deployments cap at rpm={} each and share one credential tpd={} estimated-token daily limit across the account, NOT an account-wide neuron/daily spending cap; enforce free-only billing at Cloudflare", policy.workers_rpm, policy::WORKERS_TPD));
         connections.push(Connection {headers:json!({}),source_id:"workers-ai-opt-in".into(),provider:upstream::ProviderIdentity::Builtin("workers-ai".into()),credential:Some(id.clone()),kind:"openai_compat".into(),base_url:workers.base_url.clone(),priority:i64::MAX,policy:policy::ModelPolicy::Workers});
         id
     });

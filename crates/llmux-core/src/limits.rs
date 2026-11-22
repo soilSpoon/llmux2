@@ -124,7 +124,7 @@ impl DeploymentLimits {
         for window in self.windows.iter() {
             let used = window.lock(now);
             let cost = window.unit.cost(tokens);
-            if used.total > 0 && used.total + cost > window.max {
+            if used.total + cost > window.max && (window.hard || used.total > 0) {
                 ready = ready.max(used.free_at(window.max.saturating_sub(cost), window.span));
             }
         }
@@ -191,7 +191,7 @@ impl DeploymentLimits {
             .collect();
         for (window, used) in &windows {
             let cost = window.unit.cost(tokens);
-            if used.total > 0 && used.total + cost > window.max {
+            if used.total + cost > window.max && (window.hard || used.total > 0) {
                 return false;
             }
         }
@@ -226,6 +226,11 @@ pub(super) struct Window {
     max: u64,
     span: Duration,
     unit: Unit,
+    /// Credential windows are hard ceilings: they reject a request whose cost
+    /// exceeds the remaining budget even when nothing has been used yet.
+    /// Deployment windows admit one oversized request to an idle deployment
+    /// so an undersized quota cannot deadlock it.
+    hard: bool,
     used: Mutex<Usage>,
 }
 
@@ -236,7 +241,23 @@ struct Usage {
 }
 
 impl Window {
+    /// Deployment-level quota windows. A request larger than the limit is
+    /// admitted on an empty window so an undersized quota cannot deadlock an
+    /// idle deployment.
     pub fn for_quota(spec: QuotaSpec) -> Vec<Arc<Self>> {
+        Self::windows(spec, false)
+    }
+
+    /// Credential-level quota windows: a hard ceiling shared by every
+    /// deployment on the credential. A request whose cost exceeds the
+    /// remaining budget is rejected even on an empty window, so a configured
+    /// daily ceiling (for example a provider's free allowance) cannot be
+    /// passed.
+    pub fn for_credential(spec: QuotaSpec) -> Vec<Arc<Self>> {
+        Self::windows(spec, true)
+    }
+
+    fn windows(spec: QuotaSpec, hard: bool) -> Vec<Arc<Self>> {
         [
             (spec.rpm, MINUTE, Unit::Requests),
             (spec.rpd, DAY, Unit::Requests),
@@ -250,6 +271,7 @@ impl Window {
                     max: u64::from(max),
                     span,
                     unit,
+                    hard,
                     used: Mutex::default(),
                 })
             })
@@ -280,9 +302,12 @@ impl Usage {
                 return at + span;
             }
         }
+        // No entries to wait on: reached only when the request can never fit
+        // the window (cost > max on a hard window), so the reset is a full
+        // span out rather than "now".
         self.entries
             .back()
-            .map_or_else(Instant::now, |&(at, _)| at + span)
+            .map_or_else(|| Instant::now() + span, |&(at, _)| at + span)
     }
 }
 
@@ -480,9 +505,51 @@ mod tests {
         );
     }
 
+    /// Credential windows are hard ceilings: an oversized request is rejected
+    /// even on an empty window, while a deployment quota admits it to keep an
+    /// undersized quota from deadlocking the deployment.
+    #[test]
+    fn a_credential_window_rejects_a_request_larger_than_the_empty_window() {
+        let key = Window::for_credential(QuotaSpec {
+            tpd: Some(100),
+            ..QuotaSpec::default()
+        });
+        let shared = Arc::new(DeploymentLimits::with_shared(QuotaSpec::default(), &key));
+        assert!(shared.admit(150).is_none());
+        assert!(shared.admit(90).is_some());
+        assert!(shared.admit(20).is_none(), "90 + 20 exceeds tpd = 100");
+
+        let own_quota = Arc::new(DeploymentLimits::new(QuotaSpec {
+            tpd: Some(100),
+            ..QuotaSpec::default()
+        }));
+        assert!(
+            own_quota.admit(150).is_some(),
+            "a deployment quota still admits an oversized request when idle"
+        );
+    }
+
+    /// A request that can never fit a credential window must report a retry
+    /// when the window resets, not "now": an empty window's `free_at` has no
+    /// entries to wait on, so it would otherwise answer immediately.
+    #[test]
+    fn an_impossible_request_on_a_credential_window_retries_when_it_resets() {
+        let key = Window::for_credential(QuotaSpec {
+            tpd: Some(100),
+            ..QuotaSpec::default()
+        });
+        let shared = Arc::new(DeploymentLimits::with_shared(QuotaSpec::default(), &key));
+        let now = Instant::now();
+        assert!(shared.admit(150).is_none());
+        assert!(
+            shared.available_at(now, 150) >= now + Duration::from_secs(86_399),
+            "a request that can never fit waits the whole window"
+        );
+    }
+
     #[test]
     fn deployments_sharing_a_key_quota_draw_on_one_window() {
-        let key = Window::for_quota(QuotaSpec {
+        let key = Window::for_credential(QuotaSpec {
             rpm: Some(1),
             tpd: Some(1_000),
             ..QuotaSpec::default()

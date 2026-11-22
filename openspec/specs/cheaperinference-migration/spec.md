@@ -383,8 +383,17 @@ the omission, including for `@cf/meta/llama-3.2-1b-instruct`.
 #### Scenario: Workers AI quota is not a spending guarantee
 
 WHEN a Workers AI deployment is emitted
-THEN it has `rpm = 1`, and documentation warns that this is per deployment,
-not account-wide neuron accounting or a guarantee against paid overage.
+THEN it has `rpm = 30` (configurable with `--workers-ai-rpm`, which requires
+the Cloudflare opt-in), and the shared Workers AI credential has
+`tpd = 6500`, a hard daily cap on estimated input tokens bound across every
+deployment on the account, sized so a day of admitted input with output up to
+5x larger stays under the documented 10,000-neuron free daily allowance even
+at the most expensive allowed model's rates. Credential quota windows are
+hard ceilings: a request whose estimate exceeds the remaining window is
+rejected even when the window is empty, while a deployment quota still admits
+one oversized request to an idle deployment.
+Documentation warns that these are not account-wide neuron accounting or a
+guarantee against paid overage.
 
 #### Scenario: Retired Llama bridge target
 

@@ -376,10 +376,21 @@ retired upstream IDs.
 **There is no Workers AI neuron or account-wide spending budget.** Core supports
 `rpm`, `rpd`, `tpm`, `tpd`, and concurrency limits, but request/token counts cannot
 enforce Cloudflare's model-dependent free neuron allowance. Imported Workers AI
-deployments use conservative `quota.rpm = 1`. This is **per deployment**, not per
-account: combos, direct names, and failover can multiply usage. It does not
-guarantee zero charges or stop daily allowance exhaustion. Use a Workers Free
-account/no paid overage at Cloudflare and monitor its account-wide allowance.
+deployments carry `quota.rpm = 30` (configurable with `--workers-ai-rpm`, which
+requires the Cloudflare opt-in), and the shared `workers-ai` credential carries
+a hard `quota.tpd = 6500` cap on estimated input tokens that binds across
+every deployment on the account. The daily cap is sized so a day of admitted
+input with output (including hidden reasoning tokens) up to 5x larger stays
+under the documented 10,000-neuron free daily allowance at the most expensive
+allowed model's rates (qwen3.8-27b: 6,500 × (0.040909 + 5 × 0.290909) ≈
+9,720 neurons). The rpm cap is **per deployment** (combos, direct names, and
+failover can multiply bursts). Credential quotas are hard ceilings — a
+request whose estimate exceeds the remaining shared window is rejected even
+on an empty window, unlike deployment quotas, which admit one oversized
+request to an idle deployment. The shared tpd still cannot guarantee zero
+charges: it counts estimated input tokens, so outputs above 5x input pass the
+allowance. Use a Workers Free account/no paid overage at Cloudflare and
+monitor its account-wide allowance.
 See https://developers.cloudflare.com/workers-ai/platform/pricing/.
 
 Keyed Kilo routes now fail closed unless `--kilo-free-models` supplies a saved

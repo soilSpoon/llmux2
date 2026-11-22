@@ -1099,6 +1099,47 @@ async fn after_a_cooldown_other_requests_fall_back_while_a_probe_is_open() {
     assert_eq!(adapter.calls.lock().unwrap().len(), 4);
 }
 
+/// A credential window is a hard ceiling: a request whose estimate exceeds
+/// the remaining budget is skipped even when the window is empty. dep2 is
+/// routed first but its credential `tpd` is smaller than the request, so it
+/// falls through to dep0, whose credential has no quota.
+#[tokio::test]
+async fn oversized_request_skips_deployment_on_a_full_or_empty_credential_window() {
+    let (executor, adapter, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("model", &[2, 0])],
+        Default::default(),
+        llmux_types::QuotaSpec {
+            tpd: Some(100),
+            ..Default::default()
+        },
+        false,
+        None,
+        [None; 3],
+    )
+    .await;
+    let oversized = || GatewayRequest {
+        est_input_tokens: 150,
+        ..request()
+    };
+    executor.execute(oversized()).await.unwrap();
+    executor.execute(oversized()).await.unwrap();
+    let served: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(
+        served,
+        ["dep0", "dep0"],
+        "dep2's credential tpd = 100 is a hard ceiling: 150 never reaches it"
+    );
+}
+
 #[tokio::test]
 async fn credential_quota_limits_the_credentials_deployments() {
     let (executor, adapter, _, _server) = fixture_full(
