@@ -42,7 +42,9 @@ impl Gateway {
         let acp_log = home.path().join("acp.log");
         let release = home.path().join("release");
         let key = home.path().join("client");
+        let dashboard_key = home.path().join("dashboard");
         fs::write(&key, "test-client\n").unwrap();
+        fs::write(&dashboard_key, "test-dashboard\n").unwrap();
         fs::create_dir_all(home.path().join(".local/share")).unwrap();
         fs::write(home.path().join(".local/share/marker"), "").unwrap();
         write_cli(&bin, &calls, &acp_log, &release, mode);
@@ -51,6 +53,7 @@ impl Gateway {
             r#"
 [server]
 client_keys = ["file:{}"]
+dashboard_key = "file:{}"
 request_timeout_ms = 4000
 
 [[models]]
@@ -121,7 +124,8 @@ provider = "devin_acp"
 upstream_model = "swe-2-retired"
 priority = 0
 "#,
-            key.display()
+            key.display(),
+            dashboard_key.display()
         );
 
         let router = llmux_server::app_with_devin(
@@ -159,6 +163,7 @@ priority = 0
     async fn models(&self) -> Vec<String> {
         let response = request(
             &self.server,
+            "test-client",
             "GET",
             "/v1/models",
             None,
@@ -182,6 +187,7 @@ priority = 0
         });
         request(
             &self.server,
+            "test-client",
             "POST",
             "/v1/chat/completions",
             Some(payload.to_string()),
@@ -255,6 +261,7 @@ fn models_invocations(calls: &[String]) -> usize {
 
 async fn request(
     server: &TestServer,
+    key: &str,
     method: &str,
     path: &str,
     payload: Option<String>,
@@ -263,7 +270,7 @@ async fn request(
     let request = Request::builder()
         .method(method)
         .uri(format!("{}{path}", server.url()))
-        .header(header::AUTHORIZATION, "Bearer test-client")
+        .header(header::AUTHORIZATION, format!("Bearer {key}"))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Full::new(Bytes::from(payload.unwrap_or_default())))
         .unwrap();
@@ -368,6 +375,24 @@ async fn stale_devin_deployment_is_skipped_for_a_same_model_fallback() {
         "an exhausted model must not be rewritten onto another model's deployment"
     );
     assert_eq!(models_invocations(&gateway.calls()), 1);
+    let stats = request(
+        &gateway.server,
+        "test-dashboard",
+        "GET",
+        "/dashboard/stats",
+        None,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(stats.status(), StatusCode::OK);
+    let stats: Value = serde_json::from_str(&body(stats).await).unwrap();
+    let stale = stats["deployments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "swe-stale")
+        .unwrap();
+    assert_eq!(stale["skip_reasons"], json!({"upstream_unavailable":1}));
 }
 
 #[tokio::test]
