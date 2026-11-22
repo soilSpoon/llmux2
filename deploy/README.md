@@ -182,7 +182,7 @@ dead routes stop being advertised without manual pruning. The service runs
   `file:` references;
 - deploys the installed release binary with `--canary 300` so a bad
   regenerated config never takes the port alone;
-- shreds `export.json` (plaintext credentials) once the import consumed it;
+- shreds `export.json` (plaintext credentials) on every exit, including a failed or aborted import;
 - skips the run entirely when no sweep output exists yet.
 
 Refresh the OmniRoute export before each run via an `ExecStartPre` drop-in
