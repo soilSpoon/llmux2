@@ -149,17 +149,22 @@ pub fn error_kind(error: &GatewayError) -> &'static str {
         GatewayError::ContextLengthExceeded { .. } => "context_length_exceeded",
         GatewayError::AllCandidatesExhausted { .. } => "all_candidates_exhausted",
         GatewayError::Internal => "internal",
-        GatewayError::Client(err) => match err.kind() {
-            ErrorKind::RateLimited => "rate_limited",
-            ErrorKind::QuotaExhausted => "quota_exhausted",
-            ErrorKind::Auth => "auth",
-            ErrorKind::BadRequest => "bad_request",
-            ErrorKind::ContextLength => "context_length",
-            ErrorKind::ServerError => "server_error",
-            ErrorKind::Timeout => "timeout",
-            ErrorKind::ConnectError => "connect_error",
-            ErrorKind::StreamBroken => "stream_broken",
-        },
+        GatewayError::Client(err) => upstream_error_kind(err),
+    }
+}
+
+/// The same vocabulary for an upstream error seen mid-attempt.
+pub fn upstream_error_kind(error: &llmux_types::UpstreamError) -> &'static str {
+    match error.kind() {
+        ErrorKind::RateLimited => "rate_limited",
+        ErrorKind::QuotaExhausted => "quota_exhausted",
+        ErrorKind::Auth => "auth",
+        ErrorKind::BadRequest => "bad_request",
+        ErrorKind::ContextLength => "context_length",
+        ErrorKind::ServerError => "server_error",
+        ErrorKind::Timeout => "timeout",
+        ErrorKind::ConnectError => "connect_error",
+        ErrorKind::StreamBroken => "stream_broken",
     }
 }
 

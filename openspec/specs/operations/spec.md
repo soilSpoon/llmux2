@@ -128,10 +128,12 @@ timestamp, request ID, requested model, last-attempted deployment ID and
 provider, attempt count, total latency, the outcome (`routed` or `error`),
 the failure kind on errors, and the remaining RPM/concurrency headroom of
 the last-attempted deployment. Each record SHALL also carry a `legs` list
-with one entry per upstream send, in send order, naming that leg's
+with one entry per upstream send, in send order — including each body
+repaired and resent to the same deployment — naming that leg's
 deployment ID and provider and its outcome — `routed` when the leg served
 the response, otherwise the failure kind — so failover legs that the
-last-attempted fields hide stay visible. Each record SHALL also carry a fingerprint of
+last-attempted fields hide stay visible. An attempt whose request could
+not be built SHALL leave no leg. Each record SHALL also carry a fingerprint of
 the gateway client key used (a `key_<16 hex>` hash keyed by the configured
 key set, never the key itself), the count of image inputs in the inbound
 request, and — when the upstream supplies one — the provider-side request ID

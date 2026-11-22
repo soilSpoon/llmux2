@@ -667,6 +667,9 @@ impl Executor {
                             trace.attempts = machine.attempts as _;
                             trace.last_attempted = Some(idx);
                             let timed_out = Err(GatewayError::Client(UpstreamError::Timeout));
+                            // A failed or timed-out build sent nothing upstream,
+                            // so it leaves no leg.
+                            let sent = matches!(upstream, Ok(Ok(_)));
                             result = match upstream {
                                 Ok(Ok(upstream)) => timeout_at(
                                     attempt_deadline,
@@ -680,13 +683,15 @@ impl Executor {
                             if let Some(stats) = &binding.stats {
                                 stats.record_attempt(result.as_ref().err());
                             }
-                            trace.legs.push(request_log::AttemptLeg {
-                                deployment: dep.id.as_ref().into(),
-                                provider: dep.provider.0.as_ref().into(),
-                                outcome: result
-                                    .as_ref()
-                                    .map_or_else(request_log::error_kind, |_| "routed"),
-                            });
+                            if sent {
+                                trace.legs.push(request_log::AttemptLeg {
+                                    deployment: dep.id.as_ref().into(),
+                                    provider: dep.provider.0.as_ref().into(),
+                                    outcome: result
+                                        .as_ref()
+                                        .map_or_else(request_log::error_kind, |_| "routed"),
+                                });
+                            }
                             last_transient = None;
                             event = Event::Result(match &result {
                                 Ok(_) => Outcome::Success,
@@ -931,6 +936,13 @@ impl Executor {
                             if !binding.limits.admit_repair(needed) {
                                 return Err(GatewayError::Client(error));
                             }
+                            // The rejected send already reached upstream; the
+                            // resend's own leg is recorded when it finishes.
+                            trace.legs.push(request_log::AttemptLeg {
+                                deployment: dep.id.as_ref().into(),
+                                provider: dep.provider.0.as_ref().into(),
+                                outcome: request_log::upstream_error_kind(&error),
+                            });
                             upstream = Request::from_parts(parts, repaired);
                             repairs += 1;
                         }
