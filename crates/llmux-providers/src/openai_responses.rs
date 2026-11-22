@@ -81,7 +81,10 @@ impl ProviderAdapter for OpenAiResponses {
                 SystemTime::now(),
             ));
         }
-        if !sse::is_event_stream(&parts.headers) {
+        // api.openai.com/v1/responses streams SSE without a Content-Type
+        // header, so a missing header is accepted; a wrong one is not.
+        if parts.headers.contains_key(header::CONTENT_TYPE) && !sse::is_event_stream(&parts.headers)
+        {
             return Err(bad_gateway());
         }
         let stream = validated(sse::decode(body));
