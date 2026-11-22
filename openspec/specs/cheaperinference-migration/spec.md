@@ -483,3 +483,69 @@ THEN removing their opt-in flags restores the previous replacement-only or
 source-routing behavior. Keyed Kilo remains fail-closed without pricing
 metadata; batch replacements are synchronous and preserve neither batch
 scheduling nor batch discounts.
+
+### Requirement: Collapse duplicate deployment legs
+
+After a model's deployments are assembled, including per-deployment headers,
+`strip_request_fields`, context and quota fields, and an optional OmniRoute
+fallback leg, the importer SHALL drop a later leg that repeats an earlier leg
+of that same model. Identity is the credential id, `upstream_model`,
+`base_url`, per-deployment `headers`, `strip_request_fields`, `max_context`,
+`quota`, and `timeout_ms`. Missing and empty header, strip, or quota values
+are the same. A known `max_context` is not the same as a missing one, and two
+different limits are not duplicates, so a request that fits only the larger
+window still has a route. Header `file:` references are compared by the file
+bytes when the file can be read at import time; an unreadable reference is
+compared as the reference string. The kept leg is the one with the lowest
+priority, then the earlier source position. The importer SHALL NOT collapse
+legs across models.
+It SHALL emit one warning per affected model naming how many legs were dropped,
+and that warning SHALL NOT contain credential values.
+
+Surviving non-fallback ids SHALL be renumbered to a contiguous
+`<sanitized-model>-0` .. `<sanitized-model>-N` sequence, using the existing id
+sanitizer so ids stay unique. Priorities SHALL be rewritten to `0..N` in that
+kept order, except that a round-robin combo's equal native priorities stay
+equal. An `omniroute-fallback-*` leg, including the catch-all, SHALL keep its
+id and SHALL be dropped only when it is itself a duplicate of an earlier leg.
+Its priority SHALL remain strictly greater than every surviving native leg of
+that model, and contiguous with them. Models with no duplicate legs SHALL be
+left unchanged.
+
+#### Scenario: Repeated connection in one combo
+
+WHEN one connection is listed in several steps of the same combo for the same upstream model
+THEN that model has one deployment for the connection, its id and priority start at zero, and one warning names the model and how many legs were dropped.
+
+#### Scenario: Same endpoint, different credentials
+
+WHEN two connections share a base URL but use different credentials
+THEN both deployments are kept, even if each connection is listed more than once.
+
+#### Scenario: Headers or strip fields differ
+
+WHEN two legs share a credential, upstream model, and base URL but differ in headers or `strip_request_fields`
+THEN both are kept.
+
+#### Scenario: Different context windows stay routable
+
+WHEN two anonymous legs share an endpoint and upstream model but have context limits of 8192 and 32768
+THEN both limits survive
+AND a 20000-token request still has a deployment whose window fits it.
+
+#### Scenario: Identical header files are one leg
+
+WHEN two anonymous legs share an endpoint and their header files contain the same bytes
+THEN one deployment remains.
+WHEN a header file cannot be read at import time
+THEN its reference string is the identity, so a different unreadable path is not collapsed.
+
+#### Scenario: Fallback leg is not a native clone
+
+WHEN a model has duplicate native legs and one OmniRoute fallback
+THEN the fallback leg remains, with its `omniroute-fallback-*` id and a priority greater than every surviving native leg.
+
+#### Scenario: Same leg in two models
+
+WHEN two models each use the same connection and upstream model
+THEN each model keeps its own deployment.

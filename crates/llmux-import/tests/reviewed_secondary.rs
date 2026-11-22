@@ -122,11 +122,10 @@ fn reviewed_secondary_appends_once_after_existing_legs_and_before_fallback() {
     }
     let mut root = fixture();
     root["combos"][0]["models"] = json!(["experlabs/gpt-6-luna", "experlabs/gpt-6-luna"]);
-    check(
-        &root,
-        &[PRIMARY, PRIMARY, SECONDARY, SECONDARY, SECONDARY],
-        false,
-    );
+    let warnings = check(&root, &[PRIMARY, SECONDARY, SECONDARY, SECONDARY], false);
+    assert!(warnings
+        .iter()
+        .any(|warning| warning == "gpt-6-luna: dropped 1 duplicate deployment"));
 }
 
 #[test]
