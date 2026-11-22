@@ -1580,7 +1580,7 @@ pub fn import_with_options(
             }
         }
     }
-    validation::validate(&config, &dir, &policy.external_references())?;
+    validation::validate(&config, &dir)?;
     let value = toml::Value::try_from(&config).map_err(|_| "could not encode configuration")?;
     let content = toml::to_string_pretty(&value).map_err(|_| "could not encode configuration")?;
     let mut file = OpenOptions::new()
