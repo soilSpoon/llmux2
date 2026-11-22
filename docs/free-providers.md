@@ -604,9 +604,10 @@ quota = { rpm = 20 }
 ### packet.ai Token Factory (promotion, ends 2026-12-16)
 
 Both models are `$0` until 2026-12-16 and then bill per token, so the expiry is
-set to the last second of that day. The page states no rate limit; the `rpm = 20`
-here is a guess, not a documented number. A wrong upstream model ID fails as an
-upstream error, not as a config error.
+set to the last second of that day. The page states no rate limit, so no `quota`
+is set here either: an undocumented guess would throttle free capacity for no
+reason. A wrong upstream model ID fails as an upstream error, not as a config
+error.
 
 ```toml
 [server]
@@ -627,7 +628,6 @@ credential = "packet-key"
 base_url = "https://api.packet.ai/v1"
 upstream_model = "nvidia/DeepSeek-V4.1-Flash-NVFP4"
 timeout_ms = 60000
-quota = { rpm = 20 }
 expires_at = 2026-12-16T23:59:59Z
 ```
 
