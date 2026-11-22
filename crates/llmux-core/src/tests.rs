@@ -1500,6 +1500,51 @@ async fn request_log_omits_legs_when_the_build_never_sent() {
 }
 
 #[tokio::test]
+async fn deployment_stats_count_outgoing_handoffs() {
+    let (mut executor, _adapter, _, _server) = fixture_full(
+        vec![
+            UpstreamError::Server {
+                status: StatusCode::BAD_GATEWAY,
+            },
+            UpstreamError::RateLimited {
+                retry_after: Some(Duration::from_secs(1)),
+            },
+        ],
+        false,
+        [Some(1024); 3],
+        &[("model", &[0, 1, 2])],
+        Default::default(),
+        Default::default(),
+        false,
+        None,
+        [None; 3],
+    )
+    .await;
+    for binding in &mut executor.bindings {
+        binding.stats = Some(Default::default());
+    }
+    let response = executor.execute(request()).await.unwrap();
+    assert_eq!(response.deployment.as_ref(), "dep2");
+    let handoffs = |executor: &Executor| {
+        executor
+            .deployment_stats()
+            .iter()
+            .map(|dep| serde_json::to_value(dep).unwrap()["handoffs"].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        serde_json::json!(handoffs(&executor)),
+        serde_json::json!([1, 1, 0])
+    );
+    executor.execute(request()).await.unwrap();
+    assert_eq!(
+        serde_json::json!(handoffs(&executor)),
+        serde_json::json!([1, 1, 0]),
+        "a first-attempt route hands nothing off"
+    );
+}
+
+#[tokio::test]
 async fn request_log_prefers_response_header_over_error_body() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("requests.jsonl");

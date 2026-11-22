@@ -673,6 +673,13 @@ impl Executor {
                                 return Err(GatewayError::InvalidRequest);
                             }
                             trace.attempts = machine.attempts as _;
+                            // A retry on the same deployment after a refresh
+                            // is not a failover; moving to another one is.
+                            if let Some(prev) = trace.last_attempted.filter(|prev| *prev != idx) {
+                                if let Some(stats) = &self.bindings[prev].stats {
+                                    stats.record_handoff();
+                                }
+                            }
                             trace.last_attempted = Some(idx);
                             let timed_out = Err(GatewayError::Client(UpstreamError::Timeout));
                             // A failed or timed-out build sent nothing upstream,
