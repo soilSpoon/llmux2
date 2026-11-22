@@ -1046,12 +1046,26 @@ mod tests {
     }
 
     #[test]
-    fn shipped_example_config_carries_the_free_offers_and_their_expiries() {
+    fn shipped_examples_keep_the_free_offers_out_of_the_quickstart() {
         for (name, value) in [
             ("LLMUX_CLIENT_KEY", "example-client-key"),
             ("GROQ_API_KEY", "example-groq-key"),
             ("TOGETHER_API_KEY", "example-together-key"),
             ("ANTHROPIC_API_KEY", "example-anthropic-key"),
+        ] {
+            std::env::set_var(name, value);
+        }
+        let quickstart = RuntimeConfig::parse(include_str!("../../../examples/llmux.example.toml"))
+            .expect("the quickstart example must load without the free-tier provider keys");
+        assert!(
+            quickstart
+                .deployments
+                .iter()
+                .all(|deployment| deployment.expires_at.is_none()),
+            "the quickstart example must not carry the opt-in free offers"
+        );
+
+        for (name, value) in [
             ("PACKET_API_KEY", "example-packet-key"),
             ("NVIDIA_API_KEY", "example-nvidia-key"),
             ("OPENCODE_ZEN_API_KEY", "example-zen-key"),
@@ -1059,8 +1073,9 @@ mod tests {
         ] {
             std::env::set_var(name, value);
         }
-        let example = include_str!("../../../examples/llmux.example.toml");
-        let parsed = RuntimeConfig::parse(example).expect("the shipped example config must load");
+        let example = include_str!("../../../examples/llmux.free-providers.example.toml");
+        let parsed =
+            RuntimeConfig::parse(example).expect("the shipped free-provider example must load");
         let expiry = |seconds: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
         let mut seen = HashSet::new();
         for dep in parsed.deployments.iter() {

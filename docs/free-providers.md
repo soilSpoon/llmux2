@@ -2,7 +2,9 @@
 
 Research snapshot: **2026-11-20**, against llmux2 `eb3b617`; the temporary
 offers in the first section were added **2026-11-23** and are configured in
-[`examples/llmux.example.toml`](../examples/llmux.example.toml). Official pages were
+[`examples/llmux.free-providers.example.toml`](../examples/llmux.free-providers.example.toml),
+a separate sample because it needs four extra provider keys the quickstart does
+not. Official pages were
 retrieved with `curl -L -sS`; quotations below are the text returned, not remembered
 quotas. Free offers and catalogs change. A documented API is not a promise of
 capacity, production suitability, permission to resell, or identical models to an
@@ -47,8 +49,11 @@ limits and stats machinery covers them.
 
 ### Offers configured on 2026-11-23
 
-These four providers — seven deployments — are wired into the shipped example
-config as `[[models.deployments]]`.
+These four providers — seven deployments — ship as `[[models.deployments]]` in
+[`examples/llmux.free-providers.example.toml`](../examples/llmux.free-providers.example.toml),
+not in the quickstart example: the loader resolves every credential at startup, so
+mixing them into `examples/llmux.example.toml` would make the llama-70b quickstart
+demand all four extra keys. Run that file on its own or copy the blocks you want.
 They are **test and failover capacity, not capacity you can budget**: every one of
 them is a promotion, a free tier, or a third-party aggregator that can change
 without notice. Each upstream limit in the example is set below the documented
@@ -384,6 +389,8 @@ page only exposes account-specific limits, no number is invented.
 ## Ready-to-paste configuration
 
 Each block is a **separate complete `llmux.toml`**, not a fragment to concatenate.
+The four 2026-11-23 offers also exist combined, as
+[`examples/llmux.free-providers.example.toml`](../examples/llmux.free-providers.example.toml).
 Export `LLMUX_CLIENT_KEY` and the named upstream key first; llmux2 accepts only
 `env:`/`file:` secret references, not inline secrets. Free tier eligibility is
 your responsibility, not the config’s.
