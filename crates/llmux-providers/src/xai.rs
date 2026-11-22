@@ -57,6 +57,7 @@ fn with_model(req: &GatewayRequest, body: Bytes, model: &str) -> GatewayRequest 
         max_output_tokens: req.max_output_tokens,
         context_overflow: req.context_overflow,
         request_id: req.request_id.clone(),
+        end_user: req.end_user.clone(),
     }
 }
 
@@ -184,6 +185,7 @@ mod tests {
             max_output_tokens: None,
             context_overflow: None,
             request_id: RequestId("req".into()),
+            end_user: None,
         }
     }
 

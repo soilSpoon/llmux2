@@ -9,8 +9,8 @@ use http::{
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use llmux_types::{
-    AuthError, AuthMaterial, BoxStream, BuildError, ChatRequestField, CredentialSource, Deployment,
-    GatewayRequest, GatewayResponse, InboundFormat, LimitObservation, ProviderAdapter,
+    provider, AuthError, AuthMaterial, BoxStream, BuildError, ChatRequestField, CredentialSource,
+    Deployment, GatewayRequest, GatewayResponse, InboundFormat, LimitObservation, ProviderAdapter,
     ProviderKind, SseEvent, Support, UpstreamError,
 };
 use serde::Deserialize;
@@ -458,6 +458,25 @@ impl OpenAiCompat {
     pub fn new(kind: impl Into<Arc<str>>) -> Self {
         Self(ProviderKind(kind.into()))
     }
+
+    fn forwards_end_user(&self) -> bool {
+        matches!(
+            self.0 .0.as_ref(),
+            provider::OPENAI | provider::OPENAI_COMPAT
+        )
+    }
+}
+
+fn apply_user_field(body: Bytes, user: &str) -> Result<Bytes, BuildError> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|_| BuildError::InvalidBody)?;
+    value
+        .as_object_mut()
+        .ok_or(BuildError::InvalidBody)?
+        .insert("user".into(), serde_json::json!(user));
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|_| BuildError::InvalidBody)
 }
 
 /// `base` joined with an endpoint suffix like `/chat/completions`.
@@ -529,6 +548,14 @@ impl ProviderAdapter for OpenAiCompat {
                 messages::request(&req.body, crate::upstream_model(req, dep))?
             }
             InboundFormat::OpenAiChat => rewrite_model(&req.body, crate::upstream_model(req, dep))?,
+        };
+        let body = if self.forwards_end_user() {
+            match req.end_user.as_deref() {
+                Some(user) => apply_user_field(body, user)?,
+                None => body,
+            }
+        } else {
+            body
         };
         let mut request = Request::builder()
             .method(Method::POST)
@@ -1115,6 +1142,7 @@ mod tests {
                 max_output_tokens: Some(64),
                 context_overflow: None,
                 request_id: RequestId("r".into()),
+                end_user: None,
             };
             let upstream = adapter
                 .build_request(&req, &deployment, &AuthMaterial::None)
@@ -1325,6 +1353,7 @@ mod tests {
             max_output_tokens: None,
             context_overflow: None,
             request_id: RequestId("r".into()),
+            end_user: None,
         };
         let build = |dep: &Deployment| {
             adapter
@@ -1835,5 +1864,66 @@ mod tests {
         assert_eq!(retry_after(&headers, now), Some(Duration::from_secs(9)));
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("invalid"));
         assert_eq!(retry_after(&headers, now), None);
+    }
+
+    #[test]
+    fn end_user_hash_overrides_user_unless_stripped_or_unsupported() {
+        use futures_util::FutureExt;
+        use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
+        let hash = "31ca399bfc61dac0b442a6bef7c00cd06cf9682c11b9192fb26a918b4a9130f8";
+        let raw = "raw-client-SHOULD-NOT-LEAK";
+        let body = Bytes::from(format!(
+            r#"{{"model":"m","user":"{raw}","messages":[],"seed":1}}"#
+        ));
+        let req = GatewayRequest {
+            format: InboundFormat::OpenAiChat,
+            model: "m".into(),
+            stream: false,
+            body,
+            est_input_tokens: 0,
+            anthropic_headers: HeaderMap::new(),
+            max_output_tokens: None,
+            context_overflow: None,
+            request_id: RequestId("r".into()),
+            end_user: Some(hash.into()),
+        };
+        let deployment = |kind: &str, strip: &[ChatRequestField]| Deployment {
+            headers: Default::default(),
+            idx: DeploymentIdx(0),
+            id: "d".into(),
+            provider: ProviderKind(kind.into()),
+            credential: "key".into(),
+            base_url: "https://example.com/v1".parse().unwrap(),
+            upstream_model: "upstream".into(),
+            strip_request_fields: strip.to_vec().into_boxed_slice(),
+            priority: 0,
+            quota: QuotaSpec::default(),
+            timeout: Duration::from_secs(5),
+            max_context: None,
+            fallback: false,
+        };
+        let send = |adapter: &OpenAiCompat, dep: &Deployment| {
+            let request = adapter
+                .build_request(&req, dep, &AuthMaterial::None)
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(request.body()).unwrap()
+        };
+        let compat = OpenAiCompat::new(provider::OPENAI_COMPAT);
+        let sent = send(&compat, &deployment(provider::OPENAI_COMPAT, &[]));
+        assert_eq!(sent["user"], hash);
+        assert!(!sent.to_string().contains(raw));
+        assert_eq!(sent["model"], "upstream");
+        let stripped = send(
+            &compat,
+            &deployment(provider::OPENAI_COMPAT, &[ChatRequestField::User]),
+        );
+        assert!(stripped.get("user").is_none());
+        assert!(!stripped.to_string().contains(raw));
+        assert!(!stripped.to_string().contains(hash));
+        let xai = OpenAiCompat::new(provider::XAI);
+        let untouched = send(&xai, &deployment(provider::XAI, &[]));
+        assert_eq!(untouched["user"], raw);
     }
 }

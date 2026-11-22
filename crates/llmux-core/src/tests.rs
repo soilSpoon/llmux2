@@ -225,6 +225,11 @@ async fn fixture_full(
             drain_grace: Duration::from_secs(2),
             expose_routing_headers: true,
             dashboard_key: None,
+            end_user_header: None,
+            end_user_salt: None,
+            end_user_from_body: false,
+            remote_images: llmux_config::RemoteImages::Allow,
+            max_image_bytes: None,
         },
         routing: llmux_config::RoutingConfig {
             max_attempts: 4,
@@ -291,6 +296,7 @@ fn request() -> GatewayRequest {
         max_output_tokens: None,
         context_overflow: None,
         request_id: RequestId("test".into()),
+        end_user: None,
     }
 }
 

@@ -1,6 +1,6 @@
 //! Parse and validate an immutable MVP routing configuration.
 
-use http::Uri;
+use http::{HeaderName, Uri};
 use llmux_types::{
     provider, CanonicalModel, Capabilities, ChatRequestField, ContextOverflow, Deployment,
     DeploymentIdx, ErrorKind, NousState, ProviderKind, QuotaSpec,
@@ -37,6 +37,24 @@ pub struct ServerConfig {
     pub drain_grace: Duration,
     pub expose_routing_headers: bool,
     pub dashboard_key: Option<Arc<str>>,
+    /// Inbound header whose value is hashed into the end-user id. `None` disables the feature.
+    pub end_user_header: Option<HeaderName>,
+    /// Secret mixed into the end-user hash. Present only when `end_user_header` is set.
+    pub end_user_salt: Option<Arc<str>>,
+    /// When the header is absent, hash the OpenAI `user` body field. Default true if the header is set.
+    pub end_user_from_body: bool,
+    pub remote_images: RemoteImages,
+    /// Decoded byte cap for inline `data:` and Anthropic base64 images. `None` is unlimited.
+    pub max_image_bytes: Option<u64>,
+}
+
+/// Whether chat requests may carry an http(s) image URL.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteImages {
+    #[default]
+    Allow,
+    Reject,
 }
 
 pub struct RoutingConfig {
@@ -133,6 +151,11 @@ struct RawServer {
     drain_grace_ms: u64,
     expose_routing_headers: bool,
     dashboard_key: Option<String>,
+    end_user_header: Option<String>,
+    end_user_salt: Option<String>,
+    end_user_from_body: Option<bool>,
+    remote_images: RemoteImages,
+    max_image_bytes: Option<u64>,
 }
 
 impl Default for RawServer {
@@ -145,6 +168,11 @@ impl Default for RawServer {
             drain_grace_ms: 2_000,
             expose_routing_headers: true,
             dashboard_key: None,
+            end_user_header: None,
+            end_user_salt: None,
+            end_user_from_body: None,
+            remote_images: RemoteImages::Allow,
+            max_image_bytes: None,
         }
     }
 }
@@ -296,6 +324,11 @@ impl RawConfig {
                 "server.dashboard_key must differ from server.client_keys",
             ));
         }
+        let end_user = end_user_settings(&server)?;
+        let max_image_bytes = match server.max_image_bytes {
+            Some(0) => return Err(invalid("max_image_bytes must be positive")),
+            other => other,
+        };
         if routing.max_attempts == 0 {
             return Err(invalid("routing.max_attempts must be positive"));
         }
@@ -676,6 +709,11 @@ impl RawConfig {
                 drain_grace: Duration::from_millis(server.drain_grace_ms),
                 expose_routing_headers: server.expose_routing_headers,
                 dashboard_key,
+                end_user_header: end_user.header,
+                end_user_salt: end_user.salt,
+                end_user_from_body: end_user.from_body,
+                remote_images: server.remote_images,
+                max_image_bytes,
             },
             routing: RoutingConfig {
                 max_attempts: routing.max_attempts,
@@ -701,6 +739,71 @@ impl RawConfig {
 
 fn invalid(message: &str) -> ConfigError {
     ConfigError::Invalid(message.to_owned())
+}
+
+struct EndUserSettings {
+    header: Option<HeaderName>,
+    salt: Option<Arc<str>>,
+    from_body: bool,
+}
+
+fn end_user_settings(server: &RawServer) -> Result<EndUserSettings, ConfigError> {
+    let header = match server.end_user_header.as_deref() {
+        None => None,
+        Some(name) if name.is_empty() || name.trim().is_empty() => {
+            return Err(invalid(
+                "end_user_header must be a nonempty HTTP header name",
+            ));
+        }
+        Some(name) => Some(end_user_header_name(name)?),
+    };
+    let salt = match (&header, server.end_user_salt.as_deref()) {
+        (None, None) => None,
+        (None, Some(_)) => return Err(invalid("end_user_salt requires end_user_header")),
+        (Some(_), None | Some("")) => {
+            return Err(invalid(
+                "end_user_salt is required when end_user_header is set and must be a nonempty env: or file: secret",
+            ));
+        }
+        (Some(_), Some(reference)) => Some(resolve_secret(reference).map_err(|err| {
+            invalid(&format!(
+                "end_user_salt must be a nonempty env: or file: secret ({err})"
+            ))
+        })?),
+    };
+    let from_body = match (header.is_some(), server.end_user_from_body) {
+        (false, Some(_)) => return Err(invalid("end_user_from_body requires end_user_header")),
+        (false, None) => false,
+        (true, None) => true,
+        (true, Some(value)) => value,
+    };
+    Ok(EndUserSettings {
+        header,
+        salt,
+        from_body,
+    })
+}
+
+fn end_user_header_name(name: &str) -> Result<HeaderName, ConfigError> {
+    let name = HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| invalid("end_user_header must be a valid HTTP header name"))?;
+    if matches!(
+        name.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "x-api-key"
+            | "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+    ) {
+        return Err(invalid(
+            "end_user_header cannot be a credential, cookie, or hop-by-hop header",
+        ));
+    }
+    Ok(name)
 }
 
 fn required_oauth(value: Option<String>, field: &str) -> Result<String, ConfigError> {
@@ -1265,5 +1368,96 @@ strip_request_fields = {fields}
         assert!(RuntimeConfig::parse(&base("anthropic", r#"["temperature", "seed"]"#)).is_err());
         assert!(RuntimeConfig::parse(&base("xai", r#"["temperature"]"#)).is_err());
         assert!(RuntimeConfig::parse(&base("openai", r#"["seed", "temperature"]"#)).is_ok());
+    }
+
+    #[test]
+    fn end_user_and_image_policy_config_is_off_by_default_and_rejects_bad_values() {
+        std::env::set_var("LLMUX_CONFIG_OAUTH_TEST_SECRET", "test-secret");
+        std::env::set_var("LLMUX_END_USER_SALT_TEST", "salt-one");
+        std::env::set_var("LLMUX_END_USER_EMPTY_TEST", "");
+        let base = r#"
+[server]
+client_keys = ["env:LLMUX_CONFIG_OAUTH_TEST_SECRET"]
+[[credentials]]
+id = "key"
+kind = "api_key"
+provider = "anthropic"
+key = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET"
+[[models]]
+name = "model"
+[[models.deployments]]
+id = "deployment"
+credential = "key"
+base_url = "https://example.com/v1"
+upstream_model = "upstream"
+"#;
+        let plain = RuntimeConfig::parse(base).unwrap();
+        assert!(plain.server.end_user_header.is_none());
+        assert!(plain.server.end_user_salt.is_none());
+        assert!(!plain.server.end_user_from_body);
+        assert_eq!(plain.server.remote_images, RemoteImages::Allow);
+        assert!(plain.server.max_image_bytes.is_none());
+
+        let with = |extra: &str| {
+            base.replace(
+                "client_keys = [\"env:LLMUX_CONFIG_OAUTH_TEST_SECRET\"]\n",
+                &format!("client_keys = [\"env:LLMUX_CONFIG_OAUTH_TEST_SECRET\"]\n{extra}\n"),
+            )
+        };
+        let enabled = RuntimeConfig::parse(&with(
+            "end_user_header = \"X-Client-User\"\nend_user_salt = \"env:LLMUX_END_USER_SALT_TEST\"\nremote_images = \"reject\"\nmax_image_bytes = 8",
+        ))
+        .unwrap();
+        assert_eq!(
+            enabled.server.end_user_header.unwrap().as_str(),
+            "x-client-user"
+        );
+        assert_eq!(enabled.server.end_user_salt.unwrap().as_ref(), "salt-one");
+        assert!(enabled.server.end_user_from_body);
+        assert_eq!(enabled.server.remote_images, RemoteImages::Reject);
+        assert_eq!(enabled.server.max_image_bytes, Some(8));
+
+        let body_off = RuntimeConfig::parse(&with(
+            "end_user_header = \"x-client-user\"\nend_user_salt = \"env:LLMUX_END_USER_SALT_TEST\"\nend_user_from_body = false",
+        ))
+        .unwrap();
+        assert!(!body_off.server.end_user_from_body);
+
+        let literal = "super-secret-salt-value";
+        let err = RuntimeConfig::parse(&with(&format!(
+            "end_user_header = \"x-client-user\"\nend_user_salt = \"{literal}\""
+        )))
+        .map(|_| ())
+        .unwrap_err();
+        assert!(!err.to_string().contains(literal));
+        for extra in [
+            "end_user_header = \"x-client-user\"",
+            "end_user_salt = \"env:LLMUX_END_USER_SALT_TEST\"",
+            "end_user_from_body = true",
+            "end_user_header = \"\"",
+            "end_user_header = \"authorization\"\nend_user_salt = \"env:LLMUX_END_USER_SALT_TEST\"",
+            "end_user_header = \"x-client-user\"\nend_user_salt = \"env:LLMUX_END_USER_EMPTY_TEST\"",
+            "max_image_bytes = 0",
+            "remote_images = \"drop\"",
+        ] {
+            assert!(RuntimeConfig::parse(&with(extra)).is_err(), "{extra}");
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "llmux-end-user-salt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "file-salt\n").unwrap();
+        let loaded = RuntimeConfig::parse(&with(&format!(
+            "end_user_header = \"x-client-user\"\nend_user_salt = \"file:{}\"",
+            path.display()
+        )))
+        .unwrap();
+        assert_eq!(loaded.server.end_user_salt.unwrap().as_ref(), "file-salt");
+        std::fs::remove_file(path).unwrap();
     }
 }

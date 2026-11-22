@@ -6,6 +6,7 @@ mod dashboard;
 mod lifecycle;
 #[cfg(unix)]
 mod notify;
+mod policy;
 pub use lifecycle::{bind, serve};
 
 use axum::body::Bytes;
@@ -329,6 +330,36 @@ async fn execute_authorized(active: &Active, request: Request, format: InboundFo
             )
         }
     };
+    let end_user = match policy::resolve_end_user(&active.config.server, &parts.headers, &body) {
+        Ok(id) => id,
+        Err(err) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                err.message(),
+            );
+        }
+    };
+    let response = route_request(
+        active,
+        &parts.headers,
+        body,
+        format,
+        context_overflow,
+        end_user.clone(),
+    )
+    .await;
+    policy::attach_end_user(response, end_user.as_deref())
+}
+
+async fn route_request(
+    active: &Active,
+    headers: &HeaderMap,
+    body: Bytes,
+    format: InboundFormat,
+    context_overflow: Option<ContextOverflow>,
+    end_user: Option<Arc<str>>,
+) -> Response {
     let Ok(metadata) = RequestMetadata::parse(&body, format) else {
         return error(
             StatusCode::BAD_REQUEST,
@@ -336,6 +367,9 @@ async fn execute_authorized(active: &Active, request: Request, format: InboundFo
             "Expected a JSON object with a nonempty string model and optional boolean stream",
         );
     };
+    if let Err(err) = policy::check_images(&body, &active.config.server) {
+        return error(err.status(), err.code(), err.message());
+    }
     if format == InboundFormat::OpenAiChat {
         if let Some(temperature) = metadata.temperature {
             match serde_json::from_str::<f64>(temperature.get()) {
@@ -352,7 +386,7 @@ async fn execute_authorized(active: &Active, request: Request, format: InboundFo
         .model_names
         .get(model.as_ref())
         .and_then(|idx| active.config.model_allowed_keys.get(idx))
-        .is_some_and(|keys| !authorized_for_format(&parts.headers, keys, format))
+        .is_some_and(|keys| !authorized_for_format(headers, keys, format))
     {
         return error(
             StatusCode::FORBIDDEN,
@@ -376,7 +410,7 @@ async fn execute_authorized(active: &Active, request: Request, format: InboundFo
     let mut anthropic_headers = HeaderMap::new();
     if format == InboundFormat::AnthropicMessages {
         for name in ["anthropic-version", "anthropic-beta"] {
-            for value in parts.headers.get_all(name) {
+            for value in headers.get_all(name) {
                 anthropic_headers.append(HeaderName::from_static(name), value.clone());
             }
         }
@@ -391,6 +425,7 @@ async fn execute_authorized(active: &Active, request: Request, format: InboundFo
         body,
         anthropic_headers: anthropic_headers.clone(),
         request_id: request_id.clone(),
+        end_user: end_user.clone(),
     };
 
     let mut dropped = 0;

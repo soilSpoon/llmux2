@@ -489,6 +489,7 @@ mod tests {
             max_output_tokens: None,
             context_overflow: None,
             request_id: RequestId("req".into()),
+            end_user: None,
         };
         let built = adapter
             .build_request(
