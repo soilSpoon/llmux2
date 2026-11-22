@@ -282,7 +282,92 @@ pub(super) const NON_CHAT_MODELS: &[&str] = &["codestral-embed", "mistral-embed"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::upstream::ProviderIdentity;
     use serde_json::json;
+
+    fn connection(provider: ProviderIdentity, policy: ModelPolicy) -> crate::Connection {
+        crate::Connection {
+            headers: json!({}),
+            source_id: "test".into(),
+            provider,
+            credential: None,
+            kind: "openai_compat".into(),
+            base_url: "https://example.com/v1".into(),
+            priority: 0,
+            policy,
+        }
+    }
+
+    fn options_policy(devin_free: Option<HashSet<String>>) -> Policy {
+        Policy {
+            workers: None,
+            workers_rpm: WORKERS_DEFAULT_RPM,
+            workers_models: None,
+            kilo_key: None,
+            kilo_free: None,
+            openrouter_replacements: false,
+            devin_free,
+        }
+    }
+
+    #[test]
+    fn billing_exceptions_never_mark_paid_or_quota_capped_legs_free() {
+        let custom = ProviderIdentity::Custom("node".into());
+        let builtin = |name: &str| ProviderIdentity::Builtin(name.into());
+        let policy = options_policy(Some(HashSet::from(["devin-free-model".to_string()])));
+
+        // A custom provider node claiming the Cloudflare prefix shares the
+        // capped Workers account — billed wherever it appears.
+        assert!(billed(
+            &connection(custom.clone(), ModelPolicy::Workers),
+            "m",
+            &policy
+        ));
+        // Paid Devin legs bill; only models the free listing names are free,
+        // and with no listing every Devin leg is billed.
+        assert!(billed(
+            &connection(builtin("devin-cli-agentic"), ModelPolicy::Any),
+            "swe-2",
+            &policy
+        ));
+        assert!(!billed(
+            &connection(builtin("devin-cli-agentic"), ModelPolicy::Any),
+            "devin-free-model",
+            &policy
+        ));
+        assert!(billed(
+            &connection(builtin("devin-cli-agentic"), ModelPolicy::Any),
+            "devin-free-model",
+            &options_policy(None)
+        ));
+        // Subscription portals and commercial providers bill.
+        assert!(billed(
+            &connection(builtin("nous"), ModelPolicy::Any),
+            "m",
+            &policy
+        ));
+        assert!(billed(
+            &connection(builtin("anthropic"), ModelPolicy::Any),
+            "m",
+            &policy
+        ));
+        // Community endpoints, custom nodes, Kilo verified-free and XPLabs
+        // free routes stay sweepable.
+        assert!(!billed(
+            &connection(builtin("github-models"), ModelPolicy::Any),
+            "m",
+            &policy
+        ));
+        assert!(!billed(&connection(custom, ModelPolicy::Any), "m", &policy));
+        assert!(!billed(
+            &connection(builtin("anthropic"), ModelPolicy::KiloFree),
+            "m",
+            &policy
+        ));
+        let mut xplabs = connection(builtin("anthropic"), ModelPolicy::Any);
+        xplabs.base_url = crate::xplabs::BASE_URL.into();
+        assert!(!billed(&xplabs, "m", &policy));
+    }
 
     #[test]
     fn cost_metadata_is_exact_and_does_not_accept_float_underflow() {
