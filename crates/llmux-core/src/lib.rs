@@ -20,7 +20,7 @@ use llmux_config::RuntimeConfig;
 use llmux_types::{
     provider, AuthMaterial, BuildError, ContextOverflow, CredentialSource, Deployment,
     DeploymentIdx, ErrorKind, GatewayRequest, GatewayResponse, ProviderAdapter, ProviderRegistry,
-    Support, UpstreamError,
+    SseCommitment, Support, UpstreamError,
 };
 use machine::{Built, Effect, Event, Outcome, Phase, State};
 use stats::{AttemptStats, SkipReason};
@@ -861,14 +861,16 @@ impl Executor {
         match response {
             GatewayResponse::Complete { .. } if !req.stream => Ok(response),
             GatewayResponse::Stream(mut events) if req.stream => {
-                // Commit on a real chunk or [DONE], not on an OpenAI-compat
-                // keepalive. Drop those before commit so a later error frame
-                // fails the attempt. The caller's attempt deadline (request
-                // timeout intersected with the deployment timeout) bounds the wait.
+                let mut preamble = None;
                 let first = loop {
                     match events.next().await {
-                        Some(Ok(event)) if !event.commits() => continue,
-                        Some(Ok(event)) => break event,
+                        Some(Ok(event)) => match event.commitment() {
+                            SseCommitment::Keepalive => {}
+                            SseCommitment::RolePreamble => {
+                                preamble.get_or_insert(event);
+                            }
+                            SseCommitment::Commit => break event,
+                        },
                         Some(Err(err)) => return Err(GatewayError::Client(err)),
                         None => {
                             return Err(GatewayError::Client(UpstreamError::StreamBroken {
@@ -926,7 +928,7 @@ impl Executor {
                     },
                 );
                 Ok(GatewayResponse::Stream(Box::pin(
-                    stream::once(async { Ok(first) }).chain(events),
+                    stream::iter(preamble.into_iter().chain([first]).map(Ok)).chain(events),
                 )))
             }
             _ => Err(GatewayError::Client(UpstreamError::Server {
