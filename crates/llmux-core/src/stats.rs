@@ -86,15 +86,17 @@ pub(crate) enum SkipReason {
     Cooldown,
     AdmissionLimited,
     UnsupportedConversion,
+    UpstreamUnavailable,
 }
 
-const SKIP_REASONS: [&str; 6] = [
+const SKIP_REASONS: [&str; 7] = [
     "disabled",
     "unsupported_format",
     "context_length",
     "cooldown",
     "admission_limited",
     "unsupported_conversion",
+    "upstream_unavailable",
 ];
 
 fn snapshot_counts<const N: usize>(

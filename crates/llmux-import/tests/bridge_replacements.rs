@@ -109,8 +109,20 @@ fn bridge_replacements_preserve_leg_order_aliases_and_optional_fallback() {
                 assert_eq!(last.upstream_model, model.name);
             }
         }
-        assert!(!config.model_names.contains_key("unknown"));
-        assert!(!config.model_names.contains_key("duckduckgo-web/gpt-6-luna"));
+        if fallback {
+            for name in ["unknown", "duckduckgo-web/gpt-6-luna"] {
+                let model = &config.models[*config
+                    .model_names
+                    .get(name)
+                    .unwrap_or_else(|| panic!("missing {name}"))];
+                let last = &config.deployments[model.deployments.last().unwrap().0 as usize];
+                assert!(last.fallback, "{name}");
+                assert_eq!(last.upstream_model.as_ref(), name, "{name}");
+            }
+        } else {
+            assert!(!config.model_names.contains_key("unknown"));
+            assert!(!config.model_names.contains_key("duckduckgo-web/gpt-6-luna"));
+        }
         assert!(!config
             .api_keys
             .keys()

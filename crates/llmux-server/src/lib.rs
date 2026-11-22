@@ -1,10 +1,12 @@
 //! Axum boundary for the OpenAI-compatible gateway.
 
 mod admin;
+mod catalog;
 mod dashboard;
 mod lifecycle;
 #[cfg(unix)]
 mod notify;
+mod policy;
 pub use lifecycle::{bind, serve};
 
 use axum::body::Bytes;
@@ -22,11 +24,12 @@ use futures_util::StreamExt;
 use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use http_body_util::LengthLimitError;
 use llmux_config::{ApiKey, RuntimeConfig};
-use llmux_core::{Executor, GatewayError, RoutedError};
+use llmux_core::{Executor, GatewayError, LiveModels, RoutedError};
+use llmux_providers::nous_portal::{NousPortalConfig, NousPortalSource};
 use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
 use llmux_providers::{
-    truncate_middle_for_format, Anthropic, OpenAiCompat, OpenAiResponses, RequestMetadata,
-    StaticKey,
+    truncate_middle_for_format, Anthropic, Antigravity, DevinAcp, DevinAcpConfig, OpenAiCompat,
+    OpenAiResponses, RequestMetadata, StaticKey, Xai,
 };
 use llmux_types::{
     provider, ContextOverflow, CredentialSource, GatewayRequest, GatewayResponse, InboundFormat,
@@ -53,15 +56,19 @@ struct AppState {
     dashboard: Option<dashboard::Dashboard>,
     config_path: Option<std::path::PathBuf>,
     reload_lock: tokio::sync::Mutex<()>,
+    catalog: Arc<catalog::Catalog>,
 }
 
-fn provider_registry() -> ProviderRegistry {
+fn provider_registry(devin: DevinAcpConfig) -> ProviderRegistry {
     let mut registry = ProviderRegistry::default();
     for kind in [provider::OPENAI, provider::OPENAI_COMPAT] {
         registry.register(Arc::new(OpenAiCompat::new(kind)));
     }
     registry.register(Arc::new(Anthropic::new(provider::ANTHROPIC)));
     registry.register(Arc::new(OpenAiResponses::new()));
+    registry.register(Arc::new(Xai::new()));
+    registry.register(Arc::new(Antigravity::new()));
+    registry.register(Arc::new(DevinAcp::new(devin)));
     registry
 }
 
@@ -83,9 +90,14 @@ fn static_sources(
 }
 
 pub fn validate_startup(mut config: RuntimeConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let registry = provider_registry();
+    let registry = provider_registry(DevinAcpConfig::from_env());
     let sources = static_sources(&mut config)?;
-    let credentials = sources.keys().chain(config.oauth.keys()).cloned().collect();
+    let credentials = sources
+        .keys()
+        .chain(config.oauth.keys())
+        .chain(config.nous.keys())
+        .cloned()
+        .collect();
     Executor::validate(&config, &registry, &credentials)?;
     Ok(())
 }
@@ -98,7 +110,25 @@ pub async fn app_with_path(
     config: RuntimeConfig,
     config_path: Option<std::path::PathBuf>,
 ) -> Result<Router, Box<dyn Error + Send + Sync>> {
-    let (config, executor) = build(config).await?;
+    app_with(config, config_path, DevinAcpConfig::from_env()).await
+}
+
+/// Same as [`app`], with an explicit Devin CLI config. Tests use this so they
+/// never read process environment or a real `devin` binary.
+pub async fn app_with_devin(
+    config: RuntimeConfig,
+    devin: DevinAcpConfig,
+) -> Result<Router, Box<dyn Error + Send + Sync>> {
+    app_with(config, None, devin).await
+}
+
+async fn app_with(
+    config: RuntimeConfig,
+    config_path: Option<std::path::PathBuf>,
+    devin: DevinAcpConfig,
+) -> Result<Router, Box<dyn Error + Send + Sync>> {
+    let catalog = Arc::new(catalog::Catalog::new(devin.clone()));
+    let (config, executor) = build(config, devin, catalog.live()).await?;
     let dashboard = config
         .server
         .dashboard_key
@@ -112,6 +142,7 @@ pub async fn app_with_path(
         dashboard,
         config_path,
         reload_lock: tokio::sync::Mutex::new(()),
+        catalog,
     });
     let mut router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -127,15 +158,22 @@ pub async fn app_with_path(
 
 async fn build(
     mut config: RuntimeConfig,
+    devin: DevinAcpConfig,
+    live: Arc<LiveModels>,
 ) -> Result<(Arc<RuntimeConfig>, Executor), Box<dyn Error + Send + Sync>> {
-    let registry = provider_registry();
+    let registry = provider_registry(devin);
     let mut sources = static_sources(&mut config)?;
     // Validate before starting OAuth sources: a rejected build must not
     // rotate refresh tokens the running gateway still relies on.
     Executor::validate(
         &config,
         &registry,
-        &sources.keys().chain(config.oauth.keys()).cloned().collect(),
+        &sources
+            .keys()
+            .chain(config.oauth.keys())
+            .chain(config.nous.keys())
+            .cloned()
+            .collect(),
     )?;
     for (id, credential) in std::mem::take(&mut config.oauth) {
         let mut oauth = OAuthConfig::new(
@@ -153,9 +191,16 @@ async fn build(
         oauth.request_timeout = credential.request_timeout;
         sources.insert(id, Arc::new(OAuthCredentialSource::start(oauth).await?));
     }
+    for (id, credential) in std::mem::take(&mut config.nous) {
+        let mut nous = NousPortalConfig::new(credential.state_path);
+        nous.refresh_skew = credential.refresh_skew;
+        nous.request_timeout = credential.request_timeout;
+        sources.insert(id, Arc::new(NousPortalSource::start(nous).await?));
+    }
 
     let config = Arc::new(config);
-    let executor = Executor::new(config.clone(), &registry, &sources)?;
+    let mut executor = Executor::new(config.clone(), &registry, &sources)?;
+    executor.set_devin_catalog(live);
     Ok((config, executor))
 }
 
@@ -164,13 +209,16 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     if !authorized(&headers, &active.config.server.client_keys) {
         return unauthorized();
     }
-    let mut ids: Vec<&str> = active
-        .config
-        .model_names
-        .keys()
-        .map(AsRef::as_ref)
-        .collect();
-    ids.sort_unstable();
+    let live = if catalog::has_devin(&active.config) {
+        let kick = state.catalog.kick();
+        if kick.inflight && state.catalog.loaded().is_none() {
+            state.catalog.wait_for(kick.target).await;
+        }
+        state.catalog.loaded()
+    } else {
+        None
+    };
+    let ids = catalog::listed_ids(&active.config, live.as_deref());
     let data: Vec<_> = ids
         .into_iter()
         .map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "llmux2"}))
@@ -222,6 +270,9 @@ async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) 
     let active = state.active.load();
     if !authorized_for_format(request.headers(), &active.config.server.client_keys, format) {
         return unauthorized();
+    }
+    if catalog::has_devin(&active.config) {
+        state.catalog.kick();
     }
     let start = state.dashboard.as_ref().map(|_| std::time::Instant::now());
     let response = execute_authorized(&active, request, format).await;
@@ -279,6 +330,36 @@ async fn execute_authorized(active: &Active, request: Request, format: InboundFo
             )
         }
     };
+    let end_user = match policy::resolve_end_user(&active.config.server, &parts.headers, &body) {
+        Ok(id) => id,
+        Err(err) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                err.message(),
+            );
+        }
+    };
+    let response = route_request(
+        active,
+        &parts.headers,
+        body,
+        format,
+        context_overflow,
+        end_user.clone(),
+    )
+    .await;
+    policy::attach_end_user(response, end_user.as_deref())
+}
+
+async fn route_request(
+    active: &Active,
+    headers: &HeaderMap,
+    body: Bytes,
+    format: InboundFormat,
+    context_overflow: Option<ContextOverflow>,
+    end_user: Option<Arc<str>>,
+) -> Response {
     let Ok(metadata) = RequestMetadata::parse(&body, format) else {
         return error(
             StatusCode::BAD_REQUEST,
@@ -286,6 +367,9 @@ async fn execute_authorized(active: &Active, request: Request, format: InboundFo
             "Expected a JSON object with a nonempty string model and optional boolean stream",
         );
     };
+    if let Err(err) = policy::check_images(&body, &active.config.server) {
+        return error(err.status(), err.code(), err.message());
+    }
     if format == InboundFormat::OpenAiChat {
         if let Some(temperature) = metadata.temperature {
             match serde_json::from_str::<f64>(temperature.get()) {
@@ -302,7 +386,7 @@ async fn execute_authorized(active: &Active, request: Request, format: InboundFo
         .model_names
         .get(model.as_ref())
         .and_then(|idx| active.config.model_allowed_keys.get(idx))
-        .is_some_and(|keys| !authorized_for_format(&parts.headers, keys, format))
+        .is_some_and(|keys| !authorized_for_format(headers, keys, format))
     {
         return error(
             StatusCode::FORBIDDEN,
@@ -326,7 +410,7 @@ async fn execute_authorized(active: &Active, request: Request, format: InboundFo
     let mut anthropic_headers = HeaderMap::new();
     if format == InboundFormat::AnthropicMessages {
         for name in ["anthropic-version", "anthropic-beta"] {
-            for value in parts.headers.get_all(name) {
+            for value in headers.get_all(name) {
                 anthropic_headers.append(HeaderName::from_static(name), value.clone());
             }
         }
@@ -341,6 +425,7 @@ async fn execute_authorized(active: &Active, request: Request, format: InboundFo
         body,
         anthropic_headers: anthropic_headers.clone(),
         request_id: request_id.clone(),
+        end_user: end_user.clone(),
     };
 
     let mut dropped = 0;
@@ -531,9 +616,10 @@ fn gateway_error(err: GatewayError) -> Response {
         GatewayError::Client(UpstreamError::RateLimited { retry_after, .. }) => {
             rate_limited(retry_after.unwrap_or_default())
         }
-        GatewayError::Client(UpstreamError::BadRequest { status, body }) => {
-            upstream_client_error(status, body)
-        }
+        GatewayError::Client(
+            UpstreamError::BadRequest { status, body }
+            | UpstreamError::ModelNotFound { status, body },
+        ) => upstream_client_error(status, body),
         GatewayError::Client(UpstreamError::ContextLength) => error(
             StatusCode::BAD_REQUEST,
             "context_length_exceeded",

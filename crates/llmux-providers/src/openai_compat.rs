@@ -1,6 +1,7 @@
 use crate::{messages, responses, sse};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use futures_util::StreamExt;
 use http::{
     header::{self, HeaderMap, HeaderName, HeaderValue},
     Method, Request, Response, StatusCode, Uri,
@@ -8,9 +9,9 @@ use http::{
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use llmux_types::{
-    AuthError, AuthMaterial, BuildError, ChatRequestField, CredentialSource, Deployment,
-    GatewayRequest, GatewayResponse, InboundFormat, LimitObservation, ProviderAdapter,
-    ProviderKind, Support, UpstreamError,
+    provider, AuthError, AuthMaterial, BoxStream, BuildError, ChatRequestField, CredentialSource,
+    Deployment, GatewayRequest, GatewayResponse, InboundFormat, LimitObservation, ProviderAdapter,
+    ProviderKind, SseEvent, Support, UpstreamError,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -371,7 +372,10 @@ pub(crate) fn rewrite_model(body: &Bytes, model: &str) -> Result<Bytes, BuildErr
     Ok(rewritten.freeze())
 }
 
-fn strip_request_fields(body: Bytes, strip: &[ChatRequestField]) -> Result<Bytes, BuildError> {
+pub(crate) fn strip_request_fields(
+    body: Bytes,
+    strip: &[ChatRequestField],
+) -> Result<Bytes, BuildError> {
     if strip.is_empty() {
         return Ok(body);
     }
@@ -386,6 +390,9 @@ fn strip_request_fields(body: Bytes, strip: &[ChatRequestField]) -> Result<Bytes
             ChatRequestField::SafetyIdentifier => "safety_identifier",
             ChatRequestField::Logprobs => "logprobs",
             ChatRequestField::TopLogprobs => "top_logprobs",
+            ChatRequestField::Temperature => "temperature",
+            ChatRequestField::TopP => "top_p",
+            ChatRequestField::TopK => "top_k",
             ChatRequestField::ReasoningEffort => {
                 if let Some(mut object) = fields
                     .get("reasoning")
@@ -451,6 +458,25 @@ impl OpenAiCompat {
     pub fn new(kind: impl Into<Arc<str>>) -> Self {
         Self(ProviderKind(kind.into()))
     }
+
+    fn forwards_end_user(&self) -> bool {
+        matches!(
+            self.0 .0.as_ref(),
+            provider::OPENAI | provider::OPENAI_COMPAT
+        )
+    }
+}
+
+fn apply_user_field(body: Bytes, user: &str) -> Result<Bytes, BuildError> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|_| BuildError::InvalidBody)?;
+    value
+        .as_object_mut()
+        .ok_or(BuildError::InvalidBody)?
+        .insert("user".into(), serde_json::json!(user));
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|_| BuildError::InvalidBody)
 }
 
 /// `base` joined with an endpoint suffix like `/chat/completions`.
@@ -523,6 +549,14 @@ impl ProviderAdapter for OpenAiCompat {
             }
             InboundFormat::OpenAiChat => rewrite_model(&req.body, crate::upstream_model(req, dep))?,
         };
+        let body = if self.forwards_end_user() {
+            match req.end_user.as_deref() {
+                Some(user) => apply_user_field(body, user)?,
+                None => body,
+            }
+        } else {
+            body
+        };
         let mut request = Request::builder()
             .method(Method::POST)
             .uri(endpoint_uri(&dep.base_url, "/chat/completions")?)
@@ -538,6 +572,7 @@ impl ProviderAdapter for OpenAiCompat {
             .body(strip_request_fields(body, &dep.strip_request_fields)?)?;
 
         request.headers_mut().extend(dep.headers.clone());
+        llmux_types::default_user_agent(request.headers_mut());
         apply_auth(
             request.headers_mut(),
             auth,
@@ -570,7 +605,7 @@ impl ProviderAdapter for OpenAiCompat {
             if !is_sse {
                 return Err(bad_gateway());
             }
-            let stream = sse::decode(body);
+            let stream = without_stream_errors(parts.headers.clone(), sse::decode(body));
             if req.format == InboundFormat::AnthropicMessages {
                 return Ok(GatewayResponse::Stream(messages::stream(stream)));
             }
@@ -708,6 +743,11 @@ fn error_details(body: &[u8]) -> serde_json::Value {
         .unwrap_or_default()
 }
 
+pub(crate) fn is_model_not_found(status: StatusCode, details: &serde_json::Value) -> bool {
+    matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND)
+        && details["code"].as_str() == Some("model_not_found")
+}
+
 pub(crate) fn classify_error(
     status: StatusCode,
     headers: &HeaderMap,
@@ -716,6 +756,62 @@ pub(crate) fn classify_error(
 ) -> UpstreamError {
     let details = error_details(&body);
     classify_error_details(status, headers, body, now, &details)
+}
+
+fn gemini_quota(details: &serde_json::Value) -> (bool, Option<Duration>) {
+    let mut daily = false;
+    let mut wait = None;
+    for detail in details["details"].as_array().into_iter().flatten() {
+        match detail["@type"].as_str() {
+            Some("type.googleapis.com/google.rpc.QuotaFailure") => {
+                daily |= detail["violations"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|violation| {
+                        ["quotaId", "quotaMetric"].iter().any(|field| {
+                            violation[field].as_str().is_some_and(|name| {
+                                let name: String = name
+                                    .chars()
+                                    .filter(char::is_ascii_alphanumeric)
+                                    .map(|c| c.to_ascii_lowercase())
+                                    .collect();
+                                name.contains("perday")
+                            })
+                        })
+                    });
+            }
+            Some("type.googleapis.com/google.rpc.RetryInfo") => {
+                wait = wait.max(detail["retryDelay"].as_str().and_then(gemini_retry_delay));
+            }
+            _ => {}
+        }
+    }
+    (daily, wait)
+}
+
+fn gemini_retry_delay(value: &str) -> Option<Duration> {
+    let value = value.strip_suffix('s')?;
+    let (seconds, nanos) = match value.split_once('.') {
+        Some((seconds, fraction)) => {
+            if fraction.is_empty()
+                || fraction.len() > 9
+                || !fraction.bytes().all(|c| c.is_ascii_digit())
+            {
+                return None;
+            }
+            (
+                seconds,
+                fraction.parse::<u32>().ok()? * 10u32.pow(9 - fraction.len() as u32),
+            )
+        }
+        None => (value, 0),
+    };
+    if seconds.is_empty() || !seconds.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let duration = Duration::new(seconds.parse().ok()?, nanos);
+    (!duration.is_zero()).then_some(duration.min(MAX_RETRY))
 }
 
 fn classify_error_details(
@@ -754,7 +850,13 @@ fn classify_error_details(
     } else {
         Scope::Unknown
     };
-    let wait = retry_after(headers, now)
+    let (daily, gemini_wait) = if status == StatusCode::TOO_MANY_REQUESTS {
+        gemini_quota(details)
+    } else {
+        (false, None)
+    };
+    let wait = gemini_wait
+        .or_else(|| retry_after(headers, now))
         .or_else(|| {
             header_text(headers, "retry-after-ms")?
                 .parse::<f64>()
@@ -784,11 +886,12 @@ fn classify_error_details(
         402 => UpstreamError::QuotaExhausted {
             reset_at: wait.and_then(|wait| now.checked_add(wait)),
         },
-        429 if quota => UpstreamError::QuotaExhausted {
+        429 if quota || daily => UpstreamError::QuotaExhausted {
             reset_at: wait.and_then(|wait| now.checked_add(wait)),
         },
         429 => UpstreamError::RateLimited { retry_after: wait },
         401 => UpstreamError::Auth { refreshable: true },
+        403 if body.trim_ascii_start().starts_with(b"<") => UpstreamError::Server { status },
         403 => UpstreamError::Auth { refreshable: false },
         408 => UpstreamError::Timeout,
         400 if message.contains("pass a valid api key")
@@ -806,6 +909,7 @@ fn classify_error_details(
         {
             UpstreamError::ContextLength
         }
+        _ if is_model_not_found(status, details) => UpstreamError::ModelNotFound { status, body },
         500..=599 => UpstreamError::Server { status },
         400..=499 => UpstreamError::BadRequest { status, body },
         _ => bad_gateway(),
@@ -867,6 +971,74 @@ fn embedded_error(body: &Bytes, headers: &HeaderMap, now: SystemTime) -> Option<
     Some(classify_error_details(
         status, headers, bounded, now, &details,
     ))
+}
+
+fn without_stream_errors(
+    headers: HeaderMap,
+    mut stream: BoxStream<'static, Result<SseEvent, UpstreamError>>,
+) -> BoxStream<'static, Result<SseEvent, UpstreamError>> {
+    Box::pin(async_stream::try_stream! {
+        let now = SystemTime::now();
+        while let Some(event) = stream.next().await {
+            let event = event?;
+            if let Some(error) = stream_frame_error(&event.data, &headers, now) {
+                Err(error)?;
+            }
+            yield event;
+        }
+    })
+}
+
+/// An SSE data frame with an `error` object and no non-empty `choices`.
+///
+/// Classification matches [`embedded_error`]: a 429 payload is rate limited
+/// (including a `Retry-After` hint from the response headers), a quota marker
+/// is quota exhausted, and an explicit client status stays terminal. A frame
+/// with no classifiable client status is a server error so the attempt can
+/// fail over instead of committing an empty 200.
+fn stream_frame_error(data: &str, headers: &HeaderMap, now: SystemTime) -> Option<UpstreamError> {
+    if data == sse::DONE {
+        return None;
+    }
+    let bytes = data.as_bytes();
+    if memchr::memmem::find(bytes, b"error").is_none() && !bytes.contains(&b'\\') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    if value
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|choices| !choices.is_empty())
+    {
+        return None;
+    }
+    let error = value.get("error")?;
+    if !error.is_object() {
+        return None;
+    }
+    let body = Bytes::from(serde_json::to_vec(&serde_json::json!({"error": error})).ok()?);
+    let classified = embedded_error(&body, headers, now).unwrap_or_else(bad_gateway);
+    Some(match classified {
+        UpstreamError::BadRequest { status, .. }
+            if status == StatusCode::BAD_REQUEST && explicit_error_status(error).is_none() =>
+        {
+            bad_gateway()
+        }
+        other => other,
+    })
+}
+
+fn explicit_error_status(error: &serde_json::Value) -> Option<StatusCode> {
+    ["status", "status_code", "code"].iter().find_map(|key| {
+        let value = error.get(*key)?;
+        let number = value
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .or_else(|| value.as_str()?.parse().ok())?;
+        StatusCode::from_u16(number)
+            .ok()
+            .filter(|status| status.is_client_error() || status.is_server_error())
+    })
 }
 
 pub(crate) fn bad_gateway() -> UpstreamError {
@@ -970,6 +1142,7 @@ mod tests {
                 max_output_tokens: Some(64),
                 context_overflow: None,
                 request_id: RequestId("r".into()),
+                end_user: None,
             };
             let upstream = adapter
                 .build_request(&req, &deployment, &AuthMaterial::None)
@@ -1054,6 +1227,60 @@ mod tests {
     }
 
     #[test]
+    fn gemini_quota_details_distinguish_daily_limits_and_prefer_retry_info() {
+        let now = SystemTime::UNIX_EPOCH;
+        for (quota_id, delay, daily, wait) in [
+            (
+                "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+                "3.125s",
+                false,
+                3125,
+            ),
+            (
+                "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                "3600s",
+                true,
+                3_600_000,
+            ),
+            (
+                "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+                "bad",
+                false,
+                8000,
+            ),
+            (
+                "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+                "0s",
+                false,
+                8000,
+            ),
+        ] {
+            let payload = serde_json::json!([{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[
+                {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaId":quota_id}]},
+                {"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":delay}
+            ]}}]);
+            let mut headers = HeaderMap::new();
+            headers.insert(header::RETRY_AFTER, HeaderValue::from_static("8"));
+            let error = classify_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                &headers,
+                Bytes::from(payload.to_string()),
+                now,
+            );
+            let wait = Duration::from_millis(wait);
+            match error {
+                UpstreamError::QuotaExhausted { reset_at } if daily => {
+                    assert_eq!(reset_at, Some(now + wait))
+                }
+                UpstreamError::RateLimited { retry_after } if !daily => {
+                    assert_eq!(retry_after, Some(wait))
+                }
+                other => panic!("unexpected error for {quota_id}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn gemini_invalid_api_key_400_is_a_rejected_credential() {
         for body in [
             r#"[{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT","details":[{"reason":"API_KEY_INVALID"}]}}]"#,
@@ -1071,6 +1298,78 @@ mod tests {
             ),
             UpstreamError::BadRequest { .. }
         ));
+    }
+
+    #[test]
+    fn waf_html_403_is_transient_not_an_auth_failure() {
+        for body in [
+            "<!DOCTYPE html>\n<html><title>Attention Required! | Cloudflare</title></html>",
+            "  <html>blocked</html>",
+        ] {
+            assert!(matches!(
+                classify(403, body),
+                UpstreamError::Server { status } if status == StatusCode::FORBIDDEN
+            ));
+        }
+        for body in [r#"{"error":{"message":"forbidden"}}"#, "Forbidden", ""] {
+            assert!(matches!(
+                classify(403, body),
+                UpstreamError::Auth { refreshable: false }
+            ));
+        }
+        assert!(matches!(
+            classify(401, "<html>login</html>"),
+            UpstreamError::Auth { refreshable: true }
+        ));
+    }
+
+    #[test]
+    fn request_carries_a_default_user_agent_unless_the_deployment_sets_one() {
+        use futures_util::FutureExt;
+        use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
+        let adapter = OpenAiCompat::new("openai_compat");
+        let mut deployment = Deployment {
+            headers: Default::default(),
+            idx: DeploymentIdx(0),
+            id: "d".into(),
+            provider: adapter.kind().clone(),
+            credential: "key".into(),
+            base_url: "https://example.com/v1".parse().unwrap(),
+            upstream_model: "m".into(),
+            strip_request_fields: Box::default(),
+            priority: 0,
+            quota: QuotaSpec::default(),
+            timeout: Duration::from_secs(5),
+            max_context: None,
+            fallback: false,
+        };
+        let req = GatewayRequest {
+            format: InboundFormat::OpenAiChat,
+            model: "m".into(),
+            stream: false,
+            body: Bytes::from_static(br#"{"model":"m","messages":[]}"#),
+            est_input_tokens: 0,
+            anthropic_headers: HeaderMap::new(),
+            max_output_tokens: None,
+            context_overflow: None,
+            request_id: RequestId("r".into()),
+            end_user: None,
+        };
+        let build = |dep: &Deployment| {
+            adapter
+                .build_request(&req, dep, &AuthMaterial::None)
+                .now_or_never()
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(
+            build(&deployment).headers()[header::USER_AGENT],
+            concat!("llmux/", env!("CARGO_PKG_VERSION"))
+        );
+        deployment
+            .headers
+            .insert(header::USER_AGENT, HeaderValue::from_static("custom/1"));
+        assert_eq!(build(&deployment).headers()[header::USER_AGENT], "custom/1");
     }
 
     #[test]
@@ -1264,6 +1563,65 @@ mod tests {
                 assert_eq!(stored.len(), MAX_ERROR_BYTES);
                 assert_eq!(stored, body.slice(..MAX_ERROR_BYTES));
             }
+        }
+    }
+
+    #[test]
+    fn stream_error_frames_use_embedded_error_classification() {
+        let now = SystemTime::UNIX_EPOCH;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("3"));
+        let rate_limited = stream_frame_error(
+            r#"{"id":"chatcmpl-keepalive","choices":[],"error":{"message":"rate limit - [429]: RESOURCE_EXHAUSTED","type":"rate_limit_error","code":429}}"#,
+            &headers,
+            now,
+        )
+        .unwrap();
+        assert!(
+            matches!(rate_limited, UpstreamError::RateLimited { retry_after: Some(wait) } if wait == Duration::from_secs(3))
+        );
+        assert!(matches!(
+            stream_frame_error(
+                r#"{"error":{"message":"quota exhausted","type":"insufficient_quota"}}"#,
+                &HeaderMap::new(),
+                now,
+            )
+            .unwrap(),
+            UpstreamError::QuotaExhausted { .. }
+        ));
+        assert!(matches!(
+            stream_frame_error(
+                r#"{"error":{"message":"upstream exploded","type":"server_error"}}"#,
+                &HeaderMap::new(),
+                now,
+            )
+            .unwrap(),
+            UpstreamError::Server {
+                status: StatusCode::BAD_GATEWAY
+            }
+        ));
+        assert!(matches!(
+            stream_frame_error(
+                r#"{"error":{"status":400,"message":"bad input","type":"invalid_request_error"}}"#,
+                &HeaderMap::new(),
+                now,
+            )
+            .unwrap(),
+            UpstreamError::BadRequest {
+                status: StatusCode::BAD_REQUEST,
+                ..
+            }
+        ));
+        for raw in [
+            r#"{"id":"chatcmpl-keepalive","object":"chat.completion.chunk","choices":[]}"#,
+            r#"{"choices":[{"delta":{"content":"Hi"}}],"error":{"code":429}}"#,
+            "[DONE]",
+            r#"{"id":"chunk-1"}"#,
+        ] {
+            assert!(
+                stream_frame_error(raw, &HeaderMap::new(), now).is_none(),
+                "{raw}"
+            );
         }
     }
 
@@ -1506,5 +1864,66 @@ mod tests {
         assert_eq!(retry_after(&headers, now), Some(Duration::from_secs(9)));
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("invalid"));
         assert_eq!(retry_after(&headers, now), None);
+    }
+
+    #[test]
+    fn end_user_hash_overrides_user_unless_stripped_or_unsupported() {
+        use futures_util::FutureExt;
+        use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
+        let hash = "31ca399bfc61dac0b442a6bef7c00cd06cf9682c11b9192fb26a918b4a9130f8";
+        let raw = "raw-client-SHOULD-NOT-LEAK";
+        let body = Bytes::from(format!(
+            r#"{{"model":"m","user":"{raw}","messages":[],"seed":1}}"#
+        ));
+        let req = GatewayRequest {
+            format: InboundFormat::OpenAiChat,
+            model: "m".into(),
+            stream: false,
+            body,
+            est_input_tokens: 0,
+            anthropic_headers: HeaderMap::new(),
+            max_output_tokens: None,
+            context_overflow: None,
+            request_id: RequestId("r".into()),
+            end_user: Some(hash.into()),
+        };
+        let deployment = |kind: &str, strip: &[ChatRequestField]| Deployment {
+            headers: Default::default(),
+            idx: DeploymentIdx(0),
+            id: "d".into(),
+            provider: ProviderKind(kind.into()),
+            credential: "key".into(),
+            base_url: "https://example.com/v1".parse().unwrap(),
+            upstream_model: "upstream".into(),
+            strip_request_fields: strip.to_vec().into_boxed_slice(),
+            priority: 0,
+            quota: QuotaSpec::default(),
+            timeout: Duration::from_secs(5),
+            max_context: None,
+            fallback: false,
+        };
+        let send = |adapter: &OpenAiCompat, dep: &Deployment| {
+            let request = adapter
+                .build_request(&req, dep, &AuthMaterial::None)
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(request.body()).unwrap()
+        };
+        let compat = OpenAiCompat::new(provider::OPENAI_COMPAT);
+        let sent = send(&compat, &deployment(provider::OPENAI_COMPAT, &[]));
+        assert_eq!(sent["user"], hash);
+        assert!(!sent.to_string().contains(raw));
+        assert_eq!(sent["model"], "upstream");
+        let stripped = send(
+            &compat,
+            &deployment(provider::OPENAI_COMPAT, &[ChatRequestField::User]),
+        );
+        assert!(stripped.get("user").is_none());
+        assert!(!stripped.to_string().contains(raw));
+        assert!(!stripped.to_string().contains(hash));
+        let xai = OpenAiCompat::new(provider::XAI);
+        let untouched = send(&xai, &deployment(provider::XAI, &[]));
+        assert_eq!(untouched["user"], raw);
     }
 }

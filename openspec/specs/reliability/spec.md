@@ -18,15 +18,63 @@ WHEN a deployment answers 429
 THEN the request is retried on the next eligible deployment without surfacing
 the error to the client.
 
+#### Scenario: An explicitly missing upstream model or an Anthropic HTTP 408 triggers failover
+
+WHEN a deployment returns HTTP 400 or 404 with the explicit upstream error
+code `model_not_found`, an OpenAI-compatible non-streaming success status
+contains that explicit error instead of a completion, or the Anthropic adapter
+receives HTTP 408
+THEN the gateway SHALL try the next eligible deployment within the existing
+attempt and time budgets, before committing a response. An ordinary upstream
+400 or generic 404 SHALL remain terminal.
+
+### Requirement: Same-deployment repair of a deprecated parameter
+
+The gateway SHALL let a provider adapter repair a rejected request body and
+resend it to the same deployment before any response is committed, at most three
+times per attempt. The Anthropic adapter uses this to drop a `temperature`,
+`top_p` or `top_k` that the upstream reports as deprecated for the model.
+
+#### Scenario: Repair stays on the deployment
+
+WHEN a repaired request is sent
+THEN it targets the same deployment and counts as one HTTP attempt toward routing limits.
+
 ### Requirement: Stream commitment
 
-Once a content-bearing SSE event has been sent to the client, the gateway
+The gateway SHALL commit a streaming response only on a frame that carries
+content, a tool call, a finish reason, or usage, or on `[DONE]`. An
+OpenAI-compatible keepalive (`choices` empty, and none of those fields) SHALL
+NOT commit. Keepalives before that frame are dropped; keepalives after it are
+forwarded. The wait for a committing frame is bounded by the existing request
+and deployment timeouts.
+
+Once a streaming response has been committed, the gateway
 SHALL NOT retry that request on another deployment.
+
+#### Scenario: Keepalives then content
+
+WHEN an OpenAI-compatible stream sends keepalive chunks and then a content chunk
+THEN the client receives the content chunk and any later keepalive, and does not
+receive the keepalives that preceded the first committing frame.
 
 #### Scenario: Mid-stream failure surfaces
 
 WHEN the upstream fails after content events were already forwarded
 THEN the error is surfaced to the client instead of restarting elsewhere.
+
+#### Scenario: An error frame before commit fails over
+
+WHEN an OpenAI-compatible upstream answers HTTP 200 `text/event-stream` and,
+before any committing frame, sends an SSE data frame whose JSON has an `error`
+object and no non-empty `choices`
+THEN the gateway classifies that frame the same way as a non-streaming embedded
+error (a 429 payload is rate limited, including a `Retry-After` hint from the
+response headers; a quota marker is quota exhausted; an explicit client status
+stays terminal; otherwise it is a server error) and tries the next eligible
+deployment within the attempt budget. The failing deployment receives the same
+cooldown as a non-stream error of that class. If every deployment fails that
+way, the client receives the classified error, not an empty 200 stream.
 
 ### Requirement: Cooldowns
 
@@ -38,6 +86,24 @@ cools down.
 
 WHEN a stream ends with a rate-limit error
 THEN the deployment is skipped for new requests until its cooldown ends.
+
+#### Scenario: Gemini reports an explicit quota violation
+
+WHEN a Gemini 429 contains a daily `google.rpc.QuotaFailure` violation
+THEN the gateway treats it as credential quota exhaustion rather than
+deployment throttling. A positive `google.rpc.RetryInfo.retryDelay` takes
+precedence over generic retry headers. Invalid or zero delays fall back to
+other hints or local backoff.
+
+#### Scenario: Anthropic exposes an exhausted rate-limit window
+
+WHEN Anthropic reports zero remaining requests, total tokens, input tokens,
+or output tokens with a future RFC3339 reset
+THEN the gateway proactively skips that deployment until the applicable
+reset. On a 429, a positive `Retry-After` takes precedence; otherwise the
+latest future reset for an exhausted or unreported window is used. Invalid
+or stale resets are ignored, and resets are subject to the configured
+cooldown cap.
 
 ### Requirement: Rate-limit avoidance
 
@@ -91,3 +157,27 @@ overhead per request.
 
 WHEN request volume stays high for an extended period
 THEN latency and error rates stay within target without resource exhaustion.
+
+### Requirement: Explicit request-path state machine
+
+The attempt loop SHALL be driven by the pure transition function
+`machine::State::step`, with phases `Select`, `Admit`, `Build`, `Gate`, `Send`,
+`Refresh`, and `Done`. The following invariants SHALL hold and are model-checked
+in `tla/` (names in parentheses):
+
+- A retry never starts after a response was committed (`NoReplayAfterCommit`,
+  `NoRetryAfterCommit`).
+- Attempts never exceed `routing.max_attempts` and no attempt starts after the
+  request deadline (`AttemptsBounded`, `NoAttemptAfterDeadline`).
+- A permit is released on every terminal path: failure, exhaustion, stream end,
+  idle timeout, mid-stream error, and client disconnect (`PermitReleasedOnExhaust`,
+  `PermitReleasedWhenClosed`).
+- A deployment in cooldown is not selected before `cooldown_until`
+  (`NoSelectInCooldown`).
+- During a slot handoff at least one slot accepts connections and a draining
+  slot accepts none (`AlwaysOneAccepting`, `DrainingNotAccepting`).
+
+#### Scenario: Transition table
+
+WHEN `max_attempts` is reached in `Select` or `Admit`
+THEN `step` returns `StopGroups` and no further attempt starts.

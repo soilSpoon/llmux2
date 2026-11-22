@@ -147,3 +147,58 @@ quota for models that sell well instead of spending it on low-value traffic.
 WHEN a deployment's quota is shared between a high-selling model and a
 low-value one
 THEN the low-value model is deprioritized first as quota runs low.
+
+### Requirement: Selection phases are explicit
+
+Deployment selection SHALL follow the `Select` → `Admit` → `Build` → `Gate` →
+`Send` phases of `machine::State`; a cooldown that appears during `Build` SHALL
+send the request back to `Select` without consuming an attempt.
+
+#### Scenario: Cooldown set during build
+
+WHEN a deployment enters cooldown while its request is being built
+THEN `Gate` skips it without an attempt and the next candidate is considered.
+
+### Requirement: Live Devin catalog
+
+The gateway SHALL refresh `devin models` at most once per 60 seconds and cache
+the last successful result. A failed refresh SHALL NOT discard a loaded catalog.
+While no catalog has loaded, configured names SHALL be listed unchanged. Chat,
+messages, and responses requests SHALL NOT wait on a refresh.
+
+`GET /v1/models` SHALL omit a configured name or alias only when every
+deployment of that model is `devin_acp` and none of their `upstream_model`
+values are in a successfully loaded catalog. It SHALL NOT add an id that the
+config does not name. A new public name appears only after import or a config
+reload.
+
+On the request path the gateway SHALL skip a `devin_acp` deployment whose
+`upstream_model` is absent from a loaded catalog the same way it skips a cooled
+deployment, so another deployment of the same model can run. It SHALL NOT
+substitute a different model. If none remain, it SHALL return the existing
+exhausted error.
+
+#### Scenario: Stale Devin id omitted after a successful load
+
+WHEN the catalog loads successfully and does not contain the only upstream id
+of a `devin_acp` model
+THEN that model and its aliases are absent from `GET /v1/models`
+AND an id present only in the catalog is not listed.
+
+#### Scenario: Failed load keeps configured names
+
+WHEN the catalog has never loaded and a refresh fails
+THEN `GET /v1/models` still lists every configured name and alias.
+
+#### Scenario: Stale deployment skipped
+
+WHEN a loaded catalog lacks a `devin_acp` deployment's upstream id
+AND the same model has another deployment whose upstream id is in the catalog
+THEN the request skips the stale deployment without invoking it
+AND the other deployment can serve.
+
+#### Scenario: All Devin deployments stale
+
+WHEN every deployment of the requested model is a stale `devin_acp` deployment
+THEN the gateway returns the existing exhausted error
+AND does not route the request to a different model.
