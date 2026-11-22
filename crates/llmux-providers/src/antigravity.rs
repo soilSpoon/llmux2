@@ -491,6 +491,8 @@ mod tests {
             context_overflow: None,
             request_id: RequestId("req".into()),
             end_user: None,
+            client_key: None,
+            image_count: 0,
         };
         let built = adapter
             .build_request(

@@ -139,6 +139,40 @@ impl ImagePolicyError {
     }
 }
 
+/// Image inputs anywhere in the body, for the per-request log. Matches the
+/// shapes `walk` checks: `image_url` fields (OpenAI chat/Responses) and
+/// Anthropic `type: "image"` blocks.
+pub(crate) fn count_images(body: &[u8]) -> u32 {
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return 0;
+    };
+    if let Some(request) = value.as_object_mut() {
+        for field in ["tools", "functions", "response_format"] {
+            request.remove(field);
+        }
+        if let Some(text) = request.get_mut("text").and_then(Value::as_object_mut) {
+            text.remove("format");
+        }
+    }
+    count_walk(&value)
+}
+
+fn count_walk(value: &Value) -> u32 {
+    match value {
+        Value::Array(items) => items.iter().map(count_walk).sum(),
+        Value::Object(map) => {
+            let mut count = 0;
+            if map.contains_key("image_url")
+                || map.get("type").and_then(Value::as_str) == Some("image")
+            {
+                count += 1;
+            }
+            count + map.values().map(count_walk).sum::<u32>()
+        }
+        _ => 0,
+    }
+}
+
 pub(crate) fn check_images(body: &[u8], server: &ServerConfig) -> Result<(), ImagePolicyError> {
     if server.remote_images == RemoteImages::Allow && server.max_image_bytes.is_none() {
         return Ok(());

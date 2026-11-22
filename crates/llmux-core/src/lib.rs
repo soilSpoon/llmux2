@@ -10,7 +10,7 @@ mod tests;
 
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
-use http::{Request, StatusCode};
+use http::{HeaderMap, Request, StatusCode};
 use http_body_util::Full;
 use hyper_util::{
     client::legacy::Client,
@@ -98,6 +98,8 @@ pub struct RoutedError {
 struct RouteTrace {
     last_attempted: Option<usize>,
     attempts: usize,
+    /// Provider-side request id from the last attempt, for flag tracing.
+    upstream_request_id: Option<Arc<str>>,
 }
 
 type HttpClient = llmux_types::HttpClient;
@@ -421,6 +423,8 @@ impl Executor {
         let started = Instant::now();
         let request_id = req.request_id.0.clone();
         let model = req.model.clone();
+        let client_key = req.client_key.clone();
+        let image_count = req.image_count;
         let result = self.route(req, &mut trace).await;
         // A middle-out context rejection is a probe: the server truncates and
         // retries under the same request ID, so logging it would double-count
@@ -440,6 +444,9 @@ impl Executor {
                 model: &model,
                 deployment: dep.map(|dep| dep.id.as_ref()),
                 provider: dep.map(|dep| dep.provider.0.as_ref()),
+                client_key: client_key.as_deref(),
+                image_count,
+                upstream_request_id: trace.upstream_request_id.as_deref(),
                 attempts: trace.attempts,
                 latency_ms: started.elapsed().as_millis() as u64,
                 outcome: if result.is_ok() { "routed" } else { "error" },
@@ -659,7 +666,7 @@ impl Executor {
                             result = match upstream {
                                 Ok(Ok(upstream)) => timeout_at(
                                     attempt_deadline,
-                                    self.attempt(&req, dep, binding, upstream, needed),
+                                    self.attempt(&req, dep, binding, upstream, needed, trace),
                                 )
                                 .await
                                 .unwrap_or(timed_out),
@@ -847,6 +854,28 @@ impl Executor {
         binding.adapter.build_request(req, dep, &auth).await
     }
 
+    /// Provider request ids come from response headers (`x-request-id`,
+    /// `request-id`, `anthropic-request-id`) or a complete body's `id` field.
+    fn upstream_request_id(headers: &HeaderMap, body: Option<&Bytes>) -> Option<Arc<str>> {
+        for name in ["anthropic-request-id", "x-request-id", "request-id"] {
+            if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
+                if !value.is_empty() {
+                    return Some(Arc::from(value));
+                }
+            }
+        }
+        if let Some(body) = body {
+            if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(body) {
+                if let Some(id) = map.get("id").and_then(serde_json::Value::as_str) {
+                    if !id.is_empty() {
+                        return Some(Arc::from(id));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     async fn attempt(
         &self,
         req: &GatewayRequest,
@@ -854,6 +883,7 @@ impl Executor {
         binding: &Binding,
         upstream: Request<Bytes>,
         needed: u64,
+        trace: &mut RouteTrace,
     ) -> Result<GatewayResponse, GatewayError> {
         let response = match binding.adapter.invoke(req, dep).await {
             Some(local) => local.map_err(GatewayError::Client)?,
@@ -875,6 +905,9 @@ impl Executor {
                     {
                         binding.limits.observe(observed, self.cfg.cooldown.max);
                     }
+                    if let Some(id) = Self::upstream_request_id(response.headers(), None) {
+                        trace.upstream_request_id = Some(id);
+                    }
                     match binding.adapter.parse_response(req, dep, response).await {
                         Err(error) if repairs < MAX_REPAIRS => {
                             let Some(repaired) = binding.adapter.repair_rejected(&body, &error)
@@ -893,8 +926,15 @@ impl Executor {
             }
         };
 
-        match response {
-            GatewayResponse::Complete { .. } if !req.stream => Ok(response),
+        let response = match response {
+            GatewayResponse::Complete { .. } if !req.stream => {
+                if let GatewayResponse::Complete { headers, body, .. } = &response {
+                    if let Some(id) = Self::upstream_request_id(headers, Some(body)) {
+                        trace.upstream_request_id = Some(id.clone());
+                    }
+                }
+                return Ok(response);
+            }
             GatewayResponse::Stream(mut events) if req.stream => {
                 let mut preamble = None;
                 let first = loop {
@@ -969,7 +1009,8 @@ impl Executor {
             _ => Err(GatewayError::Client(UpstreamError::Server {
                 status: StatusCode::BAD_GATEWAY,
             })),
-        }
+        };
+        response
     }
 }
 

@@ -37,6 +37,14 @@ pub struct RequestRecord<'a> {
     pub deployment: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<&'a str>,
+    /// Fingerprint of the gateway client key; never the key itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<&'a str>,
+    /// Image inputs in the inbound request body.
+    pub image_count: u32,
+    /// Provider-side request id (e.g. Anthropic `msg_`/`req_`, OpenAI `x-request-id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_request_id: Option<&'a str>,
     pub attempts: usize,
     pub latency_ms: u64,
     pub outcome: &'a str,
@@ -167,6 +175,9 @@ mod tests {
                 model: "shared",
                 deployment: Some("dep"),
                 provider: Some("openai_compat"),
+                client_key: Some("key_ab12"),
+                image_count: 2,
+                upstream_request_id: Some("msg_01Xy"),
                 attempts: i + 1,
                 latency_ms: 42,
                 outcome: "routed",
@@ -203,6 +214,9 @@ mod tests {
             model: "shared",
             deployment: None,
             provider: None,
+            client_key: None,
+            image_count: 0,
+            upstream_request_id: None,
             attempts: 4,
             latency_ms: 1000,
             outcome: "error",
@@ -217,6 +231,9 @@ mod tests {
         assert_eq!(parsed["error_kind"], "rate_limited");
         assert!(parsed.get("deployment").is_none());
         assert!(parsed.get("quota_remaining").is_none());
+        assert!(parsed.get("client_key").is_none());
+        assert!(parsed.get("upstream_request_id").is_none());
+        assert_eq!(parsed["image_count"], 0);
     }
 
     #[test]
@@ -231,6 +248,9 @@ mod tests {
             model: "shared",
             deployment: None,
             provider: None,
+            client_key: None,
+            image_count: 0,
+            upstream_request_id: None,
             attempts: 1,
             latency_ms: 1,
             outcome: "routed",

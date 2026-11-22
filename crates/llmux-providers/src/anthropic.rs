@@ -1134,6 +1134,8 @@ mod tests {
             context_overflow: None,
             request_id: RequestId("r".into()),
             end_user: None,
+            client_key: None,
+            image_count: 0,
         };
         dep.headers
             .insert("x-deployment", HeaderValue::from_static("static-value"));
@@ -1260,6 +1262,8 @@ mod tests {
                 context_overflow: None,
                 request_id: RequestId("r".into()),
                 end_user: None,
+                client_key: None,
+                image_count: 0,
             };
             let request = a
                 .build_request(&req, &dep, &AuthMaterial::None)
@@ -1342,6 +1346,8 @@ mod tests {
                 context_overflow: None,
                 request_id: RequestId("r".into()),
                 end_user: end_user.map(Arc::from),
+                client_key: None,
+                image_count: 0,
             };
             let request = a
                 .build_request(&req, &dep, &AuthMaterial::None)

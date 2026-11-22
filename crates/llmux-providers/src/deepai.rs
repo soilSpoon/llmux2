@@ -372,6 +372,8 @@ mod tests {
             context_overflow: None,
             request_id: RequestId("r".into()),
             end_user: None,
+            client_key: None,
+            image_count: 0,
         }
     }
 
