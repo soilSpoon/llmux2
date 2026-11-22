@@ -27,6 +27,21 @@ WHEN a provider only offers a free tier with a request cap
 THEN it is configured as a normal deployment and its limits are tracked like
 any other.
 
+### Requirement: DeepAI text API
+
+The gateway SHALL convert non-streaming Chat Completions requests with one
+user text message for keyed `text-generator` and `summarization` deployments.
+It SHALL reject unsupported options and send the key in
+`Api-Key`, not `Authorization`. DeepAI Code SHALL use the existing
+`openai_compat` adapter when its gateway speaks Chat Completions.
+
+#### Scenario: DeepAI text response
+
+WHEN a configured `deepai` deployment receives a text chat request
+and DeepAI returns a string `output`
+THEN the gateway returns the output as assistant text and identifies the
+configured upstream model in the response.
+
 ### Requirement: Keyless deployments
 
 The gateway SHALL support explicit keyless upstreams via `auth = "none"` with

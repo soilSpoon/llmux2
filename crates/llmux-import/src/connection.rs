@@ -43,7 +43,7 @@ pub(super) fn identity<'a>(connection: &'a Value, nodes: &'a [Value]) -> &'a str
 
 fn replacement(provider: &str) -> Option<&'static str> {
     match provider {
-        "cloudflare-playground" | "cfp" | "duckduckgo-web" => Some(SESSION_FALLBACK),
+        "cloudflare-playground" | "cfp" | "duckduckgo-web" | "ddgw" => Some(SESSION_FALLBACK),
         _ => None,
     }
 }
@@ -51,7 +51,10 @@ fn replacement(provider: &str) -> Option<&'static str> {
 pub(super) const SESSION_FALLBACK: &str = "no native adapter; pass --omniroute-fallback and --omniroute-key to keep serving this provider through OmniRoute";
 
 pub(super) fn session_provider(provider: &str) -> bool {
-    matches!(provider, "duckduckgo-web" | "cloudflare-playground" | "cfp")
+    matches!(
+        provider,
+        "duckduckgo-web" | "ddgw" | "cloudflare-playground" | "cfp"
+    )
 }
 
 fn workers_hint() -> &'static str {
@@ -172,10 +175,7 @@ fn keyed_bridge(connection: &Value, nodes: &[Value]) -> bool {
 }
 
 pub(super) fn keyed_loopback_bridge(provider: &str) -> bool {
-    matches!(
-        provider,
-        "deepai" | "deepai-code" | "cloudflare-direct" | "cfpd"
-    )
+    matches!(provider, "cloudflare-direct" | "cfpd")
 }
 
 pub(super) fn select_auth<'a>(
@@ -205,9 +205,7 @@ pub(super) fn select_auth<'a>(
     if matches!(provider, "cloudflare-direct" | "cfpd") && !keyed_bridge(connection, nodes) {
         return Err(workers_hint());
     }
-    if matches!(provider, "deepai" | "deepai-code") && !keyed_bridge(connection, nodes) {
-        return Err("no official HTTP API; dropped");
-    }
+
     if crate::devin::bridge(provider) {
         return Ok(SelectedAuth::None);
     }

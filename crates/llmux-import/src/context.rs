@@ -31,7 +31,11 @@ impl Overrides {
                         .and_then(|limit| u32::try_from(limit).ok())
                         .filter(|limit| *limit > 0);
                     let key = (
-                        crate::upstream::canonical_provider(provider, array(root, "providerNodes")),
+                        crate::upstream::canonical_for_model(
+                            provider,
+                            model,
+                            array(root, "providerNodes"),
+                        ),
                         model.to_owned(),
                     );
                     if let Some(limit) = limit.filter(|_| {

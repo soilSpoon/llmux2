@@ -1,7 +1,8 @@
-//! OpenAI-compatible and Anthropic Messages adapters and static-key / OAuth credential sources.
+//! Upstream adapters and static-key / OAuth credential sources.
 
 mod anthropic;
 mod antigravity;
+mod deepai;
 mod devin_acp;
 mod messages;
 pub mod nous_portal;
@@ -15,6 +16,7 @@ mod xai;
 
 pub use anthropic::Anthropic;
 pub use antigravity::Antigravity;
+pub use deepai::DeepAi;
 pub use devin_acp::{list_models as list_devin_models, DevinAcp, DevinAcpConfig};
 pub use llmux_types::{parse_devin_models, DevinModel};
 pub use openai_compat::{OpenAiCompat, RequestMetadata, StaticKey};

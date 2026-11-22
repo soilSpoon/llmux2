@@ -412,9 +412,26 @@ fn skips_malformed_steps_and_unsupported_custom_protocols() {
 
 #[test]
 fn provider_table_uses_adapter_base_urls_and_unique_ids() {
+    let provider_table: Vec<_> = llmux_import::PROVIDERS
+        .iter()
+        .map(|&(id, kind, url)| match id {
+            "deepai" => (id, kind, url, "text-generator"),
+            "deepai-code" => (id, kind, "http://127.0.0.1:8790/deepai/v1", "org/model"),
+            _ => (id, kind, url, "org/model"),
+        })
+        .collect();
     let root = json!({
-        "providerConnections": llmux_import::PROVIDERS.iter().enumerate().map(|(i,(id,_,_))| json!({"id":format!("key {i}"),"provider":id,"authType":"apikey","apiKey":format!("test-key-{i}")})).collect::<Vec<_>>(),
-        "combos":[{"name":"all / models", "models":llmux_import::PROVIDERS.iter().map(|(id,_,_)|format!("{id}/org/model")).collect::<Vec<_>>()}, {"name":"all---models", "models":["openai/other"]}],
+        "providerConnections": provider_table.iter().enumerate().map(|(i,(id,_,url,_))| {
+            let mut connection = json!({"id":format!("key {i}"),"provider":id,"authType":"apikey",
+                "apiKey":format!("test-key-{i}")});
+            if *id == "deepai-code" {
+                connection["providerSpecificData"] = json!({"baseUrl":url});
+            }
+            connection
+        }).collect::<Vec<_>>(),
+        "combos":[{"name":"all / models", "models":provider_table.iter()
+            .map(|(id,_,_,model)|format!("{id}/{model}")).collect::<Vec<_>>()},
+            {"name":"all---models", "models":["openai/other"]}],
         "apiKeys":[{"key":"test-gateway"}]
     });
     let dir = tempfile::tempdir().unwrap();
@@ -436,10 +453,11 @@ fn provider_table_uses_adapter_base_urls_and_unique_ids() {
     )
     .unwrap();
     let config = RuntimeConfig::load(output).unwrap();
-    for (dep, (_, kind, url)) in config.deployments.iter().zip(llmux_import::PROVIDERS) {
-        assert_eq!(dep.provider.0.as_ref(), *kind);
-        assert_eq!(dep.base_url.to_string().trim_end_matches('/'), *url);
-        assert_eq!(dep.upstream_model.as_ref(), "org/model");
+    assert_eq!(config.models[0].deployments.len(), provider_table.len());
+    for (dep, (_, kind, url, model)) in config.deployments.iter().zip(provider_table) {
+        assert_eq!(dep.provider.0.as_ref(), kind);
+        assert_eq!(dep.base_url.to_string().trim_end_matches('/'), url);
+        assert_eq!(dep.upstream_model.as_ref(), model);
     }
     let ids = config
         .deployments

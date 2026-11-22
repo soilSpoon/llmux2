@@ -52,8 +52,9 @@ leg. These are not counts of legs that can be restored unchanged.
 | Skipped connection | Official replacement | Free status and llmux2 decision |
 | --- | --- | --- |
 | `cloudflare-direct`, `cloudflare-playground` (43-leg bridge group) | Workers AI account API token, `/client/v4/accounts/ACCOUNT_ID/ai/v1` [CF1–2] | 10,000 neurons/day; `openai_compat`. Use a free-eligible model, not the playground catalog. In particular GLM-5.2 is explicitly paid-method-gated. |
-| `deepai` / `deepai-code` bridge (same group) | DeepAI official `https://api.deepai.org/api/<model>` with `api-key` [D1] | No free text/code API allowance verified. Official form/job API is not Chat Completions; not an as-is adapter replacement. Use Kilo, OpenRouter or AI Studio for coding instead. |
-| `duckduckgo-web` (same group) | No official third-party Duck.ai inference API verified [D2] | Drop bridge. Substitute Kilo/OpenRouter/Workers AI/AI Studio; these are model-access substitutes, not DuckDuckGo search or privacy-equivalent services. |
+| `deepai` (same group) | DeepAI's `https://api.deepai.org/api/<model>` with an `Api-Key` header [D1] | The `deepai` adapter converts text Chat Completions for `text-generator` and `summarization`. Neither authenticated generation nor free API use is verified. |
+| `deepai-code` (same group) | Keyed DeepAI Code sidecar with Chat Completions | Use `openai_compat`, not `deepai`. The importer accepts the reviewed keyed sidecar at `http://127.0.0.1:8790/deepai/v1` for the exported node with the `deepai` prefix or built-in `deepai-code` connection. The listener must be reachable from llmux2. The live sidecar and pricing remain unverified. |
+| `duckduckgo-web` / `ddgw` (same group) | No supported third-party Duck.ai inference API verified [D2] | Direct import remains unavailable. The existing opt-in importer replacement uses only reviewed same-model matches. |
 | `antigravity` (34-leg OAuth group) | Google AI Studio/Gemini API key [G1–3] | Official free eligible models, project quotas, data-use caveats. `openai_compat`; do not migrate consumer OAuth. Five existing keys are not five independent project quotas. |
 | `xai-oauth` / grok-cli (same group) | xAI API key at `https://api.x.ai/v1` [X1–2] | Official keyed access, but no current free credit grant verified. Do not count as a free replacement. Current quickstart demonstrates Responses; llmux2 has no native upstream `responses` kind. Chat compatibility/model eligibility must be checked separately. |
 | `kilo`, `kilo-free` (7-leg no-auth group) | Same official gateway with Kilo API key; anonymous free access is also explicitly documented [K1–3] | Both keyed and explicit `auth = "none"` deployments work. Anonymous is 200 requests/hour/IP. |
@@ -230,11 +231,11 @@ page only exposes account-specific limits, no number is invented.
   `# or "fast", "pro", or a model ID from /v1/models`. Free limits unverified.
 - **D1** [DeepAI docs](https://deepai.org/docs):
   “Pass your key in the api-key header and the model's inputs as form fields. The endpoint URL is https://api.deepai.org/api/<model>”.
-  Website/app free chat is not evidence of a supported free text API. No official
-  code/chat bridge protocol or free API limit verified.
-- **D2** [DuckDuckGo help URL attempted](https://duckduckgo.com/duckduckgo-help-pages/duckai/ai-chat):
-  returned the generic DuckDuckGo shell, not third-party inference documentation.
-  No official API was verified; this is not a claim to have proven none exists.
+  Keyless probes returned HTTP 401 for `text-generator` and `summarization`.
+  That verifies endpoint recognition, not successful generation or free API use.
+- **D2** [Duck.ai terms](https://duckduckgo.com/duckai/privacy-terms):
+  Prohibit automated querying and circumventing safeguards. Status requests to
+  both Duck.ai hosts returned a browser challenge, not a plain anonymous token.
 - **X1** [xAI overview](https://docs.x.ai/docs/overview):
   `base_url="https://api.x.ai/v1"`, `model="grok-4.7"` in Responses example;
   navigation says “Purchase credits”.
@@ -253,13 +254,14 @@ page only exposes account-specific limits, no number is invented.
   Keyless and keyed deployments share model routing and fallback but retain
   separate RPM/concurrency limits, cooldowns and anonymous auth-failure state.
   Their upstream account/IP policies still apply across gateway instances.
-- **No arbitrary upstream header configuration:** `RawDeployment` has no header
-  field and uses `deny_unknown_fields`; so does the credential schema. The
-  adapter's internal `AuthMaterial::Header` and `StaticKey::header` do not expose
-  a TOML map. HMS is blocked on both official provenance and configurable headers.
-  OpenRouter optional `HTTP-Referer`/title attribution headers cannot be set here;
-  they are not required for the normal Bearer-auth request. No implementation changes made.
-- **Kinds:** server registry installs `openai`, `openai_compat`, and `anthropic`.
+- **DeepAI text requests:** Use one user message with text content and set
+  `stream` to false or omit it. The official text endpoint accepts a single
+  text input and does not expose Chat Completions options. The adapter rejects
+  unsupported options instead of ignoring them.
+- **Credential headers:** A `deepai` API-key credential sets `Api-Key`. An
+  `openai_compat` API-key credential sets Bearer authorization. Do not set the
+  credential header again in deployment headers.
+- **Kinds:** the server registry includes `deepai` for the official text API.
   `/v1/responses` is an **inbound** route converted for existing adapters, not a
   native upstream `provider = "responses"` implementation. A config string parsing
   does not mean a provider kind exists in the server registry.

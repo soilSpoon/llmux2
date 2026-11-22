@@ -243,19 +243,37 @@ pub(super) fn ensure_session_models(
         if name.is_empty() || name.contains('*') || is_excluded(excluded, name) {
             continue;
         }
-        if let Some(model) = models
-            .iter_mut()
-            .find(|model| string(model, "name") == name)
-        {
+        if let Some(model) = models.iter_mut().find(|model| {
+            string(model, "name") == name
+                || array(model, "aliases")
+                    .iter()
+                    .any(|alias| alias.as_str() == Some(name.as_str()))
+        }) {
+            let canonical = string(model, "name").to_owned();
+            let via_alias = canonical != *name;
             let deployments = model["deployments"]
                 .as_array()
                 .ok_or("imported model has no deployments")?;
-            if deployments
+            if via_alias {
+                if deployments.iter().any(|dep| {
+                    dep["fallback"] == true
+                        && string(dep, "credential") == credential
+                        && string(dep, "base_url") == options.base_url
+                        && string(dep, "upstream_model") == canonical
+                }) {
+                    continue;
+                }
+            } else if deployments
                 .last()
                 .is_some_and(|dep| dep["fallback"] == true && string(dep, "upstream_model") == name)
             {
                 continue;
             }
+            let upstream = if via_alias {
+                canonical.as_str()
+            } else {
+                name.as_str()
+            };
             let priority = deployments
                 .iter()
                 .filter_map(|dep| dep["priority"].as_i64())
@@ -264,11 +282,13 @@ pub(super) fn ensure_session_models(
                 .checked_add(1)
                 .filter(|priority| i32::try_from(*priority).is_ok())
                 .ok_or("no priority available for OmniRoute fallback")?;
-            let id = unique(&format!("omniroute-fallback-{name}"), ids);
+            let id = unique(&format!("omniroute-fallback-{upstream}"), ids);
             model["deployments"]
                 .as_array_mut()
                 .unwrap()
-                .push(session_deployment(&id, credential, options, name, priority));
+                .push(session_deployment(
+                    &id, credential, options, upstream, priority,
+                ));
         } else {
             let id = unique(&format!("omniroute-fallback-{name}"), ids);
             models.push(json!({

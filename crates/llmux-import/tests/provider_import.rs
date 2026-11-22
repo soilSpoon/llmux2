@@ -20,11 +20,12 @@ fn session_export() -> Value {
         .unwrap()
         .extend([
             json!({"id":"ddg","provider":"duckduckgo-web","authType":"apikey","apiKey":"synthetic-ddg-key"}),
+            json!({"id":"ddgw","provider":"ddgw","authType":"apikey","apiKey":"synthetic-ddgw-key"}),
             json!({"id":"cfp","provider":"cloudflare-playground","authType":"none"}),
         ]);
     root["combos"].as_array_mut().unwrap().push(json!({
         "name":"ddg-only",
-        "models":["duckduckgo-web/mistral-small-2603","cfp/meta/llama-3.1-8b-instruct"]
+        "models":["duckduckgo-web/mistral-small-2603","ddgw/mistral-small-2603","cfp/meta/llama-3.1-8b-instruct"]
     }));
     root
 }
@@ -39,6 +40,7 @@ fn session_providers_need_omniroute_fallback_and_keep_the_same_model_id() {
         "{warnings}"
     );
     assert!(warnings.contains("(ddg): skipped"));
+    assert!(warnings.contains("(ddgw): skipped"));
     assert!(warnings.contains("(cfp): skipped"));
     assert!(!warnings.contains("unsupported"));
     assert!(!warnings.contains("dropped"));
@@ -47,6 +49,7 @@ fn session_providers_need_omniroute_fallback_and_keep_the_same_model_id() {
         .model_names
         .contains_key("duckduckgo-web/mistral-small-2603"));
     assert!(!text.contains("synthetic-ddg-key"));
+    assert!(!text.contains("synthetic-ddgw-key"));
 
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("out.toml");
@@ -65,6 +68,7 @@ fn session_providers_need_omniroute_fallback_and_keep_the_same_model_id() {
     let text = std::fs::read_to_string(&output).unwrap();
     assert!(!text.contains("synthetic-session-fallback-secret"));
     assert!(!text.contains("synthetic-ddg-key"));
+    assert!(!text.contains("synthetic-ddgw-key"));
     assert!(!report
         .warnings
         .join("\n")
@@ -73,6 +77,7 @@ fn session_providers_need_omniroute_fallback_and_keep_the_same_model_id() {
     for name in [
         "ddg-only",
         "duckduckgo-web/mistral-small-2603",
+        "ddgw/mistral-small-2603",
         "cloudflare-playground/meta/llama-3.1-8b-instruct",
         "cfp/meta/llama-3.1-8b-instruct",
     ] {
@@ -103,6 +108,69 @@ fn session_providers_need_omniroute_fallback_and_keep_the_same_model_id() {
             "http://127.0.0.1:20128/v1"
         );
     }
+}
+
+// A `ddgw/<model>` string can be attached as an alias before the session
+// fallback legs are ensured; the leg must land on the model that owns the alias
+// instead of creating a duplicate model name that fails validation. The shared
+// chain must keep a single OmniRoute fallback whose upstream id is the
+// canonical model name, so a request for `baseline` is never sent upstream as
+// the alias.
+#[test]
+fn session_fallback_leg_follows_an_attached_alias() {
+    let mut root = session_export();
+    root["modelAliases"] = json!({"ddgw/mistral-small-2603": "baseline"});
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let key = dir.path().join("fallback-key");
+    std::fs::write(&key, "synthetic-session-fallback-secret").unwrap();
+    let reference = format!("file:{}", key.display());
+    let options = ImportOptions {
+        omniroute_fallback: Some(OmniRouteFallback {
+            base_url: "http://127.0.0.1:20128/v1",
+            key: &reference,
+        }),
+        ..ImportOptions::default()
+    };
+    let report =
+        llmux_import::import_with_options(&root.to_string(), &output, None, &options).unwrap();
+    let config = RuntimeConfig::load(&output).unwrap();
+    assert_eq!(
+        config.model_names["ddgw/mistral-small-2603"],
+        config.model_names["baseline"]
+    );
+    let model = &config.models[config.model_names["baseline"]];
+    let deps: Vec<_> = model
+        .deployments
+        .iter()
+        .map(|idx| &config.deployments[idx.0 as usize])
+        .collect();
+    let fallbacks: Vec<_> = deps.iter().copied().filter(|dep| dep.fallback).collect();
+    assert_eq!(
+        fallbacks.len(),
+        1,
+        "alias session id must not add a second OmniRoute fallback"
+    );
+    assert_eq!(fallbacks[0].upstream_model.as_ref(), "baseline");
+    assert!(
+        fallbacks
+            .iter()
+            .all(|dep| dep.upstream_model.as_ref() == "baseline"),
+        "fallback upstream_model must equal the canonical model name"
+    );
+    assert!(
+        deps.iter()
+            .all(|dep| dep.upstream_model.as_ref() != "ddgw/mistral-small-2603"),
+        "alias must not leak into the canonical deployment chain"
+    );
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("baseline") && warning.contains("dropped")),
+        "canonical fallback must be reused, not deduped: {:?}",
+        report.warnings
+    );
 }
 
 fn import(root: &Value) -> (llmux_import::ImportReport, RuntimeConfig, String) {

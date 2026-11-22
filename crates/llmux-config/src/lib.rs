@@ -904,7 +904,8 @@ pub fn validate_deployment_header(
             | "http2-settings"
     ) || (!anonymous
         && (name == http::header::AUTHORIZATION
-            || (provider == provider::ANTHROPIC && name == "x-api-key")))
+            || (provider == provider::ANTHROPIC && name == provider::ANTHROPIC_KEY_HEADER)
+            || (provider == provider::DEEPAI && name == provider::DEEPAI_KEY_HEADER)))
     {
         return Err(invalid("forbidden deployment header"));
     }
@@ -966,6 +967,7 @@ mod tests {
         assert!(
             validate_deployment_header("x-api-key", "value", false, provider::ANTHROPIC).is_err()
         );
+        assert!(validate_deployment_header("Api-Key", "value", false, provider::DEEPAI).is_err());
         assert!(validate_deployment_header(
             "authorization",
             "value",

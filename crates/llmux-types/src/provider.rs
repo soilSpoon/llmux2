@@ -9,6 +9,7 @@ pub const OPENAI_COMPAT: &str = "openai_compat";
 pub const OPENAI_RESPONSES: &str = "openai_responses";
 /// Anthropic Messages API.
 pub const ANTHROPIC: &str = "anthropic";
+pub const DEEPAI: &str = "deepai";
 
 /// xAI OAuth at api.x.ai. Chat and Responses, selected per model.
 pub const XAI: &str = "xai";
@@ -21,6 +22,8 @@ pub const DEVIN_ACP_BASE_URL: &str = "http://127.0.0.1/devin-acp";
 
 /// Header carrying the Anthropic API key at the upstream edge.
 pub const ANTHROPIC_KEY_HEADER: &str = "x-api-key";
+pub const DEEPAI_KEY_HEADER: &str = "api-key";
+pub const DEEPAI_TEXT_MODELS: &[&str] = &["text-generator", "summarization"];
 
 #[cfg(test)]
 mod tests {
@@ -37,14 +40,15 @@ mod tests {
                 OPENAI_COMPAT,
                 OPENAI_RESPONSES,
                 ANTHROPIC,
+                DEEPAI,
                 XAI,
                 ANTIGRAVITY,
-                DEVIN_ACP
+                DEVIN_ACP,
             ]
             .into_iter()
             .collect::<HashSet<_>>()
             .len(),
-            7
+            8
         );
         assert_eq!(ANTHROPIC_KEY_HEADER, "x-api-key");
     }

@@ -86,8 +86,18 @@ node with a baseUrl SHALL import as `openai_compat` at that baseUrl, including
 loopback. DuckDuckGo and Cloudflare Playground have no native adapter. Without
 `--omniroute-fallback` and `--omniroute-key`, their skip warning SHALL name
 those flags. With both flags, each of their model ids SHALL get an OmniRoute
-fallback deployment last, with that same upstream model id. Factory, Augment,
-and Z.AI SHALL remain excluded.
+fallback deployment last, with that same upstream model id. A session model id
+attached to an imported model as an alias SHALL resolve to that model at
+request time and SHALL NOT get its own model or fallback leg, so a canonical
+request never sends the session alias upstream. Factory, Augment, and Z.AI
+SHALL remain excluded.
+
+#### Scenario: Session id attached as an alias
+
+WHEN a session provider model id is attached to an imported model's aliases
+THEN the model's last OmniRoute fallback deployment keeps the imported model
+name as its upstream model id
+AND no extra model or fallback leg is created for the alias.
 
 #### Scenario: xAI OAuth token URL
 
@@ -172,8 +182,9 @@ THEN no field stripping is added.
 ### Requirement: Reviewed Morph official migration and logprobs order
 The importer SHALL migrate only built-in Morph loopback connection overrides to
 `https://api.morphllm.com/v1`, warning about the reviewed endpoint substitution.
-Other loopback providers, custom nodes, nonofficial Morph hosts and unspecified
-bind addresses SHALL remain excluded. The existing Morph credential is reused.
+Other loopback providers, custom nodes, nonofficial Morph hosts, and unspecified
+bind addresses SHALL remain excluded except for the reviewed DeepAI Code sidecar
+below. The existing Morph credential is reused.
 
 The reviewed combo names `deepseek-v4.1-flash`, `deepseek-v4.1-flash-fast`,
 `deepseek-v4.1-flash-1017`, `deepseek-v4.1-flash-1017-fast` and
@@ -400,6 +411,25 @@ WHEN the operator supplies a snapshot
 THEN documentation identifies the snapshot as static evidence rather than
 live cost enforcement; paid models and missing pricing do not become keyed
 deployments through names or free-status hints alone.
+
+### Requirement: Direct DeepAI migration
+
+The importer SHALL accept an API key for the built-in DeepAI connection and
+route only `text-generator` and `summarization` to the official text API.
+The importer SHALL retain the explicitly configured
+`http://127.0.0.1:8790/deepai/v1` sidecar as `openai_compat` for a keyed
+`deepai-code` connection or OpenAI-compatible node with prefix `deepai`.
+The regular loopback restrictions apply to other URLs. An explicit
+same-model replacement option still takes precedence for bridge nodes.
+The two native DeepAI text IDs take precedence over the Code node's
+`deepai` prefix. The Code node's explicit ID remains distinct.
+
+#### Scenario: Distinct protocols
+
+WHEN an export contains keyed connections for the official DeepAI API and
+the reviewed local DeepAI Code sidecar
+THEN the importer selects `deepai` for supported text IDs
+and `openai_compat` for the sidecar.
 
 ### Requirement: Reviewed same-model bridge replacements
 

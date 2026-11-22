@@ -28,8 +28,8 @@ use llmux_core::{Executor, GatewayError, LiveModels, RoutedError};
 use llmux_providers::nous_portal::{NousPortalConfig, NousPortalSource};
 use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
 use llmux_providers::{
-    truncate_middle_for_format, Anthropic, Antigravity, DevinAcp, DevinAcpConfig, OpenAiCompat,
-    OpenAiResponses, RequestMetadata, StaticKey, Xai,
+    truncate_middle_for_format, Anthropic, Antigravity, DeepAi, DevinAcp, DevinAcpConfig,
+    OpenAiCompat, OpenAiResponses, RequestMetadata, StaticKey, Xai,
 };
 use llmux_types::{
     provider, ContextOverflow, CredentialSource, GatewayRequest, GatewayResponse, InboundFormat,
@@ -45,6 +45,7 @@ const ATTEMPTS_HEADER: HeaderName = HeaderName::from_static("x-llmux-attempts");
 const CONTEXT_OVERFLOW_HEADER: HeaderName = HeaderName::from_static("x-llmux-context-overflow");
 const DROPPED_MESSAGES_HEADER: HeaderName = HeaderName::from_static("x-llmux-dropped-messages");
 const ANTHROPIC_KEY_HEADER: HeaderName = HeaderName::from_static(provider::ANTHROPIC_KEY_HEADER);
+const DEEPAI_KEY_HEADER: HeaderName = HeaderName::from_static(provider::DEEPAI_KEY_HEADER);
 
 struct Active {
     config: Arc<RuntimeConfig>,
@@ -66,6 +67,7 @@ fn provider_registry(devin: DevinAcpConfig) -> ProviderRegistry {
     }
     registry.register(Arc::new(Anthropic::new(provider::ANTHROPIC)));
     registry.register(Arc::new(OpenAiResponses::new()));
+    registry.register(Arc::new(DeepAi::new()));
     registry.register(Arc::new(Xai::new()));
     registry.register(Arc::new(Antigravity::new()));
     registry.register(Arc::new(DevinAcp::new(devin)));
@@ -79,10 +81,10 @@ fn static_sources(
     std::mem::take(&mut config.api_keys)
         .into_iter()
         .map(|(id, ApiKey { provider, key })| {
-            let source = if &*provider.0 == provider::ANTHROPIC {
-                StaticKey::header(ANTHROPIC_KEY_HEADER, &key)?
-            } else {
-                StaticKey::bearer(&key)?
+            let source = match provider.0.as_ref() {
+                provider::ANTHROPIC => StaticKey::header(ANTHROPIC_KEY_HEADER, &key)?,
+                provider::DEEPAI => StaticKey::header(DEEPAI_KEY_HEADER, &key)?,
+                _ => StaticKey::bearer(&key)?,
             };
             Ok((id, Arc::new(source) as Arc<dyn CredentialSource>))
         })
