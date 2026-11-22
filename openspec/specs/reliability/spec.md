@@ -92,6 +92,12 @@ cools down.
 WHEN a stream ends with a rate-limit error
 THEN the deployment is skipped for new requests until its cooldown ends.
 
+#### Scenario: A committed stream reports credential quota exhaustion
+
+WHEN a committed stream ends with credential quota exhaustion
+THEN the gateway surfaces the stream error without replay and applies the
+same credential-wide cooldown as for a pre-commit quota error.
+
 #### Scenario: Gemini reports an explicit quota violation
 
 WHEN a Gemini 429 contains a daily `google.rpc.QuotaFailure` violation

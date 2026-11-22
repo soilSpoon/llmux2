@@ -103,7 +103,7 @@ struct Binding {
     disabled: Arc<AtomicBool>,
     limits: Arc<DeploymentLimits>,
     /// Other routes on the same credential, cooled together when its quota runs out.
-    key_peers: Box<[Arc<DeploymentLimits>]>,
+    key_peers: Arc<[Arc<DeploymentLimits>]>,
     stats: Option<Arc<AttemptStats>>,
 }
 
@@ -253,7 +253,7 @@ impl Executor {
                     auth,
                     disabled,
                     limits: Self::shared_limits(&mut shared_limits, &key_windows, dep),
-                    key_peers: Box::default(),
+                    key_peers: Arc::default(),
                     stats: cfg.server.dashboard_key.is_some().then(Arc::default),
                 })
             })
@@ -739,22 +739,13 @@ impl Executor {
                                         reset_at,
                                     })),
                                 ) => {
-                                    let hint = reset_at.map(|reset| {
-                                        reset.duration_since(SystemTime::now()).unwrap_or_default()
-                                    });
-                                    let until = binding.limits.limited(
-                                        hint,
+                                    cool_credential(
+                                        &binding.limits,
+                                        &binding.key_peers,
+                                        reset_at,
                                         self.cfg.cooldown.default,
                                         self.cfg.cooldown.max,
                                     );
-                                    for peer in &binding.key_peers {
-                                        match hint {
-                                            Some(wait) => {
-                                                peer.cool_down(wait.min(self.cfg.cooldown.max));
-                                            }
-                                            None => peer.cool_down_until(until),
-                                        }
-                                    }
                                 }
                                 (Outcome::ModelNotFound, Err(GatewayError::Client(err))) => {
                                     incompatible.push(idx);
@@ -886,10 +877,11 @@ impl Executor {
                         events,
                         binding.stats.clone(),
                         binding.limits.clone(),
+                        binding.key_peers.clone(),
                         Box::pin(tokio::time::sleep(idle_timeout)),
                     )),
                     move |state| async move {
-                        let (mut events, stats, limits, mut idle) = state?;
+                        let (mut events, stats, limits, key_peers, mut idle) = state?;
                         // Measure idle from each poll, not from the last event: a
                         // downstream pause must not eat into the upstream idle window.
                         idle.as_mut().reset(Instant::now() + idle_timeout);
@@ -898,7 +890,7 @@ impl Executor {
                                 Some(Ok(event)) => {
                                     return Some((
                                         Ok(event),
-                                        Some((events, stats, limits, idle)),
+                                        Some((events, stats, limits, key_peers, idle)),
                                     ));
                                 }
                                 Some(Err(err)) => err,
@@ -912,17 +904,16 @@ impl Executor {
                         if let Some(stats) = &stats {
                             stats.record_stream_error(error.kind());
                         }
-                        let hint = match &error {
-                            UpstreamError::RateLimited { retry_after, .. } => Some(*retry_after),
-                            UpstreamError::QuotaExhausted { reset_at } => {
-                                Some(reset_at.map(|reset| {
-                                    reset.duration_since(SystemTime::now()).unwrap_or_default()
-                                }))
+                        match &error {
+                            UpstreamError::RateLimited { retry_after, .. } => {
+                                limits.limited(*retry_after, cooldown.0, cooldown.1);
                             }
-                            _ => None,
-                        };
-                        if let Some(hint) = hint {
-                            limits.limited(hint, cooldown.0, cooldown.1);
+                            UpstreamError::QuotaExhausted { reset_at } => {
+                                cool_credential(
+                                    &limits, &key_peers, *reset_at, cooldown.0, cooldown.1,
+                                );
+                            }
+                            _ => {}
                         }
                         Some((Err(error), None))
                     },
@@ -934,6 +925,25 @@ impl Executor {
             _ => Err(GatewayError::Client(UpstreamError::Server {
                 status: StatusCode::BAD_GATEWAY,
             })),
+        }
+    }
+}
+
+fn cool_credential(
+    limits: &DeploymentLimits,
+    peers: &[Arc<DeploymentLimits>],
+    reset_at: Option<SystemTime>,
+    default: Duration,
+    max: Duration,
+) {
+    let hint = reset_at.map(|reset| reset.duration_since(SystemTime::now()).unwrap_or_default());
+    let until = limits.limited(hint, default, max);
+    for peer in peers {
+        match hint {
+            Some(wait) => {
+                peer.cool_down(wait.min(max));
+            }
+            None => peer.cool_down_until(until),
         }
     }
 }
