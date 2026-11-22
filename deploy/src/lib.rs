@@ -1,8 +1,9 @@
+pub mod alert;
 mod cli;
 mod host;
 
-pub use cli::main_entry;
-pub use host::{health, systemctl_args, unit_active, Host};
+pub use cli::{main_entry, Tool};
+pub use host::{health, http_get, systemctl_args, unit_active, Host};
 use serde_json::{json, Value};
 use std::{
     fs::{self, File, OpenOptions},

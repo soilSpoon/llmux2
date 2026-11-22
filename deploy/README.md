@@ -13,7 +13,8 @@ Build `cargo build --locked --release -p llmux-server -p llmux2-ops`. From the r
 ```sh
 mkdir -p "$HOME/llmux2/bin" "$HOME/.config/systemd/user"
 chmod 700 "$HOME/llmux2" "$HOME/llmux2/bin"
-install -m 700 target/release/llmux2-deploy target/release/llmux2-guard "$HOME/llmux2/bin/"
+install -m 700 target/release/llmux2-deploy target/release/llmux2-guard \
+  target/release/llmux2-alert "$HOME/llmux2/bin/"
 install -m 600 deploy/systemd/* "$HOME/.config/systemd/user/"
 systemctl --user daemon-reload
 ```
@@ -85,6 +86,40 @@ listener closes. Only then does the bounded in-flight/SSE drain start.
 Keep `server.drain_grace_ms + server.shutdown_timeout_ms` below the service's
 90-second stop timeout. The grace mitigates the close/send race; it does not
 guarantee error-free handoffs for clients stalled beyond the grace interval.
+
+## Alert thresholds
+
+`llmux2-alert` probes the live gateway and prints one `ALERT` line per breach
+on stderr, exiting 1; it exits 0 with `ok` when nothing breaches and 2 on a
+malformed thresholds file. Run it on a timer so breaches land in the journal:
+
+```sh
+install -m 700 target/release/llmux2-alert "$HOME/llmux2/bin/"
+systemctl --user enable --now llmux2-alert.timer
+```
+
+Thresholds live in `$HOME/llmux2/alerts.toml` (`--config` overrides). A missing
+file means only reachability checks; every threshold is optional and unset
+checks are skipped.
+
+```toml
+listen = "127.0.0.1:8090"          # default: recorded active.json listen
+key_file = "/home/opc/llmux2/dashboard.key"  # bearer for /admin stats
+failure_ratio = 0.2                # new failures / new attempts per deployment
+min_attempts = 10                  # window floor for failure_ratio (default 10; 0 disables it)
+max_cooldowns = 2                  # more than this many cooling deployments
+max_disabled = 0                   # any disabled deployment alerts
+```
+
+`failure_ratio` compares new `failed_attempts + stream_errors` against new
+attempts (`routed + failed_attempts` — `routed` already counts requests that
+later error mid-stream) since the previous run's counters, persisted atomically
+in `$HOME/llmux2/alert-state.json`. Values outside `0..=1` (including `nan`)
+are rejected as config errors. The
+first run (or any run after counters reset, e.g. a reload or restart) records
+a baseline and cannot breach the ratio. Wire notifications with
+`OnFailure=` on `llmux2-alert.service` or a journal watcher; the tool itself
+only reports.
 
 ## Rollback and deliberate stop
 

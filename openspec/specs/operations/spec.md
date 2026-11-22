@@ -65,6 +65,42 @@ WHEN CI runs deployment tests
 THEN it SHALL run the Rust tests once in the coverage job, using fake waits,
 and merge-gate Rust tests SHALL also run there rather than in the check job.
 
+### Requirement: Alert thresholds over gateway stats
+
+`llmux2-ops` SHALL build a standalone `llmux2-alert` binary that probes the
+running gateway and reports threshold breaches as `ALERT` lines with a nonzero
+exit, so a systemd timer plus journal or an `OnFailure` hook surfaces them.
+Each pass SHALL check `/healthz` and `GET /admin/deployments`, authenticating
+with a bearer token read from a configured `key_file`. Unreachable health or
+admin endpoints SHALL themselves be breaches.
+
+`alerts.toml` (default `$HOME/llmux2/alerts.toml`, overridable with `--config`)
+SHALL support `listen`, `key_file`, `failure_ratio`, `min_attempts`,
+`max_cooldowns` and `max_disabled`; a missing file uses defaults (only
+reachability checks). An unset threshold disables its check. `failure_ratio`
+SHALL compare against the previous counter snapshot persisted atomically in
+`alert-state.json`, counting `failed_attempts` plus `stream_errors` over new
+attempts per deployment, and SHALL apply only when new attempts reach
+`min_attempts` (default 10; `0` disables the floor). A counter decrease in
+`routed`, `failed_attempts`, or `stream_errors` SHALL skip the ratio and
+re-base the snapshot. A 200 response without a `deployments` array SHALL alert
+and leave the snapshot untouched. `llmux2-alert` SHALL NOT take the deployment lock.
+
+#### Scenario: Breach reports and exits
+
+WHEN a configured threshold is exceeded or a probe fails
+THEN `llmux2-alert` prints one `ALERT` line per breach and exits 1.
+
+#### Scenario: First run and counter reset
+
+WHEN there is no snapshot, or a deployment's counters decreased
+THEN the run records a fresh baseline and reports no failure-ratio breach.
+
+#### Scenario: Quiet window
+
+WHEN new attempts are below `min_attempts`
+THEN no failure-ratio breach fires regardless of the ratio.
+
 ### Requirement: Bounded fallback traffic visibility
 The gateway SHALL expose reporting-only deployment `fallback` flags, defaulting
 to false and always true for catch-all deployments. The importer SHALL mark

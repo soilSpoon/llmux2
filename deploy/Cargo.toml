@@ -5,7 +5,9 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 libc = "0.2"
 
 [[bin]]
@@ -19,3 +21,7 @@ path = "src/bin/guard.rs"
 [[bin]]
 name = "llmux2-probe"
 path = "src/bin/probe.rs"
+
+[[bin]]
+name = "llmux2-alert"
+path = "src/bin/alert.rs"
