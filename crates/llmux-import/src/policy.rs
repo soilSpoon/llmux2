@@ -22,12 +22,13 @@ pub(super) const WORKERS_DEFAULT_RPM: u32 = 30;
 
 /// Hard daily cap on estimated input tokens for the shared Workers AI
 /// credential, bound across every deployment on the account. Sized so a day
-/// of worst-case billed usage stays under the
-/// documented 10,000-neuron free daily allowance even when output (including
-/// hidden reasoning tokens) is 5x the admitted input: the most expensive
-/// allowed model bills 27,273 neurons/M output tokens, and
-/// 60,000 * (0.018182 + 5 * 0.027273) is about 9,273 neurons.
-pub(super) const WORKERS_TPD: u32 = 60_000;
+/// of worst-case billed usage stays under the documented 10,000-neuron free
+/// daily allowance even when output (including hidden reasoning tokens) is
+/// 5x the admitted input: the most expensive allowed model
+/// (`@cf/meta/llama-3.3-70b-instruct-fp8-fast`) bills 204,805 neurons/M
+/// output tokens, and 9,000 * (0.026668 + 5 * 0.204805) is about 9,456
+/// neurons.
+pub(super) const WORKERS_TPD: u32 = 9_000;
 
 pub(super) struct Policy {
     pub workers: Option<External>,
