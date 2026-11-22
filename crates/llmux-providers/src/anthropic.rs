@@ -1064,6 +1064,39 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_credit_error_requires_status_type_and_message_prefix() {
+        let message = "Your credit balance is too low to access the Anthropic API.";
+        let embedded = format!("Invalid input referenced this message: {message}");
+        for (case, status, kind, text) in [
+            (
+                "non-400 status",
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                message,
+            ),
+            (
+                "different error type",
+                StatusCode::BAD_REQUEST,
+                "not_found_error",
+                message,
+            ),
+            (
+                "mid-message phrase",
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                embedded.as_str(),
+            ),
+        ] {
+            let body = Bytes::from(json!({"error": {"type": kind, "message": text}}).to_string());
+            let error = client_error(status, body, true);
+            assert!(
+                matches!(error, UpstreamError::BadRequest { status: actual, .. } if actual == status),
+                "{case}: expected unchanged client error for {status}, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn errors_and_limits() {
         let body = Bytes::from_static(
             br#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#,
