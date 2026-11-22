@@ -360,6 +360,20 @@ fn refuses_overwrites_and_invalid_urls() {
 }
 
 #[test]
+fn identical_secrets_are_reused_on_re_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = dir.path().join("secrets");
+    llmux_import::import(FIXTURE, &dir.path().join("one.toml"), Some(&secrets)).unwrap();
+    // A scheduled re-import regenerates the same export's credentials; an
+    // identical existing file is reused rather than aborting.
+    llmux_import::import(FIXTURE, &dir.path().join("two.toml"), Some(&secrets)).unwrap();
+    let differing = secrets.join("upstream-slow-key");
+    fs::write(&differing, "rotated-by-hand").unwrap();
+    assert!(llmux_import::import(FIXTURE, &dir.path().join("three.toml"), Some(&secrets)).is_err());
+    assert_eq!(fs::read_to_string(&differing).unwrap(), "rotated-by-hand");
+}
+
+#[test]
 fn cli_reports_without_leaking_secrets() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("export.json");
@@ -389,6 +403,35 @@ fn cli_reports_without_leaking_secrets() {
         .unwrap();
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("usage:"));
+}
+
+#[test]
+fn cli_listen_reaches_the_emitted_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("export.json");
+    let output = dir.path().join("out.toml");
+    fs::write(&input, FIXTURE).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_llmux-import"))
+        .args(["--input"])
+        .arg(input)
+        .arg("--output")
+        .arg(&output)
+        .args(["--listen", "127.0.0.1:8090"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        RuntimeConfig::load(&output)
+            .unwrap()
+            .server
+            .listen
+            .to_string(),
+        "127.0.0.1:8090"
+    );
 }
 
 #[test]

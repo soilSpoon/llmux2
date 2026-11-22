@@ -401,6 +401,17 @@ fn unrestricted_client_key(key: &Value) -> bool {
 
 fn write_secret(dir: &Path, id: &str, secret: &str) -> Result<String, String> {
     let path = dir.join(id);
+    // Scheduled re-imports regenerate the same credentials into a shared
+    // secrets directory: an identical existing file is reused; a differing
+    // one (rotated by hand or a changed export) still fails closed.
+    if let Ok(existing) = fs::read_to_string(&path) {
+        if existing == secret {
+            return Ok(format!("file:{}", path.display()));
+        }
+        return Err(
+            "could not create secret file (existing files are never overwritten)".to_owned(),
+        );
+    }
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
