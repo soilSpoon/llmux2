@@ -15,6 +15,10 @@
 set -euo pipefail
 
 dir="$HOME/llmux2"
+# The export carries plaintext credentials: shred it on every exit —
+# success, a failed or aborted import, or an early bail — so it never
+# outlives the run that consumed it.
+trap 'if command -v shred >/dev/null; then shred -u "$dir/export.json" 2>/dev/null || rm -f "$dir/export.json"; else rm -f "$dir/export.json"; fi' EXIT
 IMPORT_FLAGS=()
 # shellcheck source=/dev/null
 [[ -f "$dir/import.env" ]] && source "$dir/import.env"
@@ -40,9 +44,6 @@ rm -f "$dir/llmux-next.toml"
     --listen "$listen" \
     --overlay "$dir/site.toml" \
     "${IMPORT_FLAGS[@]}"
-# The export carries plaintext credentials; remove it once the import
-# consumed it.
-if command -v shred >/dev/null; then shred -u "$dir/export.json"; else rm -f "$dir/export.json"; fi
 # A short canary window keeps the old slot sharing the port while the new
 # slot proves stable; a bad regenerated config never takes the port alone.
 "$dir/bin/llmux2-deploy" deploy --binary "$dir/bin/llmux-server" --config "$dir/llmux-next.toml" --canary 300

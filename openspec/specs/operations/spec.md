@@ -357,7 +357,7 @@ the site's supplemental importer options, the deployed slot's listen
 address, and the site's overlay (`--overlay`, merging `[server]`/`[routing]`
 settings and site-added credentials/models), and SHALL never delete secrets
 the deployed config still references. The prune SHALL shred the credential
-export once the import consumed it and deploy the installed release binary.
+export on every exit — success, failure, or abort — and deploy the installed release binary.
 
 #### Scenario: A full sweep finds the long tail
 
