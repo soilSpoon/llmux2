@@ -100,6 +100,9 @@ struct RouteTrace {
     attempts: usize,
     /// Provider-side request id from the last attempt, for flag tracing.
     upstream_request_id: Option<Arc<str>>,
+    /// Every upstream send, in send order — failover hides the losing legs
+    /// from `last_attempted`, so they are kept here for the request record.
+    legs: Vec<request_log::AttemptLeg>,
 }
 
 type HttpClient = llmux_types::HttpClient;
@@ -448,6 +451,7 @@ impl Executor {
                 image_count,
                 upstream_request_id: trace.upstream_request_id.as_deref(),
                 attempts: trace.attempts,
+                legs: trace.legs,
                 latency_ms: started.elapsed().as_millis() as u64,
                 outcome: if result.is_ok() { "routed" } else { "error" },
                 error_kind: result.as_ref().err().map(request_log::error_kind),
@@ -676,6 +680,13 @@ impl Executor {
                             if let Some(stats) = &binding.stats {
                                 stats.record_attempt(result.as_ref().err());
                             }
+                            trace.legs.push(request_log::AttemptLeg {
+                                deployment: dep.id.as_ref().into(),
+                                provider: dep.provider.0.as_ref().into(),
+                                outcome: result
+                                    .as_ref()
+                                    .map_or_else(request_log::error_kind, |_| "routed"),
+                            });
                             last_transient = None;
                             event = Event::Result(match &result {
                                 Ok(_) => Outcome::Success,
