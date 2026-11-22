@@ -113,6 +113,8 @@ mod tests {
             r#"{"choices":[{"delta":{"role":"assistant","reasoning_content":"hi"}}]}"#,
             r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_1"}]}}]}"#,
             r#"{"choices":[{"finish_reason":"stop"}]}"#,
+            r#"{"choices":[{"delta":{"role":"assistant"},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[{"delta":{"role":"assistant"},"logprobs":{"content":[{"token":"Hi","logprob":-0.1}]}}]}"#,
             r#"{"choices":[],"usage":{"prompt_tokens":1}}"#,
         ] {
             assert_eq!(
