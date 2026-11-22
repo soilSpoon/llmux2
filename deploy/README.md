@@ -55,6 +55,16 @@ remain active with zero restarts and the same nonzero PID. A port health probe
 must also succeed, but cannot identify the new slot under SO_REUSEPORT: the old
 slot might answer it. Only after both checks does deployment stop/drain the old
 slot and record/enable the new one for boot.
+
+Pass `--canary SECONDS` to hold the handoff: after the new slot is stable and
+healthy, both slots keep running and the kernel splits new connections between
+them over the shared SO_REUSEPORT listener (roughly half reach the new build).
+For that window the new unit must keep the same PID with zero restarts; a
+failure stops the new slot and leaves the old one serving, so a bad build never
+takes the port alone. The port probe still cannot tell the two slots apart, so
+the window verifies unit state, not per-slot responses. A successful window
+promotes exactly like a plain deploy. `0` disables the window (the default).
+
 Use the same listen address across deployments. A failed start, stability or health check
 stops the new slot without stopping the old one. Both slots active is an
 ambiguous interrupted handoff: inspect logs and stop the unwanted slot before

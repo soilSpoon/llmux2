@@ -123,7 +123,10 @@ impl Fixture {
         }
     }
     fn deploy(&mut self) -> Result<String> {
-        self.ops.deploy(&self.binary, &self.config)
+        self.ops.deploy(&self.binary, &self.config, 0.0)
+    }
+    fn deploy_canary(&mut self, seconds: f64) -> Result<String> {
+        self.ops.deploy(&self.binary, &self.config, seconds)
     }
     fn called(&self, action: &str, slot: &str) -> bool {
         self.ops
@@ -247,6 +250,129 @@ fn cli_checks_new_unit_properties() {
             "ActiveState,NRestarts,MainPID",
             "llmux2@b.service"
         ]));
+}
+#[test]
+fn canary_window_observes_new_slot_before_handoff() {
+    let mut f = Fixture::new();
+    assert_eq!(f.deploy_canary(1.2).unwrap(), "b");
+    assert_eq!(f.ops.runtime.active, BTreeSet::from(["b".into()]));
+    assert_eq!(
+        f.ops
+            .runtime
+            .calls
+            .iter()
+            .filter(|v| v == &&["show", "b"])
+            .count(),
+        10
+    );
+    let waits: Vec<f64> = f.ops.runtime.waits.clone();
+    assert_eq!(waits.len(), 6 + 3);
+    assert_eq!(waits.iter().sum::<f64>(), 6.0 * 0.5 + 1.2);
+    let calls = &f.ops.runtime.calls;
+    let last_show = calls.iter().rposition(|v| v == &["show", "b"]).unwrap();
+    assert!(calls.iter().position(|v| v == &["stop", "a"]).unwrap() > last_show);
+    assert!(f.called("enable", "b"));
+}
+#[test]
+fn canary_failure_keeps_old_and_stops_new() {
+    for state in [
+        json!({"ActiveState":"failed","NRestarts":"0","MainPID":"1234"}),
+        json!({"ActiveState":"active","NRestarts":"1","MainPID":"1234"}),
+        json!({"ActiveState":"active","NRestarts":"0","MainPID":"5678"}),
+        json!({"ActiveState":"active","NRestarts":"0","MainPID":"0"}),
+    ] {
+        let mut f = Fixture::new();
+        f.ops.runtime.states =
+            VecDeque::from_iter(std::iter::repeat_with(stable).take(7).chain([state]));
+        let error = f.deploy_canary(2.0).unwrap_err().to_string();
+        assert!(error.contains("canary"), "{error}");
+        assert_eq!(f.ops.runtime.active, BTreeSet::from(["a".into()]));
+        assert!(f.called("stop", "b"));
+        assert!(!f.called("stop", "a"));
+        assert!(!f.temp.0.join("active.json").exists());
+    }
+}
+#[test]
+fn canary_window_also_runs_on_first_install() {
+    let mut f = Fixture::new();
+    f.ops.runtime.active.clear();
+    f.ops.runtime.states = VecDeque::from_iter(
+        std::iter::repeat_with(stable)
+            .take(7)
+            .chain([json!({"ActiveState":"failed","NRestarts":"0","MainPID":"1234"})]),
+    );
+    assert!(f
+        .deploy_canary(1.0)
+        .unwrap_err()
+        .to_string()
+        .contains("canary"));
+    assert!(f.ops.runtime.active.is_empty());
+    assert!(f.called("stop", "a"));
+}
+#[test]
+fn stopped_slots_deploy_to_the_unrecorded_slot() {
+    for canary in [0.0, 1.0] {
+        let mut f = Fixture::new();
+        f.ops.runtime.active.clear();
+        fs::create_dir(f.temp.0.join("bin")).unwrap();
+        fs::write(f.temp.0.join("bin/llmux-server-a"), b"good").unwrap();
+        fs::write(
+            f.temp.0.join("active.json"),
+            json!({"slot":"a","listen":"127.0.0.1:8080"}).to_string(),
+        )
+        .unwrap();
+        f.ops.runtime.states = VecDeque::from_iter(
+            std::iter::repeat_with(stable)
+                .take(7)
+                .chain([json!({"ActiveState":"failed","NRestarts":"0","MainPID":"1234"})]),
+        );
+        if canary > 0.0 {
+            assert!(f
+                .deploy_canary(canary)
+                .unwrap_err()
+                .to_string()
+                .contains("canary"));
+        } else {
+            f.ops.runtime.healthy = false;
+            assert!(f.deploy().unwrap_err().to_string().contains("health"));
+        }
+        assert_eq!(
+            fs::read(f.temp.0.join("bin/llmux-server-a")).unwrap(),
+            b"good"
+        );
+        assert!(!f.called("stop", "a"));
+        assert!(f.called("stop", "b"));
+    }
+}
+#[test]
+fn record_with_only_a_valid_slot_still_guides_slot_choice() {
+    let mut f = Fixture::new();
+    f.ops.runtime.active.clear();
+    fs::create_dir(f.temp.0.join("bin")).unwrap();
+    fs::write(f.temp.0.join("bin/llmux-server-a"), b"good").unwrap();
+    fs::write(
+        f.temp.0.join("active.json"),
+        json!({"slot":"a","listen":"bad"}).to_string(),
+    )
+    .unwrap();
+    f.ops.runtime.healthy = false;
+    assert!(f.deploy().unwrap_err().to_string().contains("health"));
+    assert_eq!(
+        fs::read(f.temp.0.join("bin/llmux-server-a")).unwrap(),
+        b"good"
+    );
+    assert!(f.called("stop", "b"));
+}
+#[test]
+fn invalid_record_does_not_block_redeploy() {
+    let mut f = Fixture::new();
+    f.ops.runtime.active.clear();
+    fs::write(f.temp.0.join("active.json"), "{").unwrap();
+    assert_eq!(f.deploy().unwrap(), "a");
+    assert_eq!(f.ops.runtime.active, BTreeSet::from(["a".into()]));
+    let record: Value =
+        serde_json::from_slice(&fs::read(f.temp.0.join("active.json")).unwrap()).unwrap();
+    assert_eq!(record["slot"], "a");
 }
 #[test]
 fn invalid_config_does_not_touch_units() {
