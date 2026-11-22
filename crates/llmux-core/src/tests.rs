@@ -842,6 +842,64 @@ async fn limit_error_after_stream_start_cools_down_the_deployment() {
 }
 
 #[tokio::test]
+async fn committed_stream_quota_cools_shared_credential_without_replay() {
+    for (error, expected) in [
+        (UpstreamError::QuotaExhausted { reset_at: None }, "dep2"),
+        (
+            UpstreamError::QuotaExhausted {
+                reset_at: Some(SystemTime::now() + Duration::from_secs(30)),
+            },
+            "dep2",
+        ),
+        (
+            UpstreamError::RateLimited {
+                retry_after: Some(Duration::from_secs(30)),
+            },
+            "dep1",
+        ),
+    ] {
+        let kind = error.kind();
+        let (executor, adapter, _, _server) = fixture_full(
+            Vec::new(),
+            false,
+            [None; 3],
+            &[("a", &[0, 2]), ("b", &[1, 2])],
+            Default::default(),
+            Default::default(),
+            true,
+            [None; 3],
+        )
+        .await;
+        adapter.stream_errors.lock().unwrap().push_back(error);
+        let routed = executor
+            .execute(GatewayRequest {
+                model: "a".into(),
+                stream: true,
+                ..request()
+            })
+            .await
+            .unwrap();
+        assert_eq!(routed.deployment.as_ref(), "dep0");
+        let GatewayResponse::Stream(events) = routed.response else {
+            panic!("expected stream")
+        };
+        let events: Vec<_> = events.collect().await;
+        assert!(matches!(events.as_slice(), [Ok(_), Err(err)] if err.kind() == kind));
+        assert_eq!(adapter.calls.lock().unwrap().len(), 1, "no stream replay");
+
+        let next = executor
+            .execute(GatewayRequest {
+                model: "b".into(),
+                ..request()
+            })
+            .await
+            .unwrap();
+        assert_eq!(next.deployment.as_ref(), expected, "{kind:?}");
+        assert_eq!(adapter.calls.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
 async fn repeated_limit_errors_after_stream_start_back_off() {
     let (executor, adapter, _, _server) = fixture(Vec::new(), false).await;
     let streaming = || GatewayRequest {
