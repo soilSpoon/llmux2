@@ -112,7 +112,10 @@ fn session_providers_need_omniroute_fallback_and_keep_the_same_model_id() {
 
 // A `ddgw/<model>` string can be attached as an alias before the session
 // fallback legs are ensured; the leg must land on the model that owns the alias
-// instead of creating a duplicate model name that fails validation.
+// instead of creating a duplicate model name that fails validation. The shared
+// chain must keep a single OmniRoute fallback whose upstream id is the
+// canonical model name, so a request for `baseline` is never sent upstream as
+// the alias.
 #[test]
 fn session_fallback_leg_follows_an_attached_alias() {
     let mut root = session_export();
@@ -129,7 +132,8 @@ fn session_fallback_leg_follows_an_attached_alias() {
         }),
         ..ImportOptions::default()
     };
-    llmux_import::import_with_options(&root.to_string(), &output, None, &options).unwrap();
+    let report =
+        llmux_import::import_with_options(&root.to_string(), &output, None, &options).unwrap();
     let config = RuntimeConfig::load(&output).unwrap();
     assert_eq!(
         config.model_names["ddgw/mistral-small-2603"],
@@ -141,9 +145,32 @@ fn session_fallback_leg_follows_an_attached_alias() {
         .iter()
         .map(|idx| &config.deployments[idx.0 as usize])
         .collect();
-    let last = deps.last().unwrap();
-    assert!(last.fallback);
-    assert_eq!(last.upstream_model.as_ref(), "ddgw/mistral-small-2603");
+    let fallbacks: Vec<_> = deps.iter().copied().filter(|dep| dep.fallback).collect();
+    assert_eq!(
+        fallbacks.len(),
+        1,
+        "alias session id must not add a second OmniRoute fallback"
+    );
+    assert_eq!(fallbacks[0].upstream_model.as_ref(), "baseline");
+    assert!(
+        fallbacks
+            .iter()
+            .all(|dep| dep.upstream_model.as_ref() == "baseline"),
+        "fallback upstream_model must equal the canonical model name"
+    );
+    assert!(
+        deps.iter()
+            .all(|dep| dep.upstream_model.as_ref() != "ddgw/mistral-small-2603"),
+        "alias must not leak into the canonical deployment chain"
+    );
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("baseline") && warning.contains("dropped")),
+        "canonical fallback must be reused, not deduped: {:?}",
+        report.warnings
+    );
 }
 
 fn import(root: &Value) -> (llmux_import::ImportReport, RuntimeConfig, String) {
