@@ -1,6 +1,7 @@
 //! Priority routing, deployment limits, and HTTP execution.
 
 mod limits;
+mod machine;
 mod stats;
 
 #[cfg(test)]
@@ -17,10 +18,11 @@ use hyper_util::{
 use limits::{DeploymentLimits, Permit, Window};
 use llmux_config::RuntimeConfig;
 use llmux_types::{
-    AuthMaterial, BuildError, ContextOverflow, CredentialSource, Deployment, DeploymentIdx,
-    ErrorKind, GatewayRequest, GatewayResponse, ProviderAdapter, ProviderRegistry, Support,
-    UpstreamError,
+    provider, AuthMaterial, BuildError, ContextOverflow, CredentialSource, Deployment,
+    DeploymentIdx, ErrorKind, GatewayRequest, GatewayResponse, ProviderAdapter, ProviderRegistry,
+    Support, UpstreamError,
 };
+use machine::{Built, Effect, Event, Outcome, Phase, State};
 use stats::AttemptStats;
 pub use stats::{CatchAllStats, DeploymentStats, FallbackStats};
 use std::{
@@ -28,11 +30,15 @@ use std::{
     ops::Range,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        Arc, RwLock,
     },
     time::{Duration, SystemTime},
 };
 use thiserror::Error;
+
+/// A rejected request body may be repaired and resent to the same deployment
+/// at most this many times (one per removable field).
+const MAX_REPAIRS: usize = 3;
 use tokio::time::{timeout_at, Instant};
 
 #[derive(Debug, Error)]
@@ -95,12 +101,34 @@ struct ModelOrder {
     min_context: u32,
 }
 
+/// Upstream ids from the last successful Devin CLI catalog. `None` means no catalog has loaded.
+#[derive(Debug, Default)]
+pub struct LiveModels {
+    ids: RwLock<Option<Arc<HashSet<Arc<str>>>>>,
+}
+
+impl LiveModels {
+    pub fn get(&self) -> Option<Arc<HashSet<Arc<str>>>> {
+        self.ids
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+
+    pub fn replace(&self, ids: impl IntoIterator<Item = Arc<str>>) {
+        *self.ids.write().unwrap_or_else(|err| err.into_inner()) =
+            Some(Arc::new(ids.into_iter().collect()));
+    }
+}
+
 pub struct Executor {
     catch_all_stats: Option<stats::CatchAllCounter>,
     cfg: Arc<RuntimeConfig>,
     bindings: Box<[Binding]>,
     orders: Box<[ModelOrder]>,
     credentials: HashMap<Arc<str>, Arc<AtomicBool>>,
+    /// Shared with the server so a refresh is visible without rebuilding the executor.
+    devin_catalog: Arc<LiveModels>,
     http: HttpClient,
 }
 
@@ -257,8 +285,23 @@ impl Executor {
             bindings,
             orders,
             credentials: disabled,
+            devin_catalog: Arc::new(LiveModels::default()),
             http: builder.build(connector),
         })
+    }
+
+    /// Use the process catalog. A loaded catalog skips a `devin_acp` deployment
+    /// whose upstream id is absent, the same way a cooldown does.
+    pub fn set_devin_catalog(&mut self, catalog: Arc<LiveModels>) {
+        self.devin_catalog = catalog;
+    }
+
+    fn devin_upstream_missing(&self, dep: &Deployment) -> bool {
+        dep.provider.0.as_ref() == provider::DEVIN_ACP
+            && self
+                .devin_catalog
+                .get()
+                .is_some_and(|ids| !ids.contains(dep.upstream_model.as_ref()))
     }
 
     /// Whether the credential is disabled in routing; `None` for unknown ids.
@@ -380,176 +423,252 @@ impl Executor {
             0
         };
         let deadline = Instant::now() + self.cfg.server.request_timeout;
-        let mut attempts = 0;
         let mut last_transient = None;
         let mut incompatible = Vec::new();
         let mut unavailable = false;
+        let mut machine = State::new(self.cfg.routing.max_attempts as u32);
         'groups: for group in &order.groups {
             let shift = sequence % group.len();
             let (before, after) = model.deployments[group.clone()].split_at(shift);
             for &idx in after.iter().chain(before) {
-                if attempts == self.cfg.routing.max_attempts {
-                    break 'groups;
-                }
                 let idx = index(idx);
                 let dep = &self.cfg.deployments[idx];
                 let binding = &self.bindings[idx];
                 let support = binding.adapter.supports(req.format);
-                if binding.disabled.load(Ordering::Relaxed) || support == Support::No || !fits(dep)
-                {
-                    continue;
-                }
                 let now = Instant::now();
-                if support != Support::Convert && binding.limits.cooldown_until(now).is_some() {
-                    unavailable = true;
-                    last_transient = None;
-                    continue;
-                }
-                if now >= deadline {
-                    return Err(GatewayError::Client(UpstreamError::Timeout));
-                }
-                let mut refreshed = false;
+                machine.select();
+                let mut event = if binding.disabled.load(Ordering::Relaxed)
+                    || support == Support::No
+                    || !fits(dep)
+                {
+                    Event::Ineligible
+                } else if support != Support::Convert
+                    && (binding.limits.cooldown_until(now).is_some()
+                        || self.devin_upstream_missing(dep))
+                {
+                    Event::Cooling
+                } else if now >= deadline {
+                    Event::DeadlinePassed
+                } else {
+                    Event::Eligible
+                };
+                let mut permit = None;
+                let mut upstream = None;
+                let mut attempt_deadline = deadline;
+                let mut result = Err(GatewayError::Internal);
                 loop {
-                    if attempts == self.cfg.routing.max_attempts {
-                        break 'groups;
-                    }
-                    let permit = if support == Support::Convert {
-                        None
-                    } else if let Some(permit) = binding.limits.admit(needed) {
-                        Some(permit)
-                    } else {
-                        unavailable = true;
-                        last_transient = None;
-                        break;
-                    };
-                    let attempt_deadline = deadline.min(Instant::now() + dep.timeout);
-                    let upstream =
-                        timeout_at(attempt_deadline, Self::build_request(&req, dep, binding)).await;
-                    if matches!(upstream, Ok(Err(BuildError::UnsupportedConversion))) {
-                        incompatible.push(idx);
-                        break;
-                    }
-                    let Some(permit) = permit.or_else(|| {
-                        if binding.limits.cooldown_until(Instant::now()).is_some() {
-                            None
-                        } else {
-                            binding.limits.admit(needed)
+                    match machine.step(event) {
+                        Effect::StopGroups => break 'groups,
+                        Effect::Skip {
+                            unavailable: cooling,
+                        } => {
+                            if cooling {
+                                unavailable = true;
+                                last_transient = None;
+                            }
+                            break;
                         }
-                    }) else {
-                        unavailable = true;
-                        last_transient = None;
-                        break;
-                    };
-                    attempts += 1;
-                    let timed_out = Err(GatewayError::Client(UpstreamError::Timeout));
-                    let result = match upstream {
-                        Ok(Ok(upstream)) => {
-                            timeout_at(attempt_deadline, self.attempt(&req, dep, binding, upstream))
+                        Effect::FailTimeout => {
+                            return Err(GatewayError::Client(UpstreamError::Timeout));
+                        }
+                        Effect::Admit if machine.phase == Phase::Admit => {
+                            permit = if support == Support::Convert {
+                                None
+                            } else {
+                                binding.limits.admit(needed)
+                            };
+                            event = Event::Admit {
+                                permit: support == Support::Convert || permit.is_some(),
+                            };
+                        }
+                        Effect::Build => {
+                            attempt_deadline = deadline.min(Instant::now() + dep.timeout);
+                            let built = timeout_at(
+                                attempt_deadline,
+                                Self::build_request(&req, dep, binding),
+                            )
+                            .await;
+                            event = Event::Built(
+                                if matches!(built, Ok(Err(BuildError::UnsupportedConversion))) {
+                                    Built::Unsupported
+                                } else {
+                                    Built::Other
+                                },
+                            );
+                            upstream = Some(built);
+                        }
+                        Effect::Incompatible => {
+                            incompatible.push(idx);
+                            break;
+                        }
+                        Effect::Admit => {
+                            permit = permit.take().or_else(|| {
+                                if binding.limits.cooldown_until(Instant::now()).is_some() {
+                                    None
+                                } else {
+                                    binding.limits.admit(needed)
+                                }
+                            });
+                            event = Event::Gate {
+                                permit: permit.is_some(),
+                            };
+                        }
+                        Effect::Send => {
+                            let timed_out = Err(GatewayError::Client(UpstreamError::Timeout));
+                            result = match upstream.take().expect("built before send") {
+                                Ok(Ok(upstream)) => timeout_at(
+                                    attempt_deadline,
+                                    self.attempt(&req, dep, binding, upstream),
+                                )
                                 .await
-                                .unwrap_or(timed_out)
+                                .unwrap_or(timed_out),
+                                Ok(Err(
+                                    BuildError::InvalidBody | BuildError::UnsupportedFormat,
+                                )) => Err(GatewayError::InvalidRequest),
+                                Ok(Err(_)) => Err(GatewayError::Internal),
+                                Err(_) => timed_out,
+                            };
+                            if let Some(stats) = &binding.stats {
+                                stats.record_attempt(result.is_ok());
+                            }
+                            last_transient = None;
+                            event = Event::Result(match &result {
+                                Ok(_) => Outcome::Success,
+                                Err(GatewayError::Client(UpstreamError::Auth { refreshable })) => {
+                                    Outcome::Refreshable {
+                                        can_refresh: binding.auth.is_some() && *refreshable,
+                                    }
+                                }
+                                Err(GatewayError::Client(UpstreamError::RateLimited {
+                                    ..
+                                })) => Outcome::Limited {
+                                    fallback: self
+                                        .cfg
+                                        .routing
+                                        .fallback_on
+                                        .contains(&ErrorKind::RateLimited),
+                                },
+                                Err(GatewayError::Client(UpstreamError::QuotaExhausted {
+                                    ..
+                                })) => Outcome::QuotaExhausted {
+                                    fallback: self
+                                        .cfg
+                                        .routing
+                                        .fallback_on
+                                        .contains(&ErrorKind::QuotaExhausted),
+                                },
+                                Err(GatewayError::Client(UpstreamError::ModelNotFound {
+                                    ..
+                                })) => Outcome::ModelNotFound,
+                                Err(GatewayError::Client(
+                                    UpstreamError::Server { .. }
+                                    | UpstreamError::Timeout
+                                    | UpstreamError::Connect
+                                    | UpstreamError::StreamBroken { .. },
+                                )) => Outcome::Transient,
+                                Err(_) => Outcome::Fatal,
+                            });
                         }
-                        Ok(Err(BuildError::InvalidBody | BuildError::UnsupportedFormat)) => {
-                            Err(GatewayError::InvalidRequest)
-                        }
-                        Ok(Err(_)) => Err(GatewayError::Internal),
-                        Err(_) => timed_out,
-                    };
-                    if let Some(stats) = &binding.stats {
-                        stats.record_attempt(result.is_ok());
-                    }
-                    last_transient = None;
-                    match result {
-                        Ok(response) => {
+                        Effect::Respond => {
                             if self.cfg.catch_all == Some(model_idx) {
                                 if let Some(stats) = &self.catch_all_stats {
                                     stats.lock().unwrap().record(&req.model);
                                 }
                             }
+                            let Ok(response) = result else {
+                                unreachable!("respond follows success")
+                            };
                             if matches!(response, GatewayResponse::Complete { .. }) {
                                 binding.limits.succeeded();
                             }
                             return Ok(RoutedResponse {
                                 deployment: dep.id.clone(),
-                                attempts,
-                                response: hold_permit(response, permit),
+                                attempts: machine.attempts as _,
+                                response: match permit.take() {
+                                    Some(permit) => hold_permit(response, permit),
+                                    None => response,
+                                },
                             });
                         }
-                        Err(GatewayError::Client(UpstreamError::Auth { refreshable })) => {
-                            if let Some(source) =
-                                binding.auth.as_ref().filter(|_| refreshable && !refreshed)
-                            {
-                                refreshed = true;
-                                if matches!(
+                        Effect::Abort => {
+                            return result.map(|_| unreachable!("abort follows an error"))
+                        }
+                        Effect::Refresh => {
+                            drop(permit.take());
+                            let refreshed = match binding.auth.as_ref() {
+                                Some(source) => matches!(
                                     timeout_at(deadline, source.refresh()).await,
                                     Ok(Ok(()))
-                                ) {
-                                    continue;
+                                ),
+                                None => false,
+                            };
+                            event = Event::Refreshed(refreshed);
+                        }
+                        Effect::Apply {
+                            outcome,
+                            stop_groups,
+                        } => {
+                            drop(permit.take());
+                            match (outcome, result) {
+                                (Outcome::AuthFatal, _) => {
+                                    binding.disabled.store(true, Ordering::Relaxed);
                                 }
-                            }
-                            binding.disabled.store(true, Ordering::Relaxed);
-                        }
-                        Err(GatewayError::Client(UpstreamError::RateLimited {
-                            retry_after,
-                            ..
-                        })) => {
-                            binding.limits.limited(
-                                retry_after,
-                                self.cfg.cooldown.default,
-                                self.cfg.cooldown.max,
-                            );
-                            if !self
-                                .cfg
-                                .routing
-                                .fallback_on
-                                .contains(&ErrorKind::RateLimited)
-                            {
-                                break 'groups;
-                            }
-                        }
-                        Err(GatewayError::Client(UpstreamError::QuotaExhausted { reset_at })) => {
-                            let hint = reset_at.map(|reset| {
-                                reset.duration_since(SystemTime::now()).unwrap_or_default()
-                            });
-                            let until = binding.limits.limited(
-                                hint,
-                                self.cfg.cooldown.default,
-                                self.cfg.cooldown.max,
-                            );
-                            // Peers wait for the key's reset, not this route's own limits.
-                            for peer in &binding.key_peers {
-                                match hint {
-                                    Some(wait) => {
-                                        peer.cool_down(wait.min(self.cfg.cooldown.max));
+                                (
+                                    _,
+                                    Err(GatewayError::Client(UpstreamError::RateLimited {
+                                        retry_after,
+                                        ..
+                                    })),
+                                ) => {
+                                    binding.limits.limited(
+                                        retry_after,
+                                        self.cfg.cooldown.default,
+                                        self.cfg.cooldown.max,
+                                    );
+                                }
+                                (
+                                    _,
+                                    Err(GatewayError::Client(UpstreamError::QuotaExhausted {
+                                        reset_at,
+                                    })),
+                                ) => {
+                                    let hint = reset_at.map(|reset| {
+                                        reset.duration_since(SystemTime::now()).unwrap_or_default()
+                                    });
+                                    let until = binding.limits.limited(
+                                        hint,
+                                        self.cfg.cooldown.default,
+                                        self.cfg.cooldown.max,
+                                    );
+                                    for peer in &binding.key_peers {
+                                        match hint {
+                                            Some(wait) => {
+                                                peer.cool_down(wait.min(self.cfg.cooldown.max));
+                                            }
+                                            None => peer.cool_down_until(until),
+                                        }
                                     }
-                                    None => peer.cool_down_until(until),
                                 }
+                                (Outcome::ModelNotFound, Err(GatewayError::Client(err))) => {
+                                    incompatible.push(idx);
+                                    last_transient = Some(err);
+                                }
+                                (_, Err(GatewayError::Client(err))) => last_transient = Some(err),
+                                _ => {}
                             }
-                            if !self
-                                .cfg
-                                .routing
-                                .fallback_on
-                                .contains(&ErrorKind::QuotaExhausted)
-                            {
+                            if stop_groups {
                                 break 'groups;
                             }
+                            break;
                         }
-                        Err(GatewayError::Client(
-                            // A stream error here precedes the first downstream byte.
-                            err @ (UpstreamError::Server { .. }
-                            | UpstreamError::Timeout
-                            | UpstreamError::Connect
-                            | UpstreamError::StreamBroken { .. }),
-                        )) => last_transient = Some(err),
-                        Err(err) => return Err(err),
                     }
-                    break;
                 }
             }
         }
         if let Some(err) = last_transient {
             return Err(GatewayError::Client(err));
         }
-        if attempts == 0 && !unavailable && !incompatible.is_empty() {
+        if machine.attempts == 0 && !unavailable && !incompatible.is_empty() {
             return Err(GatewayError::InvalidRequest);
         }
         // The next request can use any compatible deployment, even if retries stopped early.
@@ -568,7 +687,7 @@ impl Executor {
             .min()
             .unwrap_or(now);
         Err(GatewayError::AllCandidatesExhausted {
-            attempts,
+            attempts: machine.attempts as _,
             retry_after: earliest.saturating_duration_since(Instant::now()),
         })
     }
@@ -593,36 +712,60 @@ impl Executor {
         binding: &Binding,
         upstream: Request<Bytes>,
     ) -> Result<GatewayResponse, GatewayError> {
-        let response = self
-            .http
-            .request(upstream.map(Full::new))
-            .await
-            .map_err(|_| GatewayError::Client(UpstreamError::Connect))?;
-        if let Some(observed) = response
-            .status()
-            .is_success()
-            .then(|| binding.adapter.observe_limits(response.headers()))
-            .flatten()
-        {
-            binding.limits.observe(observed, self.cfg.cooldown.max);
-        }
-        let response = binding
-            .adapter
-            .parse_response(req, dep, response)
-            .await
-            .map_err(GatewayError::Client)?;
+        let response = match binding.adapter.invoke(req, dep).await {
+            Some(local) => local.map_err(GatewayError::Client)?,
+            None => {
+                let mut upstream = upstream;
+                let mut repairs = 0;
+                loop {
+                    let (parts, body) = upstream.into_parts();
+                    let response = self
+                        .http
+                        .request(Request::from_parts(parts.clone(), Full::new(body.clone())))
+                        .await
+                        .map_err(|_| GatewayError::Client(UpstreamError::Connect))?;
+                    if let Some(observed) = response
+                        .status()
+                        .is_success()
+                        .then(|| binding.adapter.observe_limits(response.headers()))
+                        .flatten()
+                    {
+                        binding.limits.observe(observed, self.cfg.cooldown.max);
+                    }
+                    match binding.adapter.parse_response(req, dep, response).await {
+                        Err(error) if repairs < MAX_REPAIRS => {
+                            let Some(repaired) = binding.adapter.repair_rejected(&body, &error)
+                            else {
+                                return Err(GatewayError::Client(error));
+                            };
+                            upstream = Request::from_parts(parts, repaired);
+                            repairs += 1;
+                        }
+                        parsed => break parsed.map_err(GatewayError::Client)?,
+                    }
+                }
+            }
+        };
 
         match response {
             GatewayResponse::Complete { .. } if !req.stream => Ok(response),
             GatewayResponse::Stream(mut events) if req.stream => {
-                // Commit downstream headers only once a complete upstream event is available.
-                let first = events
-                    .next()
-                    .await
-                    .ok_or(GatewayError::Client(UpstreamError::StreamBroken {
-                        bytes_sent: 0,
-                    }))?
-                    .map_err(GatewayError::Client)?;
+                // Commit on a real chunk or [DONE], not on an OpenAI-compat
+                // keepalive. Drop those before commit so a later error frame
+                // fails the attempt. The caller's attempt deadline (request
+                // timeout intersected with the deployment timeout) bounds the wait.
+                let first = loop {
+                    match events.next().await {
+                        Some(Ok(event)) if !event.commits() => continue,
+                        Some(Ok(event)) => break event,
+                        Some(Err(err)) => return Err(GatewayError::Client(err)),
+                        None => {
+                            return Err(GatewayError::Client(UpstreamError::StreamBroken {
+                                bytes_sent: 0,
+                            }))
+                        }
+                    }
+                };
                 let idle_timeout = self.cfg.server.request_timeout.min(dep.timeout);
                 let cooldown = (self.cfg.cooldown.default, self.cfg.cooldown.max);
                 let events = stream::unfold(

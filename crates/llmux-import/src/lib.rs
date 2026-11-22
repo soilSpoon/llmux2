@@ -5,9 +5,11 @@ mod bridge;
 mod connection;
 mod context;
 mod db_dump;
+mod devin;
 mod direct;
 mod fallback;
 mod morph;
+mod nous;
 mod policy;
 mod replacements;
 mod secondary;
@@ -16,7 +18,8 @@ mod validation;
 mod xplabs;
 
 use llmux_types::provider::{
-    ANTHROPIC as KIND_ANTHROPIC, OPENAI as KIND_OPENAI, OPENAI_COMPAT as KIND_OPENAI_COMPAT,
+    ANTHROPIC as KIND_ANTHROPIC, DEVIN_ACP as KIND_DEVIN_ACP, OPENAI as KIND_OPENAI,
+    OPENAI_COMPAT as KIND_OPENAI_COMPAT, OPENAI_RESPONSES as KIND_OPENAI_RESPONSES,
 };
 use serde_json::{json, Value};
 use std::{
@@ -42,6 +45,12 @@ pub struct ImportOptions<'a> {
     pub kilo_free_models: Option<&'a Path>,
     pub kilo_key_file: Option<&'a Path>,
     pub openrouter_replacements: bool,
+    /// Saved `devin models` output; its `Free` rows rank ahead of Devin-plan models.
+    pub devin_models: Option<&'a Path>,
+    /// Nous Portal login state (`llmux-login nous`) and a saved `GET /v1/models`
+    /// listing; together they add `nous/<id>` models, free ones first.
+    pub nous_state: Option<&'a Path>,
+    pub nous_models: Option<&'a Path>,
     pub omniroute_fallback: Option<OmniRouteFallback<'a>>,
 }
 
@@ -121,6 +130,16 @@ fn deepseek_model(model: &str) -> bool {
             || parts.any(|part| {
                 part.eq_ignore_ascii_case("deepseek") || part.eq_ignore_ascii_case("deepseek-ai")
             }))
+}
+
+/// Anthropic rejects `temperature` and `top_p` unless they equal 1 on the
+/// Claude 5 generation, Fable 5 and Opus 4.8.
+fn anthropic_rejects_sampling(model: &str) -> bool {
+    let leaf = model.rsplit('/').next().unwrap_or_default();
+    let normalized = leaf.to_ascii_lowercase().replace('.', "-");
+    let parts: Vec<_> = normalized.split('-').collect();
+    matches!(parts.as_slice(), ["claude", family, "5", ..] if family.chars().all(|c| c.is_ascii_alphabetic()))
+        || matches!(parts.as_slice(), ["claude", "opus", "4", "8", ..])
 }
 
 fn unique(raw: &str, used: &mut HashSet<String>) -> String {
@@ -335,8 +354,12 @@ impl Expander<'_> {
                 ));
                 continue;
             }
-            let antigravity =
-                p.is_builtin("antigravity") && replacements::antigravity(model).is_some();
+            let native_antigravity = self.connections.iter().any(|connection| {
+                connection.provider.is_builtin("antigravity") && connection.kind == "antigravity"
+            });
+            let antigravity = p.is_builtin("antigravity")
+                && replacements::antigravity(model).is_some()
+                && !native_antigravity;
             let bridge = self
                 .policy
                 .openrouter_replacements
@@ -498,6 +521,11 @@ pub fn import_with_options(
     options: &ImportOptions<'_>,
 ) -> Result<ImportReport, String> {
     let policy = policy::Policy::load(options)?;
+    let nous = match (options.nous_state, options.nous_models) {
+        (None, None) => None,
+        (Some(state), Some(models)) => Some(nous::Nous::load(state, models)?),
+        _ => return Err("--nous-state and --nous-models must be provided together".into()),
+    };
     let fallback = options.omniroute_fallback;
     if let Some(options) = &fallback {
         if !["env:", "file:"].iter().any(|prefix| {
@@ -575,6 +603,10 @@ pub fn import_with_options(
     for (index, c) in array(&root, "providerConnections").iter().enumerate() {
         let label = format!("connection {index} ({})", string(c, "id"));
         let identity = connection::identity(c, array(&root, "providerNodes"));
+        if let Some(reason) = devin::excluded(identity) {
+            warnings.push(format!("{label}: skipped {reason}"));
+            continue;
+        }
         if policy.openrouter_replacements && identity == "openrouter" {
             warnings.push(format!(
                 "{label}: skipped OpenRouter; only verified connected replacements enabled"
@@ -597,6 +629,8 @@ pub fn import_with_options(
                 "openai_compat".into(),
                 policy.workers.as_ref().unwrap().base_url.clone(),
             ))
+        } else if let connection::SelectedAuth::Oauth(oauth) = &auth {
+            Ok((oauth.kind.to_owned(), oauth.base_url.to_owned()))
         } else {
             upstream::resolve(c, array(&root, "providerNodes"), &mut warnings)
         } {
@@ -628,6 +662,8 @@ pub fn import_with_options(
             warnings.push(format!("{label}: skipped missing/duplicate connection id"));
             continue;
         }
+        let keyed = matches!(auth, connection::SelectedAuth::Key(_));
+        let workers_auth = matches!(auth, connection::SelectedAuth::Workers);
         let credential = match auth {
             connection::SelectedAuth::Workers => workers_credential.clone(),
             connection::SelectedAuth::Key(value) => {
@@ -641,6 +677,48 @@ pub fn import_with_options(
                 let key = write_secret(&dir, &id, value)?;
                 credentials.push(json!({"id":id,"kind":"api_key","provider":kind,"key":key}));
                 Some(id)
+            }
+            connection::SelectedAuth::Oauth(oauth) => {
+                let id = unique(&format!("upstream-{source_id}"), &mut ids);
+                let refresh = write_secret(&dir, &id, &oauth.refresh)?;
+                let mut credential = json!({
+                    "id": id,
+                    "kind": "oauth",
+                    "provider": kind,
+                    "token_url": oauth.token_url,
+                    "client_id": oauth.client_id,
+                    "refresh_token": refresh,
+                });
+                if let Some(secret) = &oauth.client_secret {
+                    let secret_id = unique(&format!("{id}-secret"), &mut ids);
+                    credential["client_secret"] = write_secret(&dir, &secret_id, secret)?.into();
+                }
+                if let Some(scopes) = &oauth.scopes {
+                    credential["scopes"] = json!(scopes);
+                }
+                credentials.push(credential);
+                if kind == "openai_responses" {
+                    header_refs.insert("originator".into(), "codex_cli_rs".into());
+                    header_refs.insert("version".into(), "0.165.0".into());
+                    header_refs.insert(
+                        "user-agent".into(),
+                        "codex-cli/0.165.0 (Linux; x86_64)".into(),
+                    );
+                    header_refs.insert("origin".into(), "https://chatgpt.com".into());
+                    if let Some(workspace) = &oauth.workspace {
+                        header_refs.insert("chatgpt-account-id".into(), workspace.clone().into());
+                    }
+                }
+                if kind == "antigravity" {
+                    if let Some(project) = &oauth.project {
+                        header_refs.insert("x-llmux-project".into(), project.clone().into());
+                    }
+                }
+                Some(id)
+            }
+            connection::SelectedAuth::None if kind == KIND_DEVIN_ACP => {
+                warnings.push(format!("{label}: Devin CLI bridge uses the host's own devin credentials; none imported"));
+                None
             }
             connection::SelectedAuth::None => {
                 if kind != KIND_OPENAI_COMPAT {
@@ -669,9 +747,9 @@ pub fn import_with_options(
             kind,
             base_url,
             priority: c["priority"].as_i64().unwrap_or(0),
-            policy: if policy::cloudflare(identity) {
+            policy: if workers_auth {
                 policy::ModelPolicy::Workers
-            } else if policy::kilo(identity) && matches!(auth, connection::SelectedAuth::Key(_)) {
+            } else if policy::kilo(identity) && keyed {
                 policy::ModelPolicy::KiloFree
             } else {
                 policy::ModelPolicy::Any
@@ -949,6 +1027,7 @@ pub fn import_with_options(
             .expand(&name, &mut Vec::new(), &mut free);
             xplabs::place(&name, &mut deployments, free, &connections, &mut warnings);
         }
+        devin::free_first(&mut deployments, &connections, policy.devin_free.as_ref());
         if combos.contains_key(&name) {
             let steps = secondary::steps(
                 &name,
@@ -996,6 +1075,7 @@ pub fn import_with_options(
         credentials.push(
             json!({"id":credential,"kind":"api_key","provider":"openai_compat","key":options.key}),
         );
+        let session_excluded = exclusions.clone();
         fallback::append(
             &mut models,
             &options,
@@ -1003,10 +1083,38 @@ pub fn import_with_options(
             &mut deployment_ids,
             exclusions,
         )?;
+        fallback::ensure_session_models(
+            &mut models,
+            &fallback::session_names(&combos, nodes),
+            &options,
+            &credential,
+            &mut deployment_ids,
+            &session_excluded,
+        )?;
         deployment_count = models
             .iter()
             .map(|model| array(model, "deployments").len())
             .sum();
+    }
+    if let Some(nous) = &nous {
+        let credential = unique("nous", &mut ids);
+        let taken: HashSet<String> = models
+            .iter()
+            .flat_map(|model| {
+                std::iter::once(string(model, "name")).chain(
+                    array(model, "aliases")
+                        .iter()
+                        .map(|alias| alias.as_str().unwrap_or("")),
+                )
+            })
+            .map(str::to_owned)
+            .collect();
+        let added = nous.models(&credential, &taken, &mut deployment_ids, &mut warnings);
+        if !added.is_empty() {
+            credentials.push(nous.credential(&credential));
+            deployment_count += added.len();
+            models.extend(added);
+        }
     }
     let credential_providers: HashMap<_, _> = credentials
         .iter()
@@ -1033,11 +1141,21 @@ pub fn import_with_options(
                     {
                         deployment["strip_request_fields"] = json!(["seed", "user"]);
                     }
+                } else if provider == KIND_ANTHROPIC
+                    && anthropic_rejects_sampling(string(deployment, "upstream_model"))
+                {
+                    deployment["strip_request_fields"] = json!(["temperature", "top_p"]);
                 }
             }
         }
     }
     if models.is_empty() {
+        if warnings
+            .iter()
+            .any(|warning| warning.contains("--omniroute-fallback"))
+        {
+            return Err("no importable models; pass --omniroute-fallback and --omniroute-key to keep serving DuckDuckGo and Cloudflare Playground through OmniRoute".into());
+        }
         return Err("no importable models; no configuration written".into());
     }
     let mut client_keys = Vec::new();
@@ -1061,6 +1179,24 @@ pub fn import_with_options(
         warnings.push(
             "no active client keys; set LLMUX_CLIENT_KEY before starting llmux-server".into(),
         );
+    }
+    let owner_oauth: HashSet<String> = credentials
+        .iter()
+        .filter(|credential| {
+            string(credential, "kind") == "oauth"
+                && string(credential, "provider") == KIND_OPENAI_RESPONSES
+        })
+        .map(|credential| string(credential, "id").to_owned())
+        .collect();
+    if !owner_oauth.is_empty() {
+        for model in &mut models {
+            if array(model, "deployments")
+                .iter()
+                .any(|deployment| owner_oauth.contains(string(deployment, "credential")))
+            {
+                model["allowed_keys"] = json!(client_keys);
+            }
+        }
     }
     let config = json!({"server":{"listen":"127.0.0.1:8080","client_keys":client_keys},"credentials":credentials,"models":models});
     validation::validate(

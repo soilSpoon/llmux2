@@ -185,6 +185,119 @@ fn is_excluded(excluded: &BTreeSet<String>, name: &str) -> bool {
     })
 }
 
+pub(super) fn session_names(combos: &HashMap<String, Value>, nodes: &[Value]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for combo in combos.values() {
+        let mut hit = false;
+        for step in array(combo, "models") {
+            if step["usable"] == false {
+                continue;
+            }
+            let Some((provider, model)) = upstream::model_target(step, nodes) else {
+                continue;
+            };
+            if model.is_empty()
+                || model.contains('*')
+                || !crate::connection::session_provider(provider.as_str())
+            {
+                continue;
+            }
+            hit = true;
+            names.insert(format!("{provider}/{model}"));
+            for (alias, id) in upstream::PROVIDER_ALIASES {
+                if provider.is_builtin(id) {
+                    names.insert(format!("{alias}/{model}"));
+                }
+            }
+            let raw = step
+                .as_str()
+                .unwrap_or_else(|| string(step, "model"))
+                .trim();
+            if let Some((prefix, rest)) = raw.split_once('/') {
+                let session = crate::connection::session_provider(prefix)
+                    || crate::connection::session_provider(
+                        upstream::canonical_provider(prefix, nodes).as_str(),
+                    );
+                if session && !rest.is_empty() && !rest.contains('*') {
+                    names.insert(raw.to_owned());
+                }
+            }
+        }
+        let name = string(combo, "name");
+        if hit && !name.is_empty() && !name.contains('*') {
+            names.insert(name.to_owned());
+        }
+    }
+    names
+}
+
+pub(super) fn ensure_session_models(
+    models: &mut Vec<Value>,
+    names: &BTreeSet<String>,
+    options: &OmniRouteFallback<'_>,
+    credential: &str,
+    ids: &mut HashSet<String>,
+    excluded: &BTreeSet<String>,
+) -> Result<(), String> {
+    for name in names {
+        if name.is_empty() || name.contains('*') || is_excluded(excluded, name) {
+            continue;
+        }
+        if let Some(model) = models
+            .iter_mut()
+            .find(|model| string(model, "name") == name)
+        {
+            let deployments = model["deployments"]
+                .as_array()
+                .ok_or("imported model has no deployments")?;
+            if deployments
+                .last()
+                .is_some_and(|dep| dep["fallback"] == true && string(dep, "upstream_model") == name)
+            {
+                continue;
+            }
+            let priority = deployments
+                .iter()
+                .filter_map(|dep| dep["priority"].as_i64())
+                .max()
+                .unwrap_or(-1)
+                .checked_add(1)
+                .filter(|priority| i32::try_from(*priority).is_ok())
+                .ok_or("no priority available for OmniRoute fallback")?;
+            let id = unique(&format!("omniroute-fallback-{name}"), ids);
+            model["deployments"]
+                .as_array_mut()
+                .unwrap()
+                .push(session_deployment(&id, credential, options, name, priority));
+        } else {
+            let id = unique(&format!("omniroute-fallback-{name}"), ids);
+            models.push(json!({
+                "name": name,
+                "aliases": [],
+                "deployments": [session_deployment(&id, credential, options, name, 0)],
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn session_deployment(
+    id: &str,
+    credential: &str,
+    options: &OmniRouteFallback<'_>,
+    name: &str,
+    priority: i64,
+) -> Value {
+    json!({
+        "id": id,
+        "credential": credential,
+        "base_url": options.base_url,
+        "upstream_model": name,
+        "priority": priority,
+        "fallback": true,
+    })
+}
+
 pub(super) fn append(
     models: &mut Vec<Value>,
     options: &OmniRouteFallback<'_>,

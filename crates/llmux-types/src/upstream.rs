@@ -1,7 +1,7 @@
 //! Shared upstream-endpoint rules: HTTPS everywhere, plain HTTP only to loopback.
 
 use bytes::Bytes;
-use http::Uri;
+use http::{HeaderMap, HeaderValue, Uri};
 use http_body_util::Full;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{
@@ -11,6 +11,17 @@ use hyper_util::{
 use std::net::IpAddr;
 
 pub type HttpClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+
+/// Sent on every outbound upstream request: Nous's Cloudflare and Vercel edges
+/// answer 403 to a request with no `User-Agent`.
+pub const USER_AGENT: &str = concat!("llmux/", env!("CARGO_PKG_VERSION"));
+
+/// Adds [`USER_AGENT`] unless the deployment's own headers already set one.
+pub fn default_user_agent(headers: &mut HeaderMap) {
+    headers
+        .entry(http::header::USER_AGENT)
+        .or_insert(HeaderValue::from_static(USER_AGENT));
+}
 
 /// Whether a URI host is a loopback IP literal (no `localhost` name lookup).
 pub fn host_is_loopback_ip(host: &str) -> bool {

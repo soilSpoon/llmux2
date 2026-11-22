@@ -49,6 +49,36 @@ WHEN an OpenAI Chat deployment is configured to strip an unsupported field
 THEN only the configured field is dropped, including only the `effort` member
 for `reasoning.effort` unless the enclosing object becomes empty.
 
+### Requirement: Anthropic sampling parameter compatibility
+
+Current Claude models (Claude 5 generation, Fable 5, Opus 4.8) reject
+`temperature`, `top_p` and `top_k` with HTTP 400 `` `<field>` is deprecated for
+this model`` unless the value is the default. The Anthropic adapter SHALL accept
+`strip_request_fields` limited to `temperature`, `top_p` and `top_k` and omit
+them from the upstream body on both the OpenAI Chat conversion and the native
+Messages passthrough. When an upstream still answers such a 400 for a field
+that was sent, the adapter SHALL remove only that field and resend the same
+deployment's request, and SHALL log which field was dropped. The retry SHALL NOT
+move to another deployment, so the served model never changes, and SHALL NOT
+apply to any other 400.
+
+#### Scenario: Configured stripping
+
+WHEN an anthropic deployment sets `strip_request_fields = ["temperature", "top_p"]`
+THEN neither field reaches the upstream on /v1/chat/completions or /v1/messages,
+and other fields are untouched.
+
+#### Scenario: Deprecation rejection heals
+
+WHEN the upstream answers 400 `` `temperature` is deprecated for this model``
+THEN the same deployment is retried once without `temperature`, and the client
+receives that retry's response.
+
+#### Scenario: Other bad request
+
+WHEN the upstream answers any other 400
+THEN it is returned to the client without a retry.
+
 ### Requirement: Static deployment headers
 
 The gateway SHALL support optional per-deployment headers with literal or
@@ -80,9 +110,14 @@ used only if the client omitted a version.
 
 ### Requirement: Excluded providers and practices
 
-The gateway SHALL NOT integrate OpenRouter, Factory, multi-account pooling, or
-multi-IP distribution to raise limits, and SHALL NOT add paid paths that cost
-provider fees unless the owner explicitly asks.
+The gateway SHALL NOT integrate OpenRouter, Factory, Augment, Z.AI,
+multi-account pooling, or multi-IP distribution to raise limits, and SHALL NOT
+add paid paths that cost provider fees unless the owner explicitly asks.
+DuckDuckGo and Cloudflare Playground have no key-based HTTP API and SHALL NOT
+be integrated by copying a session cookie, solving a browser challenge, or
+driving a headless browser to pass a TLS fingerprint check. The importer SHALL
+keep their model ids on an OmniRoute fallback leg when that fallback is
+configured, and SHALL otherwise warn that the fallback flags are required.
 
 #### Scenario: Codex access
 
@@ -93,5 +128,71 @@ shared fallback pool.
 #### Scenario: xAI OAuth deployment
 
 WHEN a deployment uses an OAuth credential minted by `llmux-login xai`
+or imported from an `xai-oauth` connection
 (the public Grok CLI client on auth.x.ai)
-THEN requests go to api.x.ai with the OAuth bearer via `openai_compat`.
+THEN requests go to api.x.ai with the OAuth bearer. Chat models use Chat
+Completions and the responses-only catalog ids use Responses. A client effort
+suffix is stripped before the upstream id.
+
+#### Scenario: Nous Portal subscription deployment
+
+WHEN a deployment uses a `nous_portal` credential created by `llmux-login nous`
+(device-code login, rotating refresh token in an owner-only state file)
+THEN requests go to inference-api.nousresearch.com with the portal access token
+via `openai_compat`, refreshed ahead of expiry and once on a 401, the model is
+exposed as `nous/<portal id>`, and it never joins another vendor's combo.
+
+#### Scenario: Default User-Agent on upstream requests
+
+WHEN any adapter (`openai_compat`, `anthropic`, `openai_responses`), the OAuth
+and Nous refresh clients, or `llmux-login` sends a request
+THEN it carries `User-Agent: llmux/<version>` unless the deployment's `headers`
+already set one, because Nous's Cloudflare and Vercel edges answer a request
+without a User-Agent with HTTP 403.
+
+#### Scenario: Cloudflare/WAF 403 is not an auth failure
+
+WHEN an `openai_compat` upstream answers 403 with an HTML body
+THEN it is classified as a transient server error and the credential stays
+enabled; a 403 with a JSON or plain body remains a non-refreshable auth failure
+and a 401 remains refreshable.
+
+#### Scenario: Nous login keeps polling through transient portal responses
+
+WHEN `llmux-login nous` polls and the portal answers 403/429/5xx, a non-JSON
+body, or fails to respond
+THEN it backs off and keeps polling until the device code expires, failing early
+only on a definitive OAuth error (`access_denied`, `expired_token`, or another
+OAuth `error` code). Errors name the HTTP status and the first 200 characters of
+the body, never the device code or tokens.
+
+### Requirement: Hashed end-user attribution
+
+When `[server] end_user_header` is set and the gateway has derived an end-user
+hash, the Anthropic adapter SHALL set `metadata.user_id` to that hash on both
+the OpenAI Chat conversion and the native Messages passthrough, overriding a
+client-supplied `user` or `metadata.user_id` and preserving other metadata
+fields on passthrough. An `openai` or `openai_compat` deployment SHALL set the
+Chat Completions `user` field to the same hash, then apply `strip_request_fields`,
+so a deployment that strips `user` does not send it. Other provider kinds SHALL
+NOT gain a `user` field from this feature. When no hash is present, adapters
+SHALL keep their previous behavior, including copying a client `user` into
+Anthropic `metadata.user_id`.
+
+#### Scenario: Hash overrides a client id
+
+WHEN a request carries an end-user hash and a client `user` or `metadata.user_id`
+THEN the Anthropic upstream receives the hash as `metadata.user_id` and an
+OpenAI-compatible upstream receives it as `user`, and neither body contains the
+raw identifier.
+
+#### Scenario: Stripped user field
+
+WHEN an `openai_compat` deployment lists `user` in `strip_request_fields`
+THEN the hashed `user` field is omitted from the upstream body.
+
+#### Scenario: No hash
+
+WHEN the end-user feature is off or the request has no identifier
+THEN Anthropic still copies a client `user` into `metadata.user_id` and does not
+invent one.

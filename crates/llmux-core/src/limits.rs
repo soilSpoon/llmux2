@@ -276,6 +276,30 @@ impl Drop for Permit {
 mod tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn provider_retry_and_proactive_reset_respect_the_cooldown_cap() {
+        let cap = Duration::from_secs(5);
+        let hint = Duration::from_secs(60);
+        let limits = DeploymentLimits::new(QuotaSpec::default());
+        let now = Instant::now();
+        assert_eq!(
+            limits.limited(Some(hint), Duration::from_secs(1), cap),
+            now + cap
+        );
+
+        let limits = DeploymentLimits::new(QuotaSpec::default());
+        limits.observe(
+            LimitObservation {
+                remaining_tokens: Some(0),
+                reset_tokens: Some(hint),
+                ..LimitObservation::default()
+            },
+            cap,
+        );
+        assert_eq!(limits.cooldown_until(now), Some(now + cap));
+        assert_eq!(limits.cooldown_until(now + cap), None);
+    }
+
     #[test]
     fn stream_permit_releases_concurrency_on_drop() {
         let limits = Arc::new(DeploymentLimits::new(QuotaSpec {

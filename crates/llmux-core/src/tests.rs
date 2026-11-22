@@ -38,6 +38,7 @@ struct Adapter {
     status: Arc<std::sync::atomic::AtomicU16>,
     stream_errors: Mutex<VecDeque<UpstreamError>>,
     calls: Mutex<Vec<(Arc<str>, Arc<str>)>>,
+    cool_on_build: Mutex<Option<Arc<DeploymentLimits>>>,
 }
 
 #[async_trait]
@@ -67,6 +68,9 @@ impl ProviderAdapter for Adapter {
             && (req.body == "document" || req.body == "image" && dep.idx == DeploymentIdx(2))
         {
             return Err(BuildError::UnsupportedConversion);
+        }
+        if let Some(limits) = self.cool_on_build.lock().unwrap().take() {
+            limits.cool_down(Duration::from_secs(30));
         }
         let AuthMaterial::Bearer(token) = auth else {
             panic!("expected bearer")
@@ -175,6 +179,7 @@ async fn fixture_full(
         status,
         stream_errors: Mutex::new(VecDeque::new()),
         calls: Mutex::new(Vec::new()),
+        cool_on_build: Mutex::new(None),
     });
     let credential = Arc::new(Credential {
         refreshes: AtomicUsize::new(0),
@@ -220,6 +225,11 @@ async fn fixture_full(
             drain_grace: Duration::from_secs(2),
             expose_routing_headers: true,
             dashboard_key: None,
+            end_user_header: None,
+            end_user_salt: None,
+            end_user_from_body: false,
+            remote_images: llmux_config::RemoteImages::Allow,
+            max_image_bytes: None,
         },
         routing: llmux_config::RoutingConfig {
             max_attempts: 4,
@@ -233,6 +243,7 @@ async fn fixture_full(
         credential_quotas: HashMap::from([("second".into(), second_quota)]),
         credential_meta: HashMap::new(),
         oauth: HashMap::new(),
+        nous: HashMap::new(),
         catch_all: None,
         catch_all_exclude: Vec::new(),
         model_names: models
@@ -285,6 +296,7 @@ fn request() -> GatewayRequest {
         max_output_tokens: None,
         context_overflow: None,
         request_id: RequestId("test".into()),
+        end_user: None,
     }
 }
 
@@ -422,6 +434,41 @@ async fn exhaustion_after_transient_then_quota_returns_limits() {
         executor.execute(request()).await,
         Err(GatewayError::AllCandidatesExhausted { attempts: 3, .. })
     ));
+}
+
+#[tokio::test]
+async fn retry_after_excludes_a_deployment_that_does_not_have_the_model() {
+    let (executor, adapter, _, _server) = fixture_full(
+        vec![UpstreamError::ModelNotFound {
+            status: StatusCode::NOT_FOUND,
+            body: Bytes::new(),
+        }],
+        false,
+        [None; 3],
+        &[("model", &[0, 2])],
+        Default::default(),
+        llmux_types::QuotaSpec {
+            rpm: Some(1),
+            ..Default::default()
+        },
+        false,
+    )
+    .await;
+    drop(executor.bindings[2].limits.admit(1).unwrap());
+
+    let Err(GatewayError::AllCandidatesExhausted {
+        attempts,
+        retry_after,
+    }) = executor.execute(request()).await
+    else {
+        panic!("expected the backup's quota to block routing");
+    };
+    assert_eq!(attempts, 1);
+    assert_eq!(adapter.calls.lock().unwrap()[0].0.as_ref(), "dep0");
+    assert!(
+        retry_after > Duration::ZERO,
+        "retry_after = {retry_after:?}"
+    );
 }
 
 #[tokio::test]
@@ -957,4 +1004,27 @@ async fn credential_peers_cool_only_until_the_quota_resets() {
         ["dep0", "dep1"],
         "dep0's own route limit is not the key's"
     );
+}
+
+#[tokio::test]
+async fn convert_deployment_cooled_during_build_is_skipped_at_the_gate() {
+    let (executor, adapter, _, _server) = fixture_with_models(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("model", &[0, 2])],
+        Default::default(),
+    )
+    .await;
+    *adapter.cool_on_build.lock().unwrap() = Some(executor.bindings[0].limits.clone());
+    let result = executor
+        .execute(GatewayRequest {
+            format: InboundFormat::AnthropicMessages,
+            body: Bytes::from_static(b"plain"),
+            ..request()
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.deployment.as_ref(), "dep2");
+    assert_eq!(adapter.calls.lock().unwrap().len(), 2);
 }

@@ -20,7 +20,7 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
 
 For Chat Completions on OpenAI-compatible upstreams, the gateway rewrites only the top-level request model. Other request fields and successful response payloads pass through.
 
-Use authenticated `GET /v1/models` to list configured model names and aliases, not upstream deployment names or the full CheaperInference catalog. An optional catch-all accepts additional IDs but is not listed.
+Use authenticated `GET /v1/models` to list configured model names and aliases, not upstream deployment names or the full CheaperInference catalog. An optional catch-all accepts additional IDs but is not listed. A `devin_acp` name is omitted only after `devin models` has loaded and every deployment of that name is `devin_acp` with an upstream id missing from that catalog. The refresh runs at most once a minute, a failure keeps the last successful catalog (or the full configured list if none has loaded), and chat requests do not wait on it. Ids the CLI reports but the config does not name are not added; a new public name still requires import or a config reload.
 
 ```sh
 curl -sS http://127.0.0.1:8080/v1/responses \
@@ -175,7 +175,19 @@ Each deployment may set `max_context` (prompt plus completion tokens), defaultin
 
 Rejecting is the default. To trim instead, set `context_overflow = "middle-out"` on a model, or send `x-llmux-context-overflow: middle-out` (or `reject`) per request. The gateway then drops messages (Responses `input` items) from the middle of the conversation until the request fits the largest window. It keeps system and developer messages and the latest message, and drops tool results together with the call before them. The response carries `x-llmux-dropped-messages: <n>`, so a trim is never silent. If dropping every middle message still doesn't fit, the request gets the same 400.
 
-`x-llmux-deployment` and `x-llmux-attempts` identify the winning deployment and number of HTTP attempts (not skipped deployments). Set `server.expose_routing_headers = false` to hide them. A stream commits on its first complete SSE event; after that, failures end the stream with an error payload rather than replaying the request.
+`x-llmux-deployment` and `x-llmux-attempts` identify the winning deployment and number of HTTP attempts (not skipped deployments). Set `server.expose_routing_headers = false` to hide them. A stream commits on the first SSE event that carries content, a tool call, a finish reason, or usage, or on `[DONE]`. OpenAI-compat keepalive chunks (`choices: []` with none of those) do not commit and are dropped until then; after commit they are forwarded. An error frame before commit is classified like a non-stream embedded error and can fail over. After commit, failures end the stream with an error payload rather than replaying the request.
+
+### End-user attribution
+
+Off unless `[server] end_user_header` is set. When the inbound request carries that header, the gateway hashes it and sends the hash as Anthropic `metadata.user_id` and, on `openai` / `openai_compat` deployments, as the Chat Completions `user` field. A client-supplied value is overridden. The raw header is not logged, not copied upstream, and not returned. The response header `x-llmux-end-user` is the hash only, including on gateway errors after the hash is computed, whether or not routing headers are exposed.
+
+The hash is lowercase hex SHA-256 of the UTF-8 salt bytes immediately followed by the UTF-8 identifier, with no separator. `end_user_salt` is required when the header is set and must be a nonempty `env:` or `file:` secret (a literal or an empty resolved value is rejected). An empty or whitespace-only header falls through. If the header is absent and `end_user_from_body` is true (the default when the header is set), the OpenAI top-level `user` string is hashed the same way. Set `end_user_from_body = false` to ignore the body field. Deployments that reject `user` keep doing so: `strip_request_fields = ["user"]` still drops the field after the hash is applied. Providers that cannot strip unknown fields (`xai`, `openai_responses`, and the rest) do not receive a `user` field. With no hash, Anthropic still copies a client `user` into `metadata.user_id` as before.
+
+`end_user_header` must be a valid HTTP header name and cannot be `Authorization`, `Cookie`, `x-api-key`, or a hop-by-hop header. Remove `end_user_header` to roll back; older binaries reject the new keys, so remove them before rolling back.
+
+### Remote images
+
+`remote_images` is `allow` (default) or `reject`. `reject` answers 400 `{"error":{"message":"remote image URLs are not accepted; send a data: URL",...}}` before any upstream call when a chat, Messages, or Responses body contains an `http`/`https` `image_url` (object or string) or an Anthropic image source URL. Optional `max_image_bytes` rejects a `data:` image, or a native Anthropic base64 image, whose decoded payload exceeds the limit with 413. A non-positive limit is a config error. Unset means no size cap. Both checks run in one place on the inbound body, not in each adapter.
 
 Before a response is committed, the gateway can fail over on upstream server, connection, and timeout errors within its attempt and time limits. Rate-limit and quota-exhaustion failover are controlled by `routing.fallback_on` and enabled by default. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local request and token quotas use per-deployment sliding windows (one minute for `rpm`/`tpm`, one day for `rpd`/`tpd`) only when configured. Token quotas count the same prompt-plus-output estimate used for context fitting, and a single request larger than a token quota is still admitted when that window is empty. A credential may also set `quota` (`rpm`, `rpd`, `tpm`, `tpd`) for providers that limit per key or project across models; those windows are shared by every deployment that uses the credential.
 
@@ -195,6 +207,17 @@ mode; it does not emulate their behavior. `reasoning.effort` removes only that
 member and drops the enclosing `reasoning` object if it becomes empty. It does
 not remove the separate top-level `reasoning_effort`. Other deployments are
 unchanged. Remove the setting to restore passthrough.
+
+### Anthropic models that reject sampling parameters
+
+Claude 5 models, Fable 5 and Opus 4.8 answer 400 `` `temperature` is deprecated
+for this model`` unless the value is the default. Set
+`strip_request_fields = ["temperature", "top_p"]` (`top_k` is also accepted) on
+the `anthropic` deployment to omit them from both `/v1/chat/completions` and
+`/v1/messages` requests; `llmux-import` does this for those models. Without the
+setting the gateway also heals itself: on that exact 400 it drops the named
+field and resends once to the same deployment (logging the field), so the served
+model never changes.
 
 ### Catch-all route for cutover
 
@@ -403,6 +426,46 @@ upstream_model = "grok-4.7"
 Do not run login concurrently with a gateway using the same rotating token file.
 Unlike Codex, an xAI credential needs no `allowed_keys` restriction unless
 your own policy wants one.
+
+## Nous Portal (subscription login)
+
+Nous Portal runs on the owner's subscription through the same OAuth device-code
+flow Hermes Agent uses, so no API key is created. On a machine with no browser:
+
+```sh
+cargo run -p llmux-login -- nous --dir ~/.config/llmux/nous
+```
+
+It prints a verification URL and a user code, polls until you approve in any
+browser, and writes `~/.config/llmux/nous/state.json` with mode 0600 (directory
+0700). The state holds the rotating refresh token and the short-lived access
+token, which is the bearer for `https://inference-api.nousresearch.com/v1`.
+Treat it as a secret, never commit it, and do not run login while a gateway
+uses the same file: Nous refresh tokens are single use.
+
+```toml
+[[credentials]]
+id = "nous"
+kind = "nous_portal"
+provider = "openai_compat"
+state_file = "/absolute/path/to/.config/llmux/nous/state.json"
+
+[[models]]
+name = "nous/tencent/hy4-flash:free"
+
+[[models.deployments]]
+id = "nous-hy4-flash-free"
+credential = "nous"
+base_url = "https://inference-api.nousresearch.com/v1"
+upstream_model = "tencent/hy4-flash:free"
+```
+
+Startup fails with a message naming `llmux-login nous` when `state_file` is
+missing or unreadable. The gateway refreshes ahead of expiry and once on a 401.
+Nous models are separate `nous/<portal id>` models and never a leg of another
+vendor's combo. To import them, save `GET /v1/models` from the inference API and
+run `llmux-import ... --nous-state PATH --nous-models PATH`; free models
+(`:free` ids, or zero prompt and completion price) rank ahead of paid ones.
 
 ## Development
 
