@@ -628,10 +628,33 @@ upstream_model = "vendor-secondary"
 priority = 0
 fallback = true
 billing = "billed"
+
+[[models]]
+name = "free-mixed"
+capabilities = {{ stream = true, max_context = 100000 }}
+
+[[models.deployments]]
+id = "d2-free"
+credential = "primary"
+base_url = "{}/free/v1"
+upstream_model = "vendor-primary"
+priority = 0
+billing = "free"
+
+[[models.deployments]]
+id = "d2-fallback"
+credential = "secondary"
+base_url = "{}/billed/v1"
+upstream_model = "vendor-secondary"
+priority = 10
+fallback = true
+billing = "billed"
 "#,
         upstream.url(),
         billed_upstream.url(),
         billed_upstream.url(),
+        billed_upstream.url(),
+        upstream.url(),
         billed_upstream.url(),
         base = base,
     );
@@ -745,6 +768,37 @@ billing = "billed"
     .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(billed.calls.load(Ordering::Relaxed), 1);
+
+    // /v1/models labels: a model needs at least one usable free leg to be
+    // advertised free — billed legs or fallbacks alone keep it billed.
+    let models: Request<Full<Bytes>> = Request::get(format!("{}/v1/models", gateway.url()))
+        .header(header::AUTHORIZATION, "Bearer test-client")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let response = timeout(
+        Duration::from_secs(5),
+        Client::builder(TokioExecutor::new())
+            .build_http()
+            .request(models),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = BodyExt::collect(response.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    let list: Value = serde_json::from_slice(&body).unwrap();
+    let labels: std::collections::HashMap<_, _> = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| (m["id"].as_str().unwrap(), m["billing"].as_str().unwrap()))
+        .collect();
+    assert_eq!(labels["mixed"], "billed");
+    assert_eq!(labels["fallback-only"], "billed");
+    assert_eq!(labels["free-mixed"], "free");
 }
 
 #[tokio::test]

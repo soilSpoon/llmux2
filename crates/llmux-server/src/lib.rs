@@ -236,20 +236,31 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     let data: Vec<_> = ids
         .into_iter()
         .map(|id| {
-            // `free` only when every non-fallback leg is marked free; a missing
-            // marker is billed. Billed fallback legs never fire under the
-            // probe's x-llmux-free-only requests, so they do not gate sweeping.
+            // `free` only when the model has at least one non-fallback leg and
+            // every non-fallback leg is marked free; a missing marker is billed.
+            // Billed fallback legs never fire under the probe's
+            // x-llmux-free-only requests, so they do not gate sweeping, but a
+            // fallback-only model has no usable free leg and must not be swept.
             let billing = match active.config.model_names.get(id) {
-                Some(&index)
-                    if active.config.models[index]
-                        .deployments
-                        .iter()
-                        .all(|idx| {
-                            let dep = &active.config.deployments[idx.0 as usize];
-                            dep.billing == Billing::Free || dep.fallback
-                        }) =>
-                {
-                    "free"
+                Some(&index) => {
+                    let mut saw_usable_free = false;
+                    let mut all_free = true;
+                    for idx in &active.config.models[index].deployments {
+                        let dep = &active.config.deployments[idx.0 as usize];
+                        if dep.fallback {
+                            continue;
+                        }
+                        if dep.billing == Billing::Free {
+                            saw_usable_free = true;
+                        } else {
+                            all_free = false;
+                        }
+                    }
+                    if saw_usable_free && all_free {
+                        "free"
+                    } else {
+                        "billed"
+                    }
                 }
                 _ => "billed",
             };
