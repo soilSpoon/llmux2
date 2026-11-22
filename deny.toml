@@ -9,6 +9,3 @@ version = 2
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 unmaintained = "all"
-ignore = [
-    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained with no safe upgrade; llmux-login uses it only for token expiry timestamps. Remove once llmux-login moves to jiff or time." },
-]

@@ -1,5 +1,8 @@
 use crate::{
-    openai_compat::{bad_gateway, collect, retry_after, rewrite_model},
+    openai_compat::{
+        apply_auth, bad_gateway, collect, endpoint_uri, retry_after, rewrite_model,
+        strip_request_fields,
+    },
     sse,
 };
 use async_trait::async_trait;
@@ -17,8 +20,61 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+
+const LIMIT_REMAINING_REQUESTS: &str = "anthropic-ratelimit-requests-remaining";
+const LIMIT_REMAINING_TOKENS: &str = "anthropic-ratelimit-tokens-remaining";
+const REQUEST_LIMIT: (&str, &str) = (
+    LIMIT_REMAINING_REQUESTS,
+    "anthropic-ratelimit-requests-reset",
+);
+const TOKEN_LIMITS: [(&str, &str); 3] = [
+    (LIMIT_REMAINING_TOKENS, "anthropic-ratelimit-tokens-reset"),
+    (
+        "anthropic-ratelimit-input-tokens-remaining",
+        "anthropic-ratelimit-input-tokens-reset",
+    ),
+    (
+        "anthropic-ratelimit-output-tokens-remaining",
+        "anthropic-ratelimit-output-tokens-reset",
+    ),
+];
+
+fn limit_window(
+    headers: &HeaderMap,
+    (remaining, reset): (&str, &str),
+    now: SystemTime,
+) -> (Option<u32>, Option<Duration>) {
+    let remaining = headers
+        .get(remaining)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok());
+    let reset = headers
+        .get(reset)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| OffsetDateTime::parse(v, &Rfc3339).ok())
+        .and_then(|date| Duration::try_from(date - OffsetDateTime::from(now)).ok())
+        .filter(|wait| !wait.is_zero());
+    (remaining, reset)
+}
+
+fn anthropic_retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+    retry_after(headers, now)
+        .filter(|wait| !wait.is_zero())
+        .or_else(|| {
+            [REQUEST_LIMIT]
+                .into_iter()
+                .chain(TOKEN_LIMITS)
+                .map(|window| limit_window(headers, window, now))
+                .filter(|(remaining, _)| remaining.is_none_or(|remaining| remaining == 0))
+                .filter_map(|(_, reset)| reset)
+                .max()
+        })
+}
+
+const DEPRECATABLE_FIELDS: [&str; 3] = ["temperature", "top_p", "top_k"];
 
 pub struct Anthropic(ProviderKind);
 
@@ -26,6 +82,20 @@ impl Anthropic {
     pub fn new(kind: impl Into<Arc<str>>) -> Self {
         Self(ProviderKind(kind.into()))
     }
+}
+
+fn set_metadata_user_id(body: Bytes, user_id: &str) -> Result<Bytes, BuildError> {
+    let mut value: Value = serde_json::from_slice(&body).map_err(|_| BuildError::InvalidBody)?;
+    let object = value.as_object_mut().ok_or(BuildError::InvalidBody)?;
+    let metadata = object.entry("metadata").or_insert_with(|| json!({}));
+    if !metadata.is_object() {
+        *metadata = json!({});
+    }
+    metadata
+        .as_object_mut()
+        .expect("metadata object")
+        .insert("user_id".into(), json!(user_id));
+    Ok(Bytes::from(value.to_string()))
 }
 
 fn string(value: &Value) -> Result<&str, BuildError> {
@@ -77,7 +147,7 @@ fn blocks(content: &Value) -> Result<Vec<Value>, BuildError> {
         .collect()
 }
 
-fn convert_request(body: &[u8], model: &str) -> Result<Bytes, BuildError> {
+fn convert_request(body: &[u8], model: &str, end_user: Option<&str>) -> Result<Bytes, BuildError> {
     let input: Value = serde_json::from_slice(body).map_err(|_| BuildError::InvalidBody)?;
     let mut messages: Vec<Value> = Vec::new();
     let mut system = Vec::new();
@@ -149,7 +219,9 @@ fn convert_request(body: &[u8], model: &str) -> Result<Bytes, BuildError> {
             return Err(BuildError::InvalidBody);
         };
     }
-    if let Some(user) = input.get("user") {
+    if let Some(user_id) = end_user {
+        out["metadata"] = json!({"user_id": user_id});
+    } else if let Some(user) = input.get("user") {
         out["metadata"] = json!({"user_id":user});
     }
     if let Some(tools) = input.get("tools") {
@@ -256,19 +328,33 @@ fn convert_response(v: &Value) -> Value {
 
 fn client_error(status: StatusCode, body: Bytes, convert: bool) -> UpstreamError {
     let value = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-    if matches!(status.as_u16(), 400 | 413)
-        && value["error"]["message"]
+    let details = &value["error"];
+    let model_not_found = crate::openai_compat::is_model_not_found(status, details);
+    if !model_not_found
+        && matches!(status.as_u16(), 400 | 413)
+        && details["message"]
             .as_str()
             .is_some_and(|s| s.contains("prompt is too long"))
     {
         return UpstreamError::ContextLength;
     }
     let body = if convert {
-        Bytes::from(json!({"error":{"message":value["error"]["message"].as_str().unwrap_or("Upstream request failed"),"type":value["error"]["type"].as_str().unwrap_or("invalid_request_error")}}).to_string())
+        let mut error = json!({
+            "message": details["message"].as_str().unwrap_or("Upstream request failed"),
+            "type": details["type"].as_str().unwrap_or("invalid_request_error")
+        });
+        if model_not_found {
+            error["code"] = details["code"].clone();
+        }
+        Bytes::from(json!({"error": error}).to_string())
     } else {
         body
     };
-    UpstreamError::BadRequest { status, body }
+    if model_not_found {
+        UpstreamError::ModelNotFound { status, body }
+    } else {
+        UpstreamError::BadRequest { status, body }
+    }
 }
 
 #[derive(Default)]
@@ -429,13 +515,21 @@ impl ProviderAdapter for Anthropic {
     ) -> Result<Request<Bytes>, BuildError> {
         let body = match self.supports(req.format) {
             Support::No => return Err(BuildError::UnsupportedFormat),
-            Support::Passthrough => rewrite_model(&req.body, crate::upstream_model(req, dep))?,
-            Support::Convert => convert_request(&req.body, crate::upstream_model(req, dep))?,
+            Support::Passthrough => {
+                let body = rewrite_model(&req.body, crate::upstream_model(req, dep))?;
+                match req.end_user.as_deref() {
+                    Some(user_id) => set_metadata_user_id(body, user_id)?,
+                    None => body,
+                }
+            }
+            Support::Convert => convert_request(
+                &req.body,
+                crate::upstream_model(req, dep),
+                req.end_user.as_deref(),
+            )?,
         };
-        let mut parts = dep.base_url.clone().into_parts();
-        parts.path_and_query =
-            Some(format!("{}/messages", dep.base_url.path().trim_end_matches('/')).parse()?);
-        let uri = http::Uri::from_parts(parts).map_err(|e| BuildError::InvalidRequest(e.into()))?;
+        let body = strip_request_fields(body, &dep.strip_request_fields)?;
+        let uri = endpoint_uri(&dep.base_url, "/messages")?;
         let mut request = Request::builder()
             .method(Method::POST)
             .uri(uri)
@@ -450,18 +544,17 @@ impl ProviderAdapter for Anthropic {
                 },
             )
             .body(body)?;
-        let auth = match auth {
-            AuthMaterial::Bearer(key) => Some((
-                http::HeaderName::from_static(provider::ANTHROPIC_KEY_HEADER),
-                HeaderValue::from_str(key).map_err(|_| BuildError::InvalidAuth)?,
-            )),
-            AuthMaterial::Header { name, value } => Some((name.clone(), value.clone())),
-            AuthMaterial::None => None,
-        };
-        if let Some((name, mut value)) = auth {
-            value.set_sensitive(true);
-            request.headers_mut().insert(name, value);
+        if req.format == InboundFormat::AnthropicMessages {
+            request.headers_mut().extend(req.anthropic_headers.clone());
         }
+        request.headers_mut().extend(dep.headers.clone());
+        llmux_types::default_user_agent(request.headers_mut());
+        apply_auth(
+            request.headers_mut(),
+            auth,
+            http::HeaderName::from_static(provider::ANTHROPIC_KEY_HEADER),
+            "",
+        )?;
         Ok(request)
     }
     async fn parse_response(
@@ -475,12 +568,13 @@ impl ProviderAdapter for Anthropic {
         match parts.status {
             StatusCode::TOO_MANY_REQUESTS => {
                 return Err(UpstreamError::RateLimited {
-                    retry_after: retry_after(&parts.headers, SystemTime::now()),
+                    retry_after: anthropic_retry_after(&parts.headers, SystemTime::now()),
                 })
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 return Err(UpstreamError::Auth { refreshable: false })
             }
+            StatusCode::REQUEST_TIMEOUT => return Err(UpstreamError::Timeout),
             s if s.is_client_error() => return Err(client_error(s, collect(body).await?, convert)),
             s if s.is_server_error() => return Err(UpstreamError::Server { status: s }),
             s if !s.is_success() => return Err(bad_gateway()),
@@ -517,22 +611,43 @@ impl ProviderAdapter for Anthropic {
             body,
         })
     }
-    fn observe_limits(&self, headers: &HeaderMap) -> Option<LimitObservation> {
-        let count = |name| {
-            headers
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u32>().ok())
+    fn repair_rejected(&self, body: &Bytes, error: &UpstreamError) -> Option<Bytes> {
+        let UpstreamError::BadRequest {
+            body: rejection, ..
+        } = error
+        else {
+            return None;
         };
-        let remaining_requests = count("anthropic-ratelimit-requests-remaining");
-        let remaining_tokens = count("anthropic-ratelimit-tokens-remaining");
+        let rejection = serde_json::from_slice::<Value>(rejection).ok()?;
+        let message = rejection["error"]["message"]
+            .as_str()
+            .or_else(|| rejection["message"].as_str())?;
+        let field = DEPRECATABLE_FIELDS
+            .into_iter()
+            .find(|field| message.contains(&format!("`{field}` is deprecated for this model")))?;
+        let mut payload = serde_json::from_slice::<Value>(body).ok()?;
+        payload.as_object_mut()?.remove(field)?;
+        eprintln!("llmux: anthropic rejected `{field}` as deprecated for this model; removed it from the repair payload");
+        Some(Bytes::from(payload.to_string()))
+    }
+    fn observe_limits(&self, headers: &HeaderMap) -> Option<LimitObservation> {
+        let now = SystemTime::now();
+        let (remaining_requests, reset_requests) = limit_window(headers, REQUEST_LIMIT, now);
+        let tokens = TOKEN_LIMITS.map(|window| limit_window(headers, window, now));
+        let remaining_tokens = tokens.iter().filter_map(|(remaining, _)| *remaining).min();
+        let reset_tokens = tokens
+            .into_iter()
+            .filter(|(remaining, _)| *remaining == Some(0))
+            .filter_map(|(_, reset)| reset)
+            .max();
         if remaining_requests.is_none() && remaining_tokens.is_none() {
             return None;
         }
         Some(LimitObservation {
             remaining_requests,
             remaining_tokens,
-            ..LimitObservation::default()
+            reset_requests,
+            reset_tokens,
         })
     }
 }
@@ -542,10 +657,98 @@ mod tests {
     use super::*;
     use futures_util::FutureExt;
     use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
+
+    #[test]
+    fn anthropic_retry_after_prefers_the_header_then_valid_reset_windows() {
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let headers = HeaderMap::from_iter([
+            (header::RETRY_AFTER, HeaderValue::from_static("7")),
+            (
+                http::HeaderName::from_static(REQUEST_LIMIT.1),
+                HeaderValue::from_static("1970-01-01T00:00:25Z"),
+            ),
+            (
+                http::HeaderName::from_static(TOKEN_LIMITS[0].1),
+                HeaderValue::from_static("invalid"),
+            ),
+            (
+                http::HeaderName::from_static(TOKEN_LIMITS[1].1),
+                HeaderValue::from_static("1970-01-01T01:00:33.5+01:00"),
+            ),
+            (
+                http::HeaderName::from_static(TOKEN_LIMITS[2].0),
+                HeaderValue::from_static("5"),
+            ),
+            (
+                http::HeaderName::from_static(TOKEN_LIMITS[2].1),
+                HeaderValue::from_static("1970-01-01T00:01:00Z"),
+            ),
+        ]);
+        assert_eq!(
+            anthropic_retry_after(&headers, now),
+            Some(Duration::from_secs(7))
+        );
+        let mut headers = headers;
+        headers.insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_static("Thu, 01 Jan 1970 00:00:20 GMT"),
+        );
+        assert_eq!(
+            anthropic_retry_after(&headers, now),
+            Some(Duration::from_millis(3500))
+        );
+        headers.remove(TOKEN_LIMITS[1].1);
+        assert_eq!(anthropic_retry_after(&headers, now), None);
+    }
     use std::time::Duration;
 
+    #[test]
+    fn exhausted_token_windows_observe_the_latest_applicable_reset() {
+        let adapter = Anthropic::new(provider::ANTHROPIC);
+        for (remaining, expected_seconds) in [
+            (["9", "0", "9"], 30),
+            (["9", "9", "0"], 20),
+            (["0", "0", "0"], 30),
+        ] {
+            let now = OffsetDateTime::now_utc();
+            let mut headers = HeaderMap::new();
+            for (((count_header, reset_header), count), seconds) in
+                TOKEN_LIMITS.into_iter().zip(remaining).zip([10, 30, 20])
+            {
+                headers.insert(count_header, HeaderValue::from_static(count));
+                let reset = now + Duration::from_secs(seconds);
+                headers.insert(
+                    reset_header,
+                    reset.format(&Rfc3339).unwrap().parse().unwrap(),
+                );
+            }
+            let before = OffsetDateTime::now_utc();
+            let observation = adapter.observe_limits(&headers).unwrap();
+            let after = OffsetDateTime::now_utc();
+            let selected = now + Duration::from_secs(expected_seconds);
+            assert_eq!(observation.remaining_tokens, Some(0), "{remaining:?}");
+            let actual = observation.reset_tokens.unwrap();
+            assert!(
+                before + actual <= selected && after + actual >= selected,
+                "unexpected reset duration {actual:?} for {remaining:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn limit_header_names_match_the_upstream_contract() {
+        assert_eq!(
+            LIMIT_REMAINING_REQUESTS,
+            "anthropic-ratelimit-requests-remaining"
+        );
+        assert_eq!(
+            LIMIT_REMAINING_TOKENS,
+            "anthropic-ratelimit-tokens-remaining"
+        );
+    }
+
     fn converted(v: Value) -> Value {
-        serde_json::from_slice(&convert_request(v.to_string().as_bytes(), "claude").unwrap())
+        serde_json::from_slice(&convert_request(v.to_string().as_bytes(), "claude", None).unwrap())
             .unwrap()
     }
 
@@ -611,7 +814,8 @@ mod tests {
         }
         assert!(convert_request(
             br#"{"messages":[{"role":"assistant","content":"hello","tool_calls":{}}]}"#,
-            "m"
+            "m",
+            None
         )
         .is_err());
     }
@@ -656,11 +860,11 @@ mod tests {
             json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"file:///x"}}]}]}),
         ] {
             assert!(matches!(
-                convert_request(v.to_string().as_bytes(), "m"),
+                convert_request(v.to_string().as_bytes(), "m", None),
                 Err(BuildError::InvalidBody)
             ));
         }
-        assert!(convert_request(b"not json", "m").is_err());
+        assert!(convert_request(b"not json", "m", None).is_err());
     }
 
     #[test]
@@ -904,27 +1108,35 @@ mod tests {
     fn auth_passthrough_and_support() {
         let a = Anthropic::new(provider::ANTHROPIC);
         let mut dep = Deployment {
+            headers: Default::default(),
+            fallback: false,
             idx: DeploymentIdx(0),
             id: "a".into(),
             provider: a.kind().clone(),
             credential: "key".into(),
             base_url: "https://example.com/v1/".parse().unwrap(),
             upstream_model: "claude".into(),
+            strip_request_fields: Box::default(),
             priority: 0,
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(10),
             max_context: None,
+            expires_at: None,
         };
         let mut req = GatewayRequest {
             format: InboundFormat::AnthropicMessages,
             model: "alias".into(),
             stream: true,
             body: Bytes::from_static(br#"{ "model":"alias", "future":{"model":"untouched"} }"#),
+            anthropic_headers: HeaderMap::new(),
             est_input_tokens: 0,
             max_output_tokens: None,
             context_overflow: None,
             request_id: RequestId("r".into()),
+            end_user: None,
         };
+        dep.headers
+            .insert("x-deployment", HeaderValue::from_static("static-value"));
         for auth in [
             AuthMaterial::Bearer("secret".into()),
             AuthMaterial::Header {
@@ -939,6 +1151,11 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(request.uri(), "https://example.com/v1/messages");
+            assert_eq!(request.headers()["x-deployment"], "static-value");
+            assert_eq!(
+                request.headers()[header::USER_AGENT],
+                concat!("llmux/", env!("CARGO_PKG_VERSION"))
+            );
             assert_eq!(request.method(), Method::POST);
             assert_eq!(request.headers()["anthropic-version"], "2023-06-01");
             assert_eq!(request.headers()[header::ACCEPT], "text/event-stream");
@@ -988,5 +1205,182 @@ mod tests {
             .unwrap();
         let body: Value = serde_json::from_slice(request.body()).unwrap();
         assert_eq!(body["model"], "alias");
+    }
+    fn rejection(message: &str) -> UpstreamError {
+        UpstreamError::BadRequest {
+            status: StatusCode::BAD_REQUEST,
+            body: Bytes::from(
+                json!({"type":"error","error":{"type":"invalid_request_error","message":message}})
+                    .to_string(),
+            ),
+        }
+    }
+
+    #[test]
+    fn strip_request_fields_applies_to_converted_and_passthrough_bodies() {
+        let a = Anthropic::new(provider::ANTHROPIC);
+        let dep = Deployment {
+            headers: Default::default(),
+            fallback: false,
+            idx: DeploymentIdx(0),
+            id: "a".into(),
+            provider: a.kind().clone(),
+            credential: "key".into(),
+            base_url: "https://example.com/v1/".parse().unwrap(),
+            upstream_model: "claude".into(),
+            strip_request_fields: Box::new([
+                llmux_types::ChatRequestField::Temperature,
+                llmux_types::ChatRequestField::TopP,
+                llmux_types::ChatRequestField::TopK,
+            ]),
+            priority: 0,
+            quota: QuotaSpec::default(),
+            timeout: Duration::from_secs(10),
+            max_context: None,
+            expires_at: None,
+        };
+        for (format, body) in [
+            (
+                InboundFormat::OpenAiChat,
+                r#"{"model":"m","temperature":0.7,"top_p":0.9,"messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+            (
+                InboundFormat::AnthropicMessages,
+                r#"{"model":"m","max_tokens":5,"temperature":0.7,"top_p":0.9,"top_k":4,"messages":[]}"#,
+            ),
+        ] {
+            let req = GatewayRequest {
+                format,
+                model: "m".into(),
+                stream: false,
+                body: Bytes::from_static(body.as_bytes()),
+                anthropic_headers: HeaderMap::new(),
+                est_input_tokens: 0,
+                max_output_tokens: None,
+                context_overflow: None,
+                request_id: RequestId("r".into()),
+                end_user: None,
+            };
+            let request = a
+                .build_request(&req, &dep, &AuthMaterial::None)
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+            let sent: Value = serde_json::from_slice(request.body()).unwrap();
+            for field in ["temperature", "top_p", "top_k"] {
+                assert!(sent.get(field).is_none(), "{format:?} kept {field}");
+            }
+            assert_eq!(sent["model"], "claude");
+        }
+    }
+
+    #[test]
+    fn deprecated_parameter_rejections_drop_only_the_named_field() {
+        let a = Anthropic::new(provider::ANTHROPIC);
+        let body = Bytes::from_static(br#"{"model":"m","temperature":0.7,"top_p":0.9,"top_k":4}"#);
+        for (field, kept) in [
+            ("temperature", ["top_p", "top_k"]),
+            ("top_p", ["temperature", "top_k"]),
+            ("top_k", ["temperature", "top_p"]),
+        ] {
+            let message = format!("`{field}` is deprecated for this model.");
+            let repaired = a.repair_rejected(&body, &rejection(&message)).unwrap();
+            let repaired: Value = serde_json::from_slice(&repaired).unwrap();
+            assert!(repaired.get(field).is_none());
+            assert!(kept.iter().all(|key| repaired.get(key).is_some()));
+            assert_eq!(repaired["model"], "m");
+        }
+    }
+
+    #[test]
+    fn unrelated_or_unactionable_rejections_are_not_repaired() {
+        let a = Anthropic::new(provider::ANTHROPIC);
+        let body = Bytes::from_static(br#"{"model":"m","temperature":0.7}"#);
+        assert!(a
+            .repair_rejected(&body, &rejection("max_tokens: field required"))
+            .is_none());
+        assert!(a.repair_rejected(&body, &UpstreamError::Timeout).is_none());
+        let without = Bytes::from_static(br#"{"model":"m"}"#);
+        assert!(a
+            .repair_rejected(
+                &without,
+                &rejection("`temperature` is deprecated for this model.")
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn end_user_hash_overrides_client_user_id_on_convert_and_passthrough() {
+        let a = Anthropic::new(provider::ANTHROPIC);
+        let dep = Deployment {
+            headers: Default::default(),
+            fallback: false,
+            idx: DeploymentIdx(0),
+            id: "a".into(),
+            provider: a.kind().clone(),
+            credential: "key".into(),
+            base_url: "https://example.com/v1/".parse().unwrap(),
+            upstream_model: "claude".into(),
+            strip_request_fields: Box::new([llmux_types::ChatRequestField::Temperature]),
+            priority: 0,
+            quota: QuotaSpec::default(),
+            timeout: Duration::from_secs(10),
+            max_context: None,
+            expires_at: None,
+        };
+        let hash = "31ca399bfc61dac0b442a6bef7c00cd06cf9682c11b9192fb26a918b4a9130f8";
+        let raw = "raw-client-SHOULD-NOT-LEAK";
+        let build = |format, body: &str, end_user: Option<&str>| {
+            let req = GatewayRequest {
+                format,
+                model: "m".into(),
+                stream: false,
+                body: Bytes::from(body.to_owned()),
+                anthropic_headers: HeaderMap::new(),
+                est_input_tokens: 0,
+                max_output_tokens: None,
+                context_overflow: None,
+                request_id: RequestId("r".into()),
+                end_user: end_user.map(Arc::from),
+            };
+            let request = a
+                .build_request(&req, &dep, &AuthMaterial::None)
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+            serde_json::from_slice::<Value>(request.body()).unwrap()
+        };
+        let converted = build(
+            InboundFormat::OpenAiChat,
+            &format!(
+                r#"{{"model":"m","temperature":0.2,"user":"{raw}","messages":[{{"role":"user","content":"hi"}}]}}"#
+            ),
+            Some(hash),
+        );
+        assert_eq!(converted["metadata"]["user_id"], hash);
+        assert!(!converted.to_string().contains(raw));
+        assert!(converted.get("temperature").is_none());
+        assert!(converted.get("user").is_none());
+
+        let passed = build(
+            InboundFormat::AnthropicMessages,
+            &format!(
+                r#"{{"model":"alias","metadata":{{"user_id":"{raw}","account":"acme"}},"messages":[]}}"#
+            ),
+            Some(hash),
+        );
+        assert_eq!(passed["metadata"]["user_id"], hash);
+        assert!(!passed.to_string().contains(raw));
+        assert_eq!(passed["metadata"]["account"], "acme");
+        assert_eq!(passed["model"], "claude");
+
+        let kept = build(
+            InboundFormat::OpenAiChat,
+            &format!(
+                r#"{{"model":"m","user":"{raw}","messages":[{{"role":"user","content":"hi"}}]}}"#
+            ),
+            None,
+        );
+        assert_eq!(kept["metadata"]["user_id"], raw);
     }
 }

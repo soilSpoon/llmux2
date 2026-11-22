@@ -127,7 +127,7 @@ test("live metrics, routing state, and disconnect recovery are displayed in Kore
   const dep = {
     model: "gateway-model", id: "primary", provider: "openai_compat",
     priority: 0, cooldown_ms: 1_200, rpm_limit: 20, concurrency_limit: 2, in_flight: 0,
-    routed: 1234, failed_attempts: 1, stream_errors: 0,
+    routed: 1234, failed_attempts: 1, stream_errors: 0, fallback: true,
   };
   let offline = false;
   const ui = dashboard(async () => {
@@ -139,6 +139,8 @@ test("live metrics, routing state, and disconnect recovery are displayed in Kore
           uptime_ms: 62_000,
           responses: { ok: 1234, rejected: 1, unavailable: 2, failed: 0, ready_us: 12_370_000 },
           deployments: [dep],
+          fallback: { routed: 2, total_routed: 5, share: 0.4 },
+          catch_all: { models: { "vendor/new": 2 }, other: 3 },
         };
       },
     };
@@ -150,6 +152,10 @@ test("live metrics, routing state, and disconnect recovery are displayed in Kore
   assert.equal(ui.element("success").textContent, "1,234");
   assert.equal(ui.element("limited").textContent, "2");
   assert.equal(ui.element("latency").textContent, "10 ms");
+  assert.equal(ui.element("fallback-share").textContent, "40%");
+  assert.equal(ui.element("catch-all-models").textContent, "vendor/new · 2");
+  assert.equal(ui.element("catch-all-other").textContent, "기타 · 3");
+  assert.equal(ui.rows[1][0].children[0].textContent, "Fallback");
   assert.equal(ui.rows[0][0].textContent, "gateway-model");
   assert.equal(ui.rows[1][2].children[0].textContent, "재시도 대기 · 2초");
   assert.equal(ui.rows[1][6].textContent, "분당 최대 20건 · 처리 중 0/2");

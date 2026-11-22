@@ -10,6 +10,23 @@ fn fixture() -> Value {
     })
 }
 
+fn import_with_free_kilo(root: &Value, output: &std::path::Path) -> llmux_import::ImportReport {
+    let catalog = output.with_extension("models.json");
+    let models = ["vendor/free", "vendor/test:free", "openrouter/free"]
+        .map(|id| json!({"id":id,"pricing":{"prompt":"0","completion":"0"}}));
+    fs::write(&catalog, json!({"data":models}).to_string()).unwrap();
+    llmux_import::import_with_options(
+        &root.to_string(),
+        output,
+        None,
+        &llmux_import::ImportOptions {
+            kilo_free_models: Some(&catalog),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
 #[test]
 fn anonymous_only_import_needs_no_credentials_or_secret_files() {
     static ENV: std::sync::Once = std::sync::Once::new();
@@ -111,7 +128,7 @@ fn one_model_can_mix_anonymous_and_keyed_kilo_deployments() {
     root["combos"] = json!([{"name":"mixed","models":["kilo/vendor/free"]}]);
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("out.toml");
-    let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let report = import_with_free_kilo(&root, &output);
     assert_eq!(
         (report.models, report.deployments, report.credentials),
         (2, 4, 1)
@@ -244,10 +261,10 @@ fn imports_horde_anonymous_and_keyed_and_kilo_keyed() {
     }
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("out.toml");
-    let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let report = import_with_free_kilo(&root, &output);
     assert_eq!(
         (report.models, report.deployments, report.credentials),
-        (16, 26, 4)
+        (16, 23, 4)
     );
     let config = RuntimeConfig::load(&output).unwrap();
     for (name, expected_model, expected_url) in [
@@ -292,6 +309,16 @@ fn imports_horde_anonymous_and_keyed_and_kilo_keyed() {
             .count(),
         2
     );
+    for name in [
+        "aihorde/aphrodite/vendor/test",
+        "aihorde/google/test",
+        "aihorde/koboldcpp/test",
+    ] {
+        assert!(
+            warnings.contains(&format!("{name}: dropped 1 duplicate deployment")),
+            "{warnings}"
+        );
+    }
     let text = fs::read_to_string(output).unwrap();
     for secret in [
         "0000000000",
@@ -328,14 +355,14 @@ fn skip_precedence_is_explicit_and_replacement_warnings_are_static() {
             "none",
             "",
             "kilo",
-            "unknown/non-compatible provider",
+            "loopback/localhost upstream",
         ),
         (
             "cloudflare-playground",
             "no-auth",
             "",
             "",
-            "replace with a Cloudflare Workers AI account API token",
+            "pass --omniroute-fallback and --omniroute-key",
         ),
         (
             "custom-cf",
@@ -349,21 +376,14 @@ fn skip_precedence_is_explicit_and_replacement_warnings_are_static() {
             "apikey",
             "",
             "",
-            "no official replacement; dropped",
-        ),
-        (
-            "custom-deepai",
-            "apikey",
-            "test-key",
-            "deepai",
-            "no official replacement; dropped",
+            "pass --omniroute-fallback and --omniroute-key",
         ),
         (
             "custom-hms",
             "apikey",
             "",
             "hms",
-            "custom headers unsupported in llmux2",
+            "missing, encrypted or invalid API key",
         ),
         (
             "aihorde",

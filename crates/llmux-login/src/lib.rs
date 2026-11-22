@@ -1,6 +1,7 @@
 //! OpenAI Sign in with ChatGPT authorization-code flow.
 
 mod http;
+pub mod nous;
 mod storage;
 
 use axum::{
@@ -9,9 +10,8 @@ use axum::{
     Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use chrono::{SecondsFormat, Utc};
 use jsonwebtoken::{decode, decode_header, jwk::JwkSet, Algorithm, DecodingKey, Validation};
-use rand::{rngs::OsRng, RngCore};
+use rand::{rngs::SysRng, TryRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -21,6 +21,7 @@ use std::{
     time::Duration,
 };
 use subtle::ConstantTimeEq;
+use time::{macros::format_description, OffsetDateTime};
 use tokio::{
     net::TcpListener,
     sync::{oneshot, Mutex},
@@ -68,6 +69,8 @@ pub enum Error {
     PlanPermission,
     #[error("required OAuth scope {0} was not granted")]
     MissingScope(&'static str),
+    #[error("{0}")]
+    Poll(String),
 }
 
 impl Error {
@@ -272,7 +275,7 @@ impl PendingLogin {
         let state = random()?;
         let nonce = random()?;
         let verifier = random_n(flow.verifier_bytes)?;
-        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(&verifier));
+        let challenge = pkce_challenge(&verifier);
         let mut authorization = flow.endpoints.authorize.clone();
         {
             let mut query = authorization.query_pairs_mut();
@@ -360,7 +363,7 @@ impl PendingLogin {
         let tokens: TokenResponse = http
             .exchange(&self.flow.endpoints.token, form, &callback.client)
             .await?;
-        let saved_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let saved_at = saved_at_timestamp(OffsetDateTime::now_utc().unix_timestamp());
         let identity = validate_identity(
             &http,
             &self.flow,
@@ -419,13 +422,17 @@ impl PendingLogin {
     }
 }
 
+fn pkce_challenge(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier))
+}
+
 fn random() -> Result<String> {
     random_n(32)
 }
 
 fn random_n(n: usize) -> Result<String> {
     let mut bytes = vec![0; n];
-    OsRng
+    SysRng
         .try_fill_bytes(&mut bytes)
         .map_err(|_| Error::Authorization)?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
@@ -583,7 +590,10 @@ async fn validate_identity(
         (None, true) => false,
         (None, false) => true,
     };
-    if identity.sub.is_empty() || identity.exp <= Utc::now().timestamp() || !nonce_ok {
+    if identity.sub.is_empty()
+        || token_expired(identity.exp, OffsetDateTime::now_utc().unix_timestamp())
+        || !nonce_ok
+    {
         return Err(Error::IdToken);
     }
     Ok(identity)
@@ -596,4 +606,48 @@ fn snippet(credentials: &Credentials, dir: &Path, flow: &Flow) -> String {
         .map(|resource| format!("resource = {}\n", quote(resource)))
         .unwrap_or_default();
     format!("[[credentials]]\nid = {}\nkind = \"oauth\"\nprovider = {}\ntoken_url = {}\nclient_id = {}\nrefresh_token = {}\n{}", quote(flow.credential_id), quote(flow.provider), quote(flow.endpoints.token.as_str()), quote(&credentials.client_id), quote(&format!("file:{}", dir.join("refresh_token").display())), resource)
+}
+
+fn saved_at_timestamp(seconds: i64) -> String {
+    OffsetDateTime::from_unix_timestamp(seconds)
+        .unwrap()
+        .format(format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second]Z"
+        ))
+        .unwrap()
+}
+
+fn token_expired(exp: i64, now: i64) -> bool {
+    exp <= now
+}
+
+#[cfg(test)]
+mod pkce_tests {
+    use super::*;
+
+    #[test]
+    fn pkce_s256_matches_rfc7636_appendix_b() {
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+
+    #[test]
+    fn saved_at_is_utc_without_fractional_seconds() {
+        assert_eq!(saved_at_timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(saved_at_timestamp(1_704_164_645), "2024-01-02T03:04:05Z");
+    }
+
+    #[test]
+    fn expiry_is_inclusive_and_has_no_leeway() {
+        assert!(token_expired(99, 100));
+        assert!(token_expired(100, 100));
+        assert!(!token_expired(101, 100));
+    }
 }

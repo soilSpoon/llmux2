@@ -55,15 +55,7 @@ pub(super) fn matches(pattern: &str, name: &str) -> bool {
     pattern[p..].iter().all(|c| *c == '*')
 }
 
-pub(super) fn prepare(
-    root: &Value,
-    combos: &HashMap<String, Value>,
-    combo_ids: &HashMap<String, String>,
-    direct: &BTreeMap<String, Value>,
-    order: &mut Vec<String>,
-    warnings: &mut Vec<String>,
-) -> (BTreeMap<String, String>, HashMap<String, Value>) {
-    let mut aliases = alias_map(root, warnings);
+pub(super) fn sorted_mappings(root: &Value) -> Vec<&Value> {
     let mut mappings: Vec<_> = array(root, "modelComboMappings")
         .iter()
         .filter(|row| row["enabled"] == true || row["enabled"] == 1)
@@ -75,8 +67,49 @@ pub(super) fn prepare(
             .cmp(&a["priority"].as_i64().unwrap_or(0))
             .then_with(|| string(a, "createdAt").cmp(string(b, "createdAt")))
     });
+    mappings
+}
+
+pub(super) fn mapping_target<'a>(
+    mapping: &Value,
+    combos: &HashMap<String, Value>,
+    combo_ids: &'a HashMap<String, String>,
+    unavailable_combos: Option<&HashSet<String>>,
+) -> Option<&'a String> {
+    combo_ids.get(string(mapping, "comboId")).filter(|name| {
+        combos
+            .get(*name)
+            .is_some_and(|combo| combo["isActive"] != false)
+            && !unavailable_combos.is_some_and(|unavailable| unavailable.contains(*name))
+    })
+}
+
+pub(super) fn prepare(
+    root: &Value,
+    combos: &HashMap<String, Value>,
+    combo_ids: &HashMap<String, String>,
+    direct: &BTreeMap<String, Value>,
+    order: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    unavailable_combos: Option<&HashSet<String>>,
+) -> (
+    BTreeMap<String, String>,
+    HashMap<String, Value>,
+    HashSet<String>,
+) {
+    let official_replacements = unavailable_combos.is_some();
+    let mut aliases = alias_map(root, warnings);
+    let mappings = sorted_mappings(root);
     let mut names: BTreeSet<_> = aliases.keys().cloned().collect();
     names.extend(direct.keys().cloned());
+    if official_replacements {
+        names.extend(
+            combos
+                .keys()
+                .filter(|name| name.starts_with("openrouter/"))
+                .cloned(),
+        );
+    }
     for row in &mappings {
         let pattern = string(row, "pattern");
         if exact(pattern) {
@@ -89,21 +122,40 @@ pub(super) fn prepare(
     }
     let mut unavailable = HashSet::new();
     for name in names {
+        let mapping = mappings
+            .iter()
+            .find(|row| matches(string(row, "pattern"), &name));
+        let target = mapping
+            .and_then(|mapping| mapping_target(mapping, combos, combo_ids, unavailable_combos));
+        if official_replacements
+            && name.starts_with("openrouter/")
+            && mapping.is_some()
+            && target.is_none()
+        {
+            warnings.push(format!(
+                "alias {name}: target unavailable (winning mapping)"
+            ));
+            aliases.remove(&name);
+            unavailable.insert(name);
+            continue;
+        }
         if combos.contains_key(&name) {
             warnings.push(format!("alias {name}: collision; existing combo wins"));
             aliases.remove(&name);
             continue;
         }
-        if let Some(mapping) = mappings
-            .iter()
-            .find(|row| matches(string(row, "pattern"), &name))
-        {
-            let target = combo_ids.get(string(mapping, "comboId")).filter(|name| {
-                combos
-                    .get(*name)
-                    .is_some_and(|combo| combo["isActive"] != false)
-            });
+        if mapping.is_some() {
             if let Some(target) = target {
+                if official_replacements && name.starts_with("openrouter/") {
+                    aliases.remove(&name);
+                    if super::replacements::find(&name["openrouter/".len()..]).is_none() {
+                        unavailable.insert(name.clone());
+                    }
+                    warnings.push(format!(
+                        "alias {name}: source mapping replaced by reviewed official-only policy"
+                    ));
+                    continue;
+                }
                 aliases.insert(name, target.clone());
             } else {
                 warnings.push(format!(
@@ -112,6 +164,11 @@ pub(super) fn prepare(
                 aliases.remove(&name);
                 unavailable.insert(name);
             }
+        } else if official_replacements && name.starts_with("openrouter/") {
+            aliases.remove(&name);
+            warnings.push(format!(
+                "alias {name}: source alias replaced by reviewed official-only policy"
+            ));
         }
     }
     let mut resolved = BTreeMap::new();
@@ -171,7 +228,7 @@ pub(super) fn prepare(
         );
         order.push(terminal);
     }
-    (resolved, synthetic)
+    (resolved, synthetic, unavailable)
 }
 
 pub(super) fn attach(

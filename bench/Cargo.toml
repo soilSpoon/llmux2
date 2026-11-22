@@ -1,0 +1,23 @@
+[package]
+name = "llmux-bench"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+tokio.workspace = true
+hyper = { workspace = true, features = ["server"] }
+hyper-util.workspace = true
+hyper-rustls = { workspace = true, features = ["native-tokio"] }
+url.workspace = true
+time.workspace = true
+http-body-util.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+llmux-config.workspace = true
+llmux-server = { path = "../crates/llmux-server" }
+llmux-testkit.workspace = true

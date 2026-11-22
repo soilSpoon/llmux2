@@ -20,7 +20,7 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
 
 For Chat Completions on OpenAI-compatible upstreams, the gateway rewrites only the top-level request model. Other request fields and successful response payloads pass through.
 
-Use authenticated `GET /v1/models` to list configured model names and aliases, not upstream deployment names or the full CheaperInference catalog. An optional catch-all accepts additional IDs but is not listed.
+Use authenticated `GET /v1/models` to list configured model names and aliases, not upstream deployment names or the full CheaperInference catalog. An optional catch-all accepts additional IDs but is not listed. A `devin_acp` name is omitted only after `devin models` has loaded and every deployment of that name is `devin_acp` with an upstream id missing from that catalog. The refresh runs at most once a minute, a failure keeps the last successful catalog (or the full configured list if none has loaded), and chat requests do not wait on it. Ids the CLI reports but the config does not name are not added; a new public name still requires import or a config reload.
 
 ```sh
 curl -sS http://127.0.0.1:8080/v1/responses \
@@ -34,6 +34,20 @@ The Responses route translates requests to Chat Completions on OpenAI-compatible
 llmux2 accepts and discards the CheaperInference routing fields `min_discount_percent`, `zdr`, and `ranking`. These fields do not impose a price ceiling, guarantee zero data retention, or change how llmux2 ranks deployments. Enforce any retention requirements in your provider configuration.
 
 Credentials use `provider = "openai"` or `"openai_compat"` for OpenAI-compatible upstreams, or `provider = "anthropic"` for the Anthropic Messages API. Anthropic deployments use a base URL such as `https://api.anthropic.com/v1` (the adapter appends `/messages`) and send the key as `x-api-key`. The gateway converts chat requests, JSON responses and SSE chunks between the OpenAI Chat and Anthropic formats, so a model can mix both kinds of deployments and fail over between them.
+
+Use `POST /v1/messages` for Anthropic Messages JSON and SSE on Anthropic deployments. Authenticate with a gateway client key in `x-api-key` or `Authorization: Bearer`.
+
+Deployments may set `headers = { "X-Custom" = "literal value", "X-Secret" = "file:/private/header" }`.
+Values can be literal or `env:`/`file:` references resolved at configuration load
+time (terminal CR/LF from reference files is trimmed). Use references for secrets.
+Headers apply on every upstream attempt, are marked sensitive, and are not logged.
+Invalid names/values, duplicate case-insensitive names, hop-by-hop/framing headers
+(`Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`, `TE`,
+`Trailer`, `Upgrade`, `Proxy-Connection`, `HTTP2-Settings`), and proxy authentication headers are rejected.
+`Authorization` and the adapter credential header (`x-api-key` for Anthropic)
+cannot be overridden on credentialed deployments. Explicit `auth = "none"`
+deployments may supply their own Authorization instead. Existing configs are
+unchanged; remove `headers` to roll back custom headers.
 
 Chat requests converted to Anthropic return one choice even when `n` asks for more. For converted Anthropic Chat streams, set `stream_options.include_usage` to `true` for a separate usage chunk just before `[DONE]`, or `false` to omit usage. Without this option, usage remains on the finish chunk. Reported cache reads appear in `usage.prompt_tokens_details.cached_tokens` and cache writes in `usage.cache_creation_input_tokens`.
 
@@ -68,6 +82,12 @@ probe; only a successful HTTP 200 sends WATCHDOG=1. See the
 migration and rollback instructions, including the host's TCP queue migration
 sysctl.
 
+Deployment uses standalone `llmux2-deploy` and `llmux2-guard` binaries from the
+non-default `llmux2-ops` workspace package. Build them with
+`cargo build --locked --release -p llmux-server -p llmux2-ops`; production hosts
+need neither Python nor Cargo. Installed binary paths and systemd units are
+unchanged; see the guide above for installation commands.
+
 ## Live dashboard
 
 Add `dashboard_key = "env:LLMUX_DASHBOARD_KEY"` to `[server]`, set that
@@ -86,22 +106,120 @@ over appears as a failed attempt, not a gateway 429. Gateway counts cover
 authorized requests to the chat and Responses endpoints. They count
 responses when ready, not when downstream transfer finishes.
 
+Mark a deployment with optional `fallback = true` (default false) to report
+cutover traffic; this flag never changes routing. Catch-all deployments are
+always fallback, even if explicitly set false. The OmniRoute importer marks
+its generated fallback legs automatically.
+
+`/dashboard/stats` adds a boolean `fallback` per deployment and a top-level
+`fallback` summary (`routed`, `total_routed`, and `share`, a fraction from 0 to 1).
+It uses the existing `routed` counter: an upstream response was obtained, or
+the first stream event was ready. Failed attempts are excluded; later stream
+errors do not undo a routed request. Empty traffic has share zero.
+The UI shows this share and the ten most-used retained catch-all model IDs.
+`catch_all.models` retains the first 256 distinct requested IDs up to 256 UTF-8
+bytes each; additional or longer IDs count in `catch_all.other`. Counts are
+case-sensitive and contain model IDs only, never prompts or authentication
+headers. Model IDs themselves are user-supplied; do not embed secrets in them.
+All counters reset on restart. Remove explicit flags to roll back reporting
+labels; catch-all traffic remains classified as fallback.
+
 Metrics stay in memory on each instance and reset on restart. The chart
 starts collecting when opened; it polls every two seconds. The dashboard
 does not collect prompts, responses, upstream URLs or credential values
 in its stats. Omit `dashboard_key` to disable the routes and collection.
 
+## Operating the gateway: API, CLI and MCP
+
+With `dashboard_key` set, the same key also unlocks an HTTP admin API under
+`/admin`: `GET /admin/status`, `GET /admin/deployments`, `GET /admin/models`,
+`GET /admin/credentials`, `POST /admin/credentials/{id}/disabled`
+(`{"disabled": true}` stops routing through every deployment that draws on
+the credential; `false` resumes), and `POST /admin/reload`, which re-reads
+the config file and atomically swaps routing. A rejected reload keeps the
+running configuration; changes to `server.listen`, `server.shutdown_timeout`
+and `server.drain_grace` only apply on restart and are reported in the
+response's `warnings`. Rotating or removing `dashboard_key` revokes the old
+key immediately. No response ever contains secret material.
+
+The `llmux` CLI is a thin client of that API — one subcommand per endpoint:
+
+```sh
+export LLMUX_ADMIN_URL=http://127.0.0.1:8080
+export LLMUX_ADMIN_KEY=...   # the dashboard key
+llmux status                 # uptime, version, response counters
+llmux deployments            # deployments with live routing stats
+llmux models                 # canonical models and their deployment order
+llmux credentials            # kind, provider, disabled flag, quota
+llmux disable spare-key      # stop routing through a credential
+llmux enable spare-key       # resume it
+llmux reload                 # hot-reload the config file
+```
+
+`llmux-mcp` serves the same operations over stdio as MCP tools
+(`llmux_status`, `llmux_deployments`, `llmux_credentials`, `llmux_models`,
+`llmux_set_disabled`, `llmux_reload`) for agents and editors, reading the
+same two environment variables:
+
+```json
+{ "command": "llmux-mcp",
+  "env": { "LLMUX_ADMIN_URL": "http://127.0.0.1:8080",
+           "LLMUX_ADMIN_KEY": "..." } }
+```
+
 ## Routing
 
-Lower numeric priority wins, with round-robin ordering among equal priorities. On an upstream HTTP 429, the gateway tries the next deployment and skips the limited deployment until its `Retry-After` (seconds or HTTP date) expires. Missing values use the configured default, doubled for each consecutive 429 from that deployment until it serves a request again, and waits are capped by `cooldown.max_ms`. A 429 or quota error that arrives after a stream has started cannot be retried, but it still cools the deployment down for later requests. A response whose rate-limit headers report zero remaining requests or tokens also skips that deployment until the reported reset. After a 429 or quota cooldown ends, the deployment takes one request at a time until one succeeds, and other requests fall back meanwhile, so a still-limited provider is not hit by every queued request at once. If none can serve the request, the gateway returns 429 with the earliest known retry delay. Optional local per-deployment request (`quota.rpm`, `quota.rpd`), estimated-token (`quota.tpm`, `quota.tpd`) and concurrency limits also skip deployments without contacting them. Deployments under different models that share the same provider, credential, base URL, upstream model and quota share one cooldown and one set of local limits, so a 429 on one model's route is not immediately retried through another model.
+Lower numeric priority wins, with round-robin ordering among equal priorities. On an upstream HTTP 429, the gateway tries the next deployment and skips the limited deployment until its `Retry-After` (seconds or HTTP date) expires. Missing values use the configured default, doubled for each consecutive 429 from that deployment until it serves a request again, and waits are capped by `cooldown.max_ms`. A 429 or quota error that arrives after a stream has started cannot be retried, but it still cools the deployment down for later requests. A response whose rate-limit headers report zero remaining requests or tokens also skips that deployment until the reported reset. After a 429 or quota cooldown ends, the deployment takes one request at a time until one succeeds, and other requests fall back meanwhile, so a still-limited provider is not hit by every queued request at once. A quota-exhausted error (402, insufficient credits, daily allocation used up) cools every deployment on the same credential, since credits and daily allowances belong to the key, not the model. If none can serve the request, the gateway returns 429 with the earliest known retry delay. Optional local per-deployment request (`quota.rpm`, `quota.rpd`), estimated-token (`quota.tpm`, `quota.tpd`) and concurrency limits also skip deployments without contacting them. Deployments under different models that share the same provider, credential, base URL, upstream model and quota share one cooldown and one set of local limits, so a 429 on one model's route is not immediately retried through another model.
+
+For time-limited offers (a provider's temporary free promotion), set `expires_at` on the deployment as an RFC 3339 timestamp, e.g. `expires_at = 2026-11-22T00:00:00Z`. Once the time passes the deployment is permanently ineligible — skipped like a disabled one, without consuming an attempt or counting a failure — until the config changes. `/admin/deployments` reports `expires_at` and `expired` per deployment so an external tracker can watch promotions and edit the config (then `POST /admin/reload`) instead of the gateway needing a catalog feed. See the "Temporary free offers" section of `docs/free-providers.md`.
 
 Each deployment may set `max_context` (prompt plus completion tokens), defaulting to the model's `capabilities.max_context`. Before routing, the gateway estimates prompt tokens (about 4 bytes of prompt text per token, ignoring base64 `data:` URLs) plus the requested output limit (`max_output_tokens` for Responses, `max_completion_tokens` else `max_tokens` for Chat), and skips deployments of that model that it would not fit. It never falls back to a different model: if no deployment fits, it returns 400 `context_length_exceeded`, naming the limit, without contacting upstream.
 
 Rejecting is the default. To trim instead, set `context_overflow = "middle-out"` on a model, or send `x-llmux-context-overflow: middle-out` (or `reject`) per request. The gateway then drops messages (Responses `input` items) from the middle of the conversation until the request fits the largest window. It keeps system and developer messages and the latest message, and drops tool results together with the call before them. The response carries `x-llmux-dropped-messages: <n>`, so a trim is never silent. If dropping every middle message still doesn't fit, the request gets the same 400.
 
-`x-llmux-deployment` and `x-llmux-attempts` identify the winning deployment and number of HTTP attempts (not skipped deployments). Set `server.expose_routing_headers = false` to hide them. A stream commits on its first complete SSE event; after that, failures end the stream with an error payload rather than replaying the request.
+`x-llmux-deployment` and `x-llmux-attempts` identify the winning deployment and number of HTTP attempts (not skipped deployments). Set `server.expose_routing_headers = false` to hide them. A stream commits on the first SSE event that carries content, a tool call, a finish reason, or usage, or on `[DONE]`. OpenAI-compat keepalive chunks (`choices: []` with none of those) do not commit and are dropped until then; after commit they are forwarded. An error frame before commit is classified like a non-stream embedded error and can fail over. After commit, failures end the stream with an error payload rather than replaying the request.
+
+### End-user attribution
+
+Off unless `[server] end_user_header` is set. When the inbound request carries that header, the gateway hashes it and sends the hash as Anthropic `metadata.user_id` and, on `openai` / `openai_compat` deployments, as the Chat Completions `user` field. A client-supplied value is overridden. The raw header is not logged, not copied upstream, and not returned. The response header `x-llmux-end-user` is the hash only, including on gateway errors after the hash is computed, whether or not routing headers are exposed.
+
+The hash is lowercase hex SHA-256 of the UTF-8 salt bytes immediately followed by the UTF-8 identifier, with no separator. `end_user_salt` is required when the header is set and must be a nonempty `env:` or `file:` secret (a literal or an empty resolved value is rejected). An empty or whitespace-only header falls through. If the header is absent and `end_user_from_body` is true (the default when the header is set), the OpenAI top-level `user` string is hashed the same way. Set `end_user_from_body = false` to ignore the body field. Deployments that reject `user` keep doing so: `strip_request_fields = ["user"]` still drops the field after the hash is applied. Providers that cannot strip unknown fields (`xai`, `openai_responses`, and the rest) do not receive a `user` field. With no hash, Anthropic still copies a client `user` into `metadata.user_id` as before.
+
+`end_user_header` must be a valid HTTP header name and cannot be `Authorization`, `Cookie`, `x-api-key`, or a hop-by-hop header. Remove `end_user_header` to roll back; older binaries reject the new keys, so remove them before rolling back.
+
+### Remote images
+
+`remote_images` is `allow` (default) or `reject`. `reject` answers 400 `{"error":{"message":"remote image URLs are not accepted; send a data: URL",...}}` before any upstream call when a chat, Messages, or Responses body contains an `http`/`https` `image_url` (object or string) or an Anthropic image source URL. Optional `max_image_bytes` rejects a `data:` image, or a native Anthropic base64 image, whose decoded payload exceeds the limit with 413. A non-positive limit is a config error. Unset means no size cap. Both checks run in one place on the inbound body, not in each adapter.
 
 Before a response is committed, the gateway can fail over on upstream server, connection, and timeout errors within its attempt and time limits. Rate-limit and quota-exhaustion failover are controlled by `routing.fallback_on` and enabled by default. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local request and token quotas use per-deployment sliding windows (one minute for `rpm`/`tpm`, one day for `rpd`/`tpd`) only when configured. Token quotas count the same prompt-plus-output estimate used for context fitting, and a single request larger than a token quota is still admitted when that window is empty. A credential may also set `quota` (`rpm`, `rpd`, `tpm`, `tpd`) for providers that limit per key or project across models; those windows are shared by every deployment that uses the credential.
+
+### Strict OpenAI-compatible upstreams
+
+Some deployments reject optional Chat Completions fields. Set
+`strip_request_fields` on the affected `openai` or `openai_compat` deployment,
+listing only the fields that upstream rejects. For example, on the strict
+DeepSeek route:
+
+```toml
+strip_request_fields = ["seed", "user", "safety_identifier", "reasoning.effort", "logprobs", "top_logprobs"]
+```
+
+The gateway omits these fields from the upstream request in both JSON and SSE
+mode; it does not emulate their behavior. `reasoning.effort` removes only that
+member and drops the enclosing `reasoning` object if it becomes empty. It does
+not remove the separate top-level `reasoning_effort`. Other deployments are
+unchanged. Remove the setting to restore passthrough.
+
+### Anthropic models that reject sampling parameters
+
+Claude 5 models, Fable 5 and Opus 4.8 answer 400 `` `temperature` is deprecated
+for this model`` unless the value is the default. Set
+`strip_request_fields = ["temperature", "top_p"]` (`top_k` is also accepted) on
+the `anthropic` deployment to omit them from both `/v1/chat/completions` and
+`/v1/messages` requests; `llmux-import` does this for those models. Without the
+setting the gateway also heals itself: on that exact 400 it drops the named
+field and resends once to the same deployment (logging the field), so the served
+model never changes.
 
 ### Catch-all route for cutover
 
@@ -273,7 +391,7 @@ are omitted, so they do not constrain upstream generation. Stateful conversation
 references, explicit Responses system items, and unsupported hosted tools are
 rejected with 400. An incomplete, failed, or interrupted stream is not successful;
 after SSE commitment errors terminate the stream without replaying the request.
-Anthropic inbound is not supported by this adapter.
+Anthropic Messages requests can also be converted through this adapter, with the same model key restrictions and Codex limitations as Chat Completions.
 
 ## xAI OAuth (api.x.ai)
 
@@ -311,6 +429,46 @@ Do not run login concurrently with a gateway using the same rotating token file.
 Unlike Codex, an xAI credential needs no `allowed_keys` restriction unless
 your own policy wants one.
 
+## Nous Portal (subscription login)
+
+Nous Portal runs on the owner's subscription through the same OAuth device-code
+flow Hermes Agent uses, so no API key is created. On a machine with no browser:
+
+```sh
+cargo run -p llmux-login -- nous --dir ~/.config/llmux/nous
+```
+
+It prints a verification URL and a user code, polls until you approve in any
+browser, and writes `~/.config/llmux/nous/state.json` with mode 0600 (directory
+0700). The state holds the rotating refresh token and the short-lived access
+token, which is the bearer for `https://inference-api.nousresearch.com/v1`.
+Treat it as a secret, never commit it, and do not run login while a gateway
+uses the same file: Nous refresh tokens are single use.
+
+```toml
+[[credentials]]
+id = "nous"
+kind = "nous_portal"
+provider = "openai_compat"
+state_file = "/absolute/path/to/.config/llmux/nous/state.json"
+
+[[models]]
+name = "nous/tencent/hy4-flash:free"
+
+[[models.deployments]]
+id = "nous-hy4-flash-free"
+credential = "nous"
+base_url = "https://inference-api.nousresearch.com/v1"
+upstream_model = "tencent/hy4-flash:free"
+```
+
+Startup fails with a message naming `llmux-login nous` when `state_file` is
+missing or unreadable. The gateway refreshes ahead of expiry and once on a 401.
+Nous models are separate `nous/<portal id>` models and never a leg of another
+vendor's combo. To import them, save `GET /v1/models` from the inference API and
+run `llmux-import ... --nous-state PATH --nous-models PATH`; free models
+(`:free` ids, or zero prompt and completion price) rank ahead of paid ones.
+
 ## Development
 
 ### Sign in with ChatGPT
@@ -346,17 +504,44 @@ node --test crates/llmux-server/tests/dashboard.cjs
 ```
 
 In CI, `coverage` runs the Rust unit and integration tests once with coverage
-instrumentation, while `check` runs Rust doctests, lint, and the dashboard and
-repository tooling tests. Use `cargo test --locked --workspace` to run all Rust
+instrumentation, including `llmux2-ops` deployment tests, while `check` runs Rust
+doctests, lint, and dashboard tests. Merge-gate tests also run in `coverage`.
+The `xtask` workspace member contains CI policy tools
+and repository-file checks; its tests run in `coverage`, not again in `check`.
+Use `cargo test --locked --workspace` to run all Rust
 tests locally without instrumentation.
+
+Run `cargo xtask pr-policy` with `PR_BODY`, `BASE_SHA`, and `HEAD_SHA` to check a
+PR description and its test evidence. Run `cargo xtask coverage-ratchet coverage.json`
+on an LLVM coverage JSON report to enforce `.github/coverage-floor`; optional
+`BASE_SHA` also prevents lowering the committed floor. Both commands exit 0 on
+success and 1 on failure. `xtask` is not a default workspace member and depends
+only on `serde_json`, not the gateway crates. New tools belong in separate modules
+behind subcommands of this one binary. Benchmarks live in the separate,
+non-default `llmux-bench` member; `cargo xtask bench` delegates to
+`cargo run --release --locked -p llmux-bench --` without adding gateway or
+benchmark dependencies to xtask.
+
+Run `cargo xtask merge-gate <n>` from a trusted, up-to-date main checkout for the
+read-only autonomous merge preflight. It uses the authenticated `gh api` CLI and
+the checked-in ruleset and merge policy; API errors, unknown mergeability,
+unfinished latest checks, and missing fresh independent evidence fail closed.
+Only a passing gate prints `Merge gate passed for PR #N at <sha>.` and exits 0.
+This command does not merge; follow AGENTS.md and pass that exact SHA to the merge
+command. Bootstrap changes to the gate require independent review before use.
+
+PR policy uses its own small `xtask` Rust dependency cache with default save
+behavior, so later PR body edits can reuse it without restoring the gateway's
+workspace and instrumented coverage artifacts. Coverage keeps its default Rust
+cache. The xtask binary itself is cheap to rebuild from cached dependencies.
 
 ## Live gateway comparison
 
-Run on the gateway host with Python 3.9+ (stdlib only), reference first, llmux second.
+Run on the gateway host with Cargo, reference first, llmux second.
 Keep keys server-side: use `file:/absolute/path` or `env:VARIABLE`, never literal keys.
 
 ```sh
-python3 bench/compare_gateways.py \
+cargo xtask bench compare-gateways \
   --gateway omniroute http://127.0.0.1:20128/v1 file:/private/omniroute-client.key \
   --gateway llmux http://127.0.0.1:8090/v1 file:/private/llmux-client.key \
   --coverage /private/coverage.json --top 25 --responses 2 \
@@ -377,15 +562,27 @@ Read `results.json` / `report.html` in a new private output directory; review be
 Learnings: API and dashboard ports differ—validate authenticated `/v1/models` first.
 Stored client keys may be encrypted; extract/decrypt readonly, server-side, into private files.
 Imported names can retain wrong upstream IDs or container-local URLs: import success ≠ usable routing.
-Run just the comparison harness tests with `python3 -m unittest bench.test_compare_gateways`.
-Check Python syntax with `python3 -m py_compile bench/compare_gateways.py bench/test_compare_gateways.py`.
+Run the comparison harness tests with `cargo test --locked -p llmux-bench compare_gateways`.
+
+## Live reliability scenarios
+
+Run `cargo xtask bench live-reliability --offline` against local fake providers,
+or pass `--config /private/llmux.toml` to exercise its real API-key providers.
+The release gateway must already be built (`cargo build --release --locked -p llmux-server`);
+`--binary PATH` selects another binary. Optional `--primary HOST`, `--fallback HOST`,
+and `--bad-key-hosts all|none|HOST,HOST` select targets. Each scenario starts a fresh
+gateway and injects faults through a loopback proxy. Keys stay in the source
+secret files; reports redact known secrets and bearer tokens. `--out DIRECTORY`
+(default `live-reliability`) writes `report.json` and `report.md`; failures or
+fewer than two healthy targets produce a nonzero exit status. Tests use only
+offline providers.
 
 ## Mock-upstream load benchmark
 
-On Linux with Python 3.10+, Cargo, and readable `/proc/<pid>/smaps_rollup`, run:
+On Linux with Cargo and readable `/proc/<pid>/smaps_rollup`, run:
 
 ```sh
-python3 bench/mock_upstream.py
+cargo xtask bench mock-upstream
 ```
 
 The command builds the release gateway and the `llmux-testkit` Axum mock, starts and stops them

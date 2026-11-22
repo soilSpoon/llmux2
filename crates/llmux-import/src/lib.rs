@@ -1,15 +1,25 @@
 //! Import OmniRoute JSON exports and SQLite table dumps into a static llmux configuration.
 
 mod aliases;
+mod bridge;
 mod connection;
+mod context;
 mod db_dump;
+mod devin;
 mod direct;
 mod fallback;
+mod morph;
+mod nous;
+mod policy;
+mod replacements;
+mod secondary;
 mod upstream;
 mod validation;
+mod xplabs;
 
 use llmux_types::provider::{
-    ANTHROPIC as KIND_ANTHROPIC, OPENAI as KIND_OPENAI, OPENAI_COMPAT as KIND_OPENAI_COMPAT,
+    ANTHROPIC as KIND_ANTHROPIC, DEVIN_ACP as KIND_DEVIN_ACP, OPENAI as KIND_OPENAI,
+    OPENAI_COMPAT as KIND_OPENAI_COMPAT, OPENAI_RESPONSES as KIND_OPENAI_RESPONSES,
 };
 use serde_json::{json, Value};
 use std::{
@@ -27,18 +37,38 @@ pub struct ImportReport {
     pub client_keys: usize,
 }
 
+#[derive(Default)]
+pub struct ImportOptions<'a> {
+    pub cloudflare_account_id_file: Option<&'a Path>,
+    pub cloudflare_token_file: Option<&'a Path>,
+    pub workers_ai_models: Option<&'a Path>,
+    pub kilo_free_models: Option<&'a Path>,
+    pub kilo_key_file: Option<&'a Path>,
+    pub openrouter_replacements: bool,
+    /// Saved `devin models` output; its `Free` rows rank ahead of Devin-plan models.
+    pub devin_models: Option<&'a Path>,
+    /// Nous Portal login state (`llmux-login nous`) and a saved `GET /v1/models`
+    /// listing; together they add `nous/<id>` models, free ones first.
+    pub nous_state: Option<&'a Path>,
+    pub nous_models: Option<&'a Path>,
+    pub omniroute_fallback: Option<OmniRouteFallback<'a>>,
+}
+
+#[derive(Clone, Copy)]
 pub struct OmniRouteFallback<'a> {
     pub base_url: &'a str,
     pub key: &'a str,
 }
 
 struct Connection {
+    headers: Value,
     source_id: String,
-    provider: String,
+    provider: upstream::ProviderIdentity,
     credential: Option<String>,
     kind: String,
     base_url: String,
     priority: i64,
+    policy: policy::ModelPolicy,
 }
 
 // OmniRoute registry/<id>/index.ts; Gemini uses Google's documented OpenAI compatibility API.
@@ -92,6 +122,164 @@ fn array<'a>(value: &'a Value, field: &str) -> &'a [Value] {
     value[field].as_array().map(Vec::as_slice).unwrap_or(&[])
 }
 
+fn deepseek_model(model: &str) -> bool {
+    let mut parts = model.rsplit('/');
+    let leaf = parts.next().unwrap_or_default();
+    !leaf.is_empty()
+        && ((leaf.len() > "deepseek-".len() && leaf.to_ascii_lowercase().starts_with("deepseek-"))
+            || parts.any(|part| {
+                part.eq_ignore_ascii_case("deepseek") || part.eq_ignore_ascii_case("deepseek-ai")
+            }))
+}
+
+/// Anthropic rejects `temperature` and `top_p` unless they equal 1 on the
+/// Claude 5 generation, Fable 5 and Opus 4.8.
+fn anthropic_rejects_sampling(model: &str) -> bool {
+    let leaf = model.rsplit('/').next().unwrap_or_default();
+    let normalized = leaf.to_ascii_lowercase().replace('.', "-");
+    let parts: Vec<_> = normalized.split('-').collect();
+    matches!(parts.as_slice(), ["claude", family, "5", ..] if family.chars().all(|c| c.is_ascii_alphabetic()))
+        || matches!(parts.as_slice(), ["claude", "opus", "4", "8", ..])
+}
+
+fn deployment_identity(
+    dep: &Value,
+) -> (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+) {
+    (
+        string(dep, "credential").to_owned(),
+        string(dep, "upstream_model").to_owned(),
+        string(dep, "base_url").to_owned(),
+        header_identity(&dep["headers"]),
+        identity_field(&dep["strip_request_fields"]),
+        identity_field(&dep["max_context"]),
+        identity_field(&dep["quota"]),
+        identity_field(&dep["timeout_ms"]),
+    )
+}
+
+fn identity_field(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Object(map) if map.is_empty() => String::new(),
+        Value::Array(items) if items.is_empty() => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn header_identity(headers: &Value) -> String {
+    let Some(map) = headers.as_object() else {
+        return String::new();
+    };
+    if map.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<_> = map
+        .iter()
+        .map(|(name, value)| format!("{name}={}", header_material(value.as_str().unwrap_or(""))))
+        .collect();
+    parts.sort();
+    parts.join("\n")
+}
+
+/// A `file:` header reference is compared by the file bytes when that file can
+/// be read at import time. If it cannot be read, the reference string itself
+/// is the identity, so two unreadable paths are not treated as the same header.
+fn header_material(reference: &str) -> String {
+    let Some(path) = reference.strip_prefix("file:") else {
+        return reference.to_owned();
+    };
+    if path.is_empty() {
+        return reference.to_owned();
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => reference.to_owned(),
+    }
+}
+
+fn fallback_leg(dep: &Value) -> bool {
+    dep["fallback"] == true || string(dep, "id").starts_with("omniroute-fallback")
+}
+
+fn dedupe_deployments(models: &mut [Value], ids: &mut HashSet<String>, warnings: &mut Vec<String>) {
+    for model in models.iter_mut() {
+        let name = string(model, "name").to_owned();
+        let Some(deployments) = model.get_mut("deployments").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let mut order: Vec<usize> = (0..deployments.len()).collect();
+        order.sort_by_key(|&index| (deployments[index]["priority"].as_i64().unwrap_or(0), index));
+        let mut seen = HashSet::new();
+        let mut keep = Vec::new();
+        for index in order {
+            if seen.insert(deployment_identity(&deployments[index])) {
+                keep.push(index);
+            }
+        }
+        let dropped = deployments.len() - keep.len();
+        if dropped == 0 {
+            continue;
+        }
+        let noun = if dropped == 1 {
+            "deployment"
+        } else {
+            "deployments"
+        };
+        warnings.push(format!("{name}: dropped {dropped} duplicate {noun}"));
+        *deployments = keep
+            .into_iter()
+            .map(|index| deployments[index].clone())
+            .collect();
+        renumber_deployments(deployments, &name, ids);
+    }
+}
+
+fn renumber_deployments(deployments: &mut [Value], name: &str, ids: &mut HashSet<String>) {
+    for dep in deployments.iter() {
+        if !fallback_leg(dep) {
+            ids.remove(string(dep, "id"));
+        }
+    }
+    let native_priorities: Vec<i64> = deployments
+        .iter()
+        .filter(|dep| !fallback_leg(dep))
+        .map(|dep| dep["priority"].as_i64().unwrap_or(0))
+        .collect();
+    let uniform = native_priorities.windows(2).all(|pair| pair[0] == pair[1]);
+    let shared = native_priorities.first().copied().unwrap_or(0);
+    let mut native_index = 0usize;
+    let mut sequential = 0i64;
+    let mut fallback_priority = if native_priorities.is_empty() {
+        0
+    } else if uniform {
+        shared + 1
+    } else {
+        i64::try_from(native_priorities.len()).unwrap_or(i64::MAX)
+    };
+    for dep in deployments.iter_mut() {
+        if fallback_leg(dep) {
+            dep["priority"] = json!(fallback_priority);
+            fallback_priority = fallback_priority.saturating_add(1);
+            continue;
+        }
+        dep["id"] = unique(&format!("{name}-{native_index}"), ids).into();
+        native_index += 1;
+        if !uniform {
+            dep["priority"] = json!(sequential);
+            sequential += 1;
+        }
+    }
+}
+
 fn unique(raw: &str, used: &mut HashSet<String>) -> String {
     let base: String = raw
         .chars()
@@ -111,6 +299,46 @@ fn unique(raw: &str, used: &mut HashSet<String>) -> String {
         n += 1;
     }
     name
+}
+
+fn connection_headers(
+    connection: &Value,
+    nodes: &[Value],
+    anonymous: bool,
+    kind: &str,
+) -> Result<HashMap<String, String>, &'static str> {
+    let metadata = upstream::metadata(connection)?;
+    let node = nodes
+        .iter()
+        .find(|node| string(node, "id") == string(connection, "provider"));
+    let raw = metadata
+        .get("customHeaders")
+        .filter(|v| !v.is_null())
+        .or_else(|| node.and_then(|node| node.get("customHeaders")));
+    let Some(raw) = raw.filter(|v| !v.is_null()) else {
+        return Ok(HashMap::new());
+    };
+    let parsed;
+    let raw = if let Some(text) = raw.as_str() {
+        parsed = serde_json::from_str::<Value>(text).map_err(|_| "invalid custom headers")?;
+        &parsed
+    } else {
+        raw
+    };
+    let raw = raw.as_object().ok_or("invalid custom headers")?;
+    let mut headers = HashMap::new();
+    for (name, value) in raw {
+        let value = value.as_str().ok_or("invalid custom headers")?;
+        llmux_config::validate_deployment_header(name, value, anonymous, kind)
+            .map_err(|_| "unsupported or forbidden custom headers")?;
+        if headers
+            .insert(name.to_ascii_lowercase(), value.to_owned())
+            .is_some()
+        {
+            return Err("duplicate custom headers");
+        }
+    }
+    Ok(headers)
 }
 
 fn valid_secret(secret: &str) -> bool {
@@ -179,12 +407,14 @@ fn write_secret(dir: &Path, id: &str, secret: &str) -> Result<String, String> {
 }
 
 struct Expander<'a> {
+    context: &'a mut context::Overrides,
     combos: &'a HashMap<String, Value>,
     connections: &'a [Connection],
     nodes: &'a [Value],
     warnings: &'a mut Vec<String>,
     remaining_steps: usize,
     exhausted: bool,
+    policy: &'a policy::Policy,
 }
 
 impl Expander<'_> {
@@ -262,19 +492,71 @@ impl Expander<'_> {
                 ));
                 continue;
             }
-            let candidates: Vec<_> = self
+            let native_antigravity = self.connections.iter().any(|connection| {
+                connection.provider.is_builtin("antigravity") && connection.kind == "antigravity"
+            });
+            let antigravity = p.is_builtin("antigravity")
+                && replacements::antigravity(model).is_some()
+                && !native_antigravity;
+            let bridge = self
+                .policy
+                .openrouter_replacements
+                .then(|| bridge::source(&p, self.nodes))
+                .flatten();
+            let redirected = antigravity || bridge.is_some();
+            let replacement = if antigravity {
+                if !pinned.is_empty() || !allowed.is_empty() {
+                    self.warnings.push(format!("combo {name} step {index}: reviewed Antigravity replacement uses eligible Gemini connections instead of source connection restrictions"));
+                }
+                replacements::antigravity(model)
+            } else if let Some(source) = bridge {
+                let Some(replacement) = bridge::find(source, model) else {
+                    self.warnings.push(format!("combo {name} step {index}: no reviewed bridge replacement for {source}/{model}"));
+                    continue;
+                };
+                if !pinned.is_empty() || !allowed.is_empty() {
+                    self.warnings.push(format!("combo {name} step {index}: reviewed bridge replacement uses eligible official connections instead of source connection restrictions"));
+                }
+                Some(replacement)
+            } else if p.is_builtin("openrouter") && self.policy.openrouter_replacements {
+                let replacement = replacements::find(model);
+                if replacement.is_none() || !pinned.is_empty() || !allowed.is_empty() {
+                    self.warnings.push(format!("combo {name} step {index}: no verified connected OpenRouter replacement (or source connection restriction)"));
+                    continue;
+                }
+                replacement
+            } else {
+                None
+            };
+            let mut candidates: Vec<_> = self
                 .connections
                 .iter()
                 .filter(|c| {
-                    c.provider == p
-                        && if !pinned.is_empty() {
-                            c.source_id == pinned
+                    replacement.map_or(c.provider == p, |r| {
+                        if antigravity {
+                            replacements::antigravity_connection(r, c)
+                        } else if bridge.is_some() {
+                            bridge::matches(r, c)
                         } else {
-                            allowed.is_empty()
-                                || allowed.iter().any(|id| id.as_str() == Some(&c.source_id))
+                            replacements::matches(r, c)
                         }
+                    }) && if redirected {
+                        true
+                    } else if !pinned.is_empty() {
+                        c.source_id == pinned
+                    } else {
+                        allowed.is_empty()
+                            || allowed.iter().any(|id| id.as_str() == Some(&c.source_id))
+                    }
                 })
                 .collect();
+            if replacement.is_some() {
+                let mut seen = HashSet::new();
+                candidates.retain(|c| seen.insert((&c.base_url, &c.credential)));
+                if model.contains(":batch") {
+                    self.warnings.push(format!("combo {name} step {index}: synchronous same-model replacement does not preserve batch scheduling or discounts"));
+                }
+            }
             if candidates.is_empty() {
                 self.warnings.push(format!("combo {name} step {index}: skipped provider {p}: no eligible imported connection"));
             }
@@ -286,7 +568,11 @@ impl Expander<'_> {
             if !pinned.is_empty() && !allowed.is_empty() {
                 self.warnings.push(format!("combo {name} step {index}: connectionId takes precedence over allowedConnectionIds"));
             }
-            for id in allowed.iter().filter_map(Value::as_str) {
+            for id in allowed
+                .iter()
+                .filter(|_| !redirected)
+                .filter_map(Value::as_str)
+            {
                 if !self
                     .connections
                     .iter()
@@ -301,7 +587,31 @@ impl Expander<'_> {
                 self.warnings.push(format!("combo {name} step {index}: truncated connections at 10000-deployment safety limit"));
             }
             for c in candidates.into_iter().take(10_000 - out.len()) {
+                let target = replacement.map_or(model, |r| r.2);
+                let model = match self.policy.model(c.policy, target) {
+                    Ok(model) => model,
+                    Err(reason) => {
+                        self.warnings
+                            .push(format!("combo {name} step {index}: skipped {reason}"));
+                        continue;
+                    }
+                };
                 let mut deployment = json!({"base_url":c.base_url,"upstream_model":model});
+                if bridge.is_some() {
+                    deployment["_bridge_replacement"] = true.into();
+                }
+                if let Some(limit) = self.context.limit(&c.provider, &model) {
+                    deployment["max_context"] = limit.into();
+                }
+                if c.headers
+                    .as_object()
+                    .is_some_and(|headers| !headers.is_empty())
+                {
+                    deployment["headers"] = c.headers.clone();
+                }
+                if c.policy == policy::ModelPolicy::Workers {
+                    deployment["quota"] = json!({"rpm":1});
+                }
                 if let Some(credential) = &c.credential {
                     deployment["credential"] = credential.clone().into();
                 } else {
@@ -322,7 +632,7 @@ pub fn import(
     output: &Path,
     secrets_dir: Option<&Path>,
 ) -> Result<ImportReport, String> {
-    import_with_fallback(input, output, secrets_dir, None)
+    import_with_options(input, output, secrets_dir, &ImportOptions::default())
 }
 
 pub fn import_with_fallback(
@@ -331,6 +641,30 @@ pub fn import_with_fallback(
     secrets_dir: Option<&Path>,
     fallback: Option<OmniRouteFallback<'_>>,
 ) -> Result<ImportReport, String> {
+    import_with_options(
+        input,
+        output,
+        secrets_dir,
+        &ImportOptions {
+            omniroute_fallback: fallback,
+            ..Default::default()
+        },
+    )
+}
+
+pub fn import_with_options(
+    input: &str,
+    output: &Path,
+    secrets_dir: Option<&Path>,
+    options: &ImportOptions<'_>,
+) -> Result<ImportReport, String> {
+    let policy = policy::Policy::load(options)?;
+    let nous = match (options.nous_state, options.nous_models) {
+        (None, None) => None,
+        (Some(state), Some(models)) => Some(nous::Nous::load(state, models)?),
+        _ => return Err("--nous-state and --nous-models must be provided together".into()),
+    };
+    let fallback = options.omniroute_fallback;
     if let Some(options) = &fallback {
         if !["env:", "file:"].iter().any(|prefix| {
             options
@@ -397,33 +731,132 @@ pub fn import_with_fallback(
     let mut credentials = Vec::new();
     let mut connections = Vec::new();
     let mut source_ids = HashSet::new();
+    let workers_credential = policy.workers.as_ref().map(|workers| {
+        let id = unique("workers-ai", &mut ids);
+        credentials.push(json!({"id":id,"kind":"api_key","provider":"openai_compat","key":workers.reference}));
+        warnings.push("Workers AI uses rpm=1 per deployment, NOT an account-wide neuron/daily spending cap; enforce free-only billing at Cloudflare".into());
+        connections.push(Connection {headers:json!({}),source_id:"workers-ai-opt-in".into(),provider:upstream::ProviderIdentity::Builtin("workers-ai".into()),credential:Some(id.clone()),kind:"openai_compat".into(),base_url:workers.base_url.clone(),priority:i64::MAX,policy:policy::ModelPolicy::Workers});
+        id
+    });
     for (index, c) in array(&root, "providerConnections").iter().enumerate() {
         let label = format!("connection {index} ({})", string(c, "id"));
-        let auth = match connection::select_auth(c, array(&root, "providerNodes")) {
+        let identity = connection::identity(c, array(&root, "providerNodes"));
+        if let Some(reason) = devin::excluded(identity) {
+            warnings.push(format!("{label}: skipped {reason}"));
+            continue;
+        }
+        if policy.openrouter_replacements && identity == "openrouter" {
+            warnings.push(format!(
+                "{label}: skipped OpenRouter; only verified connected replacements enabled"
+            ));
+            continue;
+        }
+        let auth = match connection::select_auth(
+            c,
+            array(&root, "providerNodes"),
+            policy.workers.is_some(),
+        ) {
             Ok(key) => key,
             Err(reason) => {
                 warnings.push(format!("{label}: skipped {reason}"));
                 continue;
             }
         };
-        let (kind, base_url) = match upstream::resolve(c, array(&root, "providerNodes")) {
+        let (kind, base_url) = match if matches!(auth, connection::SelectedAuth::Workers) {
+            Ok((
+                "openai_compat".into(),
+                policy.workers.as_ref().unwrap().base_url.clone(),
+            ))
+        } else if let connection::SelectedAuth::Oauth(oauth) = &auth {
+            Ok((oauth.kind.to_owned(), oauth.base_url.to_owned()))
+        } else {
+            upstream::resolve(c, array(&root, "providerNodes"), &mut warnings)
+        } {
             Ok(provider) => provider,
             Err(reason) => {
                 warnings.push(format!("{label}: skipped {reason}"));
                 continue;
             }
         };
+        let headers = match connection_headers(
+            c,
+            array(&root, "providerNodes"),
+            matches!(auth, connection::SelectedAuth::None),
+            &kind,
+        ) {
+            Ok(headers) => headers,
+            Err(reason) => {
+                warnings.push(format!("{label}: skipped {reason}"));
+                continue;
+            }
+        };
+        let mut header_refs = serde_json::Map::new();
+        for (name, value) in headers {
+            let id = unique("upstream-header", &mut ids);
+            header_refs.insert(name, write_secret(&dir, &id, &value)?.into());
+        }
         let source_id = string(c, "id");
         if source_id.is_empty() || !source_ids.insert(source_id.to_owned()) {
             warnings.push(format!("{label}: skipped missing/duplicate connection id"));
             continue;
         }
+        let keyed = matches!(auth, connection::SelectedAuth::Key(_));
+        let workers_auth = matches!(auth, connection::SelectedAuth::Workers);
         let credential = match auth {
+            connection::SelectedAuth::Workers => workers_credential.clone(),
             connection::SelectedAuth::Key(value) => {
+                if policy::kilo(identity) && policy.kilo_free.is_none() {
+                    warnings.push(format!(
+                        "{label}: keyed Kilo requires --kilo-free-models; skipped to avoid cost"
+                    ));
+                    continue;
+                }
                 let id = unique(&format!("upstream-{source_id}"), &mut ids);
                 let key = write_secret(&dir, &id, value)?;
                 credentials.push(json!({"id":id,"kind":"api_key","provider":kind,"key":key}));
                 Some(id)
+            }
+            connection::SelectedAuth::Oauth(oauth) => {
+                let id = unique(&format!("upstream-{source_id}"), &mut ids);
+                let refresh = write_secret(&dir, &id, &oauth.refresh)?;
+                let mut credential = json!({
+                    "id": id,
+                    "kind": "oauth",
+                    "provider": kind,
+                    "token_url": oauth.token_url,
+                    "client_id": oauth.client_id,
+                    "refresh_token": refresh,
+                });
+                if let Some(secret) = &oauth.client_secret {
+                    let secret_id = unique(&format!("{id}-secret"), &mut ids);
+                    credential["client_secret"] = write_secret(&dir, &secret_id, secret)?.into();
+                }
+                if let Some(scopes) = &oauth.scopes {
+                    credential["scopes"] = json!(scopes);
+                }
+                credentials.push(credential);
+                if kind == "openai_responses" {
+                    header_refs.insert("originator".into(), "codex_cli_rs".into());
+                    header_refs.insert("version".into(), "0.165.0".into());
+                    header_refs.insert(
+                        "user-agent".into(),
+                        "codex-cli/0.165.0 (Linux; x86_64)".into(),
+                    );
+                    header_refs.insert("origin".into(), "https://chatgpt.com".into());
+                    if let Some(workspace) = &oauth.workspace {
+                        header_refs.insert("chatgpt-account-id".into(), workspace.clone().into());
+                    }
+                }
+                if kind == "antigravity" {
+                    if let Some(project) = &oauth.project {
+                        header_refs.insert("x-llmux-project".into(), project.clone().into());
+                    }
+                }
+                Some(id)
+            }
+            connection::SelectedAuth::None if kind == KIND_DEVIN_ACP => {
+                warnings.push(format!("{label}: Devin CLI bridge uses the host's own devin credentials; none imported"));
+                None
             }
             connection::SelectedAuth::None => {
                 if kind != KIND_OPENAI_COMPAT {
@@ -442,12 +875,23 @@ pub fn import_with_fallback(
             }
         };
         connections.push(Connection {
+            headers: Value::Object(header_refs),
             source_id: source_id.into(),
-            provider: string(c, "provider").into(),
+            provider: upstream::ProviderIdentity::connection(
+                string(c, "provider"),
+                array(&root, "providerNodes"),
+            ),
             credential,
             kind,
             base_url,
             priority: c["priority"].as_i64().unwrap_or(0),
+            policy: if workers_auth {
+                policy::ModelPolicy::Workers
+            } else if policy::kilo(identity) && keyed {
+                policy::ModelPolicy::KiloFree
+            } else {
+                policy::ModelPolicy::Any
+            },
         });
         if c.get("globalPriority").is_some()
             || c.get("maxConcurrent").is_some()
@@ -456,6 +900,43 @@ pub fn import_with_fallback(
             warnings.push(format!(
                 "{label}: ignored global priority and account-level limits"
             ));
+        }
+    }
+    if let Some(reference) = &policy.kilo_key {
+        if policy.kilo_free.is_none() {
+            warnings.push(
+                "keyed Kilo requires --kilo-free-models; external key skipped to avoid cost".into(),
+            );
+        } else {
+            let id = unique("kilo-external", &mut ids);
+            credentials
+                .push(json!({"id":id,"kind":"api_key","provider":"openai_compat","key":reference}));
+            let mut providers: Vec<_> = connections
+                .iter()
+                .filter(|c| c.base_url == "https://ai-gateway.kilo.ai/api/v1")
+                .map(|c| c.provider.clone())
+                .collect();
+            providers.extend(
+                ["kilo", "kilocode"].map(|id| upstream::ProviderIdentity::Builtin(id.into())),
+            );
+            providers.sort();
+            providers.dedup();
+            let mut external_ids: HashSet<_> = array(&root, "providerConnections")
+                .iter()
+                .map(|c| string(c, "id").to_owned())
+                .collect();
+            for provider in providers {
+                connections.push(Connection {
+                    headers: json!({}),
+                    source_id: unique(&format!("kilo-external-{provider}"), &mut external_ids),
+                    provider,
+                    credential: Some(id.clone()),
+                    kind: "openai_compat".into(),
+                    base_url: "https://ai-gateway.kilo.ai/api/v1".into(),
+                    priority: i64::MAX,
+                    policy: policy::ModelPolicy::KiloFree,
+                });
+            }
         }
     }
     connections.sort_by_key(|c| c.priority);
@@ -499,19 +980,119 @@ pub fn import_with_fallback(
         }
         combos.insert(name, combo);
     }
+    let fallback_exclusions = fallback
+        .map(|_| {
+            let mut excluded = fallback::exclusions(&root, &combos, &combo_ids, "codex")?;
+            if policy.openrouter_replacements {
+                excluded.extend(fallback::exclusions(
+                    &root,
+                    &combos,
+                    &combo_ids,
+                    "openrouter",
+                )?);
+            }
+            Ok::<_, String>(excluded)
+        })
+        .transpose()?;
+    if policy.openrouter_replacements {
+        for name in &order {
+            if let Some(model) = name.strip_prefix("openrouter/") {
+                if let Some(combo) = combos.get_mut(name) {
+                    combo["models"] =
+                        json!([
+                            upstream::ProviderIdentity::Builtin("openrouter".into()).step(model)
+                        ]);
+                    warnings.push(format!(
+                        "combo {name}: source combo replaced by reviewed official-only policy"
+                    ));
+                }
+            }
+        }
+    }
     let nodes = array(&root, "providerNodes");
+    let mut context = context::Overrides::load(&root, &mut warnings);
     let mut direct = direct::collect(&combos, nodes, &connections);
-    let (aliases, mut synthetic) = aliases::prepare(
+    replacements::seed_antigravity(&mut direct, &connections);
+    if policy.openrouter_replacements {
+        replacements::seed(&mut direct, &connections);
+        bridge::seed(&mut direct, nodes, &connections);
+    }
+    let mut unavailable_combos = HashSet::new();
+    if policy.openrouter_replacements {
+        let mappings = aliases::sorted_mappings(&root);
+        let targets: HashSet<_> = mappings
+            .iter()
+            .filter_map(|row| combo_ids.get(string(row, "comboId")))
+            .collect();
+        loop {
+            unavailable_combos.clear();
+            for target in &targets {
+                let mut deployments = Vec::new();
+                Expander {
+                    context: &mut context,
+                    combos: &combos,
+                    connections: &connections,
+                    nodes,
+                    warnings: &mut Vec::new(),
+                    remaining_steps: 1024,
+                    exhausted: false,
+                    policy: &policy,
+                }
+                .expand(target, &mut Vec::new(), &mut deployments);
+                if deployments.is_empty() {
+                    unavailable_combos.insert((*target).clone());
+                }
+            }
+            let blocked: Vec<_> = combos
+                .iter()
+                .filter(|(name, combo)| {
+                    name.starts_with("openrouter/") && !array(combo, "models").is_empty()
+                })
+                .filter(|(name, _)| {
+                    mappings
+                        .iter()
+                        .find(|row| aliases::matches(string(row, "pattern"), name))
+                        .is_some_and(|mapping| {
+                            aliases::mapping_target(
+                                mapping,
+                                &combos,
+                                &combo_ids,
+                                Some(&unavailable_combos),
+                            )
+                            .is_none()
+                        })
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+            if blocked.is_empty() {
+                break;
+            }
+            for name in blocked {
+                if let Some(combo) = combos.get_mut(&name) {
+                    combo["models"] = json!([]);
+                }
+            }
+        }
+    }
+    let (aliases, mut synthetic, unavailable_aliases) = aliases::prepare(
         &root,
         &combos,
         &combo_ids,
         &direct,
         &mut order,
         &mut warnings,
+        policy
+            .openrouter_replacements
+            .then_some(&unavailable_combos),
     );
     direct.extend(direct::collect(&synthetic, nodes, &connections));
     for (name, model) in direct {
-        if combos.contains_key(&name) || direct::reserved(&root, &name) {
+        let official = policy.openrouter_replacements
+            && name
+                .strip_prefix("openrouter/")
+                .is_some_and(|model| replacements::find(model).is_some())
+            && !unavailable_aliases.contains(&name);
+        if combos.contains_key(&name) || (!official && direct::reserved(&root, &name)) {
             warnings.push(format!(
                 "direct {name}: collision; existing combo/alias wins"
             ));
@@ -523,8 +1104,8 @@ pub fn import_with_fallback(
         }
     }
     let mut models = Vec::new();
+    context.reset_usage();
     let mut deployment_ids = HashSet::new();
-    let mut deployment_count = 0;
     for name in order {
         let lookup = if synthetic.contains_key(&name) {
             &synthetic
@@ -543,14 +1124,76 @@ pub fn import_with_fallback(
         }
         let mut deployments = Vec::new();
         Expander {
+            context: &mut context,
             combos: lookup,
             connections: &connections,
             nodes: array(&root, "providerNodes"),
             warnings: &mut warnings,
             remaining_steps: 1024,
             exhausted: false,
+            policy: &policy,
         }
         .expand(&name, &mut Vec::new(), &mut deployments);
+        morph::order(&name, &mut deployments, &connections, nodes, &mut warnings);
+        if let Some(step) = combos
+            .contains_key(&name)
+            .then(|| {
+                xplabs::step(
+                    &name,
+                    strategy,
+                    &deployments,
+                    &connections,
+                    &root,
+                    &mut warnings,
+                )
+            })
+            .flatten()
+        {
+            let mut free = Vec::new();
+            let combo = HashMap::from([(name.clone(), json!({"models":[step]}))]);
+            Expander {
+                context: &mut context,
+                combos: &combo,
+                connections: &connections,
+                nodes,
+                warnings: &mut warnings,
+                remaining_steps: 1,
+                exhausted: false,
+                policy: &policy,
+            }
+            .expand(&name, &mut Vec::new(), &mut free);
+            xplabs::place(&name, &mut deployments, free, &connections, &mut warnings);
+        }
+        devin::free_first(&mut deployments, &connections, policy.devin_free.as_ref());
+        if combos.contains_key(&name) {
+            let steps = secondary::steps(
+                &name,
+                strategy,
+                &deployments,
+                &connections,
+                &root,
+                &mut warnings,
+            );
+            if !steps.is_empty() {
+                let extra = HashMap::from([(name.clone(), json!({"models":steps}))]);
+                Expander {
+                    context: &mut context,
+                    combos: &extra,
+                    connections: &connections,
+                    nodes,
+                    warnings: &mut warnings,
+                    remaining_steps: 1024,
+                    exhausted: false,
+                    policy: &policy,
+                }
+                .expand(&name, &mut Vec::new(), &mut deployments);
+            }
+        }
+        for deployment in &mut deployments {
+            if let Some(fields) = deployment.as_object_mut() {
+                fields.remove("_bridge_replacement");
+            }
+        }
         if deployments.is_empty() {
             warnings.push(format!("combo {name}: skipped: no deployments"));
             continue;
@@ -559,16 +1202,16 @@ pub fn import_with_fallback(
             dep["id"] = unique(&format!("{name}-{i}"), &mut deployment_ids).into();
             dep["priority"] = if strategy == "round-robin" { 0 } else { i }.into();
         }
-        deployment_count += deployments.len();
         models.push(json!({"name":name,"aliases":[],"deployments":deployments}));
     }
     aliases::attach(&mut models, aliases, &mut warnings);
-    if let Some(options) = fallback {
-        let exclusions = fallback::exclusions(&root, &combos, &combo_ids)?;
+    context.report(&mut warnings);
+    if let (Some(options), Some(exclusions)) = (fallback, fallback_exclusions) {
         let credential = unique("omniroute-fallback", &mut ids);
         credentials.push(
             json!({"id":credential,"kind":"api_key","provider":"openai_compat","key":options.key}),
         );
+        let session_excluded = exclusions.clone();
         fallback::append(
             &mut models,
             &options,
@@ -576,12 +1219,79 @@ pub fn import_with_fallback(
             &mut deployment_ids,
             exclusions,
         )?;
-        deployment_count = models
-            .iter()
-            .map(|model| array(model, "deployments").len())
-            .sum();
+        fallback::ensure_session_models(
+            &mut models,
+            &fallback::session_names(&combos, nodes),
+            &options,
+            &credential,
+            &mut deployment_ids,
+            &session_excluded,
+        )?;
     }
+    if let Some(nous) = &nous {
+        let credential = unique("nous", &mut ids);
+        let taken: HashSet<String> = models
+            .iter()
+            .flat_map(|model| {
+                std::iter::once(string(model, "name")).chain(
+                    array(model, "aliases")
+                        .iter()
+                        .map(|alias| alias.as_str().unwrap_or("")),
+                )
+            })
+            .map(str::to_owned)
+            .collect();
+        let added = nous.models(&credential, &taken, &mut deployment_ids, &mut warnings);
+        if !added.is_empty() {
+            credentials.push(nous.credential(&credential));
+            models.extend(added);
+        }
+    }
+    let credential_providers: HashMap<_, _> = credentials
+        .iter()
+        .map(|credential| (string(credential, "id"), string(credential, "provider")))
+        .collect();
+    for model in &mut models {
+        if let Some(deployments) = model["deployments"].as_array_mut() {
+            for deployment in deployments {
+                let provider = credential_providers
+                    .get(string(deployment, "credential"))
+                    .copied()
+                    .unwrap_or_else(|| string(deployment, "provider"));
+                if matches!(provider, KIND_OPENAI | KIND_OPENAI_COMPAT) {
+                    if deepseek_model(string(deployment, "upstream_model")) {
+                        deployment["strip_request_fields"] =
+                            json!(["seed", "user", "safety_identifier", "reasoning.effort"]);
+                    } else if string(deployment, "base_url")
+                        .parse::<http::Uri>()
+                        .is_ok_and(|url| {
+                            url.host().is_some_and(|host| {
+                                host.eq_ignore_ascii_case("generativelanguage.googleapis.com")
+                            })
+                        })
+                    {
+                        deployment["strip_request_fields"] = json!(["seed", "user"]);
+                    }
+                } else if provider == KIND_ANTHROPIC
+                    && anthropic_rejects_sampling(string(deployment, "upstream_model"))
+                {
+                    deployment["strip_request_fields"] = json!(["temperature", "top_p"]);
+                }
+            }
+        }
+    }
+    dedupe_deployments(&mut models, &mut deployment_ids, &mut warnings);
+    let deployment_count: usize = models
+        .iter()
+        .map(|model| array(model, "deployments").len())
+        .sum();
     if models.is_empty() {
+        if warnings
+            .iter()
+            .any(|warning| warning.contains("--omniroute-fallback"))
+        {
+            return Err("no importable models; pass --omniroute-fallback and --omniroute-key to keep serving DuckDuckGo and Cloudflare Playground through OmniRoute".into());
+        }
         return Err("no importable models; no configuration written".into());
     }
     let mut client_keys = Vec::new();
@@ -606,8 +1316,31 @@ pub fn import_with_fallback(
             "no active client keys; set LLMUX_CLIENT_KEY before starting llmux-server".into(),
         );
     }
+    let owner_oauth: HashSet<String> = credentials
+        .iter()
+        .filter(|credential| {
+            string(credential, "kind") == "oauth"
+                && string(credential, "provider") == KIND_OPENAI_RESPONSES
+        })
+        .map(|credential| string(credential, "id").to_owned())
+        .collect();
+    if !owner_oauth.is_empty() {
+        for model in &mut models {
+            if array(model, "deployments")
+                .iter()
+                .any(|deployment| owner_oauth.contains(string(deployment, "credential")))
+            {
+                model["allowed_keys"] = json!(client_keys);
+            }
+        }
+    }
     let config = json!({"server":{"listen":"127.0.0.1:8080","client_keys":client_keys},"credentials":credentials,"models":models});
-    validation::validate(&config, client_count == 0, &dir)?;
+    validation::validate(
+        &config,
+        client_count == 0,
+        &dir,
+        &policy.external_references(),
+    )?;
     let value = toml::Value::try_from(&config).map_err(|_| "could not encode configuration")?;
     let content = toml::to_string_pretty(&value).map_err(|_| "could not encode configuration")?;
     let mut file = OpenOptions::new()
@@ -624,4 +1357,106 @@ pub fn import_with_fallback(
         credentials: credentials.len(),
         client_keys: client_count,
     })
+}
+
+#[cfg(test)]
+mod dedupe_tests {
+    use super::*;
+
+    fn run(models: &mut [Value]) -> Vec<String> {
+        let mut ids = models
+            .iter()
+            .flat_map(|model| array(model, "deployments").iter())
+            .map(|dep| string(dep, "id").to_owned())
+            .collect();
+        let mut warnings = Vec::new();
+        dedupe_deployments(models, &mut ids, &mut warnings);
+        warnings
+    }
+
+    #[test]
+    fn headers_and_strip_fields_keep_otherwise_identical_legs() {
+        let mut models = vec![json!({
+            "name": "m",
+            "deployments": [
+                {"id":"m-0","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":0,"headers":{"x-a":"1"}},
+                {"id":"m-1","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":1,"headers":{"x-a":"2"}},
+                {"id":"m-2","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":2,"strip_request_fields":["seed"]},
+                {"id":"m-3","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":3},
+                {"id":"m-4","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":4,"headers":{"x-a":"1"}},
+                {"id":"m-5","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":5,"headers":{}}
+            ]
+        })];
+        let warnings = run(&mut models);
+        let deps = models[0]["deployments"].as_array().unwrap();
+        assert_eq!(deps.len(), 4);
+        assert_eq!(
+            deps.iter().map(|dep| string(dep, "id")).collect::<Vec<_>>(),
+            vec!["m-0", "m-1", "m-2", "m-3"]
+        );
+        assert_eq!(warnings, vec!["m: dropped 2 duplicate deployments"]);
+    }
+
+    #[test]
+    fn duplicate_fallback_is_dropped_and_its_id_is_not_reused() {
+        let mut models = vec![json!({
+            "name": "m",
+            "deployments": [
+                {"id":"m-0","credential":"native","upstream_model":"u","base_url":"https://up.example/v1","priority":0},
+                {"id":"m-2","credential":"native","upstream_model":"u","base_url":"https://up.example/v1","priority":2},
+                {"id":"omniroute-fallback-m","credential":"omniroute-fallback","upstream_model":"m","base_url":"http://127.0.0.1:20128/v1","priority":3,"fallback":true},
+                {"id":"omniroute-fallback-m-2","credential":"omniroute-fallback","upstream_model":"m","base_url":"http://127.0.0.1:20128/v1","priority":4,"fallback":true}
+            ]
+        })];
+        let warnings = run(&mut models);
+        let deps = models[0]["deployments"].as_array().unwrap();
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0]["id"], "m-0");
+        assert_eq!(deps[0]["priority"], 0);
+        assert_eq!(deps[1]["id"], "omniroute-fallback-m");
+        assert_eq!(deps[1]["priority"], 1);
+        assert_eq!(warnings, vec!["m: dropped 2 duplicate deployments"]);
+    }
+
+    #[test]
+    fn routing_fields_and_unreadable_header_files_stay_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left");
+        let right = dir.path().join("right");
+        std::fs::write(&left, "same-bytes").unwrap();
+        std::fs::write(&right, "same-bytes").unwrap();
+        let missing_a = dir.path().join("missing-a");
+        let missing_b = dir.path().join("missing-b");
+        let mut models = vec![json!({
+            "name": "m",
+            "deployments": [
+                {"id":"m-0","credential":"","upstream_model":"u","base_url":"https://example.com/v1","priority":0,"max_context":8192,"headers":{"x-a": format!("file:{}", left.display())}},
+                {"id":"m-1","credential":"","upstream_model":"u","base_url":"https://example.com/v1","priority":1,"max_context":8192,"headers":{"x-a": format!("file:{}", right.display())}},
+                {"id":"m-2","credential":"","upstream_model":"u","base_url":"https://example.com/v1","priority":2,"max_context":32768},
+                {"id":"m-3","credential":"","upstream_model":"u","base_url":"https://example.com/v1","priority":3,"quota":{"rpm":1}},
+                {"id":"m-4","credential":"","upstream_model":"u","base_url":"https://example.com/v1","priority":4,"quota":{"rpm":2}},
+                {"id":"m-5","credential":"","upstream_model":"u","base_url":"https://example.com/v1","priority":5,"timeout_ms":1000},
+                {"id":"m-6","credential":"","upstream_model":"u","base_url":"https://example.com/v1","priority":6,"timeout_ms":2000},
+                {"id":"m-7","credential":"","upstream_model":"u","base_url":"https://example.com/v1","priority":7,"headers":{"x-a": format!("file:{}", missing_a.display())}},
+                {"id":"m-8","credential":"","upstream_model":"u","base_url":"https://example.com/v1","priority":8,"headers":{"x-a": format!("file:{}", missing_b.display())}}
+            ]
+        })];
+        let warnings = run(&mut models);
+        let deps = models[0]["deployments"].as_array().unwrap();
+        assert_eq!(deps.len(), 8);
+        assert!(deps.iter().any(|dep| dep["max_context"] == 8192));
+        assert!(deps.iter().any(|dep| dep["max_context"] == 32768));
+        assert!(deps.iter().any(|dep| dep["quota"]["rpm"] == 1));
+        assert!(deps.iter().any(|dep| dep["quota"]["rpm"] == 2));
+        assert!(deps.iter().any(|dep| dep["timeout_ms"] == 1000));
+        assert!(deps.iter().any(|dep| dep["timeout_ms"] == 2000));
+        let unread: Vec<_> = deps
+            .iter()
+            .filter_map(|dep| dep["headers"]["x-a"].as_str())
+            .filter(|value| value.contains("missing-"))
+            .collect();
+        assert_eq!(unread.len(), 2);
+        assert_ne!(unread[0], unread[1]);
+        assert_eq!(warnings, vec!["m: dropped 1 duplicate deployment"]);
+    }
 }
