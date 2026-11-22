@@ -175,6 +175,16 @@ No logprobs fields are stripped. An enabled OmniRoute fallback remains last.
 To roll back, remove the reviewed
 Morph endpoint exception and combo-order policy before regenerating config.
 
+Free XPLabs (Experiential Labs) routes go first in the reviewed combos
+`gpt-6-luna`, `deepseek-v4.1-flash` and `deepseek-v4.1-flash-fast` (after Morph
+in the fast combo), using the active API-key connection of the custom
+`experlabs` node at `https://api.experientiallabs.ai/v1`. A declared leg for the
+same model moves instead of duplicating. OCI saw `usage.cost` 0 for both models
+and logprobs on DeepSeek; the Free tier allows 10 RPM and 1M tokens/day shared,
+so a 429 falls through to the next leg. Billed XPLabs models (Haiku 5.5,
+Qwen3.8 27B, the 1017 model) keep their declared position. Round-robin combos and
+other names are unchanged.
+
 The existing source combo `gpt-6-luna` also has a reviewed Respan secondary
 policy. After its surviving source legs (Experlabs stays first), the importer
 appends `gpt-6-luna`, `openai/gpt-6-luna`, and `perplexity/gpt-6-luna`, in that
