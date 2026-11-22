@@ -83,7 +83,9 @@ A missing refresh token or client id SHALL skip that row with a counted
 warning and SHALL NOT panic. The importer SHALL NOT invent a client secret.
 A keyed OpenAI-compatible `deepai`/`deepai-code` or `cloudflare-direct`/`cfpd`
 node with a baseUrl SHALL import as `openai_compat` at that baseUrl, including
-loopback. DuckDuckGo and Cloudflare Playground have no native adapter. Without
+loopback. An OpenAI-compatible `freellmapi` node with a baseUrl SHALL import as
+`openai_compat` at that baseUrl, including loopback, warning that the reviewed
+local sidecar must be reachable on the llmux2 host. DuckDuckGo and Cloudflare Playground have no native adapter. Without
 `--omniroute-fallback` and `--omniroute-key`, their skip warning SHALL name
 those flags. With both flags, each of their model ids SHALL get an OmniRoute
 fallback deployment last, with that same upstream model id. A session model id
@@ -115,6 +117,12 @@ THEN import skips that row with a missing-refresh-token warning and continues.
 
 WHEN a DeepAI Code node has a valid API key and `http://127.0.0.1:8790/deepai/v1`
 THEN its deployment uses `openai_compat` at that URL and the same model id.
+
+#### Scenario: freellmapi loopback sidecar
+
+WHEN an OpenAI-compatible node has prefix `freellmapi` and a loopback baseUrl
+THEN its connection imports as `openai_compat` at that URL with the same model
+id, warning that the reviewed local sidecar must be reachable on the llmux2 host.
 
 ### Requirement: Custom provider headers
 
@@ -183,8 +191,8 @@ THEN no field stripping is added.
 The importer SHALL migrate only built-in Morph loopback connection overrides to
 `https://api.morphllm.com/v1`, warning about the reviewed endpoint substitution.
 Other loopback providers, custom nodes, nonofficial Morph hosts, and unspecified
-bind addresses SHALL remain excluded except for the reviewed DeepAI Code sidecar
-below. The existing Morph credential is reused.
+bind addresses SHALL remain excluded except for the reviewed DeepAI Code and
+freellmapi sidecars. The existing Morph credential is reused.
 
 The reviewed combo names `deepseek-v4.1-flash`, `deepseek-v4.1-flash-fast`,
 `deepseek-v4.1-flash-1017`, `deepseek-v4.1-flash-1017-fast` and

@@ -302,6 +302,14 @@ pub(super) fn resolve(
     let url = if provider.is_builtin("morph") && local_host(url, false) {
         warnings.push(format!("connection {}: reviewed Morph loopback override replaced with official https://api.morphllm.com/v1", string(connection, "id")));
         super::morph::OFFICIAL_URL
+    } else if identity == "freellmapi" && local_host(url, false) {
+        // Reviewed: OmniRoute serves this node's traffic through a freellmapi
+        // container bound to 127.0.0.1 on the same host llmux2 runs on.
+        warnings.push(format!(
+            "connection {}: reviewed freellmapi sidecar must be reachable on the llmux2 host",
+            string(connection, "id")
+        ));
+        url
     } else if local_host(url, true)
         && !(local_host(url, false) && super::connection::keyed_loopback_bridge(identity))
     {

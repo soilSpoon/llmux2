@@ -595,3 +595,35 @@ fn skip_precedence_is_explicit_and_replacement_warnings_are_static() {
         assert!(warning.ends_with(expected));
     }
 }
+
+#[test]
+fn freellmapi_keyed_sidecar_imports_gpt_oss_20b_combo() {
+    let mut root = fixture();
+    root["providerNodes"] = json!([
+        {"id":"openai-compatible-chat-9fce011f","prefix":"freellmapi","type":"openai-compatible","apiType":"chat","baseUrl":"http://127.0.0.1:3001/v1"}
+    ]);
+    root["providerConnections"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id":"flm", "provider":"openai-compatible-chat-9fce011f",
+            "authType":"apikey", "apiKey":"synthetic-flm-key"
+        }));
+    root["combos"].as_array_mut().unwrap().push(json!({
+        "name":"gpt-oss-20b",
+        "models":[{"providerId":"openai-compatible-chat-9fce011f","model":"freellmapi/openai/gpt-oss-20b","weight":1}]
+    }));
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let config = RuntimeConfig::load(&output).unwrap();
+    let model = &config.models[config.model_names["gpt-oss-20b"]];
+    assert_eq!(model.deployments.len(), 1);
+    let dep = &config.deployments[model.deployments[0].0 as usize];
+    assert_eq!(dep.base_url.to_string(), "http://127.0.0.1:3001/v1");
+    assert_eq!(dep.upstream_model.as_ref(), "openai/gpt-oss-20b");
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.contains("reachable on the llmux2 host")));
+}
