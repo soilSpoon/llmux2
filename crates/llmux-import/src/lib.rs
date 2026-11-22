@@ -141,6 +141,99 @@ fn anthropic_rejects_sampling(model: &str) -> bool {
         || matches!(parts.as_slice(), ["claude", "opus", "4", "8", ..])
 }
 
+fn deployment_identity(dep: &Value) -> (String, String, String, String, String) {
+    (
+        string(dep, "credential").to_owned(),
+        string(dep, "upstream_model").to_owned(),
+        string(dep, "base_url").to_owned(),
+        identity_field(&dep["headers"]),
+        identity_field(&dep["strip_request_fields"]),
+    )
+}
+
+fn identity_field(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Object(map) if map.is_empty() => String::new(),
+        Value::Array(items) if items.is_empty() => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn fallback_leg(dep: &Value) -> bool {
+    dep["fallback"] == true || string(dep, "id").starts_with("omniroute-fallback")
+}
+
+fn dedupe_deployments(models: &mut [Value], ids: &mut HashSet<String>, warnings: &mut Vec<String>) {
+    for model in models.iter_mut() {
+        let name = string(model, "name").to_owned();
+        let Some(deployments) = model.get_mut("deployments").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let mut order: Vec<usize> = (0..deployments.len()).collect();
+        order.sort_by_key(|&index| (deployments[index]["priority"].as_i64().unwrap_or(0), index));
+        let mut seen = HashSet::new();
+        let mut keep = Vec::new();
+        for index in order {
+            if seen.insert(deployment_identity(&deployments[index])) {
+                keep.push(index);
+            }
+        }
+        let dropped = deployments.len() - keep.len();
+        if dropped == 0 {
+            continue;
+        }
+        let noun = if dropped == 1 {
+            "deployment"
+        } else {
+            "deployments"
+        };
+        warnings.push(format!("{name}: dropped {dropped} duplicate {noun}"));
+        *deployments = keep
+            .into_iter()
+            .map(|index| deployments[index].clone())
+            .collect();
+        renumber_deployments(deployments, &name, ids);
+    }
+}
+
+fn renumber_deployments(deployments: &mut [Value], name: &str, ids: &mut HashSet<String>) {
+    for dep in deployments.iter() {
+        if !fallback_leg(dep) {
+            ids.remove(string(dep, "id"));
+        }
+    }
+    let native_priorities: Vec<i64> = deployments
+        .iter()
+        .filter(|dep| !fallback_leg(dep))
+        .map(|dep| dep["priority"].as_i64().unwrap_or(0))
+        .collect();
+    let uniform = native_priorities.windows(2).all(|pair| pair[0] == pair[1]);
+    let shared = native_priorities.first().copied().unwrap_or(0);
+    let mut native_index = 0usize;
+    let mut sequential = 0i64;
+    let mut fallback_priority = if native_priorities.is_empty() {
+        0
+    } else if uniform {
+        shared + 1
+    } else {
+        i64::try_from(native_priorities.len()).unwrap_or(i64::MAX)
+    };
+    for dep in deployments.iter_mut() {
+        if fallback_leg(dep) {
+            dep["priority"] = json!(fallback_priority);
+            fallback_priority = fallback_priority.saturating_add(1);
+            continue;
+        }
+        dep["id"] = unique(&format!("{name}-{native_index}"), ids).into();
+        native_index += 1;
+        if !uniform {
+            dep["priority"] = json!(sequential);
+            sequential += 1;
+        }
+    }
+}
+
 fn unique(raw: &str, used: &mut HashSet<String>) -> String {
     let base: String = raw
         .chars()
@@ -967,7 +1060,6 @@ pub fn import_with_options(
     let mut models = Vec::new();
     context.reset_usage();
     let mut deployment_ids = HashSet::new();
-    let mut deployment_count = 0;
     for name in order {
         let lookup = if synthetic.contains_key(&name) {
             &synthetic
@@ -1035,7 +1127,6 @@ pub fn import_with_options(
             dep["id"] = unique(&format!("{name}-{i}"), &mut deployment_ids).into();
             dep["priority"] = if strategy == "round-robin" { 0 } else { i }.into();
         }
-        deployment_count += deployments.len();
         models.push(json!({"name":name,"aliases":[],"deployments":deployments}));
     }
     aliases::attach(&mut models, aliases, &mut warnings);
@@ -1061,10 +1152,6 @@ pub fn import_with_options(
             &mut deployment_ids,
             &session_excluded,
         )?;
-        deployment_count = models
-            .iter()
-            .map(|model| array(model, "deployments").len())
-            .sum();
     }
     if let Some(nous) = &nous {
         let credential = unique("nous", &mut ids);
@@ -1082,7 +1169,6 @@ pub fn import_with_options(
         let added = nous.models(&credential, &taken, &mut deployment_ids, &mut warnings);
         if !added.is_empty() {
             credentials.push(nous.credential(&credential));
-            deployment_count += added.len();
             models.extend(added);
         }
     }
@@ -1119,6 +1205,11 @@ pub fn import_with_options(
             }
         }
     }
+    dedupe_deployments(&mut models, &mut deployment_ids, &mut warnings);
+    let deployment_count: usize = models
+        .iter()
+        .map(|model| array(model, "deployments").len())
+        .sum();
     if models.is_empty() {
         if warnings
             .iter()
@@ -1191,4 +1282,64 @@ pub fn import_with_options(
         credentials: credentials.len(),
         client_keys: client_count,
     })
+}
+
+#[cfg(test)]
+mod dedupe_tests {
+    use super::*;
+
+    fn run(models: &mut [Value]) -> Vec<String> {
+        let mut ids = models
+            .iter()
+            .flat_map(|model| array(model, "deployments").iter())
+            .map(|dep| string(dep, "id").to_owned())
+            .collect();
+        let mut warnings = Vec::new();
+        dedupe_deployments(models, &mut ids, &mut warnings);
+        warnings
+    }
+
+    #[test]
+    fn headers_and_strip_fields_keep_otherwise_identical_legs() {
+        let mut models = vec![json!({
+            "name": "m",
+            "deployments": [
+                {"id":"m-0","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":0,"headers":{"x-a":"1"}},
+                {"id":"m-1","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":1,"headers":{"x-a":"2"}},
+                {"id":"m-2","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":2,"strip_request_fields":["seed"]},
+                {"id":"m-3","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":3},
+                {"id":"m-4","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":4,"headers":{"x-a":"1"}},
+                {"id":"m-5","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":5,"headers":{}}
+            ]
+        })];
+        let warnings = run(&mut models);
+        let deps = models[0]["deployments"].as_array().unwrap();
+        assert_eq!(deps.len(), 4);
+        assert_eq!(
+            deps.iter().map(|dep| string(dep, "id")).collect::<Vec<_>>(),
+            vec!["m-0", "m-1", "m-2", "m-3"]
+        );
+        assert_eq!(warnings, vec!["m: dropped 2 duplicate deployments"]);
+    }
+
+    #[test]
+    fn duplicate_fallback_is_dropped_and_its_id_is_not_reused() {
+        let mut models = vec![json!({
+            "name": "m",
+            "deployments": [
+                {"id":"m-0","credential":"native","upstream_model":"u","base_url":"https://up.example/v1","priority":0},
+                {"id":"m-2","credential":"native","upstream_model":"u","base_url":"https://up.example/v1","priority":2},
+                {"id":"omniroute-fallback-m","credential":"omniroute-fallback","upstream_model":"m","base_url":"http://127.0.0.1:20128/v1","priority":3,"fallback":true},
+                {"id":"omniroute-fallback-m-2","credential":"omniroute-fallback","upstream_model":"m","base_url":"http://127.0.0.1:20128/v1","priority":4,"fallback":true}
+            ]
+        })];
+        let warnings = run(&mut models);
+        let deps = models[0]["deployments"].as_array().unwrap();
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0]["id"], "m-0");
+        assert_eq!(deps[0]["priority"], 0);
+        assert_eq!(deps[1]["id"], "omniroute-fallback-m");
+        assert_eq!(deps[1]["priority"], 1);
+        assert_eq!(warnings, vec!["m: dropped 2 duplicate deployments"]);
+    }
 }
