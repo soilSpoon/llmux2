@@ -6,7 +6,7 @@ const PREFIX: &str = "experlabs";
 
 // OCI verified usage.cost 0 on the existing key for these models, and logprobs on DeepSeek
 // (Free tier: 10 RPM, 1M tokens/day shared). Haiku 5.5, Qwen3.8 27B and the 1017 model
-// were billed, so their declared legs keep their place. Reviewed combo -> XPLabs model id.
+// were billed, so only legs whose model is listed here survive. Reviewed combo -> XPLabs model id.
 const FREE: &[(&str, &str)] = &[
     ("gpt-6-luna", "gpt-6-luna"),
     ("deepseek-v4.1-flash", "deepseek-v4.1-flash"),
@@ -54,6 +54,13 @@ pub(super) fn step(
     let mut step = connection.provider.step(model);
     step["connectionId"] = json!(connection.source_id);
     Some(step)
+}
+
+/// Whether `model` on the XPLabs endpoint is verified free. Billed legs (Haiku 5.5, Qwen3.8
+/// 27B, the 1017 model) must never be generated while the account is overdrawn, so expansion
+/// drops them before limits, availability scans or ordering ever see them.
+pub(super) fn free_model(model: &str) -> bool {
+    FREE.iter().any(|(_, free)| *free == model)
 }
 
 /// Places `free` first (after the verified Morph route in fast combos). Declared legs for the

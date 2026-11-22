@@ -182,8 +182,9 @@ in the fast combo), using the active API-key connection of the custom
 same model moves instead of duplicating. OCI saw `usage.cost` 0 for both models
 and logprobs on DeepSeek; the Free tier allows 10 RPM and 1M tokens/day shared,
 so a 429 falls through to the next leg. Billed XPLabs models (Haiku 5.5,
-Qwen3.8 27B, the 1017 model) keep their declared position. Round-robin combos and
-other names are unchanged.
+Qwen3.8 27B, the 1017 model) are dropped with a warning in every combo and
+strategy — the account is overdrawn, so nothing billed may draw on it — and a
+combo left with no deployments is skipped. Other names are unchanged.
 
 The existing source combo `gpt-6-luna` also has a reviewed Respan secondary
 policy, opt-in via `--openrouter-replacements`. After its surviving source

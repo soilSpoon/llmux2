@@ -603,6 +603,12 @@ impl Expander<'_> {
                         continue;
                     }
                 };
+                if c.base_url == xplabs::BASE_URL && !xplabs::free_model(&model) {
+                    self.warnings.push(format!(
+                        "combo {name} step {index}: dropped billed XPLabs route {model}"
+                    ));
+                    continue;
+                }
                 let mut deployment = json!({"base_url":c.base_url,"upstream_model":model});
                 if bridge.is_some() {
                     deployment["_bridge_replacement"] = true.into();
