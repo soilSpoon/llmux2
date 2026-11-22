@@ -86,8 +86,18 @@ node with a baseUrl SHALL import as `openai_compat` at that baseUrl, including
 loopback. DuckDuckGo and Cloudflare Playground have no native adapter. Without
 `--omniroute-fallback` and `--omniroute-key`, their skip warning SHALL name
 those flags. With both flags, each of their model ids SHALL get an OmniRoute
-fallback deployment last, with that same upstream model id. Factory, Augment,
-and Z.AI SHALL remain excluded.
+fallback deployment last, with that same upstream model id. A session model id
+attached to an imported model as an alias SHALL resolve to that model at
+request time and SHALL NOT get its own model or fallback leg, so a canonical
+request never sends the session alias upstream. Factory, Augment, and Z.AI
+SHALL remain excluded.
+
+#### Scenario: Session id attached as an alias
+
+WHEN a session provider model id is attached to an imported model's aliases
+THEN the model's last OmniRoute fallback deployment keeps the imported model
+name as its upstream model id
+AND no extra model or fallback leg is created for the alias.
 
 #### Scenario: xAI OAuth token URL
 
