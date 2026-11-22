@@ -12,7 +12,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use thiserror::Error;
 
@@ -280,6 +280,7 @@ struct RawDeployment {
     quota: QuotaSpec,
     timeout_ms: Option<u64>,
     max_context: Option<u32>,
+    expires_at: Option<toml::value::Datetime>,
 }
 
 #[derive(Deserialize)]
@@ -669,6 +670,7 @@ impl RawConfig {
                         .map_err(|_| invalid("too many deployments"))?,
                 );
                 candidates.push(idx);
+                let expires_at = dep.expires_at.map(|stamp| expiry(&id, stamp)).transpose()?;
                 deployments.push(Deployment {
                     headers: deployment_headers(
                         dep.headers,
@@ -687,6 +689,7 @@ impl RawConfig {
                     quota: dep.quota,
                     timeout: timeout(dep.timeout_ms.unwrap_or(server.request_timeout_ms))?,
                     max_context: dep.max_context.or(model.capabilities.max_context),
+                    expires_at,
                 });
             }
 
@@ -804,6 +807,22 @@ fn end_user_header_name(name: &str) -> Result<HeaderName, ConfigError> {
         ));
     }
     Ok(name)
+}
+
+fn expiry(deployment: &str, stamp: toml::value::Datetime) -> Result<SystemTime, ConfigError> {
+    let text = stamp.to_string();
+    let parsed = time::OffsetDateTime::parse(&text, &time::format_description::well_known::Rfc3339)
+        .map_err(|_| {
+            invalid(&format!(
+                "deployment {deployment} expires_at must be an RFC 3339 timestamp"
+            ))
+        })?;
+    let seconds: u64 = parsed.unix_timestamp().try_into().map_err(|_| {
+        invalid(&format!(
+            "deployment {deployment} expires_at is out of range"
+        ))
+    })?;
+    Ok(SystemTime::UNIX_EPOCH + Duration::new(seconds, parsed.nanosecond()))
 }
 
 fn required_oauth(value: Option<String>, field: &str) -> Result<String, ConfigError> {
@@ -1015,6 +1034,44 @@ mod tests {
             assert!(
                 super::RuntimeConfig::parse(&config(auth)).is_err(),
                 "{auth}"
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_expiry_parses_and_bad_timestamps_are_rejected() {
+        let base = config(REQUIRED);
+        let parsed = RuntimeConfig::parse(&base.replace(
+            "upstream_model = \"upstream\"",
+            "expires_at = 2030-01-01T00:00:00Z\nupstream_model = \"upstream\"",
+        ))
+        .expect("RFC 3339 expiry");
+        assert!(parsed.deployments[0].expires_at.is_some());
+        let fractional = RuntimeConfig::parse(&base.replace(
+            "upstream_model = \"upstream\"",
+            "expires_at = 2030-01-01T00:00:00.900Z\nupstream_model = \"upstream\"",
+        ))
+        .expect("fractional RFC 3339 expiry");
+        assert_eq!(
+            fractional.deployments[0]
+                .expires_at
+                .unwrap()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .subsec_millis(),
+            900
+        );
+        assert!(RuntimeConfig::parse(&base).unwrap().deployments[0]
+            .expires_at
+            .is_none());
+        for value in ["\"soon\"", "2030-01-01", "\"2030-01-01 00:00:00\""] {
+            assert!(
+                RuntimeConfig::parse(&base.replace(
+                    "upstream_model = \"upstream\"",
+                    &format!("expires_at = {value}\nupstream_model = \"upstream\""),
+                ))
+                .is_err(),
+                "accepted expires_at = {value}"
             );
         }
     }

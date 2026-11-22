@@ -504,6 +504,7 @@ mod tests {
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(10),
             max_context: None,
+            expires_at: None,
         };
         dep.headers.insert(
             "x-deployment",

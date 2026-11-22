@@ -65,6 +65,8 @@ pub struct DeploymentStats<'a> {
     provider: &'a str,
     priority: i32,
     disabled: bool,
+    expired: bool,
+    expires_at_unix: Option<u64>,
     cooldown_ms: Option<u64>,
     rpm_limit: Option<u32>,
     concurrency_limit: Option<u32>,
@@ -103,6 +105,14 @@ impl AttemptStats {
             provider: &dep.provider.0,
             priority: dep.priority,
             disabled,
+            expired: dep
+                .expires_at
+                .is_some_and(|end| std::time::SystemTime::now() >= end),
+            expires_at_unix: dep.expires_at.and_then(|end| {
+                end.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|span| span.as_secs())
+            }),
             cooldown_ms,
             rpm_limit: dep.quota.rpm,
             concurrency_limit: dep.quota.concurrent,
