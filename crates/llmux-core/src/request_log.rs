@@ -10,6 +10,7 @@ use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, SyncSender},
+        Arc, Barrier,
     },
     thread::{self, JoinHandle},
     time::SystemTime,
@@ -56,20 +57,35 @@ impl RequestLog {
     /// Opens the file and starts its writer thread. The caller's runtime never
     /// touches the filesystem after this.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self::spawn_writer(file, None))
+    }
+
+    /// Test seam: the writer parks on `gate` before draining, so tests can fill
+    /// the bounded queue deterministically.
+    #[cfg(test)]
+    fn open_gated(path: &Path, gate: Arc<Barrier>) -> io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self::spawn_writer(file, Some(gate)))
+    }
+
+    fn spawn_writer(mut file: std::fs::File, gate: Option<Arc<Barrier>>) -> Self {
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(QUEUE_CAPACITY);
         let writer = thread::spawn(move || {
+            if let Some(gate) = gate {
+                gate.wait();
+            }
             while let Ok(line) = rx.recv() {
                 if let Err(err) = file.write_all(&line).and_then(|()| file.flush()) {
                     eprintln!("llmux: request log write failed: {err}");
                 }
             }
         });
-        Ok(Self {
+        Self {
             tx: Some(tx),
             dropped: AtomicU64::new(0),
             writer: Some(writer),
-        })
+        }
     }
 
     /// Serializes the record and queues it for the writer thread; never blocks
@@ -201,5 +217,49 @@ mod tests {
         assert_eq!(parsed["error_kind"], "rate_limited");
         assert!(parsed.get("deployment").is_none());
         assert!(parsed.get("quota_remaining").is_none());
+    }
+
+    #[test]
+    fn saturated_queue_drops_records_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.jsonl");
+        let gate = Arc::new(Barrier::new(2));
+        let log = Arc::new(RequestLog::open_gated(&path, gate.clone()).unwrap());
+        let record = |request_id: &'static str| RequestRecord {
+            ts_ms: now_ms(),
+            request_id,
+            model: "shared",
+            deployment: None,
+            provider: None,
+            attempts: 1,
+            latency_ms: 1,
+            outcome: "routed",
+            error_kind: None,
+            quota_remaining: None,
+        };
+        // The writer is parked on the barrier, so these fill the bounded queue.
+        for _ in 0..QUEUE_CAPACITY {
+            log.record(&record("accepted"));
+        }
+        assert_eq!(log.dropped.load(Ordering::Relaxed), 0);
+        // One more submission must return while the writer is still parked.
+        let (done_tx, done_rx) = mpsc::channel();
+        let overflow = thread::spawn({
+            let log = Arc::clone(&log);
+            move || {
+                log.record(&record("overflow"));
+                let _ = done_tx.send(());
+            }
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("record() blocked on a full queue");
+        overflow.join().unwrap();
+        assert_eq!(log.dropped.load(Ordering::Relaxed), 1);
+        gate.wait();
+        drop(log);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().count(), QUEUE_CAPACITY);
+        assert!(!body.contains("overflow"));
     }
 }
