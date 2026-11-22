@@ -130,10 +130,14 @@ impl ProviderAdapter for DeepAi {
         );
         // The complete body is synthesized; surface a real upstream job id
         // as a response header so upstream_request_id can record it without
-        // mistaking the fallback id for a provider one.
-        if let Some(job_id) = output["id"].as_str().filter(|id| !id.is_empty()) {
-            if let Ok(value) = HeaderValue::from_str(job_id) {
-                headers.insert("x-request-id", value);
+        // mistaking the fallback id for a provider one. A real request-id
+        // header on the upstream response stays authoritative, so skip the
+        // stamped header then.
+        if header_request_id(&parts.headers).is_none() {
+            if let Some(job_id) = output["id"].as_str().filter(|id| !id.is_empty()) {
+                if let Ok(value) = HeaderValue::from_str(job_id) {
+                    headers.insert("x-request-id", value);
+                }
             }
         }
         Ok(GatewayResponse::Complete {
@@ -291,6 +295,11 @@ mod tests {
                     "text=success" => {
                         Json(json!({"id":"job-123","output":"completed text"})).into_response()
                     }
+                    "text=hdr" => (
+                        [("x-request-id", "hdr_req_1")],
+                        Json(json!({"id":"job-9","output":"done"})),
+                    )
+                        .into_response(),
                     "text=image" => {
                         Json(json!({"id":"job-123","output_url":"https://example.com/a.png"}))
                             .into_response()
@@ -317,6 +326,7 @@ mod tests {
         let client = Client::builder(TokioExecutor::new()).build_http();
         for text in [
             "success",
+            "hdr",
             "image",
             "nontext",
             "invalid",
@@ -359,6 +369,16 @@ mod tests {
                             .as_deref(),
                         Some("job-123")
                     );
+                }
+                "hdr" => {
+                    // A real upstream request-id header stays authoritative:
+                    // the synthesized headers must not shadow it with the
+                    // body's job id.
+                    let GatewayResponse::Complete { headers, body, .. } = result.unwrap() else {
+                        panic!("expected a complete response");
+                    };
+                    assert!(headers.get("x-request-id").is_none());
+                    assert!(adapter.upstream_request_id(&headers, Some(&body)).is_none());
                 }
                 "unauthorized" => assert!(matches!(
                     result,
