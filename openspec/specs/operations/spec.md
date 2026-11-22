@@ -144,7 +144,7 @@ unset, no file is written.
 
 #### Scenario: Provider flag traced by upstream ID
 - WHEN an upstream response carries `anthropic-request-id`, `x-request-id` or `request-id`, or a provider-owned body carries `id` or `request_id` (including in an error body)
-- THEN the record includes it as `upstream_request_id`, on success and on failure.
+- THEN the record includes it as `upstream_request_id`, on success and on failure, preferring the header id when both differ.
 
 #### Scenario: No attempts made
 - WHEN every candidate is cooling or limited before any attempt

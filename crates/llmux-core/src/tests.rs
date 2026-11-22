@@ -1281,6 +1281,41 @@ async fn request_log_records_each_request() {
 }
 
 #[tokio::test]
+async fn request_log_prefers_response_header_over_error_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, _adapter, _, _server) = fixture_full(
+        vec![UpstreamError::BadRequest {
+            status: StatusCode::BAD_REQUEST,
+            body: Bytes::from_static(br#"{"request_id":"req_body_9"}"#),
+        }],
+        false,
+        [Some(1024); 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+    )
+    .await;
+
+    assert!(matches!(
+        executor.execute(request()).await,
+        Err(GatewayError::Client(UpstreamError::BadRequest { .. }))
+    ));
+    drop(executor);
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["upstream_request_id"], "req_fixture_1");
+}
+
+#[tokio::test]
 async fn convert_deployment_cooled_during_build_is_skipped_at_the_gate() {
     let (executor, adapter, _, _server) = fixture_with_models(
         Vec::new(),

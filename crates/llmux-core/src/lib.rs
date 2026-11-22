@@ -867,8 +867,10 @@ impl Executor {
             }
             _ => return,
         };
-        if let Some(id) = adapter.upstream_request_id(&HeaderMap::new(), Some(body)) {
-            trace.upstream_request_id = Some(id);
+        // The response header id stays authoritative: a provider can place a
+        // different id in an error body, and lookups search the header id.
+        if trace.upstream_request_id.is_none() {
+            trace.upstream_request_id = adapter.upstream_request_id(&HeaderMap::new(), Some(body));
         }
     }
 
