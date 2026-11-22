@@ -14,6 +14,8 @@ pub enum UpstreamError {
     Auth { refreshable: bool },
     #[error("bad request")]
     BadRequest { status: StatusCode, body: Bytes },
+    #[error("model not found at deployment")]
+    ModelNotFound { status: StatusCode, body: Bytes },
     #[error("context too long")]
     ContextLength,
     #[error("server error ({status})")]
@@ -46,7 +48,7 @@ impl UpstreamError {
             Self::RateLimited { .. } => ErrorKind::RateLimited,
             Self::QuotaExhausted { .. } => ErrorKind::QuotaExhausted,
             Self::Auth { .. } => ErrorKind::Auth,
-            Self::BadRequest { .. } => ErrorKind::BadRequest,
+            Self::BadRequest { .. } | Self::ModelNotFound { .. } => ErrorKind::BadRequest,
             Self::ContextLength => ErrorKind::ContextLength,
             Self::Server { .. } => ErrorKind::ServerError,
             Self::Timeout => ErrorKind::Timeout,
@@ -60,6 +62,9 @@ impl UpstreamError {
 pub enum BuildError {
     #[error("unsupported inbound format")]
     UnsupportedFormat,
+    /// A converting adapter cannot represent this request upstream.
+    #[error("request cannot be converted for this deployment")]
+    UnsupportedConversion,
     #[error("invalid request body")]
     InvalidBody,
     #[error("invalid upstream URI or request headers")]

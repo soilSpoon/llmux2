@@ -99,5 +99,7 @@ pub(super) fn normalize(root: &Value) -> Result<Value, String> {
         "combos": rows(root, "combos")?,
         "modelAliases": aliases,
         "modelComboMappings": rows(root, "model_combo_mappings")?,
+        "modelContextOverrides": root["model_context_overrides"],
+        "modelCapabilityOverrides": root["model_capability_overrides"],
     }))
 }

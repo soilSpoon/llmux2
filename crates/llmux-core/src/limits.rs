@@ -99,6 +99,10 @@ impl DeploymentLimits {
         self.baseline + Duration::from_nanos(offset_ns.max(previous))
     }
 
+    pub fn cool_down_until(&self, until: Instant) {
+        self.cool_down(until.saturating_duration_since(Instant::now()));
+    }
+
     pub fn available_at(&self, now: Instant, tokens: u64) -> Instant {
         let mut ready = self.cooldown_until(now).unwrap_or(now);
         for window in self.windows.iter() {
@@ -151,7 +155,19 @@ impl DeploymentLimits {
         } else {
             Permit(None, None)
         };
+        if !self.charge_windows(tokens, Instant::now()) {
+            return None;
+        }
+        permit.1 = probe.1.take();
+        Some(permit)
+    }
+
+    pub fn admit_repair(&self, tokens: u64) -> bool {
         let now = Instant::now();
+        self.cooldown_until(now).is_none() && self.charge_windows(tokens, now)
+    }
+
+    fn charge_windows(&self, tokens: u64, now: Instant) -> bool {
         let mut windows: Vec<_> = self
             .windows
             .iter()
@@ -160,7 +176,7 @@ impl DeploymentLimits {
         for (window, used) in &windows {
             let cost = window.unit.cost(tokens);
             if used.total > 0 && used.total + cost > window.max {
-                return None;
+                return false;
             }
         }
         for (window, used) in &mut windows {
@@ -170,8 +186,7 @@ impl DeploymentLimits {
                 used.total += cost;
             }
         }
-        permit.1 = probe.1.take();
-        Some(permit)
+        true
     }
 }
 
@@ -271,6 +286,30 @@ impl Drop for Permit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_retry_and_proactive_reset_respect_the_cooldown_cap() {
+        let cap = Duration::from_secs(5);
+        let hint = Duration::from_secs(60);
+        let limits = DeploymentLimits::new(QuotaSpec::default());
+        let now = Instant::now();
+        assert_eq!(
+            limits.limited(Some(hint), Duration::from_secs(1), cap),
+            now + cap
+        );
+
+        let limits = DeploymentLimits::new(QuotaSpec::default());
+        limits.observe(
+            LimitObservation {
+                remaining_tokens: Some(0),
+                reset_tokens: Some(hint),
+                ..LimitObservation::default()
+            },
+            cap,
+        );
+        assert_eq!(limits.cooldown_until(now), Some(now + cap));
+        assert_eq!(limits.cooldown_until(now + cap), None);
+    }
 
     #[test]
     fn stream_permit_releases_concurrency_on_drop() {

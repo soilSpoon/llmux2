@@ -280,7 +280,7 @@ fn repeated_custom_routing_segments_preserve_vendor_ids_and_observed_names() {
 }
 
 #[test]
-fn custom_node_ids_do_not_claim_another_providers_registry_alias() {
+fn custom_prefixes_take_precedence_over_registry_aliases() {
     let mut root = fixture();
     root["providerNodes"][0]["prefix"] = json!("ds");
     root["providerConnections"].as_array_mut().unwrap().push(
@@ -293,8 +293,9 @@ fn custom_node_ids_do_not_claim_another_providers_registry_alias() {
     let config = RuntimeConfig::load(output).unwrap();
     let model = &config.models[config.model_names["node/vendor/custom"]];
     assert_eq!(model.deployments.len(), 2);
-    assert!(!config.model_names.contains_key("ds/vendor/custom"));
-    let native = &config.models[config.model_names["ds/vendor/native"]];
+    assert!(config.model_names.contains_key("ds/vendor/custom"));
+    assert!(!config.model_names.contains_key("ds/vendor/native"));
+    let native = &config.models[config.model_names["deepseek/vendor/native"]];
     assert_eq!(
         config.deployments[native.deployments[0].0 as usize]
             .credential

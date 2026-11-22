@@ -1,14 +1,15 @@
 use crate::{
-    openai_compat::{bad_gateway, classify_error, collect_error},
+    messages,
+    openai_compat::{apply_auth, bad_gateway, classify_error, collect_error, endpoint_uri},
     sse, OpenAiCompat,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode};
+use http::{header, HeaderMap, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use llmux_types::{
-    AuthMaterial, BoxStream, BuildError, Deployment, GatewayRequest, GatewayResponse,
+    provider, AuthMaterial, BoxStream, BuildError, Deployment, GatewayRequest, GatewayResponse,
     InboundFormat, LimitObservation, ProviderAdapter, ProviderKind, SseEvent, Support,
     UpstreamError, Usage,
 };
@@ -19,7 +20,7 @@ pub struct OpenAiResponses(ProviderKind);
 
 impl Default for OpenAiResponses {
     fn default() -> Self {
-        Self(ProviderKind("openai_responses".into()))
+        Self(ProviderKind(provider::OPENAI_RESPONSES.into()))
     }
 }
 
@@ -37,8 +38,7 @@ impl ProviderAdapter for OpenAiResponses {
     fn supports(&self, inbound: InboundFormat) -> Support {
         match inbound {
             InboundFormat::OpenAiResponses => Support::Passthrough,
-            InboundFormat::OpenAiChat => Support::Convert,
-            _ => Support::No,
+            InboundFormat::OpenAiChat | InboundFormat::AnthropicMessages => Support::Convert,
         }
     }
     async fn build_request(
@@ -50,29 +50,20 @@ impl ProviderAdapter for OpenAiResponses {
         if self.supports(req.format) == Support::No {
             return Err(BuildError::UnsupportedFormat);
         }
-        let body = normalize(&req.body, &dep.upstream_model, req.format)?;
-        let mut parts = dep.base_url.clone().into_parts();
-        parts.path_and_query =
-            Some(format!("{}/responses", dep.base_url.path().trim_end_matches('/')).parse()?);
-        let uri = http::Uri::from_parts(parts).map_err(|e| BuildError::InvalidRequest(e.into()))?;
+        let body = normalize(&req.body, crate::upstream_model(req, dep), req.format)?;
+        let uri = endpoint_uri(&dep.base_url, "/responses")?;
         let mut request = Request::post(uri)
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT, "text/event-stream")
             .body(Bytes::from(body.to_string()))?;
-        match auth {
-            AuthMaterial::Bearer(token) => {
-                let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
-                    .map_err(|_| BuildError::InvalidAuth)?;
-                value.set_sensitive(true);
-                request.headers_mut().insert(header::AUTHORIZATION, value);
-            }
-            AuthMaterial::Header { name, value } => {
-                let mut value = value.clone();
-                value.set_sensitive(true);
-                request.headers_mut().insert(name, value);
-            }
-            AuthMaterial::None => {}
-        }
+        request.headers_mut().extend(dep.headers.clone());
+        llmux_types::default_user_agent(request.headers_mut());
+        apply_auth(
+            request.headers_mut(),
+            auth,
+            header::AUTHORIZATION,
+            "Bearer ",
+        )?;
         Ok(request)
     }
     async fn parse_response(
@@ -99,7 +90,9 @@ impl ProviderAdapter for OpenAiResponses {
         let stream = validated(sse::decode(body));
         if req.stream {
             return Ok(GatewayResponse::Stream(
-                if req.format == InboundFormat::OpenAiChat {
+                if req.format == InboundFormat::AnthropicMessages {
+                    messages::stream(chat_stream(stream, true))
+                } else if req.format == InboundFormat::OpenAiChat {
                     let include_usage = serde_json::from_slice::<Value>(&req.body)
                         .map_err(|_| bad_gateway())?["stream_options"]["include_usage"]
                         == true;
@@ -114,10 +107,12 @@ impl ProviderAdapter for OpenAiResponses {
             let value: Value = serde_json::from_str(&event?.data).map_err(|_| bad_gateway())?;
             if value["type"] == "response.completed" {
                 let response = &value["response"];
-                let response = if req.format == InboundFormat::OpenAiChat {
-                    chat_complete(response)?
-                } else {
-                    response.clone()
+                let response = match req.format {
+                    InboundFormat::OpenAiChat => chat_complete(response)?,
+                    InboundFormat::AnthropicMessages => {
+                        messages::complete_chat(&chat_complete(response)?)?
+                    }
+                    InboundFormat::OpenAiResponses => response.clone(),
                 };
                 return Ok(GatewayResponse::Complete {
                     status: StatusCode::OK,
@@ -129,7 +124,7 @@ impl ProviderAdapter for OpenAiResponses {
         Err(bad_gateway())
     }
     fn observe_limits(&self, headers: &HeaderMap) -> Option<LimitObservation> {
-        OpenAiCompat::new("openai_responses").observe_limits(headers)
+        OpenAiCompat::new(provider::OPENAI_RESPONSES).observe_limits(headers)
     }
 }
 
@@ -153,7 +148,11 @@ const OMIT: &[&str] = &[
 ];
 
 fn normalize(body: &[u8], model: &str, format: InboundFormat) -> Result<Value, BuildError> {
-    let mut value: Value = serde_json::from_slice(body).map_err(|_| BuildError::InvalidBody)?;
+    let mut value: Value = if format == InboundFormat::AnthropicMessages {
+        messages::chat_request(body, model)?
+    } else {
+        serde_json::from_slice(body).map_err(|_| BuildError::InvalidBody)?
+    };
     if !value.is_object() {
         return Err(BuildError::InvalidBody);
     }
@@ -163,7 +162,7 @@ fn normalize(body: &[u8], model: &str, format: InboundFormat) -> Result<Value, B
     {
         return Err(BuildError::InvalidBody);
     }
-    if format == InboundFormat::OpenAiChat {
+    if format != InboundFormat::OpenAiResponses {
         value = chat_request(&value)?;
     }
     let object = value.as_object_mut().ok_or(BuildError::InvalidBody)?;
@@ -487,6 +486,125 @@ fn chat_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt;
+    use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
+    use std::time::Duration;
+
+    #[test]
+    fn wildcard_deployment_forwards_requested_model() {
+        let adapter = OpenAiResponses::new();
+        let mut dep = Deployment {
+            headers: Default::default(),
+            fallback: false,
+            idx: DeploymentIdx(0),
+            id: "r".into(),
+            provider: adapter.kind().clone(),
+            credential: "key".into(),
+            base_url: "https://example.com/v1".parse().unwrap(),
+            upstream_model: "fixed".into(),
+            strip_request_fields: Box::default(),
+            priority: 0,
+            quota: QuotaSpec::default(),
+            timeout: Duration::from_secs(10),
+            max_context: None,
+            expires_at: None,
+        };
+        dep.headers.insert(
+            "x-deployment",
+            http::HeaderValue::from_static("static-value"),
+        );
+        for (format, body) in [
+            (
+                InboundFormat::OpenAiResponses,
+                json!({"model":"vendor/New-ID","input":"hi"}),
+            ),
+            (
+                InboundFormat::OpenAiChat,
+                json!({"model":"vendor/New-ID","messages":[{"role":"user","content":"hi"}]}),
+            ),
+        ] {
+            let req = GatewayRequest {
+                format,
+                model: "vendor/New-ID".into(),
+                stream: false,
+                body: Bytes::from(body.to_string()),
+                anthropic_headers: HeaderMap::new(),
+                est_input_tokens: 0,
+                max_output_tokens: None,
+                context_overflow: None,
+                request_id: RequestId("r".into()),
+                end_user: None,
+            };
+            for (upstream, expected) in [("fixed", "fixed"), ("*", "vendor/New-ID")] {
+                dep.upstream_model = upstream.into();
+                let request = adapter
+                    .build_request(&req, &dep, &AuthMaterial::None)
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap();
+                let sent: Value = serde_json::from_slice(request.body()).unwrap();
+                assert_eq!(request.headers()["x-deployment"], "static-value");
+                assert_eq!(sent["model"], expected, "{format:?} {upstream}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_conversion_preserves_responses_refusals() {
+        let response = json!({"id":"r1","model":"model","status":"completed","output":[
+            {"type":"message","content":[{"type":"refusal","refusal":"Cannot help."}]}
+        ]});
+        let message = messages::complete_chat(&chat_complete(&response).unwrap()).unwrap();
+        assert_eq!(
+            message["content"],
+            json!([{"type":"text","text":"Cannot help."}])
+        );
+        assert_eq!(message["stop_reason"], "refusal");
+
+        let upstream = [
+            json!({"type":"response.created","response":response}),
+            json!({"type":"response.refusal.delta","delta":"Cannot help."}),
+            json!({"type":"response.completed","response":response}),
+        ];
+        let events: Vec<Value> = messages::stream(chat_stream(
+            Box::pin(futures_util::stream::iter(upstream.into_iter().map(
+                |value| {
+                    Ok(SseEvent {
+                        event: None,
+                        data: value.to_string(),
+                    })
+                },
+            ))),
+            false,
+        ))
+        .map(|event| serde_json::from_str(&event.unwrap().data).unwrap())
+        .collect()
+        .await;
+        assert!(events
+            .iter()
+            .any(|event| event["delta"]["text"] == "Cannot help."));
+        assert!(events
+            .iter()
+            .any(|event| event["delta"]["stop_reason"] == "refusal"));
+    }
+
+    #[test]
+    fn converts_anthropic_messages_for_responses_deployments() {
+        assert_eq!(
+            OpenAiResponses::new().supports(InboundFormat::AnthropicMessages),
+            Support::Convert,
+        );
+        let normalized = normalize(
+            br#"{"model":"alias","max_tokens":64,"system":"Be brief","messages":[{"role":"user","content":"Hello"}]}"#,
+            "codex-model",
+            InboundFormat::AnthropicMessages,
+        ).unwrap();
+        assert_eq!(normalized["model"], "codex-model");
+        assert_eq!(normalized["instructions"], "Be brief");
+        assert_eq!(normalized["input"][0]["role"], "user");
+        assert_eq!(normalized["stream"], true);
+        assert_eq!(normalized["store"], false);
+    }
 
     #[test]
     fn chat_options_and_multipart_instructions_are_converted() {

@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+arc-swap.workspace = true
 axum.workspace = true
 futures-util.workspace = true
 http.workspace = true
@@ -13,7 +14,9 @@ llmux-config.workspace = true
 llmux-core.workspace = true
 llmux-providers.workspace = true
 llmux-types.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 subtle.workspace = true
 tokio = { workspace = true, features = ["signal", "io-util", "sync"] }
 uuid.workspace = true

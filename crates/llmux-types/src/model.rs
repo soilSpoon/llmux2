@@ -1,5 +1,8 @@
-use serde::Deserialize;
-use std::{sync::Arc, time::Duration};
+use serde::{Deserialize, Serialize};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DeploymentIdx(pub u32);
@@ -10,7 +13,7 @@ pub struct ProviderKind(pub Arc<str>);
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RequestId(pub Arc<str>);
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct QuotaSpec {
     pub rpm: Option<u32>,
@@ -36,8 +39,25 @@ impl Default for Capabilities {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatRequestField {
+    Seed,
+    User,
+    SafetyIdentifier,
+    #[serde(rename = "reasoning.effort")]
+    ReasoningEffort,
+    Logprobs,
+    TopLogprobs,
+    Temperature,
+    TopP,
+    TopK,
+}
+
 #[derive(Debug)]
 pub struct Deployment {
+    pub headers: http::HeaderMap,
+    pub fallback: bool,
     pub idx: DeploymentIdx,
     pub id: Arc<str>,
     pub provider: ProviderKind,
@@ -45,11 +65,15 @@ pub struct Deployment {
     pub credential: Arc<str>,
     pub base_url: http::Uri,
     pub upstream_model: Arc<str>,
+    pub strip_request_fields: Box<[ChatRequestField]>,
     pub priority: i32,
     pub quota: QuotaSpec,
     pub timeout: Duration,
     /// Context window in tokens (prompt plus completion); `None` is unchecked.
     pub max_context: Option<u32>,
+    /// When this deployment stops being eligible, for time-limited offers.
+    /// `None` means it never expires.
+    pub expires_at: Option<SystemTime>,
 }
 
 /// What to do with a request that fits no deployment's context window.
