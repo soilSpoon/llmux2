@@ -593,7 +593,20 @@ fn matched_key(headers: &HeaderMap, keys: &[Arc<str>], format: InboundFormat) ->
     keys.iter()
         .find(|key| bool::from(key.as_bytes().ct_eq(&presented)))
         .map(|key| {
-            let digest = Sha256::digest(key.as_bytes());
+            // Pepper the fingerprint with a hash of the configured key set so
+            // a log reader cannot confirm a guessed low-entropy key without
+            // knowing every configured key. Fingerprints change only when the
+            // key set does.
+            let mut pepper = Sha256::new();
+            for configured in keys.iter() {
+                pepper.update(configured.as_bytes());
+                pepper.update([0]);
+            }
+            let pepper = pepper.finalize();
+            let mut hasher = Sha256::new();
+            hasher.update(pepper);
+            hasher.update(key.as_bytes());
+            let digest = hasher.finalize();
             let mut fingerprint = String::from("key_");
             for byte in &digest[..8] {
                 fingerprint.push_str(&format!("{byte:02x}"));
