@@ -143,9 +143,17 @@ pub(crate) fn check_images(body: &[u8], server: &ServerConfig) -> Result<(), Ima
     if server.remote_images == RemoteImages::Allow && server.max_image_bytes.is_none() {
         return Ok(());
     }
-    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
         return Ok(());
     };
+    if let Some(request) = value.as_object_mut() {
+        for field in ["tools", "functions", "response_format"] {
+            request.remove(field);
+        }
+        if let Some(text) = request.get_mut("text").and_then(Value::as_object_mut) {
+            text.remove("format");
+        }
+    }
     walk(&value, server)
 }
 
@@ -365,6 +373,28 @@ mod tests {
         assert!(resolve_end_user(&cfg, &headers, br#"{"user":"body-user"}"#)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn schema_examples_are_not_image_inputs() {
+        let cfg = server(RemoteImages::Reject, Some(1), true);
+        let example = serde_json::json!({"image_url":"https://example.com/example.png"});
+        for mut body in [
+            serde_json::json!({"tools":[{"input_schema":{"examples":[example]}}]}),
+            serde_json::json!({"functions":[{"parameters":{"examples":[example]}}]}),
+            serde_json::json!({"response_format":{"json_schema":{"schema":{"examples":[example]}}}}),
+            serde_json::json!({"text":{"format":{"schema":{"examples":[example]}}}}),
+        ] {
+            assert!(check_images(body.to_string().as_bytes(), &cfg).is_ok());
+            body["messages"] = serde_json::json!([{"content":[{
+                "type":"tool_result",
+                "content":[{"type":"image","source":{"type":"url","url":"https://example.com/input.png"}}],
+            }]}]);
+            assert!(matches!(
+                check_images(body.to_string().as_bytes(), &cfg),
+                Err(ImagePolicyError::Remote)
+            ));
+        }
     }
 
     #[test]
