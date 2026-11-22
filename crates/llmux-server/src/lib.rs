@@ -436,6 +436,9 @@ async fn route_request(
             }
         }
     }
+    // The record describes the inbound request; a middle-out retry sends a
+    // truncated body but must not shrink the logged image count.
+    let image_count = policy::count_images(upstream_body.as_ref());
     let request = |body: Bytes, prompt_bytes: u64| GatewayRequest {
         format,
         model: model.clone(),
@@ -443,7 +446,7 @@ async fn route_request(
         est_input_tokens: u32::try_from(prompt_bytes.div_ceil(4)).unwrap_or(u32::MAX),
         max_output_tokens: metadata.max_output_tokens,
         context_overflow,
-        image_count: policy::count_images(body.as_ref()),
+        image_count,
         body,
         anthropic_headers: anthropic_headers.clone(),
         request_id: request_id.clone(),
