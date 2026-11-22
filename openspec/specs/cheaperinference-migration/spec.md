@@ -434,10 +434,12 @@ and `openai_compat` for the sidecar.
 ### Requirement: Reviewed same-model bridge replacements
 
 With `--openrouter-replacements`, the importer SHALL also replace only the
-DuckDuckGo and DeepAI Code model IDs explicitly reviewed in `src/bridge.rs`
-with the same declared model family, version and size on eligible connected
-official endpoints. It SHALL NOT import bridge authentication, infer a similar
-model, use Codex/Factory/OpenRouter targets, or relax Workers AI eligibility.
+DuckDuckGo, DeepAI Code and `cloudflare-direct`/`cfpd` model IDs explicitly
+reviewed in `src/bridge.rs` with the same declared model family, version and
+size on eligible connected official endpoints — including reviewed Morph
+targets such as `morph-kimik31` for `moonshotai/kimi-k3.1-pro`. It SHALL NOT
+import bridge authentication, infer a similar model, use Codex/Factory/
+OpenRouter targets, or relax Workers AI eligibility.
 
 #### Scenario: Bridge leg expansion and precedence
 

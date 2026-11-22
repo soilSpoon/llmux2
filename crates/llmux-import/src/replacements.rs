@@ -52,6 +52,12 @@ pub(super) fn matches(route: &Route, connection: &Connection) -> bool {
             connection.base_url == "https://generativelanguage.googleapis.com/v1beta/openai"
         }
         "mistral" => connection.base_url == "https://api.mistral.ai/v1",
+        // cfpd bridge routes only (kimi): keyed builtin Morph at its official
+        // endpoint — morph.rs::OFFICIAL_URL, enforced by upstream::resolve.
+        "morph" => {
+            connection.provider.is_builtin("morph")
+                && connection.base_url == "https://api.morphllm.com/v1"
+        }
         "workers" => {
             connection.provider.is_builtin("workers-ai")
                 && connection.policy == ModelPolicy::Workers
