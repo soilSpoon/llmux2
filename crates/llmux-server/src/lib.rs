@@ -595,10 +595,12 @@ fn matched_key(headers: &HeaderMap, keys: &[Arc<str>], format: InboundFormat) ->
         .map(|key| {
             // Pepper the fingerprint with a hash of the configured key set so
             // a log reader cannot confirm a guessed low-entropy key without
-            // knowing every configured key. Fingerprints change only when the
-            // key set does.
+            // knowing every configured key. Keys are hashed sorted so a
+            // reload that only reorders them keeps the same fingerprints.
+            let mut ordered: Vec<&Arc<str>> = keys.iter().collect();
+            ordered.sort();
             let mut pepper = Sha256::new();
-            for configured in keys.iter() {
+            for configured in ordered {
                 pepper.update(configured.as_bytes());
                 pepper.update([0]);
             }
@@ -792,4 +794,24 @@ fn json_body(status: StatusCode, body: Body) -> Response {
         body,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_fingerprint_survives_key_reorder() {
+        let keys: Vec<Arc<str>> = vec!["sk-alpha".into(), "sk-beta".into()];
+        let mut reordered = keys.clone();
+        reordered.reverse();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-beta"),
+        );
+        let before = matched_key(&headers, &keys, InboundFormat::OpenAiChat);
+        let after = matched_key(&headers, &reordered, InboundFormat::OpenAiChat);
+        assert_eq!(before, after);
+    }
 }
