@@ -60,17 +60,33 @@ fn substitute_refs(
 ) -> Result<(), String> {
     match value {
         Value::String(reference) => {
-            let resolvable = if let Some(name) = reference.strip_prefix("env:") {
-                !name.is_empty() && std::env::var_os(name).is_some()
-            } else if let Some(path) = reference.strip_prefix("file:") {
-                !path.is_empty() && fs::read_to_string(path).is_ok()
-            } else {
-                true
-            };
-            // References that resolve here are left for llmux-config to
+            // References resolving here are left for llmux-config to
             // resolve to their real values, so equality and validity match
-            // deploy-time semantics; unresolvable ones get a marker.
-            if !resolvable {
+            // deploy-time semantics. Malformed or deterministically
+            // unreadable references fail now, exactly as deploy preflight
+            // would; only valid references absent on this host (an unset
+            // env var or a file living on the deploy host) get a marker.
+            let marker_needed = if let Some(name) = reference.strip_prefix("env:") {
+                if name.is_empty() {
+                    return Err("empty env: reference in generated configuration".to_owned());
+                }
+                std::env::var_os(name).is_none()
+            } else if let Some(path) = reference.strip_prefix("file:") {
+                if path.is_empty() {
+                    return Err("empty file: reference in generated configuration".to_owned());
+                }
+                match fs::read_to_string(path) {
+                    Ok(_) => false,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        return Err(format!("key file {path} is not valid UTF-8"));
+                    }
+                    Err(_) => true,
+                }
+            } else {
+                false
+            };
+            if marker_needed {
                 let marker = marker_for(dir, markers, reference)?;
                 *reference = format!("file:{}", marker.0.display());
             }
@@ -133,6 +149,28 @@ mod tests {
             std::env::remove_var("LLMUX_TEST_GATE_EQ");
             std::env::remove_var("LLMUX_TEST_OWNER_EQ");
         }
+    }
+
+    #[test]
+    fn malformed_references_fail_import_like_deploy_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let deployment = json!({"id":"d","auth":"none","provider":"openai_compat","base_url":"http://127.0.0.1/","upstream_model":"m"});
+        let model = json!({"name":"m","allowed_keys":["file:"],"deployments":[deployment]});
+        let config = json!({"server":{"listen":"127.0.0.1:1","client_keys":["file:"]},"credentials":[],"models":[model]});
+        assert!(validate(&config, dir.path()).is_err());
+        let env_config = json!({"server":{"listen":"127.0.0.1:1","client_keys":["env:"]},"credentials":[],"models":[]});
+        assert!(validate(&env_config, dir.path()).is_err());
+    }
+
+    #[test]
+    fn non_utf8_key_file_fails_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("key.bin");
+        fs::write(&key_file, [0x80u8, 0x81, 0x82]).unwrap();
+        let deployment = json!({"id":"d","auth":"none","provider":"openai_compat","base_url":"http://127.0.0.1/","upstream_model":"m"});
+        let reference = format!("file:{}", key_file.display());
+        let config = json!({"server":{"listen":"127.0.0.1:1","client_keys":[reference.clone()]},"credentials":[],"models":[{"name":"m","allowed_keys":[reference],"deployments":[deployment]}]});
+        assert!(validate(&config, dir.path()).is_err());
     }
 
     #[test]
