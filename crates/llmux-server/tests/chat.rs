@@ -1637,6 +1637,7 @@ async fn middle_out_truncation_is_opt_in_and_reported() {
 
 const KEEPALIVE_FRAME: &str = "data: {\"id\":\"chatcmpl-keepalive\",\"object\":\"chat.completion.chunk\",\"model\":\"gemini-3-flash\",\"choices\":[]}\n\n";
 const RATE_LIMIT_FRAME: &str = "data: {\"error\":{\"message\":\"antigravity/gemini-3-flash: rate limit - [429]: Antigravity refused this exact request with 429 RESOURCE_EXHAUSTED\",\"type\":\"rate_limit_error\",\"code\":429}}\n\n";
+const ROLE_FRAME: &str = "data: {\"id\":\"chatcmpl-role\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n";
 
 fn sse(body: &str) -> Reply {
     Reply::Sse(Arc::from(body))
@@ -1672,6 +1673,25 @@ async fn stream_keepalive_then_rate_limit_frame_fails_over() {
         [1, 2],
         "the deployment that streamed a 429 frame must cool down"
     );
+}
+
+#[tokio::test]
+async fn stream_role_preamble_then_rate_limit_fails_over() {
+    let content = "data: {\"id\":\"chatcmpl-role\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n";
+    let backup = format!("{ROLE_FRAME}{content}data: [DONE]\n\n");
+    let fixture = Fixture::start(
+        [
+            sse(&format!("{ROLE_FRAME}{RATE_LIMIT_FRAME}")),
+            sse(&backup),
+        ],
+        [Reply::Complete, Reply::Complete],
+        "",
+    )
+    .await;
+    let response = fixture.request("test-client", "alias", true).await;
+    check_route(&response, "d2", "2");
+    assert_eq!(body(response).await, backup);
+    assert_eq!(fixture.counts(), [1, 1]);
 }
 
 #[tokio::test]

@@ -49,6 +49,11 @@ NOT commit. Keepalives before that frame are dropped; keepalives after it are
 forwarded. The wait for a committing frame is bounded by the existing request
 and deployment timeouts.
 
+An OpenAI-compatible assistant-role preamble without content, tool calls,
+finish reason, usage or other output SHALL NOT commit. The first such preamble
+is held until commitment and then sent before the committing frame. If the
+attempt fails before commitment, its preamble is discarded.
+
 Once a streaming response has been committed, the gateway
 SHALL NOT retry that request on another deployment.
 

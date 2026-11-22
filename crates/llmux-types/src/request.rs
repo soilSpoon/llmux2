@@ -45,27 +45,52 @@ pub struct SseEvent {
     pub data: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SseCommitment {
+    Keepalive,
+    RolePreamble,
+    Commit,
+}
+
 impl SseEvent {
-    /// Whether forwarding this frame commits the downstream response.
-    ///
-    /// OpenAI-compat keepalive chunks (`choices: []` with no usage object) do
-    /// not. `[DONE]` and every other complete event do, so a role-only or
-    /// non-JSON frame still commits the way it does today.
-    pub fn commits(&self) -> bool {
-        if self.data == "[DONE]" {
-            return true;
-        }
+    pub fn commitment(&self) -> SseCommitment {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&self.data) else {
-            return true;
+            return SseCommitment::Commit;
         };
         let Some(choices) = value.get("choices").and_then(serde_json::Value::as_array) else {
-            return true;
+            return SseCommitment::Commit;
         };
-        if !choices.is_empty() {
-            return true;
+        if value.get("usage").is_some_and(serde_json::Value::is_object) {
+            return SseCommitment::Commit;
         }
-        value.get("usage").is_some_and(serde_json::Value::is_object)
+        if choices.is_empty() {
+            return SseCommitment::Keepalive;
+        }
+        if choices.iter().all(is_role_only) {
+            return SseCommitment::RolePreamble;
+        }
+        SseCommitment::Commit
     }
+}
+
+fn is_role_only(choice: &serde_json::Value) -> bool {
+    let Some(choice) = choice.as_object() else {
+        return false;
+    };
+    let Some(delta) = choice.get("delta").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    delta.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+        && choice.iter().all(|(key, value)| match key.as_str() {
+            "index" | "delta" => true,
+            "finish_reason" | "logprobs" => value.is_null(),
+            _ => false,
+        })
+        && delta.iter().all(|(key, value)| match key.as_str() {
+            "role" => true,
+            "content" => value.is_null() || value.as_str() == Some(""),
+            _ => value.is_null(),
+        })
 }
 
 #[cfg(test)]
@@ -78,22 +103,25 @@ mod tests {
             event: None,
             data: r#"{"id":"chatcmpl-keepalive","choices":[]}"#.into(),
         };
-        assert!(!keepalive.commits());
+        assert_eq!(keepalive.commitment(), SseCommitment::Keepalive);
         for data in [
             "[DONE]",
             r#"{"id":"chunk-1"}"#,
             "{}",
             r#"{"choices":[{"delta":{"content":"Hi"}}]}"#,
+            r#"{"choices":[{"delta":{"role":"assistant","content":"Hi"}}]}"#,
+            r#"{"choices":[{"delta":{"role":"assistant","reasoning_content":"hi"}}]}"#,
             r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_1"}]}}]}"#,
             r#"{"choices":[{"finish_reason":"stop"}]}"#,
             r#"{"choices":[],"usage":{"prompt_tokens":1}}"#,
         ] {
-            assert!(
+            assert_eq!(
                 SseEvent {
                     event: None,
                     data: data.into(),
                 }
-                .commits(),
+                .commitment(),
+                SseCommitment::Commit,
                 "{data}"
             );
         }
