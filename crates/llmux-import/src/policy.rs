@@ -16,8 +16,21 @@ pub(super) struct External {
     pub base_url: String,
 }
 
+/// Default requests-per-minute cap for imported Workers AI deployments,
+/// overridable with `--workers-ai-rpm`.
+pub(super) const WORKERS_DEFAULT_RPM: u32 = 30;
+
+/// Hard daily cap on estimated input tokens for imported Workers AI
+/// deployments. Sized so a day of worst-case billed usage stays under the
+/// documented 10,000-neuron free daily allowance even when output (including
+/// hidden reasoning tokens) is 5x the admitted input: the most expensive
+/// allowed model bills 27,273 neurons/M output tokens, and
+/// 60,000 * (0.018182 + 5 * 0.027273) is about 9,273 neurons.
+pub(super) const WORKERS_TPD: u32 = 60_000;
+
 pub(super) struct Policy {
     pub workers: Option<External>,
+    pub workers_rpm: u32,
     workers_models: Option<HashSet<String>>,
     pub kilo_key: Option<String>,
     pub kilo_free: Option<HashSet<String>>,
@@ -122,8 +135,15 @@ impl Policy {
                 Ok::<_, String>(free)
             })
             .transpose()?;
+        if options.workers_ai_rpm.is_some() && workers.is_none() {
+            return Err(
+                "--workers-ai-rpm requires --cloudflare-account-id-file and --cloudflare-token-file"
+                    .into(),
+            );
+        }
         Ok(Self {
             workers,
+            workers_rpm: options.workers_ai_rpm.unwrap_or(WORKERS_DEFAULT_RPM),
             workers_models,
             kilo_free,
             kilo_key: options.kilo_key_file.map(reference).transpose()?,

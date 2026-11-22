@@ -354,7 +354,8 @@ fn workers_options_compose_with_explicit_omniroute_fallback() {
     let first = &config.deployments[model.deployments[0].0 as usize];
     let last = &config.deployments[model.deployments[1].0 as usize];
     assert_eq!(first.upstream_model.as_ref(), "@cf/openai/gpt-oss-20b");
-    assert_eq!(first.quota.rpm, Some(1));
+    assert_eq!(first.quota.rpm, Some(30));
+    assert_eq!(first.quota.tpd, Some(60_000));
     assert_eq!(last.upstream_model.as_ref(), "workers");
     assert_eq!(last.base_url.to_string(), "http://127.0.0.1:20128/v1");
     assert!(last.priority > first.priority);
@@ -697,7 +698,8 @@ fn workers_opt_in_maps_bridges_and_fails_closed_for_unknown_deprecated_and_paid_
             dep.base_url.to_string(),
             "https://api.cloudflare.com/client/v4/accounts/0123456789abcdef0123456789abcdef/ai/v1"
         );
-        assert_eq!(dep.quota.rpm, Some(1));
+        assert_eq!(dep.quota.rpm, Some(30));
+        assert_eq!(dep.quota.tpd, Some(60_000));
         assert!(!dep.credential.is_empty());
     }
     for name in ["unknown", "deprecated", "paid"] {
@@ -975,6 +977,57 @@ fn external_kilo_key_and_verified_openrouter_replacements_use_real_loader() {
     let text = fs::read_to_string(dir.path().join("out.toml")).unwrap();
     assert!(text.contains(&format!("file:{}", kilo.display())));
     assert!(!text.contains("synthetic-kilo-external-key"));
+}
+
+#[test]
+fn workers_quota_rpm_is_configurable_and_needs_the_cloudflare_opt_in() {
+    let mut root = fixture();
+    root["providerConnections"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"cf","provider":"cloudflare-direct","authType":"none"}));
+    root["combos"].as_array_mut().unwrap().push(json!({
+        "name":"workers", "models":["cfpd/openai/gpt-oss-20b"]
+    }));
+    let dir = tempfile::tempdir().unwrap();
+    let account = dir.path().join("account");
+    let token = dir.path().join("token");
+    fs::write(&account, "0123456789abcdef0123456789abcdef").unwrap();
+    fs::write(&token, "synthetic-token").unwrap();
+    success(&run(
+        &root,
+        dir.path(),
+        &[
+            ("--cloudflare-account-id-file", &account),
+            ("--cloudflare-token-file", &token),
+            ("--workers-ai-rpm", Path::new("12")),
+        ],
+    ));
+    let config = RuntimeConfig::load(dir.path().join("out.toml")).unwrap();
+    let model = &config.models[config.model_names["workers"]];
+    let dep = &config.deployments[model.deployments[0].0 as usize];
+    assert_eq!(dep.quota.rpm, Some(12));
+    assert_eq!(dep.quota.tpd, Some(60_000));
+
+    let result = run(&root, dir.path(), &[("--workers-ai-rpm", Path::new("12"))]);
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+    assert!(
+        stderr.contains(
+            "--workers-ai-rpm requires --cloudflare-account-id-file and --cloudflare-token-file"
+        ),
+        "{stderr}"
+    );
+    let result = run(
+        &root,
+        dir.path(),
+        &[
+            ("--cloudflare-account-id-file", &account),
+            ("--cloudflare-token-file", &token),
+            ("--workers-ai-rpm", Path::new("0")),
+        ],
+    );
+    assert!(!result.status.success());
 }
 
 #[test]
