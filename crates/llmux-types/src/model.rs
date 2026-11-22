@@ -74,6 +74,20 @@ pub struct Deployment {
     /// When this deployment stops being eligible, for time-limited offers.
     /// `None` means it never expires.
     pub expires_at: Option<SystemTime>,
+    /// Whether probing this leg can spend money or quota; `Billed` is the
+    /// safe default when the config does not say.
+    pub billing: Billing,
+}
+
+/// Whether a leg of a model can be called at no cost. `Billed` covers paid
+/// providers, billed credentials, and quota-capped legs (Workers AI's daily
+/// cap), and is the default for configs that carry no marker.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Billing {
+    #[default]
+    Billed,
+    Free,
 }
 
 /// What to do with a request that fits no deployment's context window.

@@ -2,7 +2,7 @@
 
 use http::{HeaderName, Uri};
 use llmux_types::{
-    provider, CanonicalModel, Capabilities, ChatRequestField, ContextOverflow, Deployment,
+    provider, Billing, CanonicalModel, Capabilities, ChatRequestField, ContextOverflow, Deployment,
     DeploymentIdx, ErrorKind, NousState, ProviderKind, QuotaSpec,
 };
 use serde::Deserialize;
@@ -285,6 +285,8 @@ struct RawDeployment {
     timeout_ms: Option<u64>,
     max_context: Option<u32>,
     expires_at: Option<toml::value::Datetime>,
+    #[serde(default)]
+    billing: Billing,
 }
 
 #[derive(Deserialize)]
@@ -694,6 +696,7 @@ impl RawConfig {
                     timeout: timeout(dep.timeout_ms.unwrap_or(server.request_timeout_ms))?,
                     max_context: dep.max_context.or(model.capabilities.max_context),
                     expires_at,
+                    billing: dep.billing,
                 });
             }
 
@@ -1091,6 +1094,24 @@ mod tests {
         for quota in ["rpd = 0", "tpm = 0", "tpd = 0"] {
             let err = RuntimeConfig::parse(&with_quota(quota)).err().expect(quota);
             assert!(err.to_string().contains("positive"), "{quota}: {err}");
+        }
+    }
+
+    #[test]
+    fn deployment_billing_parses_and_defaults_to_billed() {
+        let base = config(REQUIRED);
+        let parsed = RuntimeConfig::parse(&base).unwrap();
+        assert_eq!(parsed.deployments[0].billing, Billing::Billed);
+        let free = RuntimeConfig::parse(
+            &base.replace("upstream_model =", "billing = \"free\"\nupstream_model ="),
+        )
+        .unwrap();
+        assert_eq!(free.deployments[0].billing, Billing::Free);
+        for invalid in ["billing = \"paid\"", "billing = \"none\""] {
+            assert!(RuntimeConfig::parse(
+                &base.replace("upstream_model =", &format!("{invalid}\nupstream_model ="))
+            )
+            .is_err());
         }
     }
 

@@ -199,7 +199,7 @@ mod tests {
     use hyper_util::{client::legacy::Client, rt::TokioExecutor};
     use llmux_testkit::TestServer;
     use llmux_types::{
-        provider::DEEPAI_KEY_HEADER, AuthMaterial, BuildError, Deployment, DeploymentIdx,
+        provider::DEEPAI_KEY_HEADER, AuthMaterial, Billing, BuildError, Deployment, DeploymentIdx,
         GatewayRequest, GatewayResponse, InboundFormat, ProviderAdapter, QuotaSpec, RequestId,
         Support, UpstreamError,
     };
@@ -438,6 +438,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             max_context: None,
             expires_at: None,
+            billing: Billing::Billed,
         }
     }
 }

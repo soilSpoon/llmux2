@@ -1,6 +1,7 @@
 use llmux_config::RuntimeConfig;
+use llmux_types::Billing;
 use serde_json::{json, Value};
-use std::{fs, process::Command};
+use std::{collections::HashMap, fs, process::Command};
 
 const FIXTURE: &str = include_str!("fixtures/export.json");
 const DB_FIXTURE: &str = include_str!("fixtures/db-dump.json");
@@ -23,6 +24,23 @@ fn raw_dump_custom_header_json_loads_as_private_references() {
     assert!(!fs::read_to_string(output)
         .unwrap()
         .contains("synthetic-header-secret"));
+}
+
+#[test]
+fn emitted_deployments_carry_billing_from_provider_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("llmux.toml");
+    llmux_import::import(DB_FIXTURE, &output, None).unwrap();
+    let config = RuntimeConfig::load(&output).unwrap();
+    // Builtin provider legs are billed; custom provider-node legs are free.
+    let by_credential: HashMap<_, _> = config
+        .deployments
+        .iter()
+        .map(|dep| (dep.credential.as_ref(), dep.billing))
+        .collect();
+    assert_eq!(by_credential["upstream-fast"], Billing::Billed);
+    assert_eq!(by_credential["upstream-slow"], Billing::Billed);
+    assert_eq!(by_credential["upstream-custom"], Billing::Free);
 }
 
 #[test]

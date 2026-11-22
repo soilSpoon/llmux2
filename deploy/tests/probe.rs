@@ -264,9 +264,9 @@ fn models_reply() -> Reply {
     Reply::json(
         200,
         json!({"object":"list","data":[
-            {"id":"beta","object":"model"},
-            {"id":"alpha","object":"model"},
-            {"id":"gamma","object":"model"}
+            {"id":"beta","object":"model","billing":"free"},
+            {"id":"alpha","object":"model","billing":"free"},
+            {"id":"gamma","object":"model","billing":"free"}
         ]}),
     )
 }
@@ -854,6 +854,44 @@ fn sweep_probes_every_listed_model_without_moving_the_cursor() {
     let output = listen_flag(&home, &gateway, &[]);
     assert_eq!(gateway.chat_models().last().unwrap(), "alpha");
     assert_eq!(summary(&output)["dead"], json!([]));
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn sweep_never_probes_a_billed_model() {
+    // The sweep must never spend on paid or quota-capped legs: only models
+    // the gateway advertises as `billing = "free"` are probed, and a missing
+    // or unrecognized marker counts as billed.
+    let home = Home::new();
+    let ok = || Reply::json(200, json!({"choices":[{"message":{"content":"ok"}}]}));
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        Reply::json(
+            200,
+            json!({"object":"list","data":[
+                {"id":"beta","object":"model","billing":"billed"},
+                {"id":"alpha","object":"model","billing":"free"},
+                {"id":"gamma","object":"model"}
+            ]}),
+        ),
+        ok(),
+    ]);
+    let output = listen_flag(&home, &gateway, &["--sweep"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(gateway.chat_models(), ["alpha"]);
+    let report = summary(&output);
+    let skipped: Vec<_> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|check| {
+            check["name"]
+                .as_str()
+                .filter(|_| check["skipped"].is_string())
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(skipped, ["chat:beta", "chat:gamma"]);
     stop.send(()).unwrap();
 }
 

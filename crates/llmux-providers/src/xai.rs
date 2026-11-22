@@ -108,6 +108,7 @@ impl ProviderAdapter for Xai {
             timeout: dep.timeout,
             max_context: dep.max_context,
             expires_at: dep.expires_at,
+            billing: dep.billing,
         };
         if responses(&model) {
             let mut request = OpenAiResponses::new()
@@ -156,7 +157,7 @@ impl ProviderAdapter for Xai {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
+    use llmux_types::{Billing, DeploymentIdx, QuotaSpec, RequestId};
     use std::time::Duration;
 
     fn dep(model: &str) -> Deployment {
@@ -175,6 +176,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             max_context: None,
             expires_at: None,
+            billing: Billing::Billed,
         }
     }
 

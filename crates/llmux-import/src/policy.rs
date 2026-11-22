@@ -1,7 +1,33 @@
-use crate::{string, ImportOptions};
+use crate::{string, upstream::ProviderIdentity, xplabs, Connection, ImportOptions};
 use llmux_types::provider::DEEPAI_TEXT_MODELS;
 use serde_json::Value;
 use std::{collections::HashSet, fs, path::Path};
+
+/// Builtin provider identities whose legs never bill or hit a shared quota at
+/// probe rates: community/free endpoints and the local Devin session.
+/// Everything else a connection can reach is billed for sweep purposes —
+/// including Workers AI, whose daily account cap this traffic consumes.
+const FREE_PROVIDERS: &[&str] = &[
+    "aihorde",
+    "devin-cli-agentic",
+    "duckduckgo-web",
+    "github-models",
+    "nous",
+];
+
+/// Whether the emitted leg can spend money or shared quota when probed.
+/// Custom (site-managed) providers are free; keyed legs against builtin
+/// providers bill, except reviewed free subsets (Kilo verified-free models,
+/// XPLabs free routes — billed XPLabs routes never reach this point).
+pub(super) fn billed(connection: &Connection) -> bool {
+    if connection.policy == ModelPolicy::KiloFree || connection.base_url == xplabs::BASE_URL {
+        return false;
+    }
+    match &connection.provider {
+        ProviderIdentity::Custom(_) => false,
+        ProviderIdentity::Builtin(id) => !FREE_PROVIDERS.contains(&id.as_str()),
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ModelPolicy {

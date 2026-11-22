@@ -154,10 +154,16 @@ upstream errors) never count toward dead.
 unit passes `127.0.0.1:8090` for the OCI slots.
 
 A separate low-rate sweep covers the whole catalog: `llmux2-sweep.timer`
-(daily) runs `llmux2-probe --sweep`, which probes every listed model once in
-a single run without moving the rotation cursor, using its own state file
-(`probe-sweep-state.json`) and writing the dead list to `dead-models.json`.
-One sweep sends one token-bearing request per advertised model, so keep its
+(`OnCalendar=daily` with `RandomizedDelaySec=86400`, so enabling it never
+fires a sweep immediately) runs `llmux2-probe --sweep`, which probes every
+listed model once in a single run without moving the rotation cursor,
+using its own state file (`probe-sweep-state.json`) and writing the dead
+list to `dead-models.json`. The sweep only probes models `/v1/models`
+marks `billing = "free"` — models with any paid or quota-capped leg
+(Morph, xAI, Anthropic, Workers AI, and other billed providers) are
+skipped, derived from each emitted deployment's `billing` marker rather
+than a hand-kept list, so it can never spend on billed routes. One sweep
+sends one token-bearing request per free advertised model, so keep its
 cadence low; the curated `--models` pin on `llmux2-probe.service` never
 builds streaks for the long tail — the sweep is what feeds `--dead-file`
 for the full catalog.

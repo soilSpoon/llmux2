@@ -2,9 +2,10 @@
 Description=Sweep all llmux2 routes daily for dead upstreams
 
 [Timer]
-OnBootSec=3600
-OnUnitActiveSec=86400
-AccuracySec=600
+# Calendar + jitter: enabling the timer never fires a sweep immediately, and
+# the full sweep lands at a randomized off-peak point each day.
+OnCalendar=daily
+RandomizedDelaySec=86400
 Unit=llmux2-sweep.service
 
 [Install]

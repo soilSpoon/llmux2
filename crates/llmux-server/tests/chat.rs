@@ -550,8 +550,8 @@ async fn model_discovery_lists_exact_routable_ids_and_requires_authentication() 
     assert_eq!(
         list,
         json!({"object": "list", "data": [
-            {"id":"alias","object":"model","created":0,"owned_by":"llmux2"},
-            {"id":"shared","object":"model","created":0,"owned_by":"llmux2"}
+            {"id":"alias","object":"model","created":0,"owned_by":"llmux2","billing":"billed"},
+            {"id":"shared","object":"model","created":0,"owned_by":"llmux2","billing":"billed"}
         ]})
     );
     assert_eq!(fixture.counts(), [0, 0]);

@@ -487,7 +487,7 @@ fn chat_stream(
 mod tests {
     use super::*;
     use futures_util::FutureExt;
-    use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
+    use llmux_types::{Billing, DeploymentIdx, QuotaSpec, RequestId};
     use std::time::Duration;
 
     #[test]
@@ -508,6 +508,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             max_context: None,
             expires_at: None,
+            billing: Billing::Billed,
         };
         dep.headers.insert(
             "x-deployment",

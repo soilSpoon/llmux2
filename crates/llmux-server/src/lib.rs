@@ -32,8 +32,8 @@ use llmux_providers::{
     OpenAiCompat, OpenAiResponses, RequestMetadata, StaticKey, Xai,
 };
 use llmux_types::{
-    provider, ContextOverflow, CredentialSource, GatewayRequest, GatewayResponse, InboundFormat,
-    ProviderRegistry, RequestId, UpstreamError,
+    provider, Billing, ContextOverflow, CredentialSource, GatewayRequest, GatewayResponse,
+    InboundFormat, ProviderRegistry, RequestId, UpstreamError,
 };
 use serde_json::{json, value::RawValue, Value};
 use sha2::{Digest, Sha256};
@@ -234,7 +234,23 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     let ids = catalog::listed_ids(&active.config, live.as_deref());
     let data: Vec<_> = ids
         .into_iter()
-        .map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "llmux2"}))
+        .map(|id| {
+            // `free` only when every leg is marked free; a missing marker is billed.
+            let billing = match active.config.model_names.get(id) {
+                Some(&index)
+                    if active.config.models[index]
+                        .deployments
+                        .iter()
+                        .all(|idx| {
+                            active.config.deployments[idx.0 as usize].billing == Billing::Free
+                        }) =>
+                {
+                    "free"
+                }
+                _ => "billed",
+            };
+            json!({"id": id, "object": "model", "created": 0, "owned_by": "llmux2", "billing": billing})
+        })
         .collect();
     Json(json!({"object": "list", "data": data})).into_response()
 }

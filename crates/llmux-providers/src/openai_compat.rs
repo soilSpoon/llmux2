@@ -1066,7 +1066,7 @@ mod tests {
         use http_body_util::Full;
         use hyper_util::{client::legacy::Client, rt::TokioExecutor};
         use llmux_testkit::TestServer;
-        use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
+        use llmux_types::{Billing, DeploymentIdx, QuotaSpec, RequestId};
         use serde_json::{json, Value};
 
         let server = TestServer::start(axum::Router::new().route(
@@ -1121,6 +1121,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             max_context: None,
             expires_at: None,
+            billing: Billing::Billed,
             fallback: false,
         };
         let client = Client::builder(TokioExecutor::new()).build_http();
@@ -1329,7 +1330,7 @@ mod tests {
     #[test]
     fn request_carries_a_default_user_agent_unless_the_deployment_sets_one() {
         use futures_util::FutureExt;
-        use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
+        use llmux_types::{Billing, DeploymentIdx, QuotaSpec, RequestId};
         let adapter = OpenAiCompat::new("openai_compat");
         let mut deployment = Deployment {
             headers: Default::default(),
@@ -1345,6 +1346,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             max_context: None,
             expires_at: None,
+            billing: Billing::Billed,
             fallback: false,
         };
         let req = GatewayRequest {
@@ -1875,7 +1877,7 @@ mod tests {
     #[test]
     fn end_user_hash_overrides_user_unless_stripped_or_unsupported() {
         use futures_util::FutureExt;
-        use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
+        use llmux_types::{Billing, DeploymentIdx, QuotaSpec, RequestId};
         let hash = "31ca399bfc61dac0b442a6bef7c00cd06cf9682c11b9192fb26a918b4a9130f8";
         let raw = "raw-client-SHOULD-NOT-LEAK";
         let body = Bytes::from(format!(
@@ -1909,6 +1911,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             max_context: None,
             expires_at: None,
+            billing: Billing::Billed,
             fallback: false,
         };
         let send = |adapter: &OpenAiCompat, dep: &Deployment| {

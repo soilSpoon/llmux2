@@ -667,7 +667,7 @@ impl ProviderAdapter for Anthropic {
 mod tests {
     use super::*;
     use futures_util::FutureExt;
-    use llmux_types::{DeploymentIdx, QuotaSpec, RequestId};
+    use llmux_types::{Billing, DeploymentIdx, QuotaSpec, RequestId};
 
     #[test]
     fn anthropic_retry_after_prefers_the_header_then_valid_reset_windows() {
@@ -1166,6 +1166,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             max_context: None,
             expires_at: None,
+            billing: Billing::Billed,
         };
         let mut req = GatewayRequest {
             format: InboundFormat::AnthropicMessages,
@@ -1284,6 +1285,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             max_context: None,
             expires_at: None,
+            billing: Billing::Billed,
         };
         for (format, body) in [
             (
@@ -1375,6 +1377,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             max_context: None,
             expires_at: None,
+            billing: Billing::Billed,
         };
         let hash = "31ca399bfc61dac0b442a6bef7c00cd06cf9682c11b9192fb26a918b4a9130f8";
         let raw = "raw-client-SHOULD-NOT-LEAK";

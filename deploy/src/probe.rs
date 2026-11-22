@@ -1,6 +1,7 @@
 use crate::{atomic_write, Result};
 use serde_json::{json, Value};
 use std::{
+    collections::HashSet,
     env,
     ffi::OsString,
     fs,
@@ -42,7 +43,7 @@ fn display_args(args: &[OsString]) -> String {
 fn parse(args: &[OsString]) -> std::result::Result<Option<Options>, String> {
     if args.first().is_some_and(|a| a == "-h" || a == "--help") {
         println!(
-            "{}\n\nSynthetic probes for the running llmux2 gateway.\n\nProbes /healthz and /v1/models on every run, then exercises\n--per-run canonical models (default 1) through /v1/chat/completions,\nrotating through the sorted model list across runs. The rotation\ncursor lives in --state-file, which also accumulates each model's\nconsecutive failure streak; a model whose last --dead-after probes\nfailed with 404 (default 2) is reported as dead, and --dead-file\nwrites those names as a JSON list for llmux-import --exclude-models.\n--sweep probes every listed model once in the same run without moving\nthe rotation cursor; it cannot be combined with --models.\nPrints a JSON report; exit 0 when every probe passes, 1 on any failure.",
+            "{}\n\nSynthetic probes for the running llmux2 gateway.\n\nProbes /healthz and /v1/models on every run, then exercises\n--per-run canonical models (default 1) through /v1/chat/completions,\nrotating through the sorted model list across runs. The rotation\ncursor lives in --state-file, which also accumulates each model's\nconsecutive failure streak; a model whose last --dead-after probes\nfailed with 404 (default 2) is reported as dead, and --dead-file\nwrites those names as a JSON list for llmux-import --exclude-models.\n--sweep probes every listed model whose gateway billing marker is `free`\nonce in the same run without moving the rotation cursor (a missing or\nunrecognized marker counts as billed and is skipped); it cannot be\ncombined with --models.\nPrints a JSON report; exit 0 when every probe passes, 1 on any failure.",
             usage()
         );
         return Ok(None);
@@ -529,6 +530,7 @@ fn run(options: &Options) -> Result<bool> {
     let start = Instant::now();
     let models = probe(options, verified, "GET", "/v1/models", Some(key), None);
     let mut listed: Vec<String> = Vec::new();
+    let mut free: HashSet<String> = HashSet::new();
     let mut catalog_valid = false;
     if let Ok(response) = &models {
         if let Ok(value) = serde_json::from_slice::<Value>(&response.body) {
@@ -540,6 +542,11 @@ fn run(options: &Options) -> Result<bool> {
                     .collect();
                 listed.sort_unstable();
                 listed.dedup();
+                free = data
+                    .iter()
+                    .filter(|m| m["billing"] == "free")
+                    .filter_map(|m| m["id"].as_str().map(str::to_string))
+                    .collect();
             }
         }
     }
@@ -601,6 +608,17 @@ fn run(options: &Options) -> Result<bool> {
     let mut failures = state["failures"].as_object().cloned().unwrap_or_default();
     for model in &selected {
         let name = format!("chat:{model}");
+        if options.sweep && !free.contains(model) {
+            // Paid and quota-capped legs are never probed; a missing marker
+            // counts as billed.
+            checks.push(json!({
+                "name": name,
+                "ok": true,
+                "skipped": "billed",
+                "latency_ms": 0,
+            }));
+            continue;
+        }
         let start = Instant::now();
         let result = probe(
             options,

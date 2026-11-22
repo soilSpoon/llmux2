@@ -348,8 +348,18 @@ import drops it rather than advertising it in `/v1/models`.
 
 A dedicated low-rate sweep SHALL cover the whole catalog: `--sweep` SHALL
 probe every listed model once in a single run without moving the rotation
-cursor, and SHALL be rejected in combination with `--models`. The shipped
-`llmux2-sweep.timer` SHALL run it on its own state file, feeding
+cursor, and SHALL be rejected in combination with `--models`. The sweep
+SHALL never call a deployment that can bill or consume a shared quota: the
+importer SHALL mark each emitted deployment `billing = "free"` or
+`"billed"` (site-managed custom providers, verified-free legs, and the
+local OmniRoute fallback are free; commercial and quota-capped legs are
+billed), `llmux-config` SHALL accept the marker defaulting to billed, and
+`/v1/models` SHALL report each model as `free` only when every leg is
+free. `--sweep` SHALL skip any listed model not marked `free` — a missing
+or unrecognized marker counts as billed — and record it as `skipped`. The shipped
+`llmux2-sweep.timer` SHALL run it on its own state file on a calendar
+schedule with randomized delay (enabling it SHALL never fire a sweep
+immediately), feeding
 `--dead-file`; `llmux2-prune.timer` SHALL re-run the import with
 `--exclude-models` on a schedule and deploy the regenerated config so dead
 routes are dropped without manual pruning. The scheduled import SHALL carry
@@ -362,7 +372,8 @@ export on every exit — success, failure, or abort — and deploy the installed
 #### Scenario: A full sweep finds the long tail
 
 WHEN `--sweep` runs against a catalog of N models
-THEN every listed model is probed exactly once and the rotation cursor is
+THEN every listed model marked `free` is probed exactly once, billed
+models are skipped without an upstream call, and the rotation cursor is
 unchanged, so recurring probes keep their place.
 
 ### Requirement: Simple and extensible
