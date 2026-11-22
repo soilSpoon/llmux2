@@ -1147,6 +1147,7 @@ mod tests {
                 end_user: None,
                 client_key: None,
                 image_count: 0,
+                free_only: false,
             };
             let upstream = adapter
                 .build_request(&req, &deployment, &AuthMaterial::None)
@@ -1362,6 +1363,7 @@ mod tests {
             end_user: None,
             client_key: None,
             image_count: 0,
+            free_only: false,
         };
         let build = |dep: &Deployment| {
             adapter
@@ -1896,6 +1898,7 @@ mod tests {
             end_user: Some(hash.into()),
             client_key: None,
             image_count: 0,
+            free_only: false,
         };
         let deployment = |kind: &str, strip: &[ChatRequestField]| Deployment {
             headers: Default::default(),

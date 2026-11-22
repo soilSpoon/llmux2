@@ -1181,6 +1181,7 @@ mod tests {
             end_user: None,
             client_key: None,
             image_count: 0,
+            free_only: false,
         };
         dep.headers
             .insert("x-deployment", HeaderValue::from_static("static-value"));
@@ -1310,6 +1311,7 @@ mod tests {
                 end_user: None,
                 client_key: None,
                 image_count: 0,
+                free_only: false,
             };
             let request = a
                 .build_request(&req, &dep, &AuthMaterial::None)
@@ -1395,6 +1397,7 @@ mod tests {
                 end_user: end_user.map(Arc::from),
                 client_key: None,
                 image_count: 0,
+                free_only: false,
             };
             let request = a
                 .build_request(&req, &dep, &AuthMaterial::None)

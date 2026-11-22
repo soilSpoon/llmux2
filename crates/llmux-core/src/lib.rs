@@ -19,7 +19,7 @@ use hyper_util::{
 use limits::{DeploymentLimits, Permit, Window};
 use llmux_config::RuntimeConfig;
 use llmux_types::{
-    provider, AuthMaterial, BuildError, ContextOverflow, CredentialSource, Deployment,
+    provider, AuthMaterial, Billing, BuildError, ContextOverflow, CredentialSource, Deployment,
     DeploymentIdx, ErrorKind, GatewayRequest, GatewayResponse, ProviderAdapter, ProviderRegistry,
     SseCommitment, Support, UpstreamError,
 };
@@ -559,6 +559,12 @@ impl Executor {
             for &idx in after.iter().chain(before) {
                 let idx = index(idx);
                 let dep = &self.cfg.deployments[idx];
+                // A free-only probe never routes to a billed leg, so a sweep
+                // cannot spend on paid or quota-capped legs — including billed
+                // fallback legs a dying free leg would otherwise fall through to.
+                if req.free_only && dep.billing == Billing::Billed {
+                    continue;
+                }
                 let binding = &self.bindings[idx];
                 let support = binding.adapter.supports(req.format);
                 let now = Instant::now();
@@ -809,6 +815,12 @@ impl Executor {
                     }
                 }
             }
+        }
+        // A free-only request that could not be served by a free leg resolves
+        // no route: never spend on billed legs, and report the model as
+        // unknown so the probe's 404 streaks can mark it dead.
+        if req.free_only {
+            return Err(GatewayError::UnknownModel);
         }
         if let Some(err) = last_transient {
             return Err(GatewayError::Client(err));

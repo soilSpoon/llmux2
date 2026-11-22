@@ -351,11 +351,15 @@ probe every listed model once in a single run without moving the rotation
 cursor, and SHALL be rejected in combination with `--models`. The sweep
 SHALL never call a deployment that can bill or consume a shared quota: the
 importer SHALL mark each emitted deployment `billing = "free"` or
-`"billed"` (site-managed custom providers, verified-free legs, and the
-local OmniRoute fallback are free; commercial and quota-capped legs are
-billed), `llmux-config` SHALL accept the marker defaulting to billed, and
-`/v1/models` SHALL report each model as `free` only when every leg is
-free. `--sweep` SHALL skip any listed model not marked `free` — a missing
+`"billed"` (site-managed custom providers and verified-free legs are
+free; commercial, quota-capped, and OmniRoute fallback legs are billed —
+OmniRoute forwards to billed upstreams), `llmux-config` SHALL accept the
+marker defaulting to billed, and `/v1/models` SHALL report each model as
+`free` only when every non-fallback leg is free. Sweep requests carry
+`x-llmux-free-only`; under it the gateway SHALL never route to a billed
+leg and SHALL answer the probe 404 when no free leg can serve the model,
+so fallback-only models still accumulate dead streaks. `--sweep` SHALL
+skip any listed model not marked `free` — a missing
 or unrecognized marker counts as billed — and record it as `skipped`. The shipped
 `llmux2-sweep.timer` SHALL run it on its own state file on a calendar
 schedule with randomized delay (enabling it SHALL never fire a sweep

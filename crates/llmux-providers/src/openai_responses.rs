@@ -537,6 +537,7 @@ mod tests {
                 end_user: None,
                 client_key: None,
                 image_count: 0,
+                free_only: false,
             };
             for (upstream, expected) in [("fixed", "fixed"), ("*", "vendor/New-ID")] {
                 dep.upstream_model = upstream.into();

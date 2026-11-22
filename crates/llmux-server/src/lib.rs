@@ -44,6 +44,7 @@ const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const DEPLOYMENT_HEADER: HeaderName = HeaderName::from_static("x-llmux-deployment");
 const ATTEMPTS_HEADER: HeaderName = HeaderName::from_static("x-llmux-attempts");
 const CONTEXT_OVERFLOW_HEADER: HeaderName = HeaderName::from_static("x-llmux-context-overflow");
+const FREE_ONLY_HEADER: HeaderName = HeaderName::from_static("x-llmux-free-only");
 const DROPPED_MESSAGES_HEADER: HeaderName = HeaderName::from_static("x-llmux-dropped-messages");
 const ANTHROPIC_KEY_HEADER: HeaderName = HeaderName::from_static(provider::ANTHROPIC_KEY_HEADER);
 const DEEPAI_KEY_HEADER: HeaderName = HeaderName::from_static(provider::DEEPAI_KEY_HEADER);
@@ -235,14 +236,17 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     let data: Vec<_> = ids
         .into_iter()
         .map(|id| {
-            // `free` only when every leg is marked free; a missing marker is billed.
+            // `free` only when every non-fallback leg is marked free; a missing
+            // marker is billed. Billed fallback legs never fire under the
+            // probe's x-llmux-free-only requests, so they do not gate sweeping.
             let billing = match active.config.model_names.get(id) {
                 Some(&index)
                     if active.config.models[index]
                         .deployments
                         .iter()
                         .all(|idx| {
-                            active.config.deployments[idx.0 as usize].billing == Billing::Free
+                            let dep = &active.config.deployments[idx.0 as usize];
+                            dep.billing == Billing::Free || dep.fallback
                         }) =>
                 {
                     "free"
@@ -417,6 +421,9 @@ async fn route_request(
         }
     }
 
+    let free_only = headers
+        .get(FREE_ONLY_HEADER)
+        .is_some_and(|value| value == "true");
     let model: Arc<str> = Arc::from(metadata.model.as_ref());
     if active
         .config
@@ -462,6 +469,7 @@ async fn route_request(
         est_input_tokens: u32::try_from(prompt_bytes.div_ceil(4)).unwrap_or(u32::MAX),
         max_output_tokens: metadata.max_output_tokens,
         context_overflow,
+        free_only,
         image_count,
         body,
         anthropic_headers: anthropic_headers.clone(),
@@ -504,7 +512,7 @@ async fn route_request(
         Err(RoutedError {
             error: GatewayError::UnknownModel,
             ..
-        }) if format == InboundFormat::OpenAiChat => {
+        }) if format == InboundFormat::OpenAiChat && !free_only => {
             return chat_bad_request("Invalid model format");
         }
         Err(failure) => {

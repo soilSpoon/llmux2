@@ -502,6 +502,7 @@ mod tests {
             end_user: None,
             client_key: None,
             image_count: 0,
+            free_only: false,
         };
         let built = adapter
             .build_request(

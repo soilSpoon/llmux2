@@ -162,7 +162,11 @@ list to `dead-models.json`. The sweep only probes models `/v1/models`
 marks `billing = "free"` — models with any paid or quota-capped leg
 (Morph, xAI, Anthropic, Workers AI, and other billed providers) are
 skipped, derived from each emitted deployment's `billing` marker rather
-than a hand-kept list, so it can never spend on billed routes. One sweep
+than a hand-kept list, so it can never spend on billed routes. OmniRoute
+fallback legs are billed (they forward to billed upstreams) but exempt
+from a model's `free` flag; sweep probes send `x-llmux-free-only`, under
+which billed legs are never candidates and a model with no usable free leg
+answers 404 and accumulates dead streaks. One sweep
 sends one token-bearing request per free advertised model, so keep its
 cadence low; the curated `--models` pin on `llmux2-probe.service` never
 builds streaks for the long tail — the sweep is what feeds `--dead-file`

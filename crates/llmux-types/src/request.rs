@@ -30,6 +30,9 @@ pub struct GatewayRequest {
     pub client_key: Option<Arc<str>>,
     /// Number of image inputs found in the inbound body.
     pub image_count: u32,
+    /// Probe requests only: billed deployments are never candidates, so a
+    /// sweep can test free legs without spending on paid or quota-capped legs.
+    pub free_only: bool,
 }
 
 pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + 'a>>;

@@ -322,6 +322,7 @@ impl BufRead for DeadlineReader {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn request(
     listen: &str,
     pin: Option<std::net::SocketAddr>,
@@ -330,6 +331,7 @@ fn request(
     key: Option<&str>,
     body: Option<&str>,
     timeout: Duration,
+    free_only: bool,
 ) -> Result<Response> {
     use std::net::ToSocketAddrs;
     let deadline = Instant::now() + timeout;
@@ -347,6 +349,9 @@ fn request(
     let mut text = format!("{method} {path} HTTP/1.1\r\nHost: {listen}\r\nConnection: close\r\n");
     if let Some(key) = key {
         text += &format!("Authorization: Bearer {key}\r\n");
+    }
+    if free_only {
+        text += "x-llmux-free-only: true\r\n";
     }
     if let Some(body) = body {
         text += &format!(
@@ -454,6 +459,10 @@ fn probe(
         key,
         body,
         options.timeout,
+        // Sweep probes carry x-llmux-free-only so the gateway never routes
+        // them to a billed leg — an OmniRoute fallback leg would forward the
+        // probe to a paid or quota-capped upstream.
+        options.sweep && method == "POST",
     )
 }
 

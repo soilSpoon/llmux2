@@ -55,6 +55,7 @@ fn with_model(req: &GatewayRequest, body: Bytes, model: &str) -> GatewayRequest 
         anthropic_headers: req.anthropic_headers.clone(),
         client_key: req.client_key.clone(),
         image_count: req.image_count,
+        free_only: req.free_only,
         est_input_tokens: req.est_input_tokens,
         max_output_tokens: req.max_output_tokens,
         context_overflow: req.context_overflow,
@@ -194,6 +195,7 @@ mod tests {
             end_user: None,
             client_key: None,
             image_count: 0,
+            free_only: false,
         }
     }
 
