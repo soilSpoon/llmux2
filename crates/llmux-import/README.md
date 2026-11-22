@@ -533,5 +533,11 @@ emit with a warning, and a combo left with no deployments is skipped as usual.
 `127.0.0.1:8080`). Scheduled re-imports pass the deployed slot's address:
 `llmux2-deploy` refuses a regenerated config whose listen differs from the
 installed one. `deploy/prune.sh` reads it from `active.json`.
+
+`--overlay PATH` merges a site TOML file into the emitted config before
+validation: `[server]`/`[routing]` keys merge field-wise, and extra
+`[[credentials]]`/`[[models]]` append — the local settings the export does
+not carry. Scheduled re-imports must pass the site's overlay (an empty file
+is a valid no-op) or the regenerated config drops them.
 An import therefore never advertises an embedding or typed-endpoint model as
 a chat route.

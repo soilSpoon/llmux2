@@ -675,3 +675,69 @@ fn shared_empty_combo_diamonds_have_bounded_work() {
     );
     assert!(RuntimeConfig::load(output).is_ok());
 }
+
+#[test]
+fn overlay_merges_site_settings_into_the_emitted_config() {
+    // SAFETY: single-threaded test binary; no other test reads OVERLAY_KEY.
+    unsafe { std::env::set_var("OVERLAY_KEY", "synthetic") };
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("llmux.toml");
+    let overlay = dir.path().join("site.toml");
+    fs::write(
+        &overlay,
+        "[server]\nrequest_log = \"/var/log/llmux/requests.jsonl\"\n\
+         [routing]\nmax_attempts = 6\n\
+         [[credentials]]\nid = \"overlay-cred\"\nkind = \"api_key\"\nprovider = \"openai_compat\"\n\
+         key = \"env:OVERLAY_KEY\"\n\
+         [[models]]\nname = \"swe-2\"\n[[models.deployments]]\nid = \"overlay-swe2\"\ncredential = \"overlay-cred\"\n\
+         upstream_model = \"swe-2\"\nbase_url = \"https://overlay.example.com/v1\"\n",
+    )
+    .unwrap();
+    let options = llmux_import::ImportOptions {
+        overlay: Some(&overlay),
+        ..Default::default()
+    };
+    llmux_import::import_with_options(FIXTURE, &output, None, &options).unwrap();
+    let config = RuntimeConfig::load(&output).unwrap();
+    assert_eq!(config.routing.max_attempts, 6);
+    assert_eq!(
+        config
+            .server
+            .request_log
+            .as_deref()
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "/var/log/llmux/requests.jsonl"
+    );
+    assert!(config.models.iter().any(|m| m.name.as_ref() == "swe-2"));
+}
+
+#[test]
+fn cli_overlay_reaches_the_emitted_config() {
+    unsafe { std::env::set_var("OVERLAY_KEY", "synthetic") };
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("export.json");
+    let output = dir.path().join("out.toml");
+    let overlay = dir.path().join("site.toml");
+    fs::write(&input, FIXTURE).unwrap();
+    fs::write(&overlay, "[routing]\nmax_attempts = 6\n").unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_llmux-import"))
+        .args(["--input"])
+        .arg(input)
+        .arg("--output")
+        .arg(&output)
+        .args(["--overlay"])
+        .arg(&overlay)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        RuntimeConfig::load(&output).unwrap().routing.max_attempts,
+        6
+    );
+}

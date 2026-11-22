@@ -171,14 +171,18 @@ dead routes stop being advertised without manual pruning. The service runs
   sourced from `~/llmux2/import.env` as a bash array (`IMPORT_FLAGS=(--omniroute-fallback
   … --nous-state …)` — the same arguments the original import used, so a
   prune never shrinks the catalog);
+- merges the site's overlay (`~/llmux2/site.toml`: extra `[server]`/`[routing]`
+  settings and site-added credentials/models) via `--overlay` — required, so
+  a prune never drops local settings; an empty file is a valid no-op;
 - passes the deployed slot's own `--listen` address read back from
   `active.json` (deploy rejects a regenerated config on a different port);
 - removes only the stale candidate config — the shared `~/llmux2/secrets/`
   directory is never deleted: the importer reuses identical secret files
   and aborts on any that differ, so both slots always resolve the same
   `file:` references;
-- deploys with `--canary 300` so a bad regenerated config never takes the
-  port alone;
+- deploys the installed release binary with `--canary 300` so a bad
+  regenerated config never takes the port alone;
+- shreds `export.json` (plaintext credentials) once the import consumed it;
 - skips the run entirely when no sweep output exists yet.
 
 Refresh the OmniRoute export before each run via an `ExecStartPre` drop-in
