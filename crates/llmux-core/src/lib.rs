@@ -235,7 +235,7 @@ impl Executor {
         let key_windows: HashMap<Arc<str>, Vec<Arc<Window>>> = cfg
             .credential_quotas
             .iter()
-            .map(|(id, quota)| (id.clone(), Window::for_quota(*quota)))
+            .map(|(id, quota)| (id.clone(), Window::for_credential(*quota)))
             .collect();
         let mut bindings = cfg
             .deployments

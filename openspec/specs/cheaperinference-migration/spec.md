@@ -377,7 +377,10 @@ the Cloudflare opt-in), and the shared Workers AI credential has
 `tpd = 9000`, a hard daily cap on estimated input tokens bound across every
 deployment on the account, sized so a day of admitted input with output up to
 5x larger stays under the documented 10,000-neuron free daily allowance even
-at the most expensive allowed model's rates.
+at the most expensive allowed model's rates. Credential quota windows are
+hard ceilings: a request whose estimate exceeds the remaining window is
+rejected even when the window is empty, while a deployment quota still admits
+one oversized request to an idle deployment.
 Documentation warns that these are not account-wide neuron accounting or a
 guarantee against paid overage.
 

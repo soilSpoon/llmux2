@@ -383,11 +383,13 @@ input with output (including hidden reasoning tokens) up to 5x larger stays
 under the documented 10,000-neuron free daily allowance at the most expensive
 allowed model's rates (llama-3.3-70b-fp8: 9,000 × (0.026668 + 5 × 0.204805) ≈
 9,456 neurons). The rpm cap is **per deployment** (combos, direct names, and
-failover can multiply bursts), and the shared tpd still cannot guarantee zero
-charges: outputs above 5x input can pass the allowance, and a single request
-larger than the cap is admitted to an idle deployment (token quotas are a
-soft budget, not a hard neuron meter). Use a Workers Free account/no paid
-overage at Cloudflare and monitor its account-wide allowance.
+failover can multiply bursts). Credential quotas are hard ceilings — a
+request whose estimate exceeds the remaining shared window is rejected even
+on an empty window, unlike deployment quotas, which admit one oversized
+request to an idle deployment. The shared tpd still cannot guarantee zero
+charges: it counts estimated input tokens, so outputs above 5x input pass the
+allowance. Use a Workers Free account/no paid overage at Cloudflare and
+monitor its account-wide allowance.
 See https://developers.cloudflare.com/workers-ai/platform/pricing/.
 
 Keyed Kilo routes now fail closed unless `--kilo-free-models` supplies a saved
