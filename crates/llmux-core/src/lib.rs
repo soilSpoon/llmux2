@@ -24,7 +24,8 @@ use llmux_types::{
     SseCommitment, Support, UpstreamError,
 };
 use machine::{Built, Effect, Event, Outcome, Phase, State};
-use request_log::{RequestLog, RequestRecord};
+pub use request_log::RequestLog;
+use request_log::RequestRecord;
 use stats::{AttemptStats, SkipReason};
 pub use stats::{CatchAllStats, DeploymentStats, FallbackStats};
 use std::{
@@ -217,10 +218,14 @@ impl Executor {
         limits
     }
 
+    /// `request_log` must already be open: the server opens it before starting
+    /// credential sources so a bad path fails the build before they can rotate
+    /// refresh tokens.
     pub fn new(
         cfg: Arc<RuntimeConfig>,
         registry: &ProviderRegistry,
         credentials: &HashMap<Arc<str>, Arc<dyn CredentialSource>>,
+        request_log: Option<RequestLog>,
     ) -> Result<Self, InitError> {
         Self::validate(&cfg, registry, &credentials.keys().cloned().collect())?;
         let mut disabled = HashMap::<Arc<str>, Arc<AtomicBool>>::new();
@@ -324,7 +329,6 @@ impl Executor {
             .pool_timer(TokioTimer::new())
             .pool_idle_timeout(Duration::from_secs(30))
             .retry_canceled_requests(false);
-        let request_log = cfg.server.request_log.clone();
         Ok(Self {
             catch_all_stats: cfg.server.dashboard_key.is_some().then(Default::default),
             cfg,
@@ -333,11 +337,7 @@ impl Executor {
             credentials: disabled,
             devin_catalog: Arc::new(LiveModels::default()),
             http: builder.build(connector),
-            request_log: request_log
-                .as_deref()
-                .map(RequestLog::open)
-                .transpose()
-                .map_err(InitError::RequestLog)?,
+            request_log,
         })
     }
 

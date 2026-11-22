@@ -24,7 +24,7 @@ use futures_util::StreamExt;
 use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use http_body_util::LengthLimitError;
 use llmux_config::{ApiKey, RuntimeConfig};
-use llmux_core::{Executor, GatewayError, LiveModels, RoutedError};
+use llmux_core::{Executor, GatewayError, InitError, LiveModels, RequestLog, RoutedError};
 use llmux_providers::nous_portal::{NousPortalConfig, NousPortalSource};
 use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
 use llmux_providers::{
@@ -175,6 +175,16 @@ async fn build(
             .cloned()
             .collect(),
     )?;
+    // Open the request log before starting credential sources: their first
+    // refresh can rotate tokens, so every fallible build step must finish
+    // before they start.
+    let request_log = config
+        .server
+        .request_log
+        .as_deref()
+        .map(RequestLog::open)
+        .transpose()
+        .map_err(InitError::RequestLog)?;
     for (id, credential) in std::mem::take(&mut config.oauth) {
         let mut oauth = OAuthConfig::new(
             credential.token_url,
@@ -199,7 +209,7 @@ async fn build(
     }
 
     let config = Arc::new(config);
-    let mut executor = Executor::new(config.clone(), &registry, &sources)?;
+    let mut executor = Executor::new(config.clone(), &registry, &sources, request_log)?;
     executor.set_devin_catalog(live);
     Ok((config, executor))
 }

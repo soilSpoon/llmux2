@@ -4,12 +4,20 @@ use crate::GatewayError;
 use llmux_types::ErrorKind;
 use serde::Serialize;
 use std::{
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     io::{self, Write},
     path::Path,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, SyncSender},
+    },
+    thread::{self, JoinHandle},
     time::SystemTime,
 };
+
+/// Records waiting for the writer thread; a stalled filesystem drops rather
+/// than blocks the runtime.
+const QUEUE_CAPACITY: usize = 4096;
 
 #[derive(Serialize)]
 pub struct QuotaRemaining {
@@ -38,29 +46,61 @@ pub struct RequestRecord<'a> {
 }
 
 pub struct RequestLog {
-    file: Mutex<File>,
+    /// `None` once the queue is disconnected for drain-on-drop.
+    tx: Option<SyncSender<Vec<u8>>>,
+    dropped: AtomicU64,
+    writer: Option<JoinHandle<()>>,
 }
 
 impl RequestLog {
+    /// Opens the file and starts its writer thread. The caller's runtime never
+    /// touches the filesystem after this.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(QUEUE_CAPACITY);
+        let writer = thread::spawn(move || {
+            while let Ok(line) = rx.recv() {
+                if let Err(err) = file.write_all(&line).and_then(|()| file.flush()) {
+                    eprintln!("llmux: request log write failed: {err}");
+                }
+            }
+        });
         Ok(Self {
-            file: Mutex::new(file),
+            tx: Some(tx),
+            dropped: AtomicU64::new(0),
+            writer: Some(writer),
         })
     }
 
+    /// Serializes the record and queues it for the writer thread; never blocks
+    /// on filesystem I/O. A full queue drops the record — logging is
+    /// best-effort and never worth stalling routing for — with a rate-limited
+    /// warning so the operator can see the loss.
     pub fn record(&self, record: &RequestRecord<'_>) {
-        let Ok(mut file) = self.file.lock() else {
-            return;
-        };
-        // Serialize first so every record is a single write: a hot reload
-        // leaves an older executor sharing this path without its mutex.
         let Ok(mut line) = serde_json::to_vec(record) else {
             return;
         };
         line.push(b'\n');
-        let _ = file.write_all(&line);
-        let _ = file.flush();
+        let Some(tx) = &self.tx else {
+            return;
+        };
+        if tx.try_send(line).is_err() {
+            let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped == 1 || dropped.is_multiple_of(256) {
+                eprintln!("llmux: request log unavailable; dropped {dropped} records");
+            }
+        }
+    }
+}
+
+impl Drop for RequestLog {
+    fn drop(&mut self) {
+        // Disconnect first so the writer drains queued records and exits, then
+        // join it: a dropped log must leave everything queued on disk.
+        drop(self.tx.take());
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
     }
 }
 
@@ -153,6 +193,7 @@ mod tests {
             error_kind: Some("rate_limited"),
             quota_remaining: None,
         });
+        drop(log);
         let parsed: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join("requests.jsonl")).unwrap(),
         )

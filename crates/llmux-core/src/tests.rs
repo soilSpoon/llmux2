@@ -297,8 +297,15 @@ async fn fixture_full(
             }),
         ),
     ]);
+    let log = cfg
+        .server
+        .request_log
+        .as_deref()
+        .map(crate::RequestLog::open)
+        .transpose()
+        .unwrap();
     (
-        Executor::new(Arc::new(cfg), &registry, &credentials).unwrap(),
+        Executor::new(Arc::new(cfg), &registry, &credentials, log).unwrap(),
         adapter,
         credential,
         server,
@@ -1193,7 +1200,7 @@ async fn credential_peers_cool_only_until_the_quota_resets() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn request_log_records_each_request() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("requests.jsonl");
@@ -1222,7 +1229,7 @@ async fn request_log_records_each_request() {
         executor.execute(request()).await,
         Err(GatewayError::AllCandidatesExhausted { .. })
     ));
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    tokio::time::advance(Duration::from_secs(2)).await;
     executor.execute(request()).await.unwrap();
     // A middle-out context rejection is a preliminary probe the server retries;
     // it must not produce a record.
