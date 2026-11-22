@@ -569,11 +569,7 @@ fn authorized_for_format(headers: &HeaderMap, keys: &[Arc<str>], format: Inbound
 
 /// Constant-time scan that also returns which key matched, so the request log
 /// can attribute the call by key fingerprint rather than the secret itself.
-fn matched_key(
-    headers: &HeaderMap,
-    keys: &[Arc<str>],
-    format: InboundFormat,
-) -> Option<Arc<str>> {
+fn matched_key(headers: &HeaderMap, keys: &[Arc<str>], format: InboundFormat) -> Option<Arc<str>> {
     let presented: Vec<u8> = if format == InboundFormat::AnthropicMessages
         && !headers.contains_key(header::AUTHORIZATION)
     {
