@@ -523,3 +523,10 @@ without the fallback flags they simply disappear from `/v1/models`. The file
 must contain only nonempty names — anything else aborts before output is
 written. Re-import to restore a route that recovers; the list is per-import
 input, not persisted state.
+
+Separately, upstream models that cannot serve chat-class endpoints — the
+reviewed non-chat table in `src/policy.rs` (`mistral-embed`,
+`codestral-embed`, `span-01-lite`) — are classified out of every combo leg at
+emit with a warning, and a combo left with no deployments is skipped as usual.
+An import therefore never advertises an embedding or typed-endpoint model as
+a chat route.

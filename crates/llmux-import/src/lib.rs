@@ -1253,6 +1253,19 @@ pub fn import_with_options(
                 fields.remove("_bridge_replacement");
             }
         }
+        let mut nonchat = Vec::new();
+        deployments.retain(|dep| {
+            let chat = !policy::NON_CHAT_MODELS.contains(&string(dep, "upstream_model"));
+            if !chat {
+                nonchat.push(string(dep, "upstream_model").to_owned());
+            }
+            chat
+        });
+        for model in nonchat {
+            warnings.push(format!(
+                "combo {name}: dropped non-chat model {model} (no chat endpoint)"
+            ));
+        }
         if deployments.is_empty() {
             warnings.push(format!("combo {name}: skipped: no deployments"));
             continue;

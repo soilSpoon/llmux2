@@ -197,6 +197,40 @@ fn exclude_models_rejects_malformed_lists_without_writing_config() {
 }
 
 #[test]
+fn non_chat_models_are_never_emitted_as_chat_routes() {
+    let mut root = fixture();
+    root["combos"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"emb","name":"embed-only","models":["openai/mistral-embed"]}));
+    root["combos"].as_array_mut().unwrap().push(
+        json!({"id":"mix","name":"mixed","models":["openai/first","openai/codestral-embed","openai/span-01-lite"]}),
+    );
+    let (dir, result) = run(&root, &[]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("embed-only") && stderr.contains("non-chat"),
+        "{stderr}"
+    );
+    // A combo whose every leg is non-chat disappears from /v1/models; a mixed
+    // combo keeps only its chat legs.
+    let cfg =
+        RuntimeConfig::parse(&fs::read_to_string(dir.path().join("out.toml")).unwrap()).unwrap();
+    assert!(!cfg.model_names.contains_key("embed-only"));
+    let upstreams: Vec<_> = cfg.models[cfg.model_names["mixed"]]
+        .deployments
+        .iter()
+        .map(|idx| cfg.deployments[idx.0 as usize].upstream_model.as_ref())
+        .collect();
+    assert_eq!(upstreams, ["first"]);
+}
+
+#[test]
 fn rejects_unrepresentable_codex_mapping_without_writing_config() {
     for pattern in ["private-?", "private-*-suffix", "private-**"] {
         let mut root = fixture();

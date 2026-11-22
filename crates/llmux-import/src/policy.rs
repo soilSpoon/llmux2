@@ -248,6 +248,14 @@ const WORKERS: &[&str] = &[
     "@cf/ibm-granite/granite-4.0-h-micro",
 ];
 
+/// Upstream model IDs that cannot serve `/v1/chat/completions`: embedding or
+/// typed-endpoint models the export lists as combo legs. llmux2 serves only
+/// chat-class endpoints, so these are classified out at emit rather than
+/// advertised as dead routes.
+// https://docs.mistral.ai/capabilities/embeddings/overview/ (mistral-embed, codestral-embed)
+// respan endpoint-type rejection observed on OCI probe sweep 2026-11-22 (span-01-lite)
+pub(super) const NON_CHAT_MODELS: &[&str] = &["codestral-embed", "mistral-embed", "span-01-lite"];
+
 #[cfg(test)]
 mod tests {
     use super::*;
