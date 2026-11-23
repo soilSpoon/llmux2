@@ -43,17 +43,20 @@ pub(super) fn billed(connection: &Connection, model: &str, policy: &Policy) -> b
 }
 
 fn host(base_url: &str) -> String {
-    base_url
+    let authority = base_url
         .split("://")
         .nth(1)
         .unwrap_or(base_url)
         .split('/')
         .next()
         .unwrap_or("")
-        .split(':')
+        .rsplit('@')
         .next()
-        .unwrap_or("")
-        .to_owned()
+        .unwrap_or("");
+    match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or("").to_owned(),
+        None => authority.split(':').next().unwrap_or("").to_owned(),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -216,6 +219,10 @@ impl Policy {
                                 "free-providers entry {provider} requires evidence"
                             ));
                         }
+                        let provider = provider
+                            .strip_prefix('[')
+                            .and_then(|p| p.strip_suffix(']'))
+                            .unwrap_or(provider);
                         Ok((provider.to_owned(), evidence.to_owned()))
                     })
                     .collect::<Result<HashMap<_, _>, _>>()
@@ -470,6 +477,15 @@ mod tests {
         let mut xplabs = connection(builtin("anthropic"), ModelPolicy::Any);
         xplabs.base_url = crate::xplabs::BASE_URL.into();
         assert!(!billed(&xplabs, "m", &policy));
+    }
+
+    #[test]
+    fn host_extraction_strips_port_userinfo_and_ipv6_brackets() {
+        assert_eq!(host("https://example.com:8443/v1"), "example.com");
+        assert_eq!(host("http://[2001:db8::1]:8080/v1"), "2001:db8::1");
+        assert_eq!(host("http://[::1]/v1"), "::1");
+        assert_eq!(host("https://user:pass@example.com/v1"), "example.com");
+        assert_eq!(host("example.com/v1"), "example.com");
     }
 
     #[test]

@@ -134,6 +134,82 @@ fn free_providers_matches_host_and_requires_evidence() {
 }
 
 #[test]
+fn free_providers_matches_ipv6_hosts_bare_and_bracketed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut root: Value = serde_json::from_str(DB_FIXTURE).unwrap();
+    root["provider_connections"][2]["provider_specific_data"] =
+        json!("{\"baseUrl\":\"https://[2001:db8::1]:8443/v1\"}");
+    for (index, provider) in ["2001:db8::1", "[2001:db8::1]"].iter().enumerate() {
+        let free = dir.path().join(format!("free-v6-{index}.json"));
+        fs::write(
+            &free,
+            json!([{"provider":provider,"evidence":"usage API shows $0"}]).to_string(),
+        )
+        .unwrap();
+        let output = dir.path().join(format!("llmux-{index}.toml"));
+        llmux_import::import_with_options(
+            &root.to_string(),
+            &output,
+            None,
+            &ImportOptions {
+                free_providers: Some(&free),
+                ..ImportOptions::default()
+            },
+        )
+        .unwrap();
+        let config = RuntimeConfig::load(&output).unwrap();
+        assert_eq!(
+            config
+                .deployments
+                .iter()
+                .find(|dep| dep.credential.as_ref() == "upstream-custom")
+                .unwrap()
+                .billing,
+            Billing::Free,
+            "provider {provider}"
+        );
+    }
+}
+
+#[test]
+fn cli_free_providers_flag_marks_emitted_billing() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("export.json");
+    fs::write(&input, DB_FIXTURE).unwrap();
+    let free = dir.path().join("free.json");
+    fs::write(
+        &free,
+        json!([{"provider":"node-test","evidence":"operator-confirmed free plan"}]).to_string(),
+    )
+    .unwrap();
+    let output = dir.path().join("llmux.toml");
+    let result = Command::new(env!("CARGO_BIN_EXE_llmux-import"))
+        .args(["--input"])
+        .arg(&input)
+        .arg("--output")
+        .arg(&output)
+        .arg("--free-providers")
+        .arg(&free)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let config = RuntimeConfig::load(&output).unwrap();
+    assert_eq!(
+        config
+            .deployments
+            .iter()
+            .find(|dep| dep.credential.as_ref() == "upstream-custom")
+            .unwrap()
+            .billing,
+        Billing::Free
+    );
+}
+
+#[test]
 fn imports_raw_sqlite_dump_through_shared_mapping() {
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("llmux.toml");
