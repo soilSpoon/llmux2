@@ -172,6 +172,42 @@ fn free_providers_matches_ipv6_hosts_bare_and_bracketed() {
 }
 
 #[test]
+fn free_legs_emit_before_billed_ones_in_stable_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("llmux.toml");
+    let free = dir.path().join("free.json");
+    fs::write(
+        &free,
+        json!([{"provider":"node-test","evidence":"operator-confirmed free plan"}]).to_string(),
+    )
+    .unwrap();
+    llmux_import::import_with_options(
+        DB_FIXTURE,
+        &output,
+        None,
+        &ImportOptions {
+            free_providers: Some(&free),
+            ..ImportOptions::default()
+        },
+    )
+    .unwrap();
+    let config = RuntimeConfig::load(&output).unwrap();
+    let order: Vec<_> = config.models[config.model_names["fallback"]]
+        .deployments
+        .iter()
+        .map(|index| {
+            let dep = &config.deployments[index.0 as usize];
+            (dep.credential.as_ref(), dep.billing)
+        })
+        .collect();
+    let split = order
+        .iter()
+        .position(|(_, billing)| *billing == Billing::Billed);
+    assert_eq!(split, Some(1), "{order:?}");
+    assert_eq!(order[0].0, "upstream-custom");
+}
+
+#[test]
 fn cli_free_providers_flag_marks_emitted_billing() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("export.json");
@@ -739,11 +775,25 @@ fn provider_table_uses_adapter_base_urls_and_unique_ids() {
     .unwrap();
     let config = RuntimeConfig::load(output).unwrap();
     assert_eq!(config.models[0].deployments.len(), provider_table.len());
-    for (dep, (_, kind, url, model)) in config.deployments.iter().zip(provider_table) {
-        assert_eq!(dep.provider.0.as_ref(), kind);
-        assert_eq!(dep.base_url.to_string().trim_end_matches('/'), url);
-        assert_eq!(dep.upstream_model.as_ref(), model);
-    }
+    let mut emitted: Vec<_> = config.models[0]
+        .deployments
+        .iter()
+        .map(|index| {
+            let dep = &config.deployments[index.0 as usize];
+            (
+                dep.provider.0.as_ref(),
+                dep.base_url.to_string().trim_end_matches('/').to_owned(),
+                dep.upstream_model.as_ref(),
+            )
+        })
+        .collect();
+    let mut expected: Vec<_> = provider_table
+        .iter()
+        .map(|&(_, kind, url, model)| (kind, url.to_owned(), model))
+        .collect();
+    emitted.sort();
+    expected.sort();
+    assert_eq!(emitted, expected);
     let ids = config
         .deployments
         .iter()

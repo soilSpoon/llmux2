@@ -1318,6 +1318,11 @@ pub fn import_with_options(
             dead: &dead,
         }
         .expand(&name, &mut Vec::new(), &mut deployments);
+        // Verified-free legs go ahead of billed ones; stable sort keeps each
+        // group's existing relative order. Deliberate placement passes below
+        // (Morph logprobs order, XPLabs placement, secondary expansion) still
+        // decide the positions of the legs they manage.
+        deployments.sort_by_key(|dep| usize::from(string(dep, "billing") != "free"));
         morph::order(&name, &mut deployments, &connections, nodes, &mut warnings);
         if let Some(step) = combos
             .contains_key(&name)

@@ -280,8 +280,8 @@ fn moved_declared_leg_keeps_its_pinned_connection() {
         root
     };
     let declared = credentials(&with("deepseek-v4.1-flash-free"));
-    let pinned = declared[1].clone();
+    let pinned = declared[0].clone();
     assert_eq!(pinned.0, "deepseek-v4.1-flash");
     let moved = credentials(&with("deepseek-v4.1-flash"));
-    assert_eq!(moved, [pinned, declared[0].clone()]);
+    assert_eq!(moved, [pinned, declared[1].clone()]);
 }

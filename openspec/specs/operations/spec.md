@@ -369,7 +369,11 @@ importer SHALL mark each emitted deployment `billing = "free"` or
 and commercial, quota-capped, and OmniRoute fallback legs are billed —
 OmniRoute forwards to billed upstreams), `llmux-config` SHALL accept the
 marker defaulting to billed, and `/v1/models` SHALL report each model as
-`free` only when every non-fallback leg is free. Sweep requests carry
+`free` only when every non-fallback leg is free. Within each emitted model
+the importer SHALL order `billing = "free"` legs ahead of billed legs,
+preserving each group's relative order; reviewed placement passes (Morph
+logprobs order, XPLabs free-route placement, Devin paid-last, and reviewed
+secondaries) still decide the positions of the legs they manage. Sweep requests carry
 `x-llmux-free-only`; under it the gateway SHALL never route to a billed
 leg. Only an upstream's own model-not-found SHALL count as dead evidence:
 a free-only request with no usable free leg (all billed, cooling, or
