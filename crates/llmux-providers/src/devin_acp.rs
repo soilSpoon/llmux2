@@ -198,6 +198,41 @@ fn content_text(content: &Value) -> String {
 /// The summarizer agent summarizes whatever it is given; this frame makes it answer.
 const FRAME: &str = "[Devin Summarizer Bridge]\nTreat the content below as a conversation whose next assistant reply must be written.\nReply with only that reply, answering the last user message directly.\nDo not summarize the conversation, describe the request, or use tools.\nDo not wrap the response in Markdown fences or a <summary> element.\n\n[Conversation]\n";
 
+/// Devin's effort vocabulary: the swe-2 families publish one free model id per
+/// tier (`swe-2-medium`, `swe-2-high`, `swe-2-max`), so every client spelling
+/// lands on a free tier — `low`/`off` have no lighter free variant than medium.
+fn effort_tier(body: &Value) -> Option<&'static str> {
+    ["reasoning_effort", "thinking_effort", "effort"]
+        .iter()
+        .find_map(|field| body.get(*field).and_then(Value::as_str))
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "disabled" | "false" | "low" | "minimal" | "medium" | "med" => {
+                Some("medium")
+            }
+            "high" | "enabled" | "true" => Some("high"),
+            "max" | "xhigh" => Some("max"),
+            _ => None,
+        })
+}
+
+/// `swe-2-high` + effort `max` -> `swe-2-max`; a `-lightning` suffix rides along.
+/// A model id without a tier suffix keeps the deployment's spelling: guessing one
+/// could mint ids the family never published (swe-1-7 has no `-high`, for example).
+fn model_for(upstream_model: &str, effort: Option<&str>) -> String {
+    let Some(tier) = effort else {
+        return upstream_model.to_owned();
+    };
+    let (base, lightning) = upstream_model
+        .strip_suffix("-lightning")
+        .map_or((upstream_model, ""), |stem| (stem, "-lightning"));
+    for published in ["medium", "high", "max"] {
+        if let Some(stem) = base.strip_suffix(&format!("-{published}")) {
+            return format!("{stem}-{tier}{lightning}");
+        }
+    }
+    upstream_model.to_owned()
+}
+
 /// Flattens chat messages into one labelled transcript under `FRAME`.
 fn prompt_text(messages: &[Value]) -> Option<String> {
     let turns: Vec<(&str, String)> = messages
@@ -545,13 +580,13 @@ impl DevinAcp {
                 status: StatusCode::BAD_REQUEST,
                 body: Bytes::new(),
             })?;
-        let model = crate::upstream_model(req, dep);
+        let model = model_for(crate::upstream_model(req, dep), effort_tier(&body));
         if req.stream {
-            return Ok(self.stream(model.to_owned(), prompt));
+            return Ok(self.stream(model, prompt));
         }
         let text = timeout(
             self.config.turn_timeout,
-            Session::spawn(&self.config)?.turn(&self.config, model, &prompt),
+            Session::spawn(&self.config)?.turn(&self.config, &model, &prompt),
         )
         .await
         .map_err(|_| UpstreamError::Timeout)??;
@@ -560,7 +595,7 @@ impl DevinAcp {
         Ok(GatewayResponse::Complete {
             status: StatusCode::OK,
             headers,
-            body: Bytes::from(completion(model, &text, false).to_string()),
+            body: Bytes::from(completion(&model, &text, false).to_string()),
         })
     }
 }
@@ -620,7 +655,96 @@ mod tests {
     #[cfg(unix)]
     mod fake_cli {
         use super::*;
+        use llmux_types::{Billing, DeploymentIdx, QuotaSpec, RequestId};
         use std::os::unix::fs::PermissionsExt;
+
+        fn dep(upstream_model: &str) -> Deployment {
+            Deployment {
+                headers: HeaderMap::new(),
+                fallback: false,
+                idx: DeploymentIdx(0),
+                id: "devin".into(),
+                provider: ProviderKind(provider::DEVIN_ACP.into()),
+                credential: "none".into(),
+                base_url: provider::DEVIN_ACP_BASE_URL.parse().unwrap(),
+                upstream_model: upstream_model.into(),
+                strip_request_fields: Box::default(),
+                priority: 0,
+                quota: QuotaSpec::default(),
+                timeout: Duration::from_secs(30),
+                max_context: None,
+                expires_at: None,
+                billing: Billing::Free,
+            }
+        }
+
+        fn request(body: Value) -> GatewayRequest {
+            GatewayRequest {
+                format: InboundFormat::OpenAiChat,
+                model: "swe-2".into(),
+                stream: false,
+                body: Bytes::from(body.to_string()),
+                anthropic_headers: HeaderMap::new(),
+                est_input_tokens: 1,
+                max_output_tokens: None,
+                context_overflow: None,
+                request_id: RequestId("req".into()),
+                end_user: Some("synthetic-user-hash".into()),
+                client_key: None,
+                image_count: 0,
+                free_only: false,
+            }
+        }
+
+        async fn complete_model(body: Value, upstream_model: &str) -> String {
+            let dir = tempfile::tempdir().unwrap();
+            let adapter = DevinAcp::new(script(dir.path(), "ok"));
+            let GatewayResponse::Complete { body: out, .. } = adapter
+                .serve(&request(body), &dep(upstream_model))
+                .await
+                .unwrap()
+            else {
+                panic!("expected a complete response");
+            };
+            let out: Value = serde_json::from_slice(&out).unwrap();
+            out["model"].as_str().unwrap().to_owned()
+        }
+
+        fn chat_body(effort: Value) -> Value {
+            json!({"model":"swe-2","reasoning_effort":effort,
+                "messages":[{"role":"user","content":"hi"}]})
+        }
+
+        #[tokio::test]
+        async fn effort_rewrites_the_model_tier() {
+            assert_eq!(
+                complete_model(chat_body(json!("max")), "swe-2-high").await,
+                "swe-2-max"
+            );
+            assert_eq!(
+                complete_model(chat_body(json!("low")), "swe-2-flash-high").await,
+                "swe-2-flash-medium"
+            );
+            assert_eq!(
+                complete_model(chat_body(json!("minimal")), "swe-2-medium-lightning").await,
+                "swe-2-medium-lightning"
+            );
+            assert_eq!(
+                complete_model(chat_body(json!("bogus")), "swe-2-high").await,
+                "swe-2-high"
+            );
+            assert_eq!(
+                complete_model(chat_body(json!("max")), "swe-2").await,
+                "swe-2"
+            );
+        }
+
+        #[tokio::test]
+        async fn absent_effort_keeps_the_deployment_model() {
+            let body = json!({"model":"swe-2",
+                "messages":[{"role":"user","content":"hi"}]});
+            assert_eq!(complete_model(body, "swe-2-high").await, "swe-2-high");
+        }
 
         fn script(dir: &std::path::Path, reply: &str) -> DevinAcpConfig {
             chunked_script(dir, &[reply])

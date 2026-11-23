@@ -99,6 +99,37 @@ WHEN an `aws_quick` deployment has an unknown upstream model and sets
 THEN the upstream body selects `smart` and contains `thinking_effort: high`,
 but the upstream header remains `x-magpie-effort: low`.
 
+### Requirement: Devin ACP effort selects the model tier
+
+The `devin_acp` provider SHALL translate a recognized `reasoning_effort`,
+`thinking_effort`, or `effort` value in the request body to a Devin catalog
+tier and rewrite the deployment `upstream_model`'s published tier suffix
+(`-medium`, `-high`, or `-max`, preserving a trailing `-lightning`). Recognized
+spellings map only onto tiers Devin lists free: `off`, `none`, `disabled`,
+`false`, `low`, `minimal`, `medium`, `med` select `medium`; `high`, `enabled`,
+`true` select `high`; `max`, `xhigh` select `max`. An absent or unrecognized
+effort SHALL keep the deployment's configured `upstream_model` unchanged, and a
+model id without a tier suffix SHALL NOT gain one from effort alone.
+
+#### Scenario: Effort selects the tier
+
+WHEN a request carries `"reasoning_effort": "max"` against a deployment whose
+`upstream_model` is `swe-2-high`
+THEN the ACP session opens with model `swe-2-max`
+AND the response reports `swe-2-max`.
+
+#### Scenario: Free tiers only
+
+WHEN a request carries `"reasoning_effort": "low"` against a deployment whose
+`upstream_model` is `swe-2-flash-high`
+THEN the ACP session opens with `swe-2-flash-medium`, the lightest published
+free tier, and not a paid or unpublished id.
+
+#### Scenario: No effort or unknown spelling
+
+WHEN the request carries no effort field or an unrecognized value
+THEN the deployment's configured `upstream_model` is used unchanged.
+
 ### Requirement: Keyless deployments
 
 The gateway SHALL support explicit keyless upstreams via `auth = "none"` with
