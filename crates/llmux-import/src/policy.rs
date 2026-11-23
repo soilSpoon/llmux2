@@ -32,7 +32,14 @@ pub(super) fn billed(connection: &Connection, model: &str, policy: &Policy) -> b
     }
     match &connection.provider {
         ProviderIdentity::Custom(id) => policy.free_custom.as_ref().is_none_or(|free| {
-            !free.contains_key(id.as_str()) && !free.contains_key(&host(&connection.base_url))
+            let entry = free
+                .get(id.as_str())
+                .or_else(|| free.get(&host(&connection.base_url)));
+            match entry {
+                None => true,
+                Some(None) => false,
+                Some(Some(models)) => !models.contains(model),
+            }
         }),
         ProviderIdentity::Builtin(id) if id == "devin-cli-agentic" => !policy
             .devin_free
@@ -94,8 +101,9 @@ pub(super) struct Policy {
     pub openrouter_replacements: bool,
     pub devin_free: Option<HashSet<String>>,
     /// Provider-node ids and connection hosts marked free by
-    /// `--free-providers`, with the evidence that justified each entry.
-    pub free_custom: Option<HashMap<String, String>>,
+    /// `--free-providers`. A `None` model set marks the whole provider free;
+    /// a `Some` set marks only the listed upstream model ids free.
+    pub free_custom: Option<HashMap<String, Option<HashSet<String>>>>,
 }
 
 fn reference(path: &Path) -> Result<String, String> {
@@ -205,27 +213,42 @@ impl Policy {
                 let rows = rows
                     .as_array()
                     .ok_or("free-providers JSON must be an array")?;
-                rows.iter()
-                    .map(|row| {
-                        let provider = string(row, "provider");
-                        let evidence = string(row, "evidence");
-                        if provider.is_empty() {
-                            return Err(
-                                "free-providers entry requires a provider (node id or host)".into(),
-                            );
-                        }
-                        if evidence.is_empty() {
-                            return Err(format!(
-                                "free-providers entry {provider} requires evidence"
-                            ));
-                        }
-                        let provider = provider
-                            .strip_prefix('[')
-                            .and_then(|p| p.strip_suffix(']'))
-                            .unwrap_or(provider);
-                        Ok((provider.to_owned(), evidence.to_owned()))
-                    })
-                    .collect::<Result<HashMap<_, _>, _>>()
+                let mut free = HashMap::<String, Option<HashSet<String>>>::new();
+                for row in rows {
+                    let provider = string(row, "provider");
+                    let evidence = string(row, "evidence");
+                    if provider.is_empty() {
+                        return Err(
+                            "free-providers entry requires a provider (node id or host)".into()
+                        );
+                    }
+                    if evidence.is_empty() {
+                        return Err(format!("free-providers entry {provider} requires evidence"));
+                    }
+                    let model = string(row, "model");
+                    if row.get("model").is_some() && model.is_empty() {
+                        return Err(format!(
+                            "free-providers entry {provider} has an empty model"
+                        ));
+                    }
+                    let provider = provider
+                        .strip_prefix('[')
+                        .and_then(|p| p.strip_suffix(']'))
+                        .unwrap_or(provider)
+                        .to_owned();
+                    if model.is_empty() {
+                        free.insert(provider, None);
+                    } else {
+                        free.entry(provider)
+                            .and_modify(|models| {
+                                if let Some(models) = models {
+                                    models.insert(model.to_owned());
+                                }
+                            })
+                            .or_insert_with(|| Some(HashSet::from([model.to_owned()])));
+                    }
+                }
+                Ok(free)
             })
             .transpose()?;
         if options.workers_ai_rpm.is_some() && workers.is_none() {
@@ -376,7 +399,7 @@ mod tests {
 
     fn options_policy(
         devin_free: Option<HashSet<String>>,
-        free_custom: Option<HashMap<String, String>>,
+        free_custom: Option<HashMap<String, Option<HashSet<String>>>>,
     ) -> Policy {
         Policy {
             workers: None,
@@ -396,10 +419,7 @@ mod tests {
         let builtin = |name: &str| ProviderIdentity::Builtin(name.into());
         let policy = options_policy(
             Some(HashSet::from(["devin-free-model".to_string()])),
-            Some(HashMap::from([(
-                "free-node".to_string(),
-                "pricing page".to_string(),
-            )])),
+            Some(HashMap::from([("free-node".to_string(), None)])),
         );
 
         // A custom provider node claiming the Cloudflare prefix shares the
@@ -459,10 +479,7 @@ mod tests {
         ));
         let host_listed = options_policy(
             None,
-            Some(HashMap::from([(
-                "example.com".to_string(),
-                "usage API".to_string(),
-            )])),
+            Some(HashMap::from([("example.com".to_string(), None)])),
         );
         assert!(!billed(
             &connection(custom, ModelPolicy::Any),

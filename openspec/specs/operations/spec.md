@@ -365,8 +365,10 @@ cursor, and SHALL be rejected in combination with `--models`. The sweep
 SHALL never call a deployment that can bill or consume a shared quota: the
 importer SHALL mark each emitted deployment `billing = "free"` or
 `"billed"` (verified-free legs are free; custom provider legs bill unless
-`--free-providers` lists the provider id or host with recorded evidence,
-and commercial, quota-capped, and OmniRoute fallback legs are billed —
+`--free-providers` lists the provider id or host with recorded evidence — an
+entry may also name one upstream `model` id, marking only that leg free on a
+mixed node — and commercial, quota-capped, and OmniRoute fallback legs are
+billed —
 OmniRoute forwards to billed upstreams), `llmux-config` SHALL accept the
 marker defaulting to billed, and `/v1/models` SHALL report each model as
 `free` only when every non-fallback leg is free. Within each emitted model
