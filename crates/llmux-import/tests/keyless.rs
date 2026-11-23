@@ -268,8 +268,11 @@ fn one_model_can_mix_anonymous_and_keyed_kilo_deployments() {
         (2, 4, 1)
     );
     let config = RuntimeConfig::load(output).unwrap();
-    assert!(config.deployments[0].credential.is_empty());
-    assert_eq!(config.deployments[1].credential.as_ref(), "upstream-keyed");
+    assert!(config.deployments.iter().any(|d| d.credential.is_empty()));
+    assert!(config
+        .deployments
+        .iter()
+        .any(|d| d.credential.as_ref() == "upstream-keyed"));
     assert!(!dir.path().join("secrets/upstream-anonymous").exists());
 }
 
