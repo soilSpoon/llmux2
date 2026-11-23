@@ -549,3 +549,15 @@ import rather than silently changing the port. `--exclude-models` applies
 after the merge, so dead overlay models are dropped with the rest.
 An import therefore never advertises an embedding or typed-endpoint model as
 a chat route.
+
+### Marking custom providers free
+
+Custom provider legs emit `billing = "billed"` by default — a deployment
+counts as free only when the config metadata says so. To mark a custom
+provider free, pass `--free-providers PATH` naming a JSON array of
+`{"provider": ..., "evidence": ...}` objects: `provider` matches the
+provider-node id or the connection's base-url host, and `evidence` must be a
+nonempty record of how the operator confirmed the provider is free (a plan
+or pricing page, or the account usage API). An entry missing either field
+aborts the import. Unlisted custom legs stay billed, so the sweep never
+spends on an unconfirmed credential.

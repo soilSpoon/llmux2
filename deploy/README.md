@@ -162,7 +162,9 @@ list to `dead-models.json`. The sweep only probes models `/v1/models`
 marks `billing = "free"` — models with any paid or quota-capped leg
 (Morph, xAI, Anthropic, Workers AI, and other billed providers) are
 skipped, derived from each emitted deployment's `billing` marker rather
-than a hand-kept list, so it can never spend on billed routes. OmniRoute
+than a hand-kept list, so it can never spend on billed routes. Custom
+provider legs bill by default; `--free-providers` marks a provider id or
+host free when the file records evidence for it. OmniRoute
 fallback legs are billed (they forward to billed upstreams) but exempt
 from a model's `free` flag; sweep probes send `x-llmux-free-only`, under
 which billed legs are never candidates. Only an upstream's own

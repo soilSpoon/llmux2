@@ -71,6 +71,12 @@ pub struct ImportOptions<'a> {
     /// their aliases are pruned, and with `--omniroute-fallback` they land in
     /// the catch-all's `exclude` so the wildcard never serves them again.
     pub exclude_models: Option<&'a Path>,
+    /// JSON list of `{"provider": ..., "evidence": ...}` entries marking
+    /// custom provider legs free: `provider` matches the provider-node id or
+    /// the connection's base-url host, and `evidence` must record how the
+    /// operator confirmed the provider is free (a plan or pricing page, or
+    /// the account usage API). Custom legs bill unless listed.
+    pub free_providers: Option<&'a Path>,
 }
 
 #[derive(Clone, Copy)]
