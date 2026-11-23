@@ -120,6 +120,8 @@ pub(crate) struct AttemptStats {
     routed: AtomicU64,
     failed_attempts: AtomicU64,
     stream_errors: AtomicU64,
+    /// Failed attempts that handed the request to another deployment.
+    handoffs: AtomicU64,
     failure_classes: [AtomicU64; FAILURE_CLASSES.len()],
     skip_reasons: [AtomicU64; SKIP_REASONS.len()],
 }
@@ -141,6 +143,7 @@ pub struct DeploymentStats<'a> {
     routed: u64,
     failed_attempts: u64,
     stream_errors: u64,
+    handoffs: u64,
     failure_classes: BTreeMap<&'static str, u64>,
     skip_reasons: BTreeMap<&'static str, u64>,
 }
@@ -157,6 +160,10 @@ impl AttemptStats {
         } else {
             self.routed.fetch_add(1, Relaxed);
         }
+    }
+
+    pub(crate) fn record_handoff(&self) {
+        self.handoffs.fetch_add(1, Relaxed);
     }
 
     pub(crate) fn record_stream_error(&self, kind: ErrorKind) {
@@ -198,6 +205,7 @@ impl AttemptStats {
             routed: self.routed.load(Relaxed),
             failed_attempts: self.failed_attempts.load(Relaxed),
             stream_errors: self.stream_errors.load(Relaxed),
+            handoffs: self.handoffs.load(Relaxed),
             failure_classes: snapshot_counts(FAILURE_CLASSES, &self.failure_classes),
             skip_reasons: snapshot_counts(SKIP_REASONS, &self.skip_reasons),
         }
