@@ -56,7 +56,7 @@ mod tests {
             .into_iter()
             .collect::<HashSet<_>>()
             .len(),
-            9
+            10
         );
         assert_eq!(ANTHROPIC_KEY_HEADER, "x-api-key");
     }
