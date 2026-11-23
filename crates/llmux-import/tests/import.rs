@@ -134,6 +134,121 @@ fn free_providers_matches_host_and_requires_evidence() {
 }
 
 #[test]
+fn free_providers_model_entry_marks_only_the_listed_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut root: Value = serde_json::from_str(DB_FIXTURE).unwrap();
+    // Give node-test a second upstream model so the node is mixed: the entry
+    // names only one of them free.
+    root["combos"][0]["data"]["models"]
+        .as_array_mut()
+        .unwrap()
+        .insert(
+            2,
+            json!({
+                "kind": "model",
+                "providerId": "node-test",
+                "model": "node-test/model-2",
+                "connectionId": "custom"
+            }),
+        );
+    let free = dir.path().join("free.json");
+    fs::write(
+        &free,
+        json!([{"provider":"node-test","model":"model","evidence":"catalog lists this id at $0"}])
+            .to_string(),
+    )
+    .unwrap();
+    let output = dir.path().join("llmux.toml");
+    llmux_import::import_with_options(
+        &root.to_string(),
+        &output,
+        None,
+        &ImportOptions {
+            free_providers: Some(&free),
+            ..ImportOptions::default()
+        },
+    )
+    .unwrap();
+    let config = RuntimeConfig::load(&output).unwrap();
+    let billing: HashMap<_, _> = config
+        .deployments
+        .iter()
+        .map(|dep| (dep.upstream_model.as_ref(), dep.billing))
+        .collect();
+    assert_eq!(billing["model"], Billing::Free);
+    assert_eq!(billing["model-2"], Billing::Billed);
+
+    // An empty model entry is rejected rather than widening to the whole node.
+    fs::write(
+        &free,
+        json!([{"provider":"node-test","model":"","evidence":"x"}]).to_string(),
+    )
+    .unwrap();
+    let error = llmux_import::import_with_options(
+        &root.to_string(),
+        &dir.path().join("bad.toml"),
+        None,
+        &ImportOptions {
+            free_providers: Some(&free),
+            ..ImportOptions::default()
+        },
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("model"), "{error}");
+}
+
+#[test]
+fn free_providers_host_node_level_entry_still_frees_when_id_is_model_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut root: Value = serde_json::from_str(DB_FIXTURE).unwrap();
+    root["combos"][0]["data"]["models"]
+        .as_array_mut()
+        .unwrap()
+        .insert(
+            2,
+            json!({
+                "kind": "model",
+                "providerId": "node-test",
+                "model": "node-test/model-2",
+                "connectionId": "custom"
+            }),
+        );
+    let host = "example.com";
+    // The id-scoped entry lists one model; the host entry marks the whole
+    // node. Both keys must be consulted or the host marking is lost.
+    let free = dir.path().join("free.json");
+    fs::write(
+        &free,
+        json!([
+            {"provider":"node-test","model":"model","evidence":"catalog $0"},
+            {"provider":host,"evidence":"operator-confirmed free plan"}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let output = dir.path().join("llmux.toml");
+    llmux_import::import_with_options(
+        &root.to_string(),
+        &output,
+        None,
+        &ImportOptions {
+            free_providers: Some(&free),
+            ..ImportOptions::default()
+        },
+    )
+    .unwrap();
+    let config = RuntimeConfig::load(&output).unwrap();
+    let billing: HashMap<_, _> = config
+        .deployments
+        .iter()
+        .map(|dep| (dep.upstream_model.as_ref(), dep.billing))
+        .collect();
+    assert_eq!(billing["model"], Billing::Free);
+    assert_eq!(billing["model-2"], Billing::Free);
+}
+
+#[test]
 fn free_providers_matches_ipv6_hosts_bare_and_bracketed() {
     let dir = tempfile::tempdir().unwrap();
     let mut root: Value = serde_json::from_str(DB_FIXTURE).unwrap();
