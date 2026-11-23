@@ -29,8 +29,7 @@ use llmux_providers::nous_portal::{NousPortalConfig, NousPortalSource};
 use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
 use llmux_providers::{
     truncate_middle_for_format, Anthropic, Antigravity, AwsQuick, DeepAi, DevinAcp, DevinAcpConfig,
-    Freebuff,
-    OpenAiCompat, OpenAiResponses, RequestMetadata, StaticKey, Xai,
+    Freebuff, OpenAiCompat, OpenAiResponses, RequestMetadata, StaticKey, Xai,
 };
 use llmux_types::{
     provider, Billing, ContextOverflow, CredentialSource, GatewayRequest, GatewayResponse,
