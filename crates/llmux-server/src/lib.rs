@@ -28,8 +28,8 @@ use llmux_core::{Executor, GatewayError, InitError, LiveModels, RequestLog, Rout
 use llmux_providers::nous_portal::{NousPortalConfig, NousPortalSource};
 use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
 use llmux_providers::{
-    truncate_middle_for_format, Anthropic, Antigravity, DeepAi, DevinAcp, DevinAcpConfig, Freebuff,
-    OpenAiCompat, OpenAiResponses, RequestMetadata, StaticKey, Xai,
+    truncate_middle_for_format, Anthropic, Antigravity, AwsQuick, DeepAi, DevinAcp, DevinAcpConfig,
+    Freebuff, OpenAiCompat, OpenAiResponses, RequestMetadata, StaticKey, Xai,
 };
 use llmux_types::{
     provider, Billing, ContextOverflow, CredentialSource, GatewayRequest, GatewayResponse,
@@ -73,6 +73,7 @@ fn provider_registry(devin: DevinAcpConfig) -> ProviderRegistry {
     registry.register(Arc::new(Freebuff::new()));
     registry.register(Arc::new(Xai::new()));
     registry.register(Arc::new(Antigravity::new()));
+    registry.register(Arc::new(AwsQuick::new()));
     registry.register(Arc::new(DevinAcp::new(devin)));
     registry
 }
