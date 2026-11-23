@@ -21,6 +21,10 @@ pub const ANTIGRAVITY: &str = "antigravity";
 pub const DEVIN_ACP: &str = "devin_acp";
 /// Placeholder endpoint for deployments that have no network upstream.
 pub const DEVIN_ACP_BASE_URL: &str = "http://127.0.0.1/devin-acp";
+/// AWS Quick through the magpie gateway the desktop plugin exposes on loopback.
+pub const AWS_QUICK: &str = "aws_quick";
+/// Where the plugin's gateway listens, for deployments that omit `base_url`.
+pub const AWS_QUICK_BASE_URL: &str = "http://127.0.0.1:3425";
 
 /// Header carrying the Anthropic API key at the upstream edge.
 pub const ANTHROPIC_KEY_HEADER: &str = "x-api-key";
@@ -47,6 +51,7 @@ mod tests {
                 XAI,
                 ANTIGRAVITY,
                 DEVIN_ACP,
+                AWS_QUICK,
             ]
             .into_iter()
             .collect::<HashSet<_>>()

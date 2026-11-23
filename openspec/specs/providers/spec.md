@@ -63,6 +63,41 @@ translates OpenAI Responses and Anthropic Messages via Chat Completions.
 
 WHEN Codebuff returns HTTP 429 with a Retry-After header
 THEN the gateway classifies it as rate limited and retains the retry delay.
+### Requirement: AWS Quick through Magpie
+
+An `aws_quick` deployment SHALL send Chat Completions to the Magpie gateway.
+It SHALL accept `auth = "none"` and default to `http://127.0.0.1:3425` when
+`base_url` is omitted. It SHALL convert OpenAI Responses and Anthropic Messages
+requests to Chat Completions and return responses in the caller's format.
+
+The adapter SHALL set both `model` and `agent_mode` to the mode selected by
+`upstream_model`, or by the requested model for a catch-all deployment.
+It SHALL recognize `fast`, `balanced`, `smart`, and `advanced` as bare modes
+or after a slash-separated prefix. It SHALL map
+`us.anthropic.claude-haiku-5-5` to `fast` and
+`us.anthropic.claude-opus-5-5` to `smart`. Unrecognized model names SHALL
+select `smart`.
+
+The adapter SHALL translate recognized client effort to Magpie's
+`off`, `low`, `medium`, `high`, or `max`, send it in `thinking_effort`,
+and set `x-magpie-effort` unless the deployment already sets that header.
+Unrecognized effort SHALL NOT add a header or a body effort value.
+
+#### Scenario: Responses request selects fast mode and maximum effort
+
+WHEN an `aws_quick` deployment with `upstream_model = "aws-quick/fast"`
+receives an OpenAI Responses request with `reasoning.effort = "xhigh"`
+THEN the upstream Chat Completions request sends `model` and `agent_mode`
+as `fast` and sends `max` in both `thinking_effort` and `x-magpie-effort`.
+The gateway returns the upstream result in OpenAI Responses format.
+
+#### Scenario: Unknown model falls back and the configured header wins
+
+WHEN an `aws_quick` deployment has an unknown upstream model and sets
+`x-magpie-effort: low`, and a Chat Completions request asks for
+`reasoning_effort = "high"`
+THEN the upstream body selects `smart` and contains `thinking_effort: high`,
+but the upstream header remains `x-magpie-effort: low`.
 
 ### Requirement: Keyless deployments
 

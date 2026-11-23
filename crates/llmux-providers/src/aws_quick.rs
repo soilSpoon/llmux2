@@ -15,16 +15,15 @@ use bytes::Bytes;
 use http::{header, HeaderName, HeaderValue, Request, Response, StatusCode, Uri};
 use hyper::body::Incoming;
 use llmux_types::{
-    AuthMaterial, BuildError, Deployment, GatewayRequest, GatewayResponse, InboundFormat,
+    provider, AuthMaterial, BuildError, Deployment, GatewayRequest, GatewayResponse, InboundFormat,
     ProviderAdapter, ProviderKind, Support, UpstreamError,
 };
 use serde_json::{json, Value};
 use std::time::SystemTime;
 
-const KIND: &str = "aws_quick";
 /// Where the plugin's gateway listens; deployments usually name it as their
 /// base URL, and this is the fallback when they do not.
-const DEFAULT_BASE: &str = "http://127.0.0.1:3425";
+const DEFAULT_BASE: &str = provider::AWS_QUICK_BASE_URL;
 const PATH: &str = "/v1/chat/completions";
 const AGENT_MODE: &str = "agent_mode";
 const EFFORT_HEADER: &str = "x-magpie-effort";
@@ -44,7 +43,7 @@ pub struct AwsQuick(ProviderKind);
 
 impl AwsQuick {
     pub fn new() -> Self {
-        Self(ProviderKind(KIND.into()))
+        Self(ProviderKind(provider::AWS_QUICK.into()))
     }
 }
 
@@ -241,7 +240,7 @@ mod tests {
             fallback: false,
             idx: DeploymentIdx(0),
             id: "quick".into(),
-            provider: ProviderKind(KIND.into()),
+            provider: ProviderKind(provider::AWS_QUICK.into()),
             credential: "key".into(),
             base_url: DEFAULT_BASE.parse().unwrap(),
             upstream_model: mode.into(),
@@ -256,8 +255,12 @@ mod tests {
     }
 
     fn request(body: Value, stream: bool) -> GatewayRequest {
+        inbound(body, stream, InboundFormat::OpenAiChat)
+    }
+
+    fn inbound(body: Value, stream: bool, format: InboundFormat) -> GatewayRequest {
         GatewayRequest {
-            format: InboundFormat::OpenAiChat,
+            format,
             model: "quick".into(),
             stream,
             body: Bytes::from(body.to_string()),
@@ -326,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn configured_effort_header_wins_over_the_body() {
-        let mut upgrade = dep("us.anthropic.claude-opus-5-5");
+        let mut upgrade = dep("unknown-model");
         upgrade
             .headers
             .insert(EFFORT_HEADER, HeaderValue::from_static("low"));
@@ -342,6 +345,7 @@ mod tests {
         assert_eq!(built.headers()["authorization"], "Bearer tok");
         let body: Value = serde_json::from_slice(built.body()).unwrap();
         assert_eq!(body[AGENT_MODE], "smart");
+        assert_eq!(body["thinking_effort"], "high");
     }
 
     async fn upstream() -> (llmux_testkit::TestServer, Deployment) {
@@ -361,14 +365,21 @@ mod tests {
                 } else {
                     (
                         [(header::CONTENT_TYPE, "application/json")],
-                        json!({"model":mode,"choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]})
+                        json!({
+                            "id":"chatcmpl-quick",
+                            "object":"chat.completion",
+                            "created":1,
+                            "model":mode,
+                            "choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+                            "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}
+                        })
                             .to_string(),
                     )
                 }
             }),
         );
         let server = llmux_testkit::TestServer::start(router).await.unwrap();
-        let mut deployment = dep("fast");
+        let mut deployment = dep("aws-quick/fast");
         deployment.base_url = server.url().parse().unwrap();
         (server, deployment)
     }
@@ -399,6 +410,83 @@ mod tests {
             }
             GatewayResponse::Stream(_) => panic!("expected a complete body"),
         }
+    }
+
+    #[tokio::test]
+    async fn responses_requests_translate_effort_and_return_responses() {
+        let (_server, deployment) = upstream().await;
+        let req = inbound(
+            json!({"model":"quick","input":"hello","reasoning":{"effort":"xhigh"}}),
+            false,
+            InboundFormat::OpenAiResponses,
+        );
+        let adapter = AwsQuick::new();
+        let built = adapter
+            .build_request(&req, &deployment, &AuthMaterial::None)
+            .await
+            .unwrap();
+        assert_eq!(built.headers()[EFFORT_HEADER], "max");
+        let outgoing: Value = serde_json::from_slice(built.body()).unwrap();
+        assert_eq!(outgoing[AGENT_MODE], "fast");
+        assert_eq!(outgoing["thinking_effort"], "max");
+        assert_eq!(
+            outgoing["messages"],
+            json!([{"role":"user","content":"hello"}])
+        );
+
+        let client = Client::builder(TokioExecutor::new()).build_http();
+        let resp = client.request(built.map(Full::new)).await.unwrap();
+        let GatewayResponse::Complete { body, .. } = adapter
+            .parse_response(&req, &deployment, resp)
+            .await
+            .unwrap()
+        else {
+            panic!("expected a complete Responses body");
+        };
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["object"], "response");
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["output"][0]["content"][0]["type"], "output_text");
+        assert_eq!(value["output"][0]["content"][0]["text"], "hi");
+    }
+
+    #[tokio::test]
+    async fn anthropic_requests_return_messages() {
+        let (_server, deployment) = upstream().await;
+        let req = inbound(
+            json!({
+                "model":"quick","max_tokens":32,"system":"Be brief",
+                "messages":[{"role":"user","content":"hello"}]
+            }),
+            false,
+            InboundFormat::AnthropicMessages,
+        );
+        let adapter = AwsQuick::new();
+        let built = adapter
+            .build_request(&req, &deployment, &AuthMaterial::None)
+            .await
+            .unwrap();
+        let outgoing: Value = serde_json::from_slice(built.body()).unwrap();
+        assert_eq!(
+            outgoing["messages"],
+            json!([{"role":"system","content":"Be brief"},{"role":"user","content":"hello"}])
+        );
+
+        let client = Client::builder(TokioExecutor::new()).build_http();
+        let resp = client.request(built.map(Full::new)).await.unwrap();
+        let GatewayResponse::Complete { body, .. } = adapter
+            .parse_response(&req, &deployment, resp)
+            .await
+            .unwrap()
+        else {
+            panic!("expected a complete Messages body");
+        };
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["type"], "message");
+        assert_eq!(value["role"], "assistant");
+        assert_eq!(value["stop_reason"], "end_turn");
+        assert_eq!(value["content"], json!([{"type":"text","text":"hi"}]));
+        assert_eq!(value["usage"], json!({"input_tokens":3,"output_tokens":2}));
     }
 
     #[tokio::test]

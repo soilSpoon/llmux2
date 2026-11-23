@@ -599,7 +599,10 @@ impl RawConfig {
                     (Some(DeploymentAuth::None), None, Some(provider))
                         if matches!(
                             provider.as_str(),
-                            provider::OPENAI | provider::OPENAI_COMPAT | provider::DEVIN_ACP
+                            provider::OPENAI
+                                | provider::OPENAI_COMPAT
+                                | provider::DEVIN_ACP
+                                | provider::AWS_QUICK
                         ) =>
                     {
                         ProviderKind(provider.as_str().into())
@@ -653,6 +656,10 @@ impl RawConfig {
                     .or_else(|| {
                         (provider.0.as_ref() == provider::DEVIN_ACP)
                             .then_some(provider::DEVIN_ACP_BASE_URL)
+                    })
+                    .or_else(|| {
+                        (provider.0.as_ref() == provider::AWS_QUICK)
+                            .then_some(provider::AWS_QUICK_BASE_URL)
                     })
                     .ok_or_else(|| invalid("deployment requires base_url"))?;
                 if dep.upstream_model.is_empty() {
