@@ -1,0 +1,138 @@
+# Free provider offers, a standalone config to run on its own or copy from.
+#
+# These are temporary promotions and third-party free tiers: test and failover
+# capacity, not capacity you can budget. See docs/free-providers.md for each
+# offer's evidence, limits and data-retention caveats.
+#
+# They live here rather than in llmux.example.toml because the loader resolves
+# every credential at startup, so the main sample would demand all four keys
+# below before llama-70b could serve.
+#
+# Required environment: LLMUX_CLIENT_KEY, PACKET_API_KEY, NVIDIA_API_KEY,
+# OPENCODE_ZEN_API_KEY, FREEMODEL_API_KEY.
+
+[server]
+client_keys = ["env:LLMUX_CLIENT_KEY"]
+
+[[credentials]]
+id = "packet-key"
+kind = "api_key"
+provider = "openai_compat"
+key = "env:PACKET_API_KEY"
+
+[[credentials]]
+id = "nvidia-key"
+kind = "api_key"
+provider = "openai_compat"
+key = "env:NVIDIA_API_KEY"
+
+[[credentials]]
+id = "zen-key"
+kind = "api_key"
+provider = "openai_compat"
+key = "env:OPENCODE_ZEN_API_KEY"
+
+[[credentials]]
+id = "freemodel-key"
+kind = "api_key"
+provider = "openai_compat"
+key = "env:FREEMODEL_API_KEY"
+
+# Temporary free offers and free tiers. These are for testing and failover, not
+# capacity you can budget: see docs/free-providers.md. Each upstream limit below
+# is set lower than the documented limit on purpose.
+
+[[models]]
+name = "deepseek-v4.1-flash"
+capabilities = { stream = true, max_context = 131072 }
+
+# packet.ai Token Factory: every token is $0 until 2026-12-16, then paid. The
+# provider's model table gives 131K context for both models, so max_context below
+# matches it; a larger window is unverified without a key to probe.
+[[models.deployments]]
+id = "packet-deepseek-v4.1-flash"
+credential = "packet-key"
+base_url = "https://api.packet.ai/v1"
+upstream_model = "nvidia/DeepSeek-V4.1-Flash-NVFP4"
+priority = 0
+timeout_ms = 60000
+expires_at = 2026-12-16T23:59:59Z
+
+# OpenCode Zen free pool. Free-tier model access is documented for the OpenCode
+# client; an outside caller may be refused with FreeUsageLimitError.
+[[models.deployments]]
+id = "zen-deepseek-v4.1-flash"
+credential = "zen-key"
+base_url = "https://opencode.ai/inference/openai/v1"
+upstream_model = "deepseek-v4.1-flash-free"
+priority = 10
+timeout_ms = 60000
+
+[[models]]
+name = "minimax-m3.1-flash"
+capabilities = { stream = true, max_context = 131072 }
+
+[[models.deployments]]
+id = "packet-minimax-m3.1-flash"
+credential = "packet-key"
+base_url = "https://api.packet.ai/v1"
+upstream_model = "MiniMaxAI/MiniMax-M3.1-Flash"
+timeout_ms = 60000
+expires_at = 2026-12-16T23:59:59Z
+
+[[models]]
+name = "gemma-4-31b"
+capabilities = { stream = true }
+
+# NVIDIA NIM: no announced end date, so no expires_at. The model page advertises
+# a free endpoint but prints no numerical limit; ~40 RPM is third-party reported,
+# so 20 leaves headroom.
+[[models.deployments]]
+id = "nvidia-gemma-4-31b"
+credential = "nvidia-key"
+base_url = "https://integrate.api.nvidia.com/v1"
+upstream_model = "google/gemma-4-31b-it"
+timeout_ms = 60000
+quota = { rpm = 20 }
+
+[[models]]
+name = "hy4-flash"
+capabilities = { stream = true, max_context = 1048576 }
+
+[[models.deployments]]
+id = "zen-hy4-flash"
+credential = "zen-key"
+base_url = "https://opencode.ai/inference/openai/v1"
+upstream_model = "hy4-flash-free"
+timeout_ms = 60000
+expires_at = 2026-11-30T23:59:59Z
+
+[[models]]
+name = "big-pickle"
+capabilities = { stream = true, max_context = 200000 }
+
+# Free "for a limited time" with no stated end date, so no expires_at. The
+# provider may train on conversations sent to it; see docs/free-providers.md.
+[[models.deployments]]
+id = "zen-big-pickle"
+credential = "zen-key"
+base_url = "https://opencode.ai/inference/openai/v1"
+upstream_model = "big-pickle"
+timeout_ms = 60000
+
+[[models]]
+name = "claude-fable-5"
+capabilities = { stream = true, max_context = 1000000 }
+
+# freemodel.in is a third-party aggregator with a recurring free allowance (1M
+# tokens a month, prompt and reply counted together), not an expiring promo, so
+# no expires_at. QuotaSpec cannot express a monthly token total; the rpm cap
+# below only limits burst. The monthly cap is enforced upstream and fails with
+# HTTP 402, which llmux2 treats as quota_exhausted.
+[[models.deployments]]
+id = "freemodel-claude-fable-5"
+credential = "freemodel-key"
+base_url = "https://freemodel.in/v1"
+upstream_model = "claude-fable-5"
+timeout_ms = 60000
+quota = { rpm = 10 }

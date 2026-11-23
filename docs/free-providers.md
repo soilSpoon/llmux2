@@ -1,6 +1,10 @@
 # Official free API providers
 
-Research snapshot: **2026-11-20**, against llmux2 `eb3b617`. Official pages were
+Research snapshot: **2026-11-20**, against llmux2 `eb3b617`; the temporary
+offers in the first section were added **2026-11-23** and are configured in
+[`examples/llmux.free-providers.example.toml`](../examples/llmux.free-providers.example.toml),
+a separate sample because it needs four extra provider keys the quickstart does
+not. Official pages were
 retrieved with `curl -L -sS`; quotations below are the text returned, not remembered
 quotas. Free offers and catalogs change. A documented API is not a promise of
 capacity, production suitability, permission to resell, or identical models to an
@@ -43,6 +47,67 @@ limits and stats machinery covers them.
   goal is to burn the free window first — the quota-expiry-first ordering
   already prefers allowances that lapse sooner.
 
+### Offers configured on 2026-11-23
+
+These four providers — seven deployments — ship as `[[models.deployments]]` in
+[`examples/llmux.free-providers.example.toml`](../examples/llmux.free-providers.example.toml),
+not in the quickstart example: the loader resolves every credential at startup, so
+mixing them into `examples/llmux.example.toml` would make the llama-70b quickstart
+demand all four extra keys. Run that file on its own or copy the blocks you want.
+They are **test and failover capacity, not capacity you can budget**: every one of
+them is a promotion, a free tier, or a third-party aggregator that can change
+without notice. Each upstream limit in the example is set below the documented
+limit so a burst degrades into a gateway-visible failure instead of an upstream
+ban.
+
+| Deployment | Upstream | Free window | Expiry in config |
+| --- | --- | --- | --- |
+| `packet-deepseek-v4.1-flash` | `api.packet.ai/v1`, `nvidia/DeepSeek-V4.1-Flash-NVFP4` | $0 per token until 2026-12-16, then paid | `expires_at = 2026-12-16T23:59:59Z` |
+| `packet-minimax-m3.1-flash` | `api.packet.ai/v1`, `MiniMaxAI/MiniMax-M3.1-Flash` | same window | `expires_at = 2026-12-16T23:59:59Z` |
+| `zen-hy4-flash` | `opencode.ai/inference/openai/v1`, `hy4-flash-free` | “for a limited time”, no date on the page | `expires_at = 2026-11-30T23:59:59Z` (the window this project was given, not an official date) |
+| `zen-deepseek-v4.1-flash` | same endpoint, `deepseek-v4.1-flash-free` | “for a limited time” | none, because no end date is announced |
+| `zen-big-pickle` | same endpoint, `big-pickle` | “for a limited time” | none |
+| `nvidia-gemma-4-31b` | `integrate.api.nvidia.com/v1`, `google/gemma-4-31b-it` | Free Endpoint Available; no announced end | none |
+| `freemodel-claude-fable-5` | `https://freemodel.in/v1`, `claude-fable-5` | 1M tokens/month on the Free plan, reset monthly | none; a recurring allowance is not an expiry |
+
+Caveats that decide whether you can send real prompts to each one:
+
+- **packet.ai Token Factory** requires an email and one SMS verification per
+  account [P1]. The upstream model IDs above carry a vendor prefix that the
+  marketing table does not print, so the exact strings `api.packet.ai` expects
+  are **unverified**; a wrong ID surfaces as an upstream `404`/`400`, not as a
+  config error. Its pricing page bills GPU rentals from a prepaid wallet, so that
+  wallet is the account the free tokens land in; whether an empty wallet blocks
+  Token Factory after the free window is **unverified**. Nothing on the page
+  states a rate limit or a data-retention policy — both **unverified**.
+- **OpenCode Zen** says “Free-tier chat models require OpenCode; use paid models
+  or Go from other clients” [Z1]. An outside caller is therefore not guaranteed
+  free capacity, and a keyless probe returned `429 FreeUsageLimitError`. Treat a
+  `FreeUsageLimitError` here as rate limiting, not as an exhausted quota: the
+  adapter maps `429` to `RateLimited` unless the body says quota, so the gateway
+  cools the deployment down instead of marking it spent.
+- **Big Pickle** is a “stealth model … free on OpenCode for a limited time” whose
+  page says the team is using the window “to collect feedback and improve the
+  model” [Z1]. The zero-retention sentence on that page belongs to DeepSeek V4.1
+  Flash Free and Hy4 Flash Free, not to Big Pickle, so assume prompts sent to
+  Big Pickle may be used for training.
+- **freemodel.in** is a third-party aggregator in front of other providers'
+  models. Its own terms are the only retention statement you get, and it resells
+  upstream capacity: retention and resale permissions of the upstream model
+  owner are **unverified**. The monthly cap is counted “both your prompt and the
+  model's reply, combined”, and exhaustion returns `402` before the request
+  reaches a model [F2].
+
+### Monthly token allowances are not expressible yet
+
+`quota` accepts `rpm`, `rpd`, `tpm`, `tpd` and `concurrent` only, and each is a
+sliding window that resets within a minute or a day. A provider that grants
+1,000,000 tokens per calendar month — freemodel.in's Free plan, with 60 RPM and
+100,000 TPM on top [F2] — has no matching field. The example config therefore sets
+a conservative `rpm` and relies on the upstream `402` for the monthly cap, which
+`llmux2` maps to `quota_exhausted` and fails over. Adding a monthly limit is a
+config and limits change, not something this document can work around.
+
 ## Import gaps → replacements
 
 The dry-run counts are **group totals**, not per-provider counts: 43 bridge legs,
@@ -59,7 +124,7 @@ leg. These are not counts of legs that can be restored unchanged.
 | `xai-oauth` / grok-cli (same group) | xAI API key at `https://api.x.ai/v1` [X1–2] | Official keyed access, but no current free credit grant verified. Do not count as a free replacement. Current quickstart demonstrates Responses; llmux2 has no native upstream `responses` kind. Chat compatibility/model eligibility must be checked separately. |
 | `kilo`, `kilo-free` (7-leg no-auth group) | Same official gateway with Kilo API key; anonymous free access is also explicitly documented [K1–3] | Both keyed and explicit `auth = "none"` deployments work. Anonymous is 200 requests/hour/IP. |
 | `aihorde` (same group) | Official OpenAI-compatible `https://oai.aihorde.net/v1`, Horde key or anonymous access [H1–4] | Omit Authorization: the service selects anonymous key `0000000000`. Works with `openai_compat`; native `https://aihorde.net/api/v2` is asynchronous and is not compatible. Queue/worker capacity, no fixed free token budget verified. |
-| `hms` (1 custom-header leg) | Unknown operator/protocol; require the original operator's API/auth documentation | No connection named `hms` was present in the supplied connection list. Custom headers are not configurable. Do not infer legitimacy from a working bridge or import arbitrary headers. |
+| `hms` (1 custom-header leg) | Unknown operator/protocol; require the original operator's API/auth documentation | No connection named `hms` was present in the supplied connection list. Its bridge leg needed custom headers, which `[[models.deployments]] headers` can now carry. Do not infer legitimacy from a working bridge or import arbitrary headers. |
 
 ## Ranked provider shortlist
 
@@ -83,12 +148,15 @@ or live catalog, not a guarantee that they remain free or available.
 | Conditional: Groq | `https://api.groq.com/openai/v1`; API key [R2] | Current free-plan entitlement and numerical free limits **unverified** in retrieved rate-limit page (account Limits page required) [R1]. `openai/gpt-oss-20b`, `openai/gpt-oss-120b` [R2–3] | Do not copy historical 30 RPM/14,400 RPD into config. Organization-scoped limits [R1]; default no retention with exceptions [R4]. Resale/multi-account terms **unverified**. Chat compatible [R2]. |
 | Trial only: Cerebras | `https://api.cerebras.ai/v1`; API key [B2] | $5 credits, verified payment method, expires 30 days; explicitly no permanently free tier [B1]. `gpt-oss-120b`: 5 RPM, 30K uncached TPM, 90K total TPM, 1M TPH/TPD | Not recurring free. `qwen-3.8-27b` also listed; do not infer its separate limits from GPT-OSS. Training/resale/multi-account terms **unverified**. Chat yes. |
 | Trial only: Scaleway | Console endpoint; current base URL/auth details **unverified** in fetched quickstart [SC2] | New customers get 1,000,000 tokens, then paid [SC1]; `glm-5.3` listed | Not verified as recurring monthly. OpenAI-compatible per official product page; billing/retention/resale/multi-account details **unverified**. No ready-to-enable config until endpoint/key confirmed. |
-| Hold: NVIDIA NIM / build.nvidia.com | `https://integrate.api.nvidia.com/v1`; Developer API key [N1, N3] | No numerical free allowance verified. Selected Llama 3.1 8B page says **Free Endpoint Deprecated** [N2] | Do not assume old 1,000 credits/40 RPM. Official key creation exists, but current free model entitlement and service terms **unverified**. NIM API compatibility alone does not prove hosted free availability. |
+| Conditional: NVIDIA NIM / build.nvidia.com | `https://integrate.api.nvidia.com/v1`; Developer API key [N1, N3] | `google/gemma-4-31b-it` page says “Start building with a free API endpoint” and **Free Endpoint Available** [N4]. Numerical limit **unverified**: the quickstart gives none, third parties report ~40 RPM [N1] | Trial use only; the Llama 3.1 8B page still says **Free Endpoint Deprecated** [N2], so per-model availability is not universal. Do not copy the old 1,000-credit figure into config. Terms **unverified**. Chat yes; configured with `rpm = 20` in the example. |
 | Hold: Mistral La Plateforme / AI Studio | `https://api.mistral.ai/v1`; API key [M1] | Current Experiment/free allowance **unverified**. `mistral-small-latest` official example | Old tier URL returned 404. Current quickstart requires a plan with API access and points to adding a payment method; limits in Admin [M1–2]. Training, resale and multi-account rules **unverified**. Chat yes, but not established free. |
 | Exclude: Hugging Face Inference Providers | `https://router.huggingface.co/v1`; HF token | Current free-user credits **None**; paid PRO $2/month [F1]. Example `deepseek-ai/DeepSeek-V3-0324` | Purchasing credits/PRO is not free. Underlying provider/model terms apply; training/resale/multi-account details **unverified**. Chat yes technically. |
 | Exclude: Chutes | Current API base/auth/model catalog **unverified** | “We do not offer a free tier at this time.” [CH1] | Pay-as-you-go, not a free replacement. Compatibility, data and resale terms **unverified** in fetched pricing page. |
 | Exclude: GitHub Models | No active endpoint/auth | Official docs say fully retired July 30, 2026 [GH1]; no current free models/limits | Do not configure legacy `models.github.ai/inference` or PAT examples. No. |
 | Hold: LLM7 | `https://api.llm7.io/v1`; dashboard API token; `default`, `fast`, `pro` selectors [L1] | No current free allowance or limits verified. Homepage advertises lower prices, not free access | First-party docs establish keyed OpenAI client support, not underlying provider authorization. Training/resale/multi-account terms and provenance **unverified**. Technically Chat yes; do not recommend until those are established. |
+| Temporary: packet.ai Token Factory | `https://api.packet.ai/v1`; account API key after email plus SMS verification [P1] | Input and output tokens `$0` for every account until 2026-12-16, then paid [P1]. `DeepSeek-V4.1-Flash-NVFP4` and `MiniMax-M3.1-Flash`, 131K ctx [P1]. Rate limit **unverified** | Promo, not recurring. Endpoint and model IDs rest on the landing page only: keyless `/v1/models` returned `403`, docs behind a challenge [P1]. Retention policy unstated. Chat with streaming, JSON mode and tool calling per the page. |
+| Conditional: OpenCode Zen free pool | `https://opencode.ai/inference/openai/v1`; Zen API key [Z1] | `*-free` IDs priced 0 in the live catalog (`deepseek-v4.1-flash-free`, `hy4-flash-free`, `big-pickle`, others); all “for a limited time”, no dates [Z1] | “Free-tier chat models require OpenCode”; a keyless outside request got `429 FreeUsageLimitError` [Z1]. Zero retention is stated for DeepSeek V4.1 Flash Free and Hy4 Flash Free only; Big Pickle may be trained on. |
+| Conditional: freemodel.in Free plan | `https://freemodel.in/v1`; account key [F2] | 1M tokens/month, prompt and reply combined, 60 RPM, 100K TPM; `402` when spent [F2]. 29 models in the catalog, including `claude-fable-5` | Third-party aggregator reselling other providers' models; its retention terms are the only ones you get, so upstream training/resale terms are **unverified**. Not an expiry: the allowance resets monthly. Monthly token caps are not expressible in `quota`. |
 
 Do not treat “unverified” ToS fields as permission. Before serving other users,
 check the exact API service agreement, upstream model license, geographic/age
@@ -242,6 +310,46 @@ page only exposes account-specific limits, no number is invented.
 - **X2** [xAI rate limits](https://docs.x.ai/docs/key-information/consumption-and-rate-limits):
   tiers are “based on total revenue received through prepaid credit purchases or successfully fulfilled invoices.”
   No current free-credit entitlement verified. Do not assume old promotions still apply.
+- **P1** [packet.ai Token Factory](https://packet.ai/) (retrieved 2026-11-23):
+  “Token Factory serves open-weight models behind an OpenAI-compatible API. Change
+  the base URL, keep your code.” “Every token, input and output, is free until
+  December 16, 2026.” “Set base_url to api.packet.ai/v1 and reuse your existing
+  OpenAI client and prompts.” Model table: `DeepSeek-V4.1-Flash-NVFP4` and
+  `MiniMax-M3.1-Flash`, both “131K ctx”, `$0` “Until Dec 16”. “After that you pay
+  per token, with input and output metered separately.” Phone verification is
+  required before the first request. No rate limit and no retention policy stated
+  on the page. `https://api.packet.ai/v1/models` without a key returned `403
+  {"error":{"message":"Request blocked by security policy"}}`; the docs links
+  redirect to `dash.packet.ai/docs`, which returned `403` behind a challenge — so
+  the model IDs and base URL rest on this page alone.
+- **Z1** [OpenCode Zen](https://opencode.ai/docs/zen/) (retrieved 2026-11-23):
+  “Free-tier chat models require OpenCode; use paid models or Go from other
+  clients.” Free models section: “DeepSeek V4.1 Flash Free is free on OpenCode for
+  a limited time. Its provider follows a zero-retention policy and does not use
+  your data for model training.” “Hy4 flash Free is free on OpenCode for a limited
+  time. Its provider follows a zero-retention policy…”. “Big Pickle is a stealth
+  model that's free on OpenCode for a limited time. The team is using this time to
+  collect feedback and improve the model.” No calendar end date is given for any
+  of them. `https://opencode.ai/inference/v1/models` listed 104 models with the
+  `*-free` IDs priced `0` on input and output; a keyless chat request returned
+  `429 {"type":"error","error":{"type":"FreeUsageLimitError",…}}`.
+- **N4** [NVIDIA gemma-4-31b-it](https://build.nvidia.com/google/gemma-4-31b-it)
+  (retrieved 2026-11-23): “Start building with a free API endpoint.” Model
+  availability table: “Free Endpoint Available Partner Endpoint Available Download
+  Available”. “Context Length 262K”, and the tab is titled “Model by Google |
+  NVIDIA NIM”. Endpoint used in the sample code:
+  `https://integrate.api.nvidia.com/v1/chat/completions` with
+  `Authorization: Bearer $NVIDIA_API_KEY`. The quickstart [N1] still states no
+  numerical rate limit, so the ~40 RPM figure remains third-party-reported.
+- **F2** [freemodel.in pricing](https://freemodel.in/pricing) and
+  [freemodel.in](https://freemodel.in/) (retrieved 2026-11-23): “Free 1M tokens
+  every month · no card needed”. Free plan data: “1M tokens / month”, “60 requests
+  / min”, “All chat models”. “Tokens cover both your prompt and the model's reply,
+  combined. Your plan allowance is spent first and resets monthly; once it is used
+  up, requests pause with a clear HTTP 402”. “+ base_url="https://freemodel.in/v1"”
+  from the OpenAI-SDK diff. `https://freemodel.in/v1/models` returned 200 with 29
+  models including `claude-fable-5`; no generation was attempted (key required).
+  The page states no data-retention policy.
 
 ## What current llmux2 can configure
 
@@ -259,21 +367,30 @@ page only exposes account-specific limits, no number is invented.
   text input and does not expose Chat Completions options. The adapter rejects
   unsupported options instead of ignoring them.
 - **Credential headers:** A `deepai` API-key credential sets `Api-Key`. An
-  `openai_compat` API-key credential sets Bearer authorization. Do not set the
-  credential header again in deployment headers.
+  `openai_compat` API-key credential sets Bearer authorization.
+- **Per-deployment upstream headers are configurable:** `headers` on
+  `[[models.deployments]]` sets extra headers, e.g. OpenRouter's optional
+  `HTTP-Referer` and `X-Title` attribution, and accepts `env:`/`file:`
+  references for the value. Hop-by-hop names and a keyed deployment's own
+  `Authorization`/`x-api-key` are rejected, as are duplicate, invalid, or
+  control-character entries, so do not set the credential header again there.
 - **Kinds:** the server registry includes `deepai` for the official text API.
   `/v1/responses` is an **inbound** route converted for existing adapters, not a
   native upstream `provider = "responses"` implementation. A config string parsing
   does not mean a provider kind exists in the server registry.
-- **Local quotas:** only `quota.rpm` and `quota.concurrent` are supported; RPD,
-  TPM and TPD config values are rejected. None of these snippets can enforce daily
-  neurons/tokens or an account-wide free spending ceiling. Keep paid billing off
-  where possible and monitor upstream limits. Do not use gateway fallback to
-  bypass account/IP policies.
+- **Local quotas:** `quota` accepts `rpm`, `rpd`, `tpm`, `tpd` and `concurrent`,
+  each a sliding window (requests or estimated tokens per minute or day). Numbers
+  must be positive. There is still no **monthly** window, no rolling calendar
+  reset, and no money ceiling: a provider that grants a monthly token allowance
+  or a free spending cap has to be enforced upstream. Keep paid billing off where
+  possible and monitor upstream limits. Do not use gateway fallback to bypass
+  account/IP policies.
 
 ## Ready-to-paste configuration
 
 Each block is a **separate complete `llmux.toml`**, not a fragment to concatenate.
+The four 2026-11-23 offers also exist combined, as
+[`examples/llmux.free-providers.example.toml`](../examples/llmux.free-providers.example.toml).
 Export `LLMUX_CLIENT_KEY` and the named upstream key first; llmux2 accepts only
 `env:`/`file:` secret references, not inline secrets. Free tier eligibility is
 your responsibility, not the config’s.
@@ -482,6 +599,155 @@ credential = "cohere-key"
 base_url = "https://api.cohere.ai/compatibility/v1"
 upstream_model = "command-a-plus-05-2026"
 quota = { rpm = 20 }
+```
+
+### packet.ai Token Factory (promotion, ends 2026-12-16)
+
+Both models are `$0` until 2026-12-16 and then bill per token, so the expiry is
+set to the last second of that day. The page states no rate limit, so no `quota`
+is set here either: an undocumented guess would throttle free capacity for no
+reason. A wrong upstream model ID fails as an upstream error, not as a config
+error.
+
+```toml
+[server]
+client_keys = ["env:LLMUX_CLIENT_KEY"]
+
+[[credentials]]
+id = "packet-key"
+kind = "api_key"
+provider = "openai_compat"
+key = "env:PACKET_API_KEY"
+
+[[models]]
+name = "deepseek-v4.1-flash"
+capabilities = { stream = true, max_context = 131072 }
+[[models.deployments]]
+id = "packet-deepseek-v4.1-flash"
+credential = "packet-key"
+base_url = "https://api.packet.ai/v1"
+upstream_model = "nvidia/DeepSeek-V4.1-Flash-NVFP4"
+timeout_ms = 60000
+expires_at = 2026-12-16T23:59:59Z
+
+[[models]]
+name = "minimax-m3.1-flash"
+capabilities = { stream = true, max_context = 131072 }
+[[models.deployments]]
+id = "packet-minimax-m3.1-flash"
+credential = "packet-key"
+base_url = "https://api.packet.ai/v1"
+upstream_model = "MiniMaxAI/MiniMax-M3.1-Flash"
+timeout_ms = 60000
+expires_at = 2026-12-16T23:59:59Z
+```
+
+### OpenCode Zen free pool (no stated end date)
+
+Free-tier models are documented for the OpenCode client, so an outside caller may
+be refused with `429 FreeUsageLimitError`, which `llmux2` treats as rate limiting
+and cools down. Only DeepSeek V4.1 Flash Free and Hy4 Flash Free are documented as
+zero-retention; Big Pickle's page only promises feedback collection, so assume it
+may train on prompts.
+
+```toml
+[server]
+client_keys = ["env:LLMUX_CLIENT_KEY"]
+
+[[credentials]]
+id = "zen-key"
+kind = "api_key"
+provider = "openai_compat"
+key = "env:OPENCODE_ZEN_API_KEY"
+
+[[models]]
+name = "deepseek-v4.1-flash"
+capabilities = { stream = true, max_context = 131072 }
+[[models.deployments]]
+id = "zen-deepseek-v4.1-flash"
+credential = "zen-key"
+base_url = "https://opencode.ai/inference/openai/v1"
+upstream_model = "deepseek-v4.1-flash-free"
+timeout_ms = 60000
+
+[[models]]
+name = "hy4-flash"
+capabilities = { stream = true, max_context = 1048576 }
+[[models.deployments]]
+id = "zen-hy4-flash"
+credential = "zen-key"
+base_url = "https://opencode.ai/inference/openai/v1"
+upstream_model = "hy4-flash-free"
+timeout_ms = 60000
+expires_at = 2026-11-30T23:59:59Z
+
+[[models]]
+name = "big-pickle"
+capabilities = { stream = true, max_context = 200000 }
+[[models.deployments]]
+id = "zen-big-pickle"
+credential = "zen-key"
+base_url = "https://opencode.ai/inference/openai/v1"
+upstream_model = "big-pickle"
+timeout_ms = 60000
+```
+
+### NVIDIA NIM (free endpoint, per-model)
+
+The model page says “Free Endpoint Available”, but the quickstart publishes no
+numerical limit, so `rpm = 20` is a guard, not a verified quota. Per-model
+availability varies: the Llama 3.1 8B page still reports its free endpoint as
+deprecated.
+
+```toml
+[server]
+client_keys = ["env:LLMUX_CLIENT_KEY"]
+
+[[credentials]]
+id = "nvidia-key"
+kind = "api_key"
+provider = "openai_compat"
+key = "env:NVIDIA_API_KEY"
+
+[[models]]
+name = "gemma-4-31b"
+capabilities = { stream = true }
+[[models.deployments]]
+id = "nvidia-gemma-4-31b"
+credential = "nvidia-key"
+base_url = "https://integrate.api.nvidia.com/v1"
+upstream_model = "google/gemma-4-31b-it"
+timeout_ms = 60000
+quota = { rpm = 20 }
+```
+
+### freemodel.in Free plan (monthly token allowance)
+
+The Free plan grants 1M tokens a month with prompt and reply counted together,
+plus 60 RPM and 100K TPM. `quota` has no monthly window, so the monthly cap is
+left to the upstream `402`, which `llmux2` maps to `quota_exhausted`. The `rpm`
+here is set well under the plan's 60 to leave room for the gateway's own retries.
+
+```toml
+[server]
+client_keys = ["env:LLMUX_CLIENT_KEY"]
+
+[[credentials]]
+id = "freemodel-key"
+kind = "api_key"
+provider = "openai_compat"
+key = "env:FREEMODEL_API_KEY"
+
+[[models]]
+name = "claude-fable-5"
+capabilities = { stream = true, max_context = 1000000 }
+[[models.deployments]]
+id = "freemodel-claude-fable-5"
+credential = "freemodel-key"
+base_url = "https://freemodel.in/v1"
+upstream_model = "claude-fable-5"
+timeout_ms = 60000
+quota = { rpm = 10 }
 ```
 
 Groq is a conditional candidate, not a verified free recommendation in this
