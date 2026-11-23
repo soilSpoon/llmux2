@@ -42,6 +42,28 @@ and DeepAI returns a string `output`
 THEN the gateway returns the output as assistant text and identifies the
 configured upstream model in the response.
 
+### Requirement: Freebuff via Codebuff Chat Completions
+
+A deployment with a `freebuff` API key credential SHALL use the Codebuff
+OpenAI-compatible Chat Completions endpoint. The adapter SHALL append
+`/chat/completions` to the configured base URL (Codebuff production:
+`https://www.codebuff.com/api/v1`), authenticate with an Authorization bearer
+key, and send the configured upstream model ID as supplied by Codebuff (for
+example, `deepseek/deepseek-v4-flash`). The adapter SHALL NOT emulate the
+upstream's Freebuff session admission or grant free-tier eligibility.
+
+#### Scenario: Configured Freebuff deployment
+
+WHEN a deployment references a `freebuff` credential and a configured upstream
+model ID
+THEN the gateway initializes and forwards Chat Completions JSON and SSE, and
+translates OpenAI Responses and Anthropic Messages via Chat Completions.
+
+#### Scenario: Freebuff rate limit
+
+WHEN Codebuff returns HTTP 429 with a Retry-After header
+THEN the gateway classifies it as rate limited and retains the retry delay.
+
 ### Requirement: Keyless deployments
 
 The gateway SHALL support explicit keyless upstreams via `auth = "none"` with
