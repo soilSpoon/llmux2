@@ -130,6 +130,39 @@ free tier, and not a paid or unpublished id.
 WHEN the request carries no effort field or an unrecognized value
 THEN the deployment's configured `upstream_model` is used unchanged.
 
+### Requirement: Devin ACP replies and emulated tool calls
+
+The `devin_acp` provider SHALL drive the default `devin acp` agent — not a
+task-specific agent type such as `summarizer`, which emits conversation
+summaries on long transcripts — and frame the flattened transcript so the
+reply is a single assistant message. When the request carries a non-empty
+`tools` array and `tool_choice` is not `"none"`, the prompt SHALL present the
+tool schemas and a structured-call protocol; a reply consisting of a
+`{"tool_calls":[…]}` object SHALL be emitted as OpenAI `tool_calls` with
+`finish_reason: "tool_calls"`, with `id`, `type`, and string-form `arguments`
+filled in when the model omits or object-encodes them. Any other reply SHALL
+be emitted as text content. Tool turns never stream incrementally: the reply
+is buffered and emitted in one shot because the JSON must be complete before
+it can be classified.
+
+#### Scenario: Tool call reply
+
+WHEN a request offers a `read` function tool and the agent replies with
+`{"tool_calls":[{"function":{"name":"read","arguments":{"path":"/etc/hostname"}}}]}`
+THEN the completion carries `finish_reason: "tool_calls"`, null `content`, and
+`tool_calls` with `id`, `type: "function"`, and `arguments` as a JSON string.
+
+#### Scenario: Plain reply with tools offered
+
+WHEN tools are offered but the agent replies with plain text
+THEN the completion carries that text as content and `finish_reason: "stop"`.
+
+#### Scenario: Tool choice none
+
+WHEN the request offers tools but sets `"tool_choice": "none"`
+THEN the prompt carries no tool schemas or tool-call protocol and the reply is
+always emitted as text.
+
 ### Requirement: Keyless deployments
 
 The gateway SHALL support explicit keyless upstreams via `auth = "none"` with
