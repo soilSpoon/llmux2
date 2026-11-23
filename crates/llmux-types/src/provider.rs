@@ -10,6 +10,8 @@ pub const OPENAI_RESPONSES: &str = "openai_responses";
 /// Anthropic Messages API.
 pub const ANTHROPIC: &str = "anthropic";
 pub const DEEPAI: &str = "deepai";
+/// Freebuff through the Codebuff Chat Completions API.
+pub const FREEBUFF: &str = "freebuff";
 
 /// xAI OAuth at api.x.ai. Chat and Responses, selected per model.
 pub const XAI: &str = "xai";
@@ -41,6 +43,7 @@ mod tests {
                 OPENAI_RESPONSES,
                 ANTHROPIC,
                 DEEPAI,
+                FREEBUFF,
                 XAI,
                 ANTIGRAVITY,
                 DEVIN_ACP,
@@ -48,7 +51,7 @@ mod tests {
             .into_iter()
             .collect::<HashSet<_>>()
             .len(),
-            8
+            9
         );
         assert_eq!(ANTHROPIC_KEY_HEADER, "x-api-key");
     }
