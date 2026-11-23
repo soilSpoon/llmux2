@@ -1,7 +1,11 @@
 use crate::{string, upstream::ProviderIdentity, xplabs, Connection, ImportOptions};
 use llmux_types::provider::DEEPAI_TEXT_MODELS;
 use serde_json::Value;
-use std::{collections::HashSet, fs, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+};
 
 /// Builtin provider identities whose legs never bill or hit a shared quota at
 /// probe rates: community/free endpoints. Everything else a connection can
@@ -11,12 +15,14 @@ use std::{collections::HashSet, fs, path::Path};
 const FREE_PROVIDERS: &[&str] = &["aihorde", "duckduckgo-web", "github-models"];
 
 /// Whether the emitted leg can spend money or shared quota when probed.
-/// Custom (site-managed) providers are free; keyed legs against builtin
-/// providers bill, except reviewed free subsets (Kilo verified-free models,
-/// XPLabs free routes — billed XPLabs routes never reach this point — and
-/// Devin models the free-models list names). Workers legs bill wherever they
-/// appear: a custom provider node claiming the Cloudflare prefix shares the
-/// same capped account.
+/// Every leg bills unless the config metadata marks it free: builtin legs on
+/// the community endpoints in FREE_PROVIDERS, reviewed free subsets (Kilo
+/// verified-free models, XPLabs free routes — billed XPLabs routes never
+/// reach this point — and Devin models the free-models list names), and
+/// custom provider legs only when --free-providers lists the provider-node id
+/// or the connection's host with recorded evidence. Workers legs bill
+/// wherever they appear: a custom provider node claiming the Cloudflare
+/// prefix shares the same capped account.
 pub(super) fn billed(connection: &Connection, model: &str, policy: &Policy) -> bool {
     if connection.policy == ModelPolicy::Workers {
         return true;
@@ -25,12 +31,31 @@ pub(super) fn billed(connection: &Connection, model: &str, policy: &Policy) -> b
         return false;
     }
     match &connection.provider {
-        ProviderIdentity::Custom(_) => false,
+        ProviderIdentity::Custom(id) => policy.free_custom.as_ref().is_none_or(|free| {
+            !free.contains_key(id.as_str()) && !free.contains_key(&host(&connection.base_url))
+        }),
         ProviderIdentity::Builtin(id) if id == "devin-cli-agentic" => !policy
             .devin_free
             .as_ref()
             .is_some_and(|free| free.contains(model)),
         ProviderIdentity::Builtin(id) => !FREE_PROVIDERS.contains(&id.as_str()),
+    }
+}
+
+fn host(base_url: &str) -> String {
+    let authority = base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(base_url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("");
+    match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or("").to_owned(),
+        None => authority.split(':').next().unwrap_or("").to_owned(),
     }
 }
 
@@ -68,6 +93,9 @@ pub(super) struct Policy {
     pub kilo_free: Option<HashSet<String>>,
     pub openrouter_replacements: bool,
     pub devin_free: Option<HashSet<String>>,
+    /// Provider-node ids and connection hosts marked free by
+    /// `--free-providers`, with the evidence that justified each entry.
+    pub free_custom: Option<HashMap<String, String>>,
 }
 
 fn reference(path: &Path) -> Result<String, String> {
@@ -167,6 +195,39 @@ impl Policy {
                 Ok::<_, String>(free)
             })
             .transpose()?;
+        let free_custom = options
+            .free_providers
+            .map(|path| {
+                let content =
+                    fs::read_to_string(path).map_err(|_| "could not read free-providers file")?;
+                let rows: Value =
+                    serde_json::from_str(&content).map_err(|_| "invalid free-providers JSON")?;
+                let rows = rows
+                    .as_array()
+                    .ok_or("free-providers JSON must be an array")?;
+                rows.iter()
+                    .map(|row| {
+                        let provider = string(row, "provider");
+                        let evidence = string(row, "evidence");
+                        if provider.is_empty() {
+                            return Err(
+                                "free-providers entry requires a provider (node id or host)".into(),
+                            );
+                        }
+                        if evidence.is_empty() {
+                            return Err(format!(
+                                "free-providers entry {provider} requires evidence"
+                            ));
+                        }
+                        let provider = provider
+                            .strip_prefix('[')
+                            .and_then(|p| p.strip_suffix(']'))
+                            .unwrap_or(provider);
+                        Ok((provider.to_owned(), evidence.to_owned()))
+                    })
+                    .collect::<Result<HashMap<_, _>, _>>()
+            })
+            .transpose()?;
         if options.workers_ai_rpm.is_some() && workers.is_none() {
             return Err(
                 "--workers-ai-rpm requires --cloudflare-account-id-file and --cloudflare-token-file"
@@ -184,6 +245,7 @@ impl Policy {
                 .devin_models
                 .map(crate::devin::free_models)
                 .transpose()?,
+            free_custom,
         })
     }
 
@@ -312,7 +374,10 @@ mod tests {
         }
     }
 
-    fn options_policy(devin_free: Option<HashSet<String>>) -> Policy {
+    fn options_policy(
+        devin_free: Option<HashSet<String>>,
+        free_custom: Option<HashMap<String, String>>,
+    ) -> Policy {
         Policy {
             workers: None,
             workers_rpm: WORKERS_DEFAULT_RPM,
@@ -321,6 +386,7 @@ mod tests {
             kilo_free: None,
             openrouter_replacements: false,
             devin_free,
+            free_custom,
         }
     }
 
@@ -328,7 +394,13 @@ mod tests {
     fn billing_exceptions_never_mark_paid_or_quota_capped_legs_free() {
         let custom = ProviderIdentity::Custom("node".into());
         let builtin = |name: &str| ProviderIdentity::Builtin(name.into());
-        let policy = options_policy(Some(HashSet::from(["devin-free-model".to_string()])));
+        let policy = options_policy(
+            Some(HashSet::from(["devin-free-model".to_string()])),
+            Some(HashMap::from([(
+                "free-node".to_string(),
+                "pricing page".to_string(),
+            )])),
+        );
 
         // A custom provider node claiming the Cloudflare prefix shares the
         // capped Workers account — billed wherever it appears.
@@ -352,7 +424,7 @@ mod tests {
         assert!(billed(
             &connection(builtin("devin-cli-agentic"), ModelPolicy::Any),
             "devin-free-model",
-            &options_policy(None)
+            &options_policy(None, None)
         ));
         // Subscription portals and commercial providers bill.
         assert!(billed(
@@ -365,14 +437,38 @@ mod tests {
             "m",
             &policy
         ));
-        // Community endpoints, custom nodes, Kilo verified-free and XPLabs
-        // free routes stay sweepable.
+        // Community endpoints, Kilo verified-free and XPLabs free routes
+        // stay sweepable.
         assert!(!billed(
             &connection(builtin("github-models"), ModelPolicy::Any),
             "m",
             &policy
         ));
-        assert!(!billed(&connection(custom, ModelPolicy::Any), "m", &policy));
+        // Custom nodes bill until --free-providers proves them free: the
+        // default policy bills them, and a listed node id or host is free.
+        assert!(billed(
+            &connection(custom.clone(), ModelPolicy::Any),
+            "m",
+            &policy
+        ));
+        let free_node = ProviderIdentity::Custom("free-node".into());
+        assert!(!billed(
+            &connection(free_node, ModelPolicy::Any),
+            "m",
+            &policy
+        ));
+        let host_listed = options_policy(
+            None,
+            Some(HashMap::from([(
+                "example.com".to_string(),
+                "usage API".to_string(),
+            )])),
+        );
+        assert!(!billed(
+            &connection(custom, ModelPolicy::Any),
+            "m",
+            &host_listed
+        ));
         assert!(!billed(
             &connection(builtin("anthropic"), ModelPolicy::KiloFree),
             "m",
@@ -381,6 +477,15 @@ mod tests {
         let mut xplabs = connection(builtin("anthropic"), ModelPolicy::Any);
         xplabs.base_url = crate::xplabs::BASE_URL.into();
         assert!(!billed(&xplabs, "m", &policy));
+    }
+
+    #[test]
+    fn host_extraction_strips_port_userinfo_and_ipv6_brackets() {
+        assert_eq!(host("https://example.com:8443/v1"), "example.com");
+        assert_eq!(host("http://[2001:db8::1]:8080/v1"), "2001:db8::1");
+        assert_eq!(host("http://[::1]/v1"), "::1");
+        assert_eq!(host("https://user:pass@example.com/v1"), "example.com");
+        assert_eq!(host("example.com/v1"), "example.com");
     }
 
     #[test]
