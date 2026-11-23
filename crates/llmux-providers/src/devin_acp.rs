@@ -243,19 +243,43 @@ fn model_for(upstream_model: &str, effort: Option<&str>) -> String {
 /// Flattens chat messages into one labelled transcript under `FRAME`, adding the
 /// tool-call protocol and schemas when `tools` holds a non-empty array. An
 /// assistant turn that only made calls still shows up — as `[tool_calls: …]` —
-/// so the agent sees the loop it is inside.
-fn prompt_text(messages: &[Value], tools: Option<&Value>, tool_choice: &Value) -> Option<String> {
-    let turns: Vec<(&str, String)> = messages
+/// so the agent sees the loop it is inside; `tool` results keep their call id
+/// (and name when present) so the model can pair call and result.
+fn prompt_text(
+    messages: &[Value],
+    tools: Option<&Value>,
+    tool_choice: &Value,
+    parallel_tool_calls: bool,
+) -> Option<String> {
+    let turns: Vec<(String, String)> = messages
         .iter()
         .map(|m| {
             let role = m["role"].as_str().unwrap_or("user");
             let mut text = content_text(&m["content"]);
-            if role == "assistant" && text.is_empty() {
+            if role == "assistant" {
                 if let Some(calls) = m["tool_calls"].as_array().filter(|c| !c.is_empty()) {
-                    text = format!("[tool_calls: {}]", Value::Array(calls.clone()));
+                    let calls = format!("[tool_calls: {}]", Value::Array(calls.clone()));
+                    text = if text.is_empty() {
+                        calls
+                    } else {
+                        format!("{text}\n{calls}")
+                    };
                 }
             }
-            (role, text)
+            let label = match role {
+                "tool" => {
+                    let id = m["tool_call_id"].as_str().unwrap_or_default();
+                    let name = m["name"].as_str().unwrap_or_default();
+                    match (id.is_empty(), name.is_empty()) {
+                        (false, false) => format!("tool({id}, {name})"),
+                        (false, true) => format!("tool({id})"),
+                        (true, false) => format!("tool({name})"),
+                        _ => "tool".to_owned(),
+                    }
+                }
+                _ => role.to_owned(),
+            };
+            (label, text)
         })
         .filter(|(_, text)| !text.is_empty())
         .collect();
@@ -264,8 +288,15 @@ fn prompt_text(messages: &[Value], tools: Option<&Value>, tool_choice: &Value) -
         if let Some(tools) = tools.and_then(Value::as_array).filter(|t| !t.is_empty()) {
             prompt.push_str(TOOL_PROTOCOL);
             prompt.push_str(&Value::Array(tools.clone()).to_string());
+            if !parallel_tool_calls {
+                prompt.push_str("\n\nAnswer with at most one tool call.");
+            }
             if tool_choice.as_str() == Some("required") {
                 prompt.push_str("\n\nYou must call at least one tool.");
+            } else if tool_choice["type"].as_str() == Some("function") {
+                if let Some(name) = tool_choice["function"]["name"].as_str() {
+                    prompt.push_str(&format!("\n\nYou must call the tool {name}."));
+                }
             }
         }
         let transcript = turns
@@ -324,7 +355,8 @@ fn tool_calls_in(text: &str) -> Option<Vec<Value>> {
 }
 
 /// Fills the fields the OpenAI shape requires but the model may drop: `id`,
-/// `type`, and `arguments` as a JSON string.
+/// `type`, the `function` wrapper for flat `{"name","arguments"}` calls, and
+/// `arguments` as a JSON string.
 fn normalize_calls(calls: Vec<Value>) -> Vec<Value> {
     calls
         .into_iter()
@@ -336,8 +368,17 @@ fn normalize_calls(calls: Vec<Value>) -> Vec<Value> {
             if call["type"].as_str().is_none_or(str::is_empty) {
                 call["type"] = json!("function");
             }
-            if let Some(args) = call["function"]["arguments"].as_object() {
-                call["function"]["arguments"] = json!(Value::Object(args.clone()).to_string());
+            if !call["function"].is_object() && call["name"].is_string() {
+                call["function"] = json!({
+                    "name": call["name"].take(),
+                    "arguments": call["arguments"].take(),
+                });
+            }
+            let args = &call["function"]["arguments"];
+            if args.is_null() {
+                call["function"]["arguments"] = json!("{}");
+            } else if !args.is_string() {
+                call["function"]["arguments"] = json!(args.to_string());
             }
             call
         })
@@ -376,6 +417,10 @@ struct Session {
     lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     next_id: u64,
     reply: String,
+    /// Flipped on the first `session/update`, which is when the stream can tell
+    /// clients the turn is alive (the marker is an empty string the consumer
+    /// filters out — real chunks follow).
+    announced: bool,
     chunks: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
@@ -411,6 +456,7 @@ impl Session {
             lines: BufReader::new(stdout).lines(),
             next_id: 1,
             reply: String::new(),
+            announced: false,
             chunks: None,
         })
     }
@@ -422,6 +468,16 @@ impl Session {
             .write_all(line.as_bytes())
             .await
             .map_err(|_| UpstreamError::Connect)
+    }
+
+    /// Writes a request without waiting for its response. Used for calls whose
+    /// answer is best-effort: the reply, if one arrives, lands on the shared
+    /// read loop inside `call` and is skipped by the id match.
+    async fn send(&mut self, method: &str, params: Value) -> Result<(), UpstreamError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.write(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
+            .await
     }
 
     /// Sends a request and waits for its response, collecting streamed message chunks.
@@ -441,6 +497,12 @@ impl Session {
                 continue;
             };
             if message["method"] == "session/update" {
+                if !self.announced {
+                    self.announced = true;
+                    if let Some(chunks) = &self.chunks {
+                        let _ = chunks.send(String::new());
+                    }
+                }
                 let update = &message["params"]["update"];
                 if update["sessionUpdate"] == "agent_message_chunk" {
                     let text = update["content"]["text"].as_str().unwrap_or("");
@@ -454,11 +516,20 @@ impl Session {
                         });
                     }
                 }
-            } else if let (Some(server_id), Some(_)) = (message.get("id"), message.get("method")) {
-                // The bridge exposes no client capabilities (files, terminals, permissions).
-                self.write(json!({"jsonrpc":"2.0","id":server_id,
-                    "error":{"code":-32601,"message":"method not supported"}}))
-                    .await?;
+            } else if let (Some(server_id), Some(method)) =
+                (message.get("id"), message.get("method"))
+            {
+                // Sessions run in `ask` mode, so no tool call should arrive; any
+                // that does is refused with a real ACP outcome — an error reply
+                // would be the agent's signal to stop the turn empty-handed.
+                let reply = if method.as_str() == Some("session/request_permission") {
+                    json!({"jsonrpc":"2.0","id":server_id,
+                        "result":{"outcome":{"outcome":"cancelled"}}})
+                } else {
+                    json!({"jsonrpc":"2.0","id":server_id,
+                        "error":{"code":-32601,"message":"method not supported"}})
+                };
+                self.write(reply).await?;
             } else if message["id"] == id {
                 if let Some(error) = message.get("error") {
                     return Err(rpc_error(error));
@@ -468,12 +539,14 @@ impl Session {
         }
     }
 
+    /// Returns the collected reply text plus the turn usage when the agent
+    /// reports it (both are needed for an OpenAI-shaped answer).
     async fn turn(
         mut self,
         config: &DevinAcpConfig,
         model: &str,
         prompt: &str,
-    ) -> Result<String, UpstreamError> {
+    ) -> Result<(String, Option<Value>), UpstreamError> {
         let cwd = config.home.to_string_lossy().into_owned();
         self.call(
             "initialize",
@@ -489,6 +562,16 @@ impl Session {
         let session_id = session["sessionId"].as_str().ok_or(UpstreamError::Server {
             status: StatusCode::BAD_GATEWAY,
         })?;
+        // `ask` ("answer questions without code changes") turns the internal
+        // tools off agent-side — a structural bound, unlike the prompt wording.
+        // Sent without awaiting: CLIs that predate the method never reply, and
+        // a reply that does arrive is ignored by the prompt call's id match.
+        let _ = self
+            .send(
+                "session/set_mode",
+                json!({"sessionId":session_id,"modeId":"ask"}),
+            )
+            .await;
         let result = self
             .call(
                 "session/prompt",
@@ -501,7 +584,10 @@ impl Session {
                 status: StatusCode::BAD_GATEWAY,
             });
         }
-        Ok(strip_summary(&self.reply).to_owned())
+        Ok((
+            strip_summary(&self.reply).to_owned(),
+            result.get("usage").filter(|u| u.is_object()).cloned(),
+        ))
     }
 }
 
@@ -533,6 +619,22 @@ fn completion(model: &str, text: &str, stream: bool) -> Value {
         "created":created,"model":model,"choices":[choice]})
 }
 
+/// Maps the ACP `session/prompt` usage block onto the OpenAI usage shape —
+/// `prompt_tokens_details.cached_tokens` is the one detail field clients read.
+fn usage_body(usage: Option<Value>) -> Option<Value> {
+    let usage = usage?;
+    let count = |key: &str| usage[key].as_u64().unwrap_or(0);
+    let mut out = json!({
+        "prompt_tokens": count("inputTokens"),
+        "completion_tokens": count("outputTokens"),
+        "total_tokens": count("totalTokens"),
+    });
+    if let Some(cached) = usage["cachedReadTokens"].as_u64() {
+        out["prompt_tokens_details"] = json!({"cached_tokens": cached});
+    }
+    Some(out)
+}
+
 /// One shot carrying the whole `tool_calls` array — the JSON must be complete
 /// before it can be re-emitted, so tool replies never stream incrementally.
 fn tool_completion(model: &str, calls: &[Value], stream: bool) -> Value {
@@ -551,7 +653,9 @@ fn tool_completion(model: &str, calls: &[Value], stream: bool) -> Value {
         calls.to_vec()
     };
     out["choices"][0] = if stream {
-        json!({"index":0,"delta":{"role":"assistant","content":null,
+        // The role-only delta already announced the turn, so this delta keeps
+        // only what changes: the calls themselves.
+        json!({"index":0,"delta":{"content":null,
             "tool_calls":calls},"finish_reason":null})
     } else {
         json!({"index":0,"message":{"role":"assistant","content":null,
@@ -619,9 +723,18 @@ impl ProviderAdapter for DevinAcp {
 impl DevinAcp {
     /// Streams one SSE delta per ACP `agent_message_chunk` as the child emits it — except
     /// when tools were offered: the reply must then be complete before it can be classified
-    /// as text or `tool_calls`, so those turns buffer and emit in a single shot. Errors
-    /// before the first event surface as the first stream item so the executor can fail over.
-    fn stream(&self, model: String, prompt: String, tools_offered: bool) -> GatewayResponse {
+    /// as text or `tool_calls`, so those turns buffer and emit in a single shot. The first
+    /// `session/update` announces the turn with the OpenAI role-only delta, so a buffered
+    /// turn still answers early instead of sitting silent until the reply completes.
+    /// Errors before the first event surface as the first stream item so the executor can
+    /// fail over.
+    fn stream(
+        &self,
+        model: String,
+        prompt: String,
+        tools_offered: bool,
+        include_usage: bool,
+    ) -> GatewayResponse {
         let config = self.config.clone();
         GatewayResponse::Stream(Box::pin(async_stream::stream! {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -646,16 +759,34 @@ impl DevinAcp {
             };
             let delta = |text: String| {
                 let mut chunk = completion(&model, &text, true);
-                chunk["choices"][0]["delta"] = json!({"role":"assistant","content":text});
+                chunk["choices"][0]["delta"] = json!({"content":text});
                 Ok(SseEvent { event: None, data: chunk.to_string() })
             };
+            // The role-only delta mirrors the first chunk OpenAI servers send;
+            // it goes out on the first marker/chunk, never ahead of an error.
+            let mut announced = false;
+            let announce = |announced: &mut bool| {
+                if !*announced {
+                    *announced = true;
+                    let mut chunk = completion(&model, "", true);
+                    chunk["choices"][0]["delta"] =
+                        json!({"role":"assistant","content":""});
+                    Some(SseEvent { event: None, data: chunk.to_string() })
+                } else {
+                    None
+                }
+            };
+            let usage;
             if tools_offered {
                 let mut reply = String::new();
                 while let Some(text) = rx.recv().await {
+                    if let Some(event) = announce(&mut announced) {
+                        yield Ok(event);
+                    }
                     reply.push_str(&text);
                 }
                 match (&mut task.0).await {
-                    Ok(Ok(_)) => {}
+                    Ok(Ok((_, u))) => usage = u,
                     Ok(Err(err)) => {
                         yield Err(err);
                         return;
@@ -681,18 +812,29 @@ impl DevinAcp {
                 let mut done = completion(&model, "", true);
                 done["choices"][0] = json!({"index":0,"delta":{},"finish_reason":finish});
                 yield Ok(SseEvent { event: None, data: done.to_string() });
+                if include_usage {
+                    if let Some(usage) = usage_body(usage) {
+                        let mut chunk = completion(&model, "", true);
+                        chunk["choices"] = json!([]);
+                        chunk["usage"] = usage;
+                        yield Ok(SseEvent { event: None, data: chunk.to_string() });
+                    }
+                }
                 yield Ok(SseEvent { event: None, data: "[DONE]".into() });
                 return;
             }
             let mut unwrapper = Unwrapper::default();
             while let Some(text) = rx.recv().await {
+                if let Some(event) = announce(&mut announced) {
+                    yield Ok(event);
+                }
                 let text = unwrapper.push(&text);
                 if !text.is_empty() {
                     yield delta(text);
                 }
             }
             match (&mut task.0).await {
-                Ok(Ok(_)) => {}
+                Ok(Ok((_, u))) => usage = u,
                 Ok(Err(err)) => {
                     yield Err(err);
                     return;
@@ -709,6 +851,14 @@ impl DevinAcp {
             let mut done = completion(&model, "", true);
             done["choices"][0] = json!({"index":0,"delta":{},"finish_reason":"stop"});
             yield Ok(SseEvent { event: None, data: done.to_string() });
+            if include_usage {
+                if let Some(usage) = usage_body(usage) {
+                    let mut chunk = completion(&model, "", true);
+                    chunk["choices"] = json!([]);
+                    chunk["usage"] = usage;
+                    yield Ok(SseEvent { event: None, data: chunk.to_string() });
+                }
+            }
             yield Ok(SseEvent { event: None, data: "[DONE]".into() });
         }))
     }
@@ -734,6 +884,7 @@ impl DevinAcp {
                     messages,
                     body.get("tools").filter(|_| tools_offered),
                     &body["tool_choice"],
+                    body["parallel_tool_calls"].as_bool().unwrap_or(true),
                 )
             })
             .ok_or(UpstreamError::BadRequest {
@@ -742,18 +893,22 @@ impl DevinAcp {
             })?;
         let model = model_for(crate::upstream_model(req, dep), effort_tier(&body));
         if req.stream {
-            return Ok(self.stream(model, prompt, tools_offered));
+            let include_usage = body["stream_options"]["include_usage"].as_bool() == Some(true);
+            return Ok(self.stream(model, prompt, tools_offered, include_usage));
         }
-        let text = timeout(
+        let (text, usage) = timeout(
             self.config.turn_timeout,
             Session::spawn(&self.config)?.turn(&self.config, &model, &prompt),
         )
         .await
         .map_err(|_| UpstreamError::Timeout)??;
-        let body = match classify(&text, tools_offered) {
+        let mut body = match classify(&text, tools_offered) {
             Reply::ToolCalls(calls) => tool_completion(&model, &calls, false),
             Reply::Text(text) => completion(&model, &text, false),
         };
+        if let Some(usage) = usage_body(usage) {
+            body["usage"] = usage;
+        }
         let mut headers = HeaderMap::new();
         headers.insert("content-type", HeaderValue::from_static("application/json"));
         Ok(GatewayResponse::Complete {
@@ -796,7 +951,7 @@ mod tests {
         let none = &Value::Null;
         let one = [json!({"role":"user","content":"hi"})];
         assert_eq!(
-            prompt_text(&one, None, none).unwrap(),
+            prompt_text(&one, None, none, true).unwrap(),
             format!("{FRAME}\n\n[Conversation]\nuser: hi")
         );
         let many = [
@@ -806,10 +961,62 @@ mod tests {
             json!({"role":"tool","tool_call_id":"c1","content":"a1-free-2"}),
         ];
         assert_eq!(
-            prompt_text(&many, None, none).unwrap(),
-            format!("{FRAME}\n\n[Conversation]\nsystem: be brief\n\nuser: hi\n\nassistant: [tool_calls: [{{\"function\":{{\"arguments\":\"{{}}\",\"name\":\"read\"}},\"id\":\"c1\",\"type\":\"function\"}}]]\n\ntool: a1-free-2")
+            prompt_text(&many, None, none, true).unwrap(),
+            format!("{FRAME}\n\n[Conversation]\nsystem: be brief\n\nuser: hi\n\nassistant: [tool_calls: [{{\"function\":{{\"arguments\":\"{{}}\",\"name\":\"read\"}},\"id\":\"c1\",\"type\":\"function\"}}]]\n\ntool(c1): a1-free-2")
         );
-        assert!(prompt_text(&[json!({"role":"user","content":""})], None, none).is_none());
+        assert!(prompt_text(&[json!({"role":"user","content":""})], None, none, true).is_none());
+    }
+
+    #[test]
+    fn tool_turns_keep_the_call_identity() {
+        let none = &Value::Null;
+        let msgs = [
+            json!({"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"call_1","name":"read","content":"a1-free-2"}),
+            json!({"role":"tool","tool_call_id":"call_2","content":"ok"}),
+        ];
+        let prompt = prompt_text(&msgs, None, none, true).unwrap();
+        assert!(prompt.contains("tool(call_1, read): a1-free-2"), "{prompt}");
+        assert!(prompt.contains("tool(call_2): ok"), "{prompt}");
+    }
+
+    #[test]
+    fn an_assistant_turn_keeps_its_text_and_its_calls() {
+        let none = &Value::Null;
+        let msgs = [
+            json!({"role":"assistant","content":"let me check","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{}"}}]}),
+        ];
+        let prompt = prompt_text(&msgs, None, none, true).unwrap();
+        assert!(
+            prompt.contains("assistant: let me check\n[tool_calls:"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn a_named_tool_choice_forces_that_function() {
+        let msgs = [json!({"role":"user","content":"hi"})];
+        let tools = json!([{"type":"function","function":{"name":"read","parameters":{}}}]);
+        let choice = json!({"type":"function","function":{"name":"read"}});
+        let prompt = prompt_text(&msgs, Some(&tools), &choice, true).unwrap();
+        assert!(prompt.contains("You must call the tool read."), "{prompt}");
+        let auto = json!("required");
+        let prompt = prompt_text(&msgs, Some(&tools), &auto, true).unwrap();
+        assert!(
+            prompt.contains("You must call at least one tool."),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn parallel_tool_calls_false_caps_the_protocol() {
+        let msgs = [json!({"role":"user","content":"hi"})];
+        let tools = json!([{"type":"function","function":{"name":"read","parameters":{}}}]);
+        let none = &Value::Null;
+        let prompt = prompt_text(&msgs, Some(&tools), none, false).unwrap();
+        assert!(prompt.contains("at most one tool"), "{prompt}");
+        let prompt = prompt_text(&msgs, Some(&tools), none, true).unwrap();
+        assert!(!prompt.contains("at most one tool"), "{prompt}");
     }
 
     #[test]
@@ -836,6 +1043,14 @@ mod tests {
             ),
             Reply::Text(_)
         ));
+        // Chat models often answer with the flat {"name":…,"arguments":…}
+        // spelling; the wire shape still needs id/type/function.
+        let flat = calls(r#"{"tool_calls":[{"name":"f","arguments":{"p":1}}]}"#);
+        assert_eq!(flat[0]["type"], "function");
+        assert_eq!(flat[0]["function"]["name"], "f");
+        assert_eq!(flat[0]["function"]["arguments"], r#"{"p":1}"#);
+        let bare = calls(r#"{"tool_calls":[{"function":{"name":"f"}}]}"#);
+        assert_eq!(bare[0]["function"]["arguments"], "{}");
     }
 
     #[test]
@@ -1017,6 +1232,65 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn sessions_run_in_ask_mode_before_the_prompt() {
+            let dir = tempfile::tempdir().unwrap();
+            let adapter = DevinAcp::new(script(dir.path(), "ok"));
+            adapter
+                .serve(&request(chat_body(Value::Null)), &dep("swe-2-high"))
+                .await
+                .unwrap();
+            let log =
+                std::fs::read_to_string(dir.path().join(".local/share/requests.log")).unwrap();
+            let set_mode = log.find(r#""session/set_mode""#).expect("set_mode call");
+            assert!(log.contains(r#""modeId":"ask""#), "{log}");
+            assert!(set_mode < log.find(r#""session/prompt""#).unwrap(), "{log}");
+        }
+
+        #[tokio::test]
+        async fn permission_requests_are_cancelled_not_errored() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = script(dir.path(), "done");
+            std::fs::write(dir.path().join(".local/share/ask_permission"), "").unwrap();
+            let adapter = DevinAcp::new(config);
+            let GatewayResponse::Complete { body, .. } = adapter
+                .serve(&request(chat_body(Value::Null)), &dep("swe-2-high"))
+                .await
+                .unwrap()
+            else {
+                panic!("expected a complete response");
+            };
+            let reply_log =
+                std::fs::read_to_string(dir.path().join(".local/share/perm_reply.log")).unwrap();
+            assert!(
+                reply_log.contains(r#""outcome":"cancelled""#),
+                "{reply_log}"
+            );
+            assert!(!reply_log.contains("-32601"), "{reply_log}");
+            let out: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(out["choices"][0]["message"]["content"], "done");
+        }
+
+        #[tokio::test]
+        async fn acp_usage_is_reported_on_the_completion() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = script(dir.path(), "ok");
+            std::fs::write(dir.path().join(".local/share/with_usage"), "").unwrap();
+            let adapter = DevinAcp::new(config);
+            let GatewayResponse::Complete { body, .. } = adapter
+                .serve(&request(chat_body(Value::Null)), &dep("swe-2-high"))
+                .await
+                .unwrap()
+            else {
+                panic!("expected a complete response");
+            };
+            let out: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(out["usage"]["prompt_tokens"], 11);
+            assert_eq!(out["usage"]["completion_tokens"], 7);
+            assert_eq!(out["usage"]["total_tokens"], 18);
+            assert_eq!(out["usage"]["prompt_tokens_details"]["cached_tokens"], 5);
+        }
+
+        #[tokio::test]
         async fn streamed_tools_reply_yields_tool_calls_delta() {
             use futures_util::StreamExt;
             let dir = tempfile::tempdir().unwrap();
@@ -1054,6 +1328,62 @@ mod tests {
                 .any(|c| c["choices"][0]["finish_reason"] == "tool_calls"));
         }
 
+        async fn served_stream(mut body: Value, reply: &str, usage_marker: bool) -> Vec<String> {
+            use futures_util::StreamExt;
+            let dir = tempfile::tempdir().unwrap();
+            let config = script(dir.path(), reply);
+            if usage_marker {
+                std::fs::write(dir.path().join(".local/share/with_usage"), "").unwrap();
+            }
+            let adapter = DevinAcp::new(config);
+            let mut req = request(std::mem::take(&mut body));
+            req.stream = true;
+            let GatewayResponse::Stream(events) =
+                adapter.serve(&req, &dep("swe-2-high")).await.unwrap()
+            else {
+                panic!("expected a stream");
+            };
+            events
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .map(|e| e.unwrap().data)
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn a_buffered_tool_turn_still_opens_with_the_role_delta() {
+            let data = served_stream(
+                tools_body(),
+                r#"{"tool_calls":[{"function":{"name":"read","arguments":"{}"}}]}"#,
+                false,
+            )
+            .await;
+            let first: Value = serde_json::from_str(&data[0]).unwrap();
+            assert_eq!(
+                first["choices"][0]["delta"],
+                json!({"role":"assistant","content":""}),
+                "{data:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn stream_usage_is_emitted_only_when_requested() {
+            let mut body = tools_body();
+            body["stream_options"] = json!({"include_usage":true});
+            let data = served_stream(body, "ok", true).await;
+            let usage = data
+                .iter()
+                .map(|d| serde_json::from_str::<Value>(d).unwrap())
+                .find(|v| v["choices"].as_array().is_some_and(|c| c.is_empty()))
+                .expect("a usage chunk");
+            assert_eq!(usage["usage"]["prompt_tokens"], 11);
+            assert_eq!(*data.last().unwrap(), "[DONE]");
+
+            let data = served_stream(tools_body(), "ok", true).await;
+            assert!(!data.iter().any(|d| d.contains(r#""usage""#)), "{data:?}");
+        }
+
         fn script(dir: &std::path::Path, reply: &str) -> DevinAcpConfig {
             chunked_script(dir, &[reply])
         }
@@ -1079,13 +1409,24 @@ if [ "$1" = models ]; then printf '  swe-2-high  X  [Free]\n'; exit 0; fi
 test -f "$XDG_DATA_HOME/marker" || exit 3
 while read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  printf '%s\n' "$line" >> "$XDG_DATA_HOME/requests.log"
   case "$line" in
     *'"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id";;
     *'"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s1"}}\n' "$id";;
+    *'"session/set_mode"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id";;
     *'"session/prompt"'*)
       printf '%s\n' "$line" >> "$XDG_DATA_HOME/prompts.log"
+      if [ -f "$XDG_DATA_HOME/ask_permission" ]; then
+        printf '%s\n' '{"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"sessionId":"s1","options":[{"optionId":"r1","kind":"reject_once"}]}}'
+        read -r reply
+        printf '%s\n' "$reply" >> "$XDG_DATA_HOME/perm_reply.log"
+      fi
       cat "$XDG_DATA_HOME/chunks.txt"
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id";;
+      if [ -f "$XDG_DATA_HOME/with_usage" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn","usage":{"inputTokens":11,"outputTokens":7,"totalTokens":18,"cachedReadTokens":5}}}\n' "$id"
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      fi;;
   esac
 done
 "#
@@ -1113,14 +1454,15 @@ done
                 .unwrap()
                 .turn(&config, "swe-2-high", "hi")
                 .await;
-            assert_eq!(text.unwrap(), "OK");
+            assert_eq!(text.unwrap().0, "OK");
         }
 
         async fn streamed(replies: &[&str]) -> Vec<String> {
             use futures_util::StreamExt;
             let dir = tempfile::tempdir().unwrap();
             let adapter = DevinAcp::new(chunked_script(dir.path(), replies));
-            let GatewayResponse::Stream(events) = adapter.stream("m".into(), "hi".into(), false)
+            let GatewayResponse::Stream(events) =
+                adapter.stream("m".into(), "hi".into(), false, false)
             else {
                 panic!("expected a stream");
             };

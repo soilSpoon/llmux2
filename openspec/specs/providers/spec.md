@@ -135,15 +135,28 @@ THEN the deployment's configured `upstream_model` is used unchanged.
 The `devin_acp` provider SHALL drive the default `devin acp` agent — not a
 task-specific agent type such as `summarizer`, which emits conversation
 summaries on long transcripts — and frame the flattened transcript so the
-reply is a single assistant message. When the request carries a non-empty
-`tools` array and `tool_choice` is not `"none"`, the prompt SHALL present the
-tool schemas and a structured-call protocol; a reply consisting of a
-`{"tool_calls":[…]}` object SHALL be emitted as OpenAI `tool_calls` with
-`finish_reason: "tool_calls"`, with `id`, `type`, and string-form `arguments`
-filled in when the model omits or object-encodes them. Any other reply SHALL
-be emitted as text content. Tool turns never stream incrementally: the reply
-is buffered and emitted in one shot because the JSON must be complete before
-it can be classified.
+reply is a single assistant message. Each session SHALL be placed in `ask`
+mode via `session/set_mode` so the agent's own tools are disabled agent-side;
+a `session/request_permission` that arrives anyway SHALL be answered with the
+`cancelled` outcome rather than a JSON-RPC error, and unrelated client-capability
+methods MAY still be answered `method not supported`. When the request carries
+a non-empty `tools` array and `tool_choice` is not `"none"`, the prompt SHALL
+present the tool schemas and a structured-call protocol; `"required"` demands
+at least one call, a `{"type":"function","function":{"name":…}}` choice demands
+that named tool, and `parallel_tool_calls: false` caps the protocol at one
+call. A reply consisting of a `{"tool_calls":[…]}` object SHALL be emitted as
+OpenAI `tool_calls` with `finish_reason: "tool_calls"`, with `id`, `type`, the
+`function` wrapper for flat `{"name","arguments"}` calls, and string-form
+`arguments` filled in when the model omits or object-encodes them. Any other
+reply SHALL be emitted as text content. Tool turns never stream incrementally:
+the reply is buffered and emitted in one shot because the JSON must be complete
+before it can be classified, but the stream SHALL open with the role-only delta
+once the first `session/update` arrives so a buffered turn is not silent.
+Assistant `tool_calls` turns and `tool` results SHALL keep their call identity
+in the transcript (`tool(<id>[, <name>]): …`). The `session/prompt` usage
+block, when present, SHALL be mapped to OpenAI `usage` (`prompt_tokens`,
+`completion_tokens`, `total_tokens`, `prompt_tokens_details.cached_tokens`);
+streams emit it only when `stream_options.include_usage` is true.
 
 #### Scenario: Tool call reply
 
@@ -162,6 +175,23 @@ THEN the completion carries that text as content and `finish_reason: "stop"`.
 WHEN the request offers tools but sets `"tool_choice": "none"`
 THEN the prompt carries no tool schemas or tool-call protocol and the reply is
 always emitted as text.
+
+#### Scenario: Internal tools stay off
+
+WHEN a request is served
+THEN the session enters `ask` mode before `session/prompt`, so an agent tool
+attempt is refused structurally rather than by prompt wording.
+
+#### Scenario: Permission request during a turn
+
+WHEN the agent issues `session/request_permission` mid-turn despite `ask` mode
+THEN the bridge answers `{"outcome":{"outcome":"cancelled"}}` and the turn
+still completes.
+
+#### Scenario: Usage on a streamed turn
+
+WHEN a stream request sets `stream_options.include_usage`
+THEN a final `choices: []` chunk carries the mapped usage before `[DONE]`.
 
 ### Requirement: Keyless deployments
 
