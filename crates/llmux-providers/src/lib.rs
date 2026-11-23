@@ -2,6 +2,7 @@
 
 mod anthropic;
 mod antigravity;
+pub mod aws_quick;
 mod deepai;
 mod devin_acp;
 mod freebuff;
@@ -17,6 +18,7 @@ mod xai;
 
 pub use anthropic::Anthropic;
 pub use antigravity::Antigravity;
+pub use aws_quick::{model_for as aws_quick_model_for, AwsQuick};
 pub use deepai::DeepAi;
 pub use devin_acp::{list_models as list_devin_models, DevinAcp, DevinAcpConfig};
 pub use freebuff::Freebuff;
