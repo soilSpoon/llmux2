@@ -32,14 +32,12 @@ pub(super) fn billed(connection: &Connection, model: &str, policy: &Policy) -> b
     }
     match &connection.provider {
         ProviderIdentity::Custom(id) => policy.free_custom.as_ref().is_none_or(|free| {
-            let entry = free
-                .get(id.as_str())
-                .or_else(|| free.get(&host(&connection.base_url)));
-            match entry {
-                None => true,
-                Some(None) => false,
-                Some(Some(models)) => !models.contains(model),
-            }
+            let entries = [free.get(id.as_str()), free.get(&host(&connection.base_url))];
+            !entries.iter().any(|e| matches!(e, Some(None)))
+                && !entries
+                    .iter()
+                    .filter_map(|e| e.and_then(|m| m.as_ref()))
+                    .any(|models| models.contains(model))
         }),
         ProviderIdentity::Builtin(id) if id == "devin-cli-agentic" => !policy
             .devin_free
