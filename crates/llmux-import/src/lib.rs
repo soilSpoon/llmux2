@@ -870,6 +870,18 @@ pub fn import_with_options(
     if fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err("secrets directory must not be a symlink".into());
     }
+    // The map artifact is a plain truncating write: it must not be able to
+    // stand in for the output configuration or overwrite a credential file.
+    if let Some(path) = options.canonical_map {
+        let path =
+            std::path::absolute(path).map_err(|_| "could not resolve --canonical-map path")?;
+        if path == output || path.starts_with(&dir) {
+            return Err(
+                "--canonical-map must not collide with the output configuration or secrets directory"
+                    .into(),
+            );
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -1633,7 +1645,7 @@ pub fn import_with_options(
     }
     validation::validate(&config, &dir)?;
     if let Some(path) = options.canonical_map {
-        write_canonical_map(path, &config, &dropped_suffixed)?;
+        write_canonical_map(path, &config, &dropped_suffixed, &dead)?;
     }
     let value = toml::Value::try_from(&config).map_err(|_| "could not encode configuration")?;
     let content = toml::to_string_pretty(&value).map_err(|_| "could not encode configuration")?;
@@ -1664,6 +1676,7 @@ fn write_canonical_map(
     path: &Path,
     config: &Value,
     dropped_suffixed: &[String],
+    dead: &HashSet<String>,
 ) -> Result<(), String> {
     let mut map = serde_json::Map::new();
     for model in array(config, "models") {
@@ -1674,6 +1687,9 @@ fn write_canonical_map(
         map.insert(name.to_owned(), Value::Array(spellings));
     }
     for name in dropped_suffixed {
+        if dead.contains(name) {
+            continue;
+        }
         map.entry(name.clone()).or_insert_with(|| json!([name]));
     }
     let spellings: usize = map

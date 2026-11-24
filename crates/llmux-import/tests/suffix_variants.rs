@@ -115,3 +115,46 @@ fn canonical_map_keeps_suffixed_names_as_distinct_entries() {
         .count();
     assert_eq!(doc["clusters"], json!(merged));
 }
+
+#[test]
+fn canonical_map_drops_suffixed_names_excluded_from_the_import() {
+    let mut root = fixture();
+    root["modelComboMappings"] =
+        json!([{"pattern":"vendor/claude-fable-5-low","comboId":"fable-5-id","enabled":true}]);
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let map_path = dir.path().join("canonical-map.json");
+    let exclude_path = dir.path().join("exclude.json");
+    std::fs::write(&exclude_path, "[\"vendor/claude-fable-5-low\"]").unwrap();
+    let options = ImportOptions {
+        canonical_map: Some(&map_path),
+        exclude_models: Some(&exclude_path),
+        ..ImportOptions::default()
+    };
+    llmux_import::import_with_options(&root.to_string(), &output, None, &options).unwrap();
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&map_path).unwrap()).unwrap();
+    // The catch-all's exclude list blocks this spelling, so the map must not
+    // advertise it as a reachable self-resolving entry.
+    assert!(doc["map"].get("vendor/claude-fable-5-low").is_none());
+}
+
+#[test]
+fn canonical_map_rejects_paths_colliding_with_import_files() {
+    let root = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let options = ImportOptions {
+        canonical_map: Some(&output),
+        ..ImportOptions::default()
+    };
+    assert!(llmux_import::import_with_options(&root.to_string(), &output, None, &options).is_err());
+    assert!(!output.exists());
+
+    let secrets = dir.path().join("secrets");
+    let options = ImportOptions {
+        canonical_map: Some(&secrets.join("conn-1")),
+        ..ImportOptions::default()
+    };
+    assert!(llmux_import::import_with_options(&root.to_string(), &output, None, &options).is_err());
+    assert!(!secrets.exists());
+}
