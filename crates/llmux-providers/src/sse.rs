@@ -109,8 +109,22 @@ pub(crate) fn with_chat_usage(
 }
 
 pub(crate) fn decode_until(
+    body: Incoming,
+    anthropic: bool,
+) -> BoxStream<'static, Result<SseEvent, UpstreamError>> {
+    decode_inner(body, anthropic, false)
+}
+
+/// Antigravity's `/v1internal` stream ends at EOF with no `data: [DONE]` frame —
+/// a clean frame boundary is end-of-stream, pending bytes are truncation.
+pub(crate) fn decode_eof(body: Incoming) -> BoxStream<'static, Result<SseEvent, UpstreamError>> {
+    decode_inner(body, false, true)
+}
+
+fn decode_inner(
     mut body: Incoming,
     anthropic: bool,
+    eof_ok: bool,
 ) -> BoxStream<'static, Result<SseEvent, UpstreamError>> {
     Box::pin(async_stream::try_stream! {
         let mut parser = Parser::default();
@@ -131,6 +145,9 @@ pub(crate) fn decode_until(
                 }
             }
         }
+        if eof_ok && parser.at_boundary() {
+            return;
+        }
         Err(UpstreamError::StreamBroken { bytes_sent })?;
     })
 }
@@ -146,6 +163,12 @@ struct Parser {
 }
 
 impl Parser {
+    /// No partial line or unterminated event is pending — the stream ended on
+    /// an event boundary.
+    fn at_boundary(&self) -> bool {
+        self.line.is_empty() && self.data.is_none() && self.event.is_none()
+    }
+
     fn next(&mut self, chunk: &mut Bytes) -> Result<Option<SseEvent>, ()> {
         if self.skip_lf {
             self.skip_lf = false;

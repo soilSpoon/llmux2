@@ -343,6 +343,30 @@ WHEN the credential declares `home` and `env` entries
 THEN the child sees `HOME` and the XDG dirs inside `home`, plus exactly the
 declared variables, with the parent's other environment scrubbed.
 
+### Requirement: Antigravity v1internal streaming
+
+An `antigravity` deployment SHALL send the upstream request to
+`/v1internal:streamGenerateContent?alt=sse` with the deployment's
+`x-llmux-project` header and a User-Agent identifying a current Antigravity
+client release. The upstream gates on the advertised client version and
+answers a stale version with a 200 carrying only an unsupported-version
+notice, so the UA moves with the real client line.
+
+The upstream stream ends at EOF without a `data: [DONE]` frame. The adapter
+SHALL treat EOF on a clean SSE event boundary as end-of-stream and EOF with
+bytes still pending in an incomplete event as stream-broken.
+
+#### Scenario: DONE-less upstream stream completes
+
+WHEN an antigravity upstream closes the response after a finish-reason event
+with no `[DONE]` frame
+THEN the turn completes normally with the streamed content.
+
+#### Scenario: Mid-event EOF
+
+WHEN the upstream EOFs with a partial SSE event buffered
+THEN the attempt fails as stream-broken.
+
 ### Requirement: Keyless deployments
 
 The gateway SHALL support explicit keyless upstreams via `auth = "none"` with

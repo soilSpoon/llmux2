@@ -22,8 +22,11 @@ use std::time::SystemTime;
 
 const PROJECT: &str = "x-llmux-project";
 const PATH: &str = "/v1internal:streamGenerateContent?alt=sse";
-const USER_AGENT: &str =
-    "antigravity/cli/1.0.0 (aidev_client; os_type=linux; arch=amd64; auth_method=consumer)";
+// The upstream gates on the advertised client version: `antigravity/cli/1.0.0`
+// gets a 200 whose only content is a "CLI no longer supported" notice. This is
+// the UA the IDE-profile connections send (verified 200 on 2026-11-25); bump it
+// when the real client line moves.
+const USER_AGENT: &str = "antigravity/2.5.5 linux/x64 google-api-nodejs-client/10.3.0";
 const SYSTEM: &str = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.";
 
 pub struct Antigravity(ProviderKind);
@@ -424,7 +427,7 @@ impl ProviderAdapter for Antigravity {
             return Err(bad_gateway());
         }
         let model = crate::upstream_model(req, dep).to_owned();
-        let stream = sse::decode(body);
+        let stream = sse::decode_eof(body);
         if req.stream {
             let chat = chat_stream(model, stream);
             return Ok(GatewayResponse::Stream(
