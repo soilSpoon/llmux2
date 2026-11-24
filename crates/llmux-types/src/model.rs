@@ -68,6 +68,10 @@ pub struct Deployment {
     pub strip_request_fields: Box<[ChatRequestField]>,
     pub priority: i32,
     pub quota: QuotaSpec,
+    /// Named `[[shared_quotas]]` family this leg draws on: legs that name the
+    /// same group share one set of windows within the group's scope — the
+    /// credential, or provider plus base URL for anonymous legs.
+    pub shared_quota: Option<Arc<str>>,
     pub timeout: Duration,
     /// Context window in tokens (prompt plus completion); `None` is unchecked.
     pub max_context: Option<u32>,

@@ -236,6 +236,7 @@ async fn fixture_full(
             } else {
                 Default::default()
             },
+            shared_quota: None,
             timeout: Duration::from_secs(1),
             max_context: max_context[i as usize],
             expires_at: expiry[i as usize],
@@ -274,6 +275,7 @@ async fn fixture_full(
             quota_max: Duration::from_secs(10 * 86_400),
         },
         api_keys: HashMap::new(),
+        shared_quotas: HashMap::new(),
         credential_quotas: HashMap::from([("second".into(), second_quota)]),
         credential_meta: HashMap::new(),
         oauth: HashMap::new(),
@@ -909,6 +911,216 @@ async fn local_rpm_budget_is_shared_by_models_on_the_same_upstream_route() {
         .map(|(dep, _)| dep.to_string())
         .collect();
     assert_eq!(calls, ["dep0", "dep2"]);
+}
+
+/// Deployments 0 and 1 sit on credential "first" serving different upstream
+/// models; `bound[i]` marks dep i as drawing on the `[[shared_quotas]]`
+/// family `group`. dep2 stays on credential "second" outside the group.
+async fn fixture_shared_group(
+    models: &[(&str, &[u32])],
+    group: Option<(&'static str, llmux_types::QuotaSpec)>,
+    bound: [bool; 3],
+) -> Fixture {
+    let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
+    let served_status = status.clone();
+    let wire_calls = Arc::new(AtomicUsize::new(0));
+    let received = wire_calls.clone();
+    let server = llmux_testkit::TestServer::start(axum::Router::new().fallback(move || {
+        received.fetch_add(1, Ordering::Relaxed);
+        let status = StatusCode::from_u16(served_status.load(Ordering::Relaxed)).unwrap();
+        async move { (status, [("request-id", "req_fixture_1")], "ok") }
+    }))
+    .await
+    .unwrap();
+    let adapter = Arc::new(Adapter {
+        kind: ProviderKind("test".into()),
+        errors: Mutex::new(VecDeque::new()),
+        build_errors: Mutex::new(VecDeque::new()),
+        observed: Mutex::new(None),
+        status,
+        stream_errors: Mutex::new(VecDeque::new()),
+        calls: Mutex::new(Vec::new()),
+        cool_on_build: Mutex::new(None),
+        cool_on_repair: Mutex::new(None),
+        wire_calls,
+    });
+    let credential = Arc::new(Credential {
+        refreshes: AtomicUsize::new(0),
+        fail: false,
+    });
+    let deployments = (0..3)
+        .map(|i| Deployment {
+            headers: Default::default(),
+            fallback: false,
+            idx: DeploymentIdx(i),
+            id: format!("dep{i}").into(),
+            provider: adapter.kind.clone(),
+            credential: if i < 2 { "first" } else { "second" }.into(),
+            base_url: server.url().parse().unwrap(),
+            upstream_model: if i == 1 { "upstream-1" } else { "upstream" }.into(),
+            strip_request_fields: Box::default(),
+            priority: i as i32,
+            quota: Default::default(),
+            shared_quota: bound[i as usize]
+                .then(|| group.map(|(name, _)| name.into()))
+                .flatten(),
+            timeout: Duration::from_secs(1),
+            max_context: None,
+            expires_at: None,
+            priority_boost: None,
+            priority_boost_until: None,
+            billing: Billing::Billed,
+        })
+        .collect();
+    let cfg = RuntimeConfig {
+        model_allowed_keys: Default::default(),
+        credential_disabled: Default::default(),
+        server: llmux_config::ServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            client_keys: Box::new([]),
+            key_policies: Box::new([]),
+            deny: Box::new([]),
+            request_timeout: Duration::from_secs(5),
+            shutdown_timeout: Duration::from_secs(60),
+            drain_grace: Duration::from_secs(2),
+            expose_routing_headers: true,
+            dashboard_key: None,
+            request_log: None,
+            end_user_header: None,
+            end_user_salt: None,
+            end_user_from_body: false,
+            remote_images: llmux_config::RemoteImages::Allow,
+            max_image_bytes: None,
+        },
+        routing: llmux_config::RoutingConfig {
+            max_attempts: 4,
+            fallback_on: Box::new([ErrorKind::RateLimited, ErrorKind::QuotaExhausted]),
+        },
+        cooldown: llmux_config::CooldownConfig {
+            default: Duration::from_secs(1),
+            max: Duration::from_secs(5),
+            quota_max: Duration::from_secs(10 * 86_400),
+        },
+        api_keys: HashMap::new(),
+        shared_quotas: group
+            .map(|(name, spec)| HashMap::from([(name.into(), spec)]))
+            .unwrap_or_default(),
+        credential_quotas: HashMap::new(),
+        credential_meta: HashMap::new(),
+        oauth: HashMap::new(),
+        nous: HashMap::new(),
+        acp_agents: HashMap::new(),
+        catch_all: None,
+        catch_all_exclude: Vec::new(),
+        model_names: models
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| (Arc::from(*name), i))
+            .collect(),
+        models: models
+            .iter()
+            .map(|(name, deployments)| CanonicalModel {
+                name: Arc::from(*name),
+                capabilities: Capabilities::default(),
+                context_overflow: ContextOverflow::default(),
+                deployments: deployments.iter().copied().map(DeploymentIdx).collect(),
+            })
+            .collect(),
+        deployments,
+    };
+    let mut registry = ProviderRegistry::default();
+    registry.register(adapter.clone());
+    let credentials: HashMap<Arc<str>, Arc<dyn CredentialSource>> = HashMap::from([
+        (
+            Arc::from("first"),
+            credential.clone() as Arc<dyn CredentialSource>,
+        ),
+        (
+            Arc::from("second"),
+            Arc::new(Credential {
+                refreshes: AtomicUsize::new(0),
+                fail: false,
+            }),
+        ),
+    ]);
+    (
+        Executor::new(Arc::new(cfg), &registry, &credentials, None).unwrap(),
+        adapter,
+        credential,
+        server,
+    )
+}
+
+#[tokio::test]
+async fn shared_quota_binds_legs_on_one_scope_to_one_window() {
+    // dep0 (model a → upstream) and dep1 (model b → upstream-1) sit on the
+    // same credential and both bind the "fam" shared quota: the family is one
+    // account-wide window across different upstream models.
+    let (executor, adapter, _, _server) = fixture_shared_group(
+        &[("a", &[0, 2]), ("b", &[1, 2])],
+        Some((
+            "fam",
+            llmux_types::QuotaSpec {
+                rpm: Some(1),
+                ..Default::default()
+            },
+        )),
+        [true, true, false],
+    )
+    .await;
+    for model in ["a", "b"] {
+        executor
+            .execute(GatewayRequest {
+                model: model.into(),
+                ..request()
+            })
+            .await
+            .unwrap();
+    }
+    let calls: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(calls, ["dep0", "dep2"]);
+}
+
+#[tokio::test]
+async fn unbound_legs_on_the_same_credential_keep_independent_windows() {
+    // dep0 alone binds the drained "fam" window; dep1 on the same credential
+    // is not in the group, so a paid leg on a shared key is never throttled
+    // by the family's allowance.
+    let (executor, adapter, _, _server) = fixture_shared_group(
+        &[("a", &[0, 2]), ("b", &[1, 2])],
+        Some((
+            "fam",
+            llmux_types::QuotaSpec {
+                rpm: Some(1),
+                ..Default::default()
+            },
+        )),
+        [true, false, false],
+    )
+    .await;
+    for model in ["a", "b"] {
+        executor
+            .execute(GatewayRequest {
+                model: model.into(),
+                ..request()
+            })
+            .await
+            .unwrap();
+    }
+    let calls: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(calls, ["dep0", "dep1"]);
 }
 
 #[tokio::test]
