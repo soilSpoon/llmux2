@@ -305,7 +305,7 @@ impl AcpAgent {
 /// caller maps it to a failover.
 async fn spawn_ready(spec: &AcpAgentSpec) -> Result<AcpSession, UpstreamError> {
     let mut session = AcpSession::spawn(&mut acp_command(spec))?;
-    session.handshake().await?;
+    session.handshake(spec.auth_method.as_deref()).await?;
     Ok(session)
 }
 
@@ -481,6 +481,7 @@ mod tests {
                 home: dir.to_owned(),
                 turn_timeout: Duration::from_secs(10),
                 mode,
+                auth_method: None,
             }
         }
 
@@ -514,6 +515,12 @@ while read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id";;
     *'"session/new"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s1"}}\n' "$id";;
     *'"session/set_mode"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id";;
+    *'"authenticate"'*)
+      if [ -f "$XDG_DATA_HOME/reject_auth" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32800,"message":"Sign-in was cancelled."}}\n' "$id"
+        continue
+      fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id";;
     *'"session/prompt"'*)
       printf '%s\n' "$line" >> "$XDG_DATA_HOME/prompts.log"
       if [ -f "$XDG_DATA_HOME/die" ]; then exit 7; fi
@@ -811,6 +818,35 @@ done
             first.unwrap();
             second.unwrap();
             assert_eq!(pid_log(dir.path()).len(), 1, "one shared child");
+        }
+
+        #[tokio::test]
+        async fn a_configured_auth_method_authenticates_before_the_turn() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut spec = script(dir.path(), &["ok"]);
+            spec.auth_method = Some("oauth-personal".into());
+            let adapter = AcpAgent::new(HashMap::from([("cli".into(), spec)]));
+            complete(&adapter, &dep("cli", "m"), chat_body())
+                .await
+                .unwrap();
+            let log =
+                std::fs::read_to_string(dir.path().join(".local/share/requests.log")).unwrap();
+            let auth = log
+                .find("\"authenticate\"")
+                .expect("authenticate was called");
+            let session = log.find("\"session/new\"").expect("session was opened");
+            assert!(auth < session, "authenticate must precede session/new");
+        }
+
+        #[tokio::test]
+        async fn a_failed_authenticate_fails_the_request() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut spec = script(dir.path(), &["ok"]);
+            spec.auth_method = Some("oauth-personal".into());
+            std::fs::write(dir.path().join(".local/share/reject_auth"), "").unwrap();
+            let adapter = AcpAgent::new(HashMap::from([("cli".into(), spec)]));
+            let err = serve_err(&adapter, &dep("cli", "m"), chat_body()).await;
+            assert!(matches!(err, UpstreamError::Server { .. }), "{err}");
         }
 
         #[tokio::test]

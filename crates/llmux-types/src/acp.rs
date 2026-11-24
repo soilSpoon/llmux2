@@ -41,6 +41,11 @@ pub struct AcpAgentSpec {
     /// attempt on top of it.
     pub turn_timeout: Duration,
     pub mode: AcpSessionMode,
+    /// ACP `authenticate` method id to call after `initialize` (e.g.
+    /// `oauth-personal` for Antigravity). Agents whose `initialize` advertises
+    /// `authMethods` require it before `session/new`; a cached sign-in makes
+    /// the call a silent token refresh, an absent one fails the spawn.
+    pub auth_method: Option<String>,
 }
 
 impl AcpAgentSpec {

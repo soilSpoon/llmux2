@@ -344,7 +344,7 @@ impl Session {
         _staged: Option<ImageStaging>,
     ) -> Result<(String, Option<Value>), UpstreamError> {
         let cwd = config.home.to_string_lossy().into_owned();
-        self.inner.handshake().await?;
+        self.inner.handshake(None).await?;
         let result = self.inner.chat_turn(&cwd, model, prompt).await;
         self.inner.kill();
         let (text, usage) = result?;
