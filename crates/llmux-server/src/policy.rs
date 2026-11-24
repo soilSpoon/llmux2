@@ -323,20 +323,23 @@ pub(crate) fn allows_model(policy: &KeyPolicy, model: &str) -> bool {
             .any(|pattern| glob_match(pattern, model))
 }
 
-/// Byte-wise glob: `*` spans any run (including `/`), `?` one byte, other
-/// bytes literal. Case-sensitive: model ids keep their case end to end.
+/// Glob: `*` spans any run (including `/`), `?` one character, other
+/// characters literal. Case-sensitive: model ids keep their case end to end.
+/// The `*` arm must run before literal equality so a `*` in the text does not
+/// consume the pattern's star without recording a backtrack point.
 fn glob_match(pattern: &str, text: &str) -> bool {
-    let (pattern, text) = (pattern.as_bytes(), text.as_bytes());
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
     let (mut p, mut t) = (0, 0);
     let (mut star, mut star_t) = (usize::MAX, 0);
     while t < text.len() {
-        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == text[t]) {
-            p += 1;
-            t += 1;
-        } else if p < pattern.len() && pattern[p] == b'*' {
+        if p < pattern.len() && pattern[p] == '*' {
             star = p;
             star_t = t;
             p += 1;
+        } else if p < pattern.len() && (pattern[p] == '?' || pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
         } else if star != usize::MAX {
             p = star + 1;
             star_t += 1;
@@ -345,7 +348,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
             return false;
         }
     }
-    while p < pattern.len() && pattern[p] == b'*' {
+    while p < pattern.len() && pattern[p] == '*' {
         p += 1;
     }
     p == pattern.len()
@@ -529,6 +532,10 @@ mod tests {
             ("abc", "abc"),
             ("a**b", "ab"), // consecutive stars collapse
             ("a*b*c", "aXYZbZc"),
+            ("vendor/*", "vendor/*foo"), // literal `*` in text still wildcard-matched
+            ("vendor/?", "vendor/é"),    // `?` is one character, not one byte
+            ("vendor/?", "vendor/🦀"),
+            ("*", "*"),
         ] {
             assert!(glob_match(pattern, text), "{pattern} ~ {text}");
         }
@@ -537,7 +544,8 @@ mod tests {
             ("claude-*", "Claude-good"), // case-sensitive
             ("claude-*", "claude"),
             ("a/*", "a"),
-            ("a?c", "ac"), // `?` must match exactly one byte
+            ("a?c", "ac"), // `?` must match exactly one character
+            ("vendor/?", "vendor/"),
             ("a?c", "abbc"),
             ("abc", "abd"),
             ("a*b", "ac"),
@@ -563,5 +571,9 @@ mod tests {
         let p = policy(&[], &["zc/*"]);
         assert!(allows_model(&p, "anything"));
         assert!(!allows_model(&p, "zc/one"));
+        // A literal `*` or multi-byte char in the name must not dodge the
+        // blocked glob.
+        assert!(!allows_model(&p, "zc/*sneaky"));
+        assert!(!allows_model(&p, "zc/é"));
     }
 }
