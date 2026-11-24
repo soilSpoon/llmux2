@@ -241,8 +241,26 @@ impl Executor {
             match shared_caps.iter().find(|(other, _)| same_scope(other)) {
                 Some((_, windows)) => windows.clone(),
                 None => {
-                    let windows =
-                        Window::for_quota(group_specs.get(group).copied().unwrap_or_default());
+                    // Parse rejects dangling `shared_quota` names; a hand-built
+                    // RuntimeConfig must still fail closed, never unlimited.
+                    // Non-hard windows admit an oversized request on an empty
+                    // window, so the fallback uses hard zero-cap windows.
+                    let windows = match group_specs.get(group) {
+                        Some(spec) => Window::for_quota(*spec),
+                        None => {
+                            debug_assert!(
+                                false,
+                                "shared_quota group `{group}` missing from shared_quotas"
+                            );
+                            Window::for_credential(llmux_types::QuotaSpec {
+                                rpm: Some(0),
+                                rpd: Some(0),
+                                tpm: Some(0),
+                                tpd: Some(0),
+                                concurrent: None,
+                            })
+                        }
+                    };
                     shared_caps.push((dep, windows.clone()));
                     windows
                 }

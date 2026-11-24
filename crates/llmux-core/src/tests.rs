@@ -78,8 +78,10 @@ impl ProviderAdapter for Adapter {
         if let Some(limits) = self.cool_on_build.lock().unwrap().take() {
             limits.cool_down(Duration::from_secs(30));
         }
-        let AuthMaterial::Bearer(token) = auth else {
-            panic!("expected bearer")
+        let token = match auth {
+            AuthMaterial::Bearer(token) => token.clone(),
+            AuthMaterial::None => "anon".into(),
+            _ => panic!("expected bearer or anonymous auth"),
         };
         self.calls
             .lock()
@@ -913,13 +915,16 @@ async fn local_rpm_budget_is_shared_by_models_on_the_same_upstream_route() {
     assert_eq!(calls, ["dep0", "dep2"]);
 }
 
-/// Deployments 0 and 1 sit on credential "first" serving different upstream
-/// models; `bound[i]` marks dep i as drawing on the `[[shared_quotas]]`
-/// family `group`. dep2 stays on credential "second" outside the group.
+/// Deployments 0 and 1 serve different upstream models; `bound[i]` marks
+/// dep i as drawing on the `[[shared_quotas]]` family `group`. `creds[i]`
+/// sets each leg's credential ("" is anonymous) and `dep2_base_url` moves
+/// dep2 to a second upstream for anonymous-scope tests.
 async fn fixture_shared_group(
     models: &[(&str, &[u32])],
     group: Option<(&'static str, llmux_types::QuotaSpec)>,
     bound: [bool; 3],
+    creds: [&str; 3],
+    dep2_base_url: Option<&str>,
 ) -> Fixture {
     let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
     let served_status = status.clone();
@@ -949,27 +954,34 @@ async fn fixture_shared_group(
         fail: false,
     });
     let deployments = (0..3)
-        .map(|i| Deployment {
-            headers: Default::default(),
-            fallback: false,
-            idx: DeploymentIdx(i),
-            id: format!("dep{i}").into(),
-            provider: adapter.kind.clone(),
-            credential: if i < 2 { "first" } else { "second" }.into(),
-            base_url: server.url().parse().unwrap(),
-            upstream_model: if i == 1 { "upstream-1" } else { "upstream" }.into(),
-            strip_request_fields: Box::default(),
-            priority: i as i32,
-            quota: Default::default(),
-            shared_quota: bound[i as usize]
-                .then(|| group.map(|(name, _)| name.into()))
-                .flatten(),
-            timeout: Duration::from_secs(1),
-            max_context: None,
-            expires_at: None,
-            priority_boost: None,
-            priority_boost_until: None,
-            billing: Billing::Billed,
+        .map(|i| {
+            let base_url = if i == 2 {
+                dep2_base_url.map_or_else(|| server.url(), str::to_string)
+            } else {
+                server.url()
+            };
+            Deployment {
+                headers: Default::default(),
+                fallback: false,
+                idx: DeploymentIdx(i),
+                id: format!("dep{i}").into(),
+                provider: adapter.kind.clone(),
+                credential: creds[i as usize].into(),
+                base_url: base_url.parse().unwrap(),
+                upstream_model: if i == 1 { "upstream-1" } else { "upstream" }.into(),
+                strip_request_fields: Box::default(),
+                priority: i as i32,
+                quota: Default::default(),
+                shared_quota: bound[i as usize]
+                    .then(|| group.map(|(name, _)| name.into()))
+                    .flatten(),
+                timeout: Duration::from_secs(1),
+                max_context: None,
+                expires_at: None,
+                priority_boost: None,
+                priority_boost_until: None,
+                billing: Billing::Billed,
+            }
         })
         .collect();
     let cfg = RuntimeConfig {
@@ -1066,6 +1078,54 @@ async fn shared_quota_binds_legs_on_one_scope_to_one_window() {
             },
         )),
         [true, true, false],
+        ["first", "first", "second"],
+        None,
+    )
+    .await;
+    for model in ["a", "b"] {
+        executor
+            .execute(GatewayRequest {
+                model: model.into(),
+                ..request()
+            })
+            .await
+            .unwrap();
+    }
+    let calls: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(calls, ["dep0", "dep2"]);
+}
+
+#[tokio::test]
+async fn shared_quota_scopes_anonymous_legs_by_provider_and_base_url() {
+    // Anonymous legs carry no credential, so the family scope is provider +
+    // base URL: dep1 mirrors dep0's scope and call 1 spends the fam rpm=1
+    // window, while dep2 names the same group on a different base URL — a
+    // different scope — and keeps its own window.
+    let other = llmux_testkit::TestServer::start(
+        axum::Router::new()
+            .fallback(|| async { (StatusCode::OK, [("request-id", "req_fixture_2")], "ok") }),
+    )
+    .await
+    .unwrap();
+    let other_url = other.url();
+    let (executor, adapter, _, _server) = fixture_shared_group(
+        &[("a", &[0, 2]), ("b", &[1, 2])],
+        Some((
+            "fam",
+            llmux_types::QuotaSpec {
+                rpm: Some(1),
+                ..Default::default()
+            },
+        )),
+        [true, true, true],
+        ["", "", ""],
+        Some(&other_url),
     )
     .await;
     for model in ["a", "b"] {
@@ -1102,6 +1162,8 @@ async fn unbound_legs_on_the_same_credential_keep_independent_windows() {
             },
         )),
         [true, false, false],
+        ["first", "first", "second"],
+        None,
     )
     .await;
     for model in ["a", "b"] {
