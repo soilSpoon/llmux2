@@ -129,7 +129,18 @@ pub async fn probe_model(
         })
         .unwrap_or("")
         .to_ascii_lowercase();
-    if status == StatusCode::PAYMENT_REQUIRED
+    // Quota/rate-limit class first: a shared free tier's daily cap can
+    // surface as 429 or a code like `insufficient_quota` — a parked leg,
+    // never a billing verdict. Checking it before the billed heuristics
+    // keeps "insufficient_quota" out of the removal path (hard rule).
+    if status == StatusCode::TOO_MANY_REQUESTS
+        || code.contains("quota")
+        || code.contains("rate_limit")
+        || code.contains("rate-limit")
+        || code.contains("ratelimit")
+    {
+        ProbeVerdict::Unknown(format!("{status}: {code}"))
+    } else if status == StatusCode::PAYMENT_REQUIRED
         || code.contains("insufficient")
         || code.contains("credit")
         || code.contains("billing")

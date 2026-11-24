@@ -54,6 +54,14 @@ async fn probe_classifies_free_billed_and_gone() {
                         json!({"error": {"message": "insufficient_credits", "code": "insufficient_credits"}}),
                     ),
                 ),
+                // A shared free tier's daily cap: 429 carrying the canonical
+                // quota code. Must park, never classify as billed.
+                "capped-model" => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(
+                        json!({"error": {"message": "insufficient_quota", "code": "insufficient_quota"}}),
+                    ),
+                ),
                 _ => (
                     StatusCode::NOT_FOUND,
                     Json(json!({"error": {"message": "model_not_allowed"}})),
@@ -77,4 +85,10 @@ async fn probe_classifies_free_billed_and_gone() {
         discovery::probe_model(&client, &base, "synthetic-key", "gone-model").await,
         ProbeVerdict::Unavailable(_)
     ));
+    // Park-only: quota exhaustion is never a removal verdict.
+    let verdict = discovery::probe_model(&client, &base, "synthetic-key", "capped-model").await;
+    assert!(
+        matches!(verdict, ProbeVerdict::Unknown(_)),
+        "quota-exhausted probe must park, got {verdict:?}"
+    );
 }
