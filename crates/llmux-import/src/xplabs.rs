@@ -5,12 +5,19 @@ pub(super) const BASE_URL: &str = "https://api.experientiallabs.ai/v1";
 const PREFIX: &str = "experlabs";
 
 // OCI verified usage.cost 0 on the existing key for these models, and logprobs on DeepSeek
-// (Free tier: 10 RPM, 1M tokens/day shared). Haiku 5.5, Qwen3.8 27B and the 1017 model
-// were billed, so only legs whose model is listed here survive. Reviewed combo -> XPLabs model id.
+// (Free tier: 10 RPM, 1M tokens/day shared). Haiku 5.5, Qwen3.8 27B and the standard 1017
+// variants were billed, so only legs whose model is listed here survive. The
+// `uncensored-fast:free` promotion returned usage.cost 0 on 2026-11-24 while the plain
+// `deepseek-v4.1-flash-uncensored` and `…-fast` ids stay billed — the :free suffix is
+// what marks the promo leg. Reviewed combo -> XPLabs model id.
 const FREE: &[(&str, &str)] = &[
     ("gpt-6-luna", "gpt-6-luna"),
     ("deepseek-v4.1-flash", "deepseek-v4.1-flash"),
     ("deepseek-v4.1-flash-fast", "deepseek-v4.1-flash"),
+    (
+        "deepseek-v4.1-flash-1017-uncensored",
+        "deepseek-v4.1-flash-uncensored-fast:free",
+    ),
 ];
 
 /// The OmniRoute step for the reviewed free XPLabs model of `name`, pinned to an eligible

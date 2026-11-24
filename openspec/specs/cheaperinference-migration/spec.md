@@ -274,17 +274,22 @@ logprobs, reorder unrelated combos, or replace the optional final fallback.
 - **THEN** no reviewed logprobs-order policy is applied
 
 ### Requirement: Reviewed free XPLabs routes first
-For the reviewed source combos `gpt-6-luna`, `deepseek-v4.1-flash` and
-`deepseek-v4.1-flash-fast`, the importer SHALL place one deployment of the
-matching Experiential Labs (XPLabs) model (`gpt-6-luna` or
-`deepseek-v4.1-flash`) first, pinned to an active, usable API-key connection of
-the custom `experlabs` node at `https://api.experientiallabs.ai/v1`. In the fast
+For the reviewed source combos `gpt-6-luna`, `deepseek-v4.1-flash`,
+`deepseek-v4.1-flash-fast` and `deepseek-v4.1-flash-1017-uncensored`, the
+importer SHALL place one deployment of the matching Experiential Labs (XPLabs)
+model (`gpt-6-luna`, `deepseek-v4.1-flash` or
+`deepseek-v4.1-flash-uncensored-fast:free`) first, pinned to an active, usable
+API-key connection of the custom `experlabs` node at
+`https://api.experientiallabs.ai/v1`. In the fast
 combo it SHALL follow the verified Morph route. A declared leg for the same model
 and endpoint SHALL be moved instead of duplicated, keeping its pinned
 connection, other legs SHALL keep their
 relative order, and a warning SHALL be emitted when the order changes. This
 follows OCI verification that these models cost 0 on the existing key and that
-XPLabs DeepSeek returns logprobs. Every XPLabs deployment whose model is not in
+XPLabs DeepSeek returns logprobs; for the uncensored combo the `:free` suffix
+is what marks the verified promo leg — the plain `deepseek-v4.1-flash-uncensored`
+and `deepseek-v4.1-flash-uncensored-fast` ids stay billed. Every XPLabs
+deployment whose model is not in
 the verified-free set SHALL be dropped with a warning, in every combo and
 strategy: the account is overdrawn, so billed models OCI observed
 (`claude-haiku-5.5`, `qwen3.8-27b`, `deepseek-v4.1-flash-1017`) must never be
