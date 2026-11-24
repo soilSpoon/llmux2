@@ -411,10 +411,23 @@ WHEN a native Messages request supplies Anthropic protocol headers
 THEN the Anthropic upstream receives them, with the gateway's default version
 used only if the client omitted a version.
 
+### Requirement: Multiple accounts per provider
+
+The gateway SHALL support several credentials of one provider — multiple
+accounts or plans — each as its own deployment with its own quota tracking.
+Ordering between them follows the normal routing rules, since two accounts of
+one provider can carry different plans; they are never pooled into one limit.
+
+#### Scenario: Two accounts of one provider
+
+WHEN two OAuth connections of the same provider are imported
+THEN the model carries one deployment per connection, each tracked against
+its own account quota window rather than a shared one.
+
 ### Requirement: Excluded providers and practices
 
-The gateway SHALL NOT integrate OpenRouter, Factory, Augment, Z.AI,
-multi-account pooling, or multi-IP distribution to raise limits, and SHALL NOT
+The gateway SHALL NOT integrate OpenRouter, Factory, Augment, Z.AI, or
+multi-IP distribution to raise limits, and SHALL NOT
 add paid paths that cost provider fees unless the owner explicitly asks.
 DuckDuckGo and Cloudflare Playground have no key-based HTTP API and SHALL NOT
 be integrated by copying a session cookie, solving a browser challenge, or
