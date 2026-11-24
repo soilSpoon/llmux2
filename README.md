@@ -254,6 +254,35 @@ them into the catch-all. Existing routing limits and retry rules still apply.
 No migration is needed for existing configs; remove the catch-all entry to
 roll back unknown-ID forwarding (older binaries do not support `exclude`).
 
+### Per-key model policy
+
+`allowed_keys` restricts a model to certain keys; `[[server.key_policies]]` is
+the reverse direction: it restricts which model names one gateway client key may
+request. List a `client_keys` secret reference plus glob lists `models` and
+`blocked`:
+
+```toml
+[server]
+client_keys = ["file:secrets/personal.key", "file:secrets/ci.key"]
+
+[[server.key_policies]]
+key = "file:secrets/ci.key"
+models = ["claude-*", "gpt-*", "morph-ultra"]
+blocked = ["zc/*", "dva/*"]
+```
+
+A key without an entry is unrestricted. A listed key may request only names
+matching at least one `models` glob and no `blocked` glob; a violation returns
+403 `model_not_allowed` before any upstream call, on every inbound format. The
+requested `model` string is checked before alias, canonical, or catch-all
+resolution. `*` matches any substring including `/`, `?` matches exactly one
+character (Unicode scalar), and matching is case-sensitive. Omit `models` (or leave it empty) for
+allow-all-minus-`blocked`; an entry with neither is a config error, as is a
+`key` that does not resolve to a `client_keys` value or a repeated key.
+`GET /v1/models` shows a restricted key only the names its policy allows; the
+`*` catch-all is never listed for any key. Older binaries reject
+`key_policies`; remove it when rolling back.
+
 ## Credentials
 
 OpenAI-compatible deployments can explicitly opt into anonymous access with

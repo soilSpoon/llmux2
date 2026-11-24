@@ -32,6 +32,8 @@ pub enum ConfigError {
 pub struct ServerConfig {
     pub listen: SocketAddr,
     pub client_keys: Box<[Arc<str>]>,
+    /// Model-name policy per `client_keys` entry; `None` leaves the key unrestricted.
+    pub key_policies: Box<[Option<KeyPolicy>]>,
     pub request_timeout: Duration,
     pub shutdown_timeout: Duration,
     pub drain_grace: Duration,
@@ -57,6 +59,14 @@ pub enum RemoteImages {
     #[default]
     Allow,
     Reject,
+}
+
+/// Glob allowlist/blocklist restricting which requested model names one
+/// gateway client key may use. An empty `models` allows every name;
+/// `blocked` matches are then subtracted.
+pub struct KeyPolicy {
+    pub models: Box<[String]>,
+    pub blocked: Box<[String]>,
 }
 
 pub struct RoutingConfig {
@@ -159,6 +169,7 @@ struct RawServer {
     end_user_from_body: Option<bool>,
     remote_images: RemoteImages,
     max_image_bytes: Option<u64>,
+    key_policies: Vec<RawKeyPolicy>,
 }
 
 impl Default for RawServer {
@@ -177,8 +188,17 @@ impl Default for RawServer {
             end_user_from_body: None,
             remote_images: RemoteImages::Allow,
             max_image_bytes: None,
+            key_policies: Vec::new(),
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawKeyPolicy {
+    key: String,
+    models: Option<Vec<String>>,
+    blocked: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -332,6 +352,7 @@ impl RawConfig {
             ));
         }
         let end_user = end_user_settings(&server)?;
+        let key_policies = resolve_key_policies(server.key_policies, &client_keys)?;
         let max_image_bytes = match server.max_image_bytes {
             Some(0) => return Err(invalid("max_image_bytes must be positive")),
             other => other,
@@ -721,6 +742,7 @@ impl RawConfig {
             server: ServerConfig {
                 listen: server.listen,
                 client_keys,
+                key_policies,
                 request_timeout,
                 shutdown_timeout: timeout(server.shutdown_timeout_ms)?,
                 drain_grace: Duration::from_millis(server.drain_grace_ms),
@@ -757,6 +779,51 @@ impl RawConfig {
 
 fn invalid(message: &str) -> ConfigError {
     ConfigError::Invalid(message.to_owned())
+}
+
+/// Resolve `[[server.key_policies]]` entries into a `client_keys`-aligned
+/// vector. Each entry must name one configured key; an entry that neither
+/// allows nor blocks anything is meaningless and rejected.
+fn resolve_key_policies(
+    raw: Vec<RawKeyPolicy>,
+    client_keys: &[Arc<str>],
+) -> Result<Box<[Option<KeyPolicy>]>, ConfigError> {
+    let mut policies: Vec<Option<KeyPolicy>> = (0..client_keys.len()).map(|_| None).collect();
+    for entry in raw {
+        let resolved = resolve_secret(&entry.key)?;
+        let Some(index) = client_keys
+            .iter()
+            .position(|key| key.as_ref() == resolved.as_ref())
+        else {
+            return Err(invalid(
+                "server.key_policies keys must be entries of server.client_keys",
+            ));
+        };
+        let models = entry.models.unwrap_or_default();
+        let blocked = entry.blocked.unwrap_or_default();
+        if models.is_empty() && blocked.is_empty() {
+            return Err(invalid(
+                "server.key_policies entries need a nonempty models or blocked list",
+            ));
+        }
+        if models
+            .iter()
+            .chain(blocked.iter())
+            .any(|pattern| pattern.is_empty())
+        {
+            return Err(invalid("server.key_policies patterns must be nonempty"));
+        }
+        if policies[index]
+            .replace(KeyPolicy {
+                models: models.into(),
+                blocked: blocked.into(),
+            })
+            .is_some()
+        {
+            return Err(invalid("server.key_policies must not repeat a key"));
+        }
+    }
+    Ok(policies.into_boxed_slice())
 }
 
 struct EndUserSettings {
@@ -1635,5 +1702,91 @@ upstream_model = "upstream"
         .unwrap();
         assert_eq!(loaded.server.end_user_salt.unwrap().as_ref(), "file-salt");
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn key_policies_parse_align_with_client_keys_and_validate() {
+        for (name, value) in [
+            ("LLMUX_CONFIG_OAUTH_TEST_SECRET", "test-secret"),
+            ("LLMUX_CONFIG_CI_TEST_SECRET", "ci-secret"),
+            ("LLMUX_CONFIG_OTHER_TEST_SECRET", "other-secret"),
+        ] {
+            std::env::set_var(name, value);
+        }
+        let base = |policies: &str| {
+            format!(
+                r#"
+[server]
+client_keys = ["env:LLMUX_CONFIG_OAUTH_TEST_SECRET", "env:LLMUX_CONFIG_CI_TEST_SECRET"]
+{policies}
+[[credentials]]
+id = "key"
+kind = "api_key"
+provider = "openai_compat"
+key = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET"
+[[models]]
+name = "model"
+[[models.deployments]]
+id = "deployment"
+credential = "key"
+base_url = "https://example.com/v1"
+upstream_model = "upstream"
+"#
+            )
+        };
+        let policy =
+            |key: &str, extra: &str| format!("[[server.key_policies]]\nkey = \"{key}\"\n{extra}");
+        let ci = "env:LLMUX_CONFIG_CI_TEST_SECRET";
+
+        // Keys without an entry stay unrestricted; the policy aligns by index.
+        let parsed = RuntimeConfig::parse(&base("")).unwrap();
+        assert!(parsed.server.key_policies.iter().all(Option::is_none));
+        let parsed = RuntimeConfig::parse(&base(&policy(
+            ci,
+            "models = [\"claude-*\", \"gpt-*\"]\nblocked = [\"zc/*\"]",
+        )))
+        .unwrap();
+        assert!(parsed.server.key_policies[0].is_none());
+        let entry = parsed.server.key_policies[1].as_ref().unwrap();
+        assert_eq!(entry.models.join(","), "claude-*,gpt-*");
+        assert_eq!(entry.blocked.join(","), "zc/*");
+
+        // A blocked-only entry is valid: allow-all minus blocked.
+        let parsed = RuntimeConfig::parse(&base(&policy(ci, "blocked = [\"zc/*\"]"))).unwrap();
+        let entry = parsed.server.key_policies[1].as_ref().unwrap();
+        assert!(entry.models.is_empty());
+        assert_eq!(entry.blocked.join(","), "zc/*");
+
+        let err = |policies: &str| {
+            RuntimeConfig::parse(&base(policies))
+                .err()
+                .expect("invalid key_policies")
+                .to_string()
+        };
+        assert!(err(&policy(
+            "env:LLMUX_CONFIG_OTHER_TEST_SECRET",
+            "models = [\"x\"]"
+        ))
+        .contains("client_keys"));
+        assert!(err(&policy("literal-value", "models = [\"x\"]")).contains("env: or file:"));
+        for meaningless in [
+            "",
+            "models = []",
+            "blocked = []",
+            "models = []\nblocked = []",
+        ] {
+            assert!(
+                err(&policy(ci, meaningless)).contains("models or blocked"),
+                "{meaningless}"
+            );
+        }
+        assert!(err(&policy(ci, "models = [\"\"]")).contains("nonempty"));
+        assert!(err(&format!(
+            "{}\n{}",
+            policy(ci, "models = [\"a\"]"),
+            policy("env:LLMUX_CONFIG_CI_TEST_SECRET", "blocked = [\"b\"]")
+        ))
+        .contains("repeat"));
+        assert!(RuntimeConfig::parse(&base(&policy(ci, "models = [\"a\"]\nunknown = 1"))).is_err());
     }
 }

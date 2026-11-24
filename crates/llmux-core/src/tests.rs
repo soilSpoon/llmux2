@@ -245,6 +245,7 @@ async fn fixture_full(
         server: llmux_config::ServerConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             client_keys: Box::new([]),
+            key_policies: Box::new([]),
             request_timeout: Duration::from_secs(5),
             shutdown_timeout: Duration::from_secs(60),
             drain_grace: Duration::from_secs(2),
