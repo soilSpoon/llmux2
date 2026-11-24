@@ -895,6 +895,14 @@ pub fn import_with_options(
         connections.push(Connection {headers:json!({}),source_id:"workers-ai-opt-in".into(),provider:upstream::ProviderIdentity::Builtin("workers-ai".into()),credential:Some(id.clone()),kind:"openai_compat".into(),base_url:workers.base_url.clone(),priority:i64::MAX,policy:policy::ModelPolicy::Workers});
         id
     });
+    // Connections resolving to this gateway's own listen port through a
+    // container host alias are the OmniRoute -> llmux2 bridge; importing
+    // them would loop requests. When --listen is absent the emitted default
+    // applies, so 8080 is the port to guard.
+    let listen_port = options
+        .listen
+        .and_then(|listen| listen.parse::<std::net::SocketAddr>().ok())
+        .map_or(8080, |addr| addr.port());
     for (index, c) in array(&root, "providerConnections").iter().enumerate() {
         let label = format!("connection {index} ({})", string(c, "id"));
         let identity = connection::identity(c, array(&root, "providerNodes"));
@@ -932,6 +940,7 @@ pub fn import_with_options(
                 array(&root, "providerNodes"),
                 matches!(auth, connection::SelectedAuth::Key(_)),
                 &mut warnings,
+                listen_port,
             )
         } {
             Ok(provider) => provider,

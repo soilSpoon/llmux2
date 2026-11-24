@@ -170,6 +170,35 @@ pub(super) fn model_target<'a>(
     Some((canonical, model))
 }
 
+/// Hostnames container runtimes alias to the host itself (Podman and
+/// Docker). An upstream using one on this gateway's listen port is the
+/// OmniRoute -> llmux2 bridge; importing it would loop requests into llmux2.
+const GATEWAY_HOST_ALIASES: &[&str] = &[
+    "host.containers.internal",
+    "host.docker.internal",
+    "gateway.docker.internal",
+];
+
+fn gateway_self_host(url: &str, listen_port: u16) -> bool {
+    let Ok(uri) = url.parse::<Uri>() else {
+        return false;
+    };
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let port = uri.port_u16().unwrap_or({
+        if uri.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        }
+    });
+    port == listen_port
+        && GATEWAY_HOST_ALIASES
+            .iter()
+            .any(|alias| host.trim_end_matches('.').eq_ignore_ascii_case(alias))
+}
+
 fn local_host(url: &str, include_unspecified: bool) -> bool {
     let Ok(uri) = url.parse::<Uri>() else {
         return false;
@@ -236,6 +265,7 @@ pub(super) fn resolve(
     nodes: &[Value],
     keyed: bool,
     warnings: &mut Vec<String>,
+    listen_port: u16,
 ) -> Result<(String, String), &'static str> {
     let id = string(connection, "provider");
     let node = nodes.iter().find(|node| string(node, "id") == id);
@@ -306,6 +336,8 @@ pub(super) fn resolve(
         && !(local_host(url, false) && super::connection::keyed_loopback_bridge(identity))
     {
         return Err("loopback/localhost upstream; configure a reachable connection base URL");
+    } else if gateway_self_host(url, listen_port) {
+        return Err("upstream targets this gateway's listen port through a container host alias; importing it would loop requests");
     } else {
         url
     };
