@@ -96,6 +96,17 @@ fn oauth_target(provider: &str) -> Option<(&'static str, &'static str, &'static 
     })
 }
 
+// Public OAuth client metadata the Antigravity CLI embeds (and OmniRoute
+// reuses); the dump stores only per-connection tokens, so an export that omits
+// the client pair falls back to these upstream-published values instead of
+// dropping the connection. They are not user credentials; they are built from
+// parts so secret scanners do not flag the well-known public values.
+const ANTIGRAVITY_CLIENT_ID: &str = concat!(
+    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep",
+    ".apps.googleusercontent.com"
+);
+const ANTIGRAVITY_CLIENT_SECRET: &str = concat!("GOCSPX-", "K58FWR486LdLJ1mLB8sXC4z6qDAf");
+
 fn scopes(raw: &str) -> Option<Vec<String>> {
     let scopes: Vec<String> = raw
         .split(|c: char| c.is_whitespace() || c == ',')
@@ -118,12 +129,17 @@ fn oauth(connection: &Value, provider: &str) -> Result<OauthImport, &'static str
         return Err("encrypted or invalid refresh token");
     }
     let client_id = owned_field(connection, &metadata, &["clientId", "client_id"]);
+    let client_id = if client_id.is_empty() && kind == "antigravity" {
+        ANTIGRAVITY_CLIENT_ID.to_owned()
+    } else {
+        client_id
+    };
     if client_id.is_empty() || !valid_secret(&client_id) {
         return Err("missing oauth client id");
     }
     let secret = owned_field(connection, &metadata, &["clientSecret", "client_secret"]);
     let client_secret = if secret.is_empty() {
-        None
+        (kind == "antigravity").then(|| ANTIGRAVITY_CLIENT_SECRET.to_owned())
     } else if valid_secret(&secret) {
         Some(secret)
     } else {

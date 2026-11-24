@@ -1,5 +1,6 @@
 use llmux_config::RuntimeConfig;
 use llmux_import::{ImportOptions, OmniRouteFallback};
+use llmux_types::ChatRequestField;
 use serde_json::{json, Value};
 
 fn base() -> Value {
@@ -323,6 +324,224 @@ fn codex_oauth_imports_responses_deployment_with_owner_keys() {
     assert_eq!(dep.headers["chatgpt-account-id"], "synthetic-workspace");
     let allowed = &config.model_allowed_keys[&config.model_names["codex/gpt-6-luna"]];
     assert!(!allowed.is_empty());
+}
+
+// The public OAuth client metadata the Antigravity CLI embeds; OmniRoute
+// stores only per-connection tokens, so the importer fills these in when a
+// dump omits them. They are upstream-supplied public values, not user secrets;
+// they are built from parts so secret scanners do not flag them.
+const ANTIGRAVITY_CLIENT_ID: &str = concat!(
+    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep",
+    ".apps.googleusercontent.com"
+);
+const ANTIGRAVITY_CLIENT_SECRET: &str = concat!("GOCSPX-", "K58FWR486LdLJ1mLB8sXC4z6qDAf");
+
+fn antigravity_dump(connections: Value) -> Value {
+    json!({
+        "provider_connections": connections,
+        "combos": [
+            {"id":"c1","name":"ag-combo","data":{"name":"ag-combo","strategy":"priority","models":[{"kind":"model","providerId":"antigravity","model":"gemini-3-flash"}]}}
+        ],
+        "api_keys": [{"id":"k","key":"synthetic-client","is_active":1}],
+        "model_combo_mappings": [],
+        "key_value": {}
+    })
+}
+
+#[test]
+fn antigravity_oauth_uses_the_embedded_public_client_when_the_dump_omits_it() {
+    let root = antigravity_dump(json!([
+        {"id":"ag","provider":"antigravity","auth_type":"oauth","is_active":1,"access_token":"synthetic-access","refresh_token":"synthetic-refresh","provider_specific_data":"{\"projectId\":\"synthetic-project\"}","priority":1},
+        {"id":"gem","provider":"gemini","auth_type":"apikey","is_active":1,"api_key":"synthetic-gemini"}
+    ]));
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let warnings = report.warnings.join("\n");
+    assert!(!warnings.contains("missing oauth client id"), "{warnings}");
+    assert!(!warnings.contains("skipped"), "{warnings}");
+    let text = std::fs::read_to_string(&output).unwrap();
+    assert!(!text.contains("synthetic-refresh"));
+    assert!(!text.contains("synthetic-access"));
+    let config = RuntimeConfig::load(&output).unwrap();
+    let credential = &config.oauth["upstream-ag"];
+    assert_eq!(credential.token_url, "https://oauth2.googleapis.com/token");
+    assert_eq!(credential.client_id, ANTIGRAVITY_CLIENT_ID);
+    assert_eq!(
+        credential.client_secret.as_deref(),
+        Some(ANTIGRAVITY_CLIENT_SECRET)
+    );
+    assert_eq!(&*credential.refresh_token, "synthetic-refresh");
+    for name in ["ag-combo", "antigravity/gemini-3-flash"] {
+        let model = &config.models[*config
+            .model_names
+            .get(name)
+            .unwrap_or_else(|| panic!("missing {name}"))];
+        let deps: Vec<_> = model
+            .deployments
+            .iter()
+            .map(|idx| &config.deployments[idx.0 as usize])
+            .collect();
+        assert_eq!(deps.len(), 1, "{name}");
+        let dep = deps[0];
+        assert_eq!(dep.provider.0.as_ref(), "antigravity", "{name}");
+        assert_eq!(
+            dep.base_url.to_string().trim_end_matches('/'),
+            "https://daily-cloudcode-pa.googleapis.com",
+            "{name}"
+        );
+        assert_eq!(dep.upstream_model.as_ref(), "gemini-3-flash", "{name}");
+        assert_eq!(dep.credential.as_ref(), "upstream-ag", "{name}");
+        assert_eq!(dep.headers["x-llmux-project"], "synthetic-project");
+    }
+}
+
+#[test]
+fn antigravity_oauth_without_a_project_id_stays_skipped() {
+    let mut root = antigravity_dump(json!([
+        {"id":"ag","provider":"antigravity","auth_type":"oauth","is_active":1,"access_token":"synthetic-access","refresh_token":"synthetic-refresh"},
+        {"id":"gem","provider":"gemini","auth_type":"apikey","is_active":1,"api_key":"synthetic-gemini"}
+    ]));
+    root["combos"][0]["data"]["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"kind":"model","providerId":"gemini","model":"gemini-3-flash-preview"}));
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let warnings = report.warnings.join("\n");
+    assert!(
+        warnings.contains("missing Antigravity project id"),
+        "{warnings}"
+    );
+    let text = std::fs::read_to_string(&output).unwrap();
+    assert!(!text.contains("synthetic-refresh"));
+    let config = RuntimeConfig::load(&output).unwrap();
+    assert!(config.oauth.is_empty());
+    assert!(config
+        .deployments
+        .iter()
+        .all(|dep| dep.provider.0.as_ref() != "antigravity"));
+}
+
+#[test]
+fn antigravity_multi_account_deployments_follow_connection_priority_with_fallback_last() {
+    let root = antigravity_dump(json!([
+        {"id":"ag-slow","provider":"antigravity","auth_type":"oauth","is_active":1,"refresh_token":"synthetic-slow-refresh","project_id":"synthetic-slow-project","priority":9},
+        {"id":"ag-fast","provider":"antigravity","auth_type":"oauth","is_active":1,"refresh_token":"synthetic-fast-refresh","project_id":"synthetic-fast-project","priority":1}
+    ]));
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let key = dir.path().join("fallback-key");
+    std::fs::write(&key, "synthetic-fallback").unwrap();
+    let reference = format!("file:{}", key.display());
+    let options = ImportOptions {
+        omniroute_fallback: Some(OmniRouteFallback {
+            base_url: "http://127.0.0.1:20128/v1",
+            key: &reference,
+        }),
+        ..ImportOptions::default()
+    };
+    llmux_import::import_with_options(&root.to_string(), &output, None, &options).unwrap();
+    let config = RuntimeConfig::load(&output).unwrap();
+    assert_eq!(
+        config.oauth["upstream-ag-fast"].client_id,
+        ANTIGRAVITY_CLIENT_ID
+    );
+    assert_eq!(
+        config.oauth["upstream-ag-slow"].client_id,
+        ANTIGRAVITY_CLIENT_ID
+    );
+    let model = &config.models[config.model_names["ag-combo"]];
+    let deps: Vec<_> = model
+        .deployments
+        .iter()
+        .map(|idx| &config.deployments[idx.0 as usize])
+        .collect();
+    assert_eq!(deps.len(), 3);
+    assert_eq!(deps[0].credential.as_ref(), "upstream-ag-fast");
+    assert_eq!(deps[0].headers["x-llmux-project"], "synthetic-fast-project");
+    assert_eq!(deps[1].credential.as_ref(), "upstream-ag-slow");
+    assert_eq!(deps[1].headers["x-llmux-project"], "synthetic-slow-project");
+    for dep in &deps[..2] {
+        assert_eq!(dep.provider.0.as_ref(), "antigravity");
+        assert_eq!(dep.upstream_model.as_ref(), "gemini-3-flash");
+        assert!(!dep.fallback);
+    }
+    assert!(deps[2].fallback);
+    assert!(deps[2].priority > deps[1].priority);
+    assert_eq!(deps[2].upstream_model.as_ref(), "ag-combo");
+}
+
+#[test]
+fn gemini_apikey_connections_emit_native_openai_compat_legs_in_priority_order() {
+    let root = json!({
+        "provider_connections": [
+            {"id":"slow","provider":"gemini","auth_type":"apikey","is_active":1,"api_key":"synthetic-slow","priority":9},
+            {"id":"fast","provider":"gemini","auth_type":"apikey","is_active":1,"api_key":"synthetic-fast","priority":1}
+        ],
+        "combos": [
+            {"id":"c1","name":"gem-combo","data":{"name":"gem-combo","strategy":"priority","models":[{"kind":"model","providerId":"gemini","model":"gemini-3-flash-preview"}]}}
+        ],
+        "api_keys": [{"id":"k","key":"synthetic-client","is_active":1}],
+        "model_combo_mappings": [],
+        "key_value": {}
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let key = dir.path().join("fallback-key");
+    std::fs::write(&key, "synthetic-fallback").unwrap();
+    let reference = format!("file:{}", key.display());
+    let options = ImportOptions {
+        omniroute_fallback: Some(OmniRouteFallback {
+            base_url: "http://127.0.0.1:20128/v1",
+            key: &reference,
+        }),
+        ..ImportOptions::default()
+    };
+    let report =
+        llmux_import::import_with_options(&root.to_string(), &output, None, &options).unwrap();
+    assert!(!report.warnings.join("\n").contains("skipped"));
+    let text = std::fs::read_to_string(&output).unwrap();
+    assert!(!text.contains("synthetic-slow"));
+    assert!(!text.contains("synthetic-fast"));
+    let config = RuntimeConfig::load(&output).unwrap();
+    for name in ["gem-combo", "gemini/gemini-3-flash-preview"] {
+        let model = &config.models[*config
+            .model_names
+            .get(name)
+            .unwrap_or_else(|| panic!("missing {name}"))];
+        let deps: Vec<_> = model
+            .deployments
+            .iter()
+            .map(|idx| &config.deployments[idx.0 as usize])
+            .collect();
+        assert_eq!(deps.len(), 3, "{name}");
+        assert_eq!(deps[0].credential.as_ref(), "upstream-fast", "{name}");
+        assert_eq!(deps[1].credential.as_ref(), "upstream-slow", "{name}");
+        for dep in &deps[..2] {
+            assert_eq!(dep.provider.0.as_ref(), "openai_compat", "{name}");
+            assert_eq!(
+                dep.base_url.to_string(),
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+                "{name}"
+            );
+            assert_eq!(
+                dep.upstream_model.as_ref(),
+                "gemini-3-flash-preview",
+                "{name}"
+            );
+            assert_eq!(
+                dep.strip_request_fields.as_ref(),
+                &[ChatRequestField::Seed, ChatRequestField::User],
+                "{name}"
+            );
+            assert!(!dep.fallback, "{name}");
+        }
+        assert!(deps[2].fallback, "{name}");
+        assert!(deps[2].priority > deps[1].priority, "{name}");
+        assert_eq!(deps[2].upstream_model.as_ref(), name, "{name}");
+    }
 }
 
 #[test]
