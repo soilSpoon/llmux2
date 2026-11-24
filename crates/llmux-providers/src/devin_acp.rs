@@ -3,6 +3,10 @@
 //! `--agent-type summarizer` variant was dropped: given a long transcript it
 //! fell back to emitting conversation summaries instead of a reply.
 
+use crate::acp::{
+    cli_command, completion as acp_completion, labelled_turns, stage_images, usage_body,
+    AbortOnDrop, AcpSession, ImageStaging,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
@@ -13,22 +17,9 @@ use llmux_types::{
     SseEvent, Support, UpstreamError,
 };
 use serde_json::{json, Value};
-use std::{
-    path::{Path, PathBuf},
-    process::Stdio,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{Child, Command},
-    time::timeout,
-};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 
-const MAX_REPLY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CATALOG_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -58,25 +49,13 @@ impl DevinAcpConfig {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(&self.binary);
-        command
-            .args(args)
-            .env_clear()
-            .env("HOME", &self.home)
-            .env("XDG_CONFIG_HOME", self.home.join(".config"))
-            .env("XDG_DATA_HOME", self.home.join(".local/share"))
-            .env("XDG_CACHE_HOME", self.home.join(".cache"))
-            .env("LANG", "C.UTF-8")
-            .env("DISABLE_TELEMETRY", "1")
-            .current_dir(&self.home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        if let Some(path) = std::env::var_os("PATH") {
-            command.env("PATH", path);
-        }
-        command
+        cli_command(
+            &self.binary,
+            &args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
+            &self.home,
+            None,
+            &BTreeMap::new(),
+        )
     }
 }
 
@@ -180,173 +159,6 @@ impl Unwrapper {
     }
 }
 
-struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
-
-impl<T> Drop for AbortOnDrop<T> {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-fn content_text(content: &Value) -> String {
-    match content {
-        Value::String(text) => text.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(|part| part["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
-}
-
-/// Where a client image lives: bytes inline (any wire spelling) or a remote URL
-/// the agent may fetch itself.
-enum ImageSource {
-    Data { mime: String, data: String },
-    Url(String),
-}
-
-/// Detects the image part spellings the bridge accepts: OpenAI `image_url` /
-/// `input_image` (string or `{url}` object) and Anthropic `image` sources.
-fn image_source(part: &Value) -> Option<ImageSource> {
-    let url_field = |key: &str| {
-        part.get(key)
-            .and_then(|v| v.get("url").and_then(Value::as_str).or_else(|| v.as_str()))
-    };
-    match part["type"].as_str() {
-        Some("image_url") | Some("input_image") => url_field("image_url").and_then(url_source),
-        Some("image") => match part["source"]["type"].as_str() {
-            Some("base64") => Some(ImageSource::Data {
-                mime: part["source"]["media_type"]
-                    .as_str()
-                    .unwrap_or("image/png")
-                    .to_owned(),
-                data: part["source"]["data"].as_str()?.to_owned(),
-            }),
-            Some("url") => part["source"]["url"].as_str().and_then(url_source),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// A `data:` URL carries its bytes inline; a remote reference must be
-/// http(s) — anything else (a bare path, `file://`) would land in the
-/// `[Images]` index and invite the agent to `read` a sandbox file it was
-/// never meant to see.
-fn url_source(url: &str) -> Option<ImageSource> {
-    if let Some(rest) = url.strip_prefix("data:") {
-        if let Some((meta, data)) = rest.split_once(',') {
-            if let Some(mime) = meta.strip_suffix(";base64") {
-                return Some(ImageSource::Data {
-                    mime: mime.to_owned(),
-                    data: data.to_owned(),
-                });
-            }
-        }
-    }
-    (url.starts_with("http://") || url.starts_with("https://"))
-        .then(|| ImageSource::Url(url.to_owned()))
-}
-
-/// Decoded image bytes must not exceed this: `devin acp` accepts inline
-/// `image` blocks at the protocol level but never shows them to the model, so
-/// images reach the model only as files the agent `read`s from its sandbox —
-/// and unbounded writes are the failure to bound here.
-const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
-
-/// Removes the staging directory when the guard drops — including aborted
-/// turns, since the future's locals are dropped with it.
-#[derive(Debug)]
-struct ImageStaging {
-    dir: PathBuf,
-}
-
-impl Drop for ImageStaging {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// Per-request uniqueness for the staging dir: a nanosecond timestamp alone
-/// can repeat on coarse clocks, so concurrent requests in this process would
-/// share a dir and each guard's cleanup would delete the other's files.
-static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Writes each inline image under `<home>/.llmux-images/<unique>/` and returns
-/// the transcript index entries — file paths for inline payloads, the URL
-/// itself for remote ones. The ACP `image` content block is intentionally not
-/// used: the agent acknowledges it but the model never sees its bytes, while
-/// a file it `read`s is rendered to the model (probed live on 3000.14.30821).
-fn stage_images(
-    home: &Path,
-    messages: &[Value],
-) -> Result<(Option<ImageStaging>, Vec<String>), UpstreamError> {
-    use base64::Engine;
-    let sources: Vec<ImageSource> = messages
-        .iter()
-        .filter_map(|m| m["content"].as_array())
-        .flatten()
-        .filter_map(image_source)
-        .collect();
-    if sources.is_empty() {
-        return Ok((None, Vec::new()));
-    }
-    let unique = format!(
-        "{}-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos()),
-        STAGE_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
-    let dir = home.join(".llmux-images").join(unique);
-    std::fs::create_dir_all(&dir).map_err(|_| UpstreamError::Server {
-        status: StatusCode::BAD_GATEWAY,
-    })?;
-    // Held from here so a mid-loop failure (bad base64, oversized payload)
-    // removes the partially-written directory too.
-    let staging = ImageStaging { dir };
-    let mut entries = Vec::with_capacity(sources.len());
-    for (index, source) in sources.into_iter().enumerate() {
-        match source {
-            ImageSource::Data { mime, data } => {
-                // Base64 decodes to ~3/4 its length; reject by encoded length
-                // first so an oversized payload is never materialized.
-                if data.len() > MAX_IMAGE_BYTES * 4 / 3 + 4 {
-                    return Err(UpstreamError::BadRequest {
-                        status: StatusCode::PAYLOAD_TOO_LARGE,
-                        body: Bytes::new(),
-                    });
-                }
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(&data)
-                    .map_err(|_| UpstreamError::BadRequest {
-                        status: StatusCode::BAD_REQUEST,
-                        body: Bytes::new(),
-                    })?;
-                // The encoded-length bound above is approximate; the exact cap
-                // is enforced on the decoded bytes.
-                if bytes.len() > MAX_IMAGE_BYTES {
-                    return Err(UpstreamError::BadRequest {
-                        status: StatusCode::PAYLOAD_TOO_LARGE,
-                        body: Bytes::new(),
-                    });
-                }
-                let ext = mime.strip_prefix("image/").unwrap_or("bin");
-                let path = staging.dir.join(format!("image-{}.{}", index + 1, ext));
-                std::fs::write(&path, bytes).map_err(|_| UpstreamError::Server {
-                    status: StatusCode::BAD_GATEWAY,
-                })?;
-                entries.push(path.to_string_lossy().into_owned());
-            }
-            ImageSource::Url(url) => entries.push(url),
-        }
-    }
-    Ok((Some(staging), entries))
-}
-
 /// The default agent continues whatever conversation it is given; this frame pins
 /// the bridge contract so the reply is one assistant message and nothing else.
 const FRAME: &str = "[Devin Chat Bridge]\nA conversation transcript follows under [Conversation]. Write the next assistant reply to it.\nReply with only that reply: plain text, no commentary about the conversation, no Markdown fences, and never use your own tools.\n";
@@ -401,52 +213,7 @@ fn prompt_text(
     tool_choice: &Value,
     parallel_tool_calls: bool,
 ) -> Option<String> {
-    let mut image_index = 0usize;
-    let turns: Vec<(String, String)> = messages
-        .iter()
-        .map(|m| {
-            let role = m["role"].as_str().unwrap_or("user");
-            let mut text = match &m["content"] {
-                Value::Array(parts) => parts
-                    .iter()
-                    .filter_map(|part| {
-                        if image_source(part).is_some() {
-                            image_index += 1;
-                            return Some(format!("[image {image_index}]"));
-                        }
-                        part["text"].as_str().map(str::to_owned)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                other => content_text(other),
-            };
-            if role == "assistant" {
-                if let Some(calls) = m["tool_calls"].as_array().filter(|c| !c.is_empty()) {
-                    let calls = format!("[tool_calls: {}]", Value::Array(calls.clone()));
-                    text = if text.is_empty() {
-                        calls
-                    } else {
-                        format!("{text}\n{calls}")
-                    };
-                }
-            }
-            let label = match role {
-                "tool" => {
-                    let id = m["tool_call_id"].as_str().unwrap_or_default();
-                    let name = m["name"].as_str().unwrap_or_default();
-                    match (id.is_empty(), name.is_empty()) {
-                        (false, false) => format!("tool({id}, {name})"),
-                        (false, true) => format!("tool({id})"),
-                        (true, false) => format!("tool({name})"),
-                        _ => "tool".to_owned(),
-                    }
-                }
-                _ => role.to_owned(),
-            };
-            (label, text)
-        })
-        .filter(|(_, text)| !text.is_empty())
-        .collect();
+    let turns = labelled_turns(messages);
     (!turns.is_empty()).then(|| {
         let mut prompt = String::from(FRAME);
         if let Some(tools) = tools.and_then(Value::as_array).filter(|t| !t.is_empty()) {
@@ -549,158 +316,20 @@ fn normalize_calls(calls: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
-fn rpc_error(error: &Value) -> UpstreamError {
-    let text = format!(
-        "{} {}",
-        error["message"].as_str().unwrap_or(""),
-        error["data"]
-    )
-    .to_ascii_lowercase();
-    if ["insufficient", "balance", "quota", "out of usage"]
-        .iter()
-        .any(|needle| text.contains(needle))
-    {
-        UpstreamError::QuotaExhausted { reset_at: None }
-    } else if text.contains("rate limit") || text.contains("429") {
-        UpstreamError::RateLimited { retry_after: None }
-    } else if text.contains("model") && (text.contains("not found") || text.contains("unknown")) {
-        UpstreamError::ModelNotFound {
-            status: StatusCode::NOT_FOUND,
-            body: Bytes::new(),
-        }
-    } else {
-        UpstreamError::Server {
-            status: StatusCode::BAD_GATEWAY,
-        }
-    }
-}
-
+/// One request-scoped conversation over the shared [`AcpSession`] transport.
 struct Session {
-    child: Child,
-    stdin: tokio::process::ChildStdin,
-    lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    next_id: u64,
-    reply: String,
-    /// Flipped on the first `session/update`, which is when the stream can tell
-    /// clients the turn is alive (the marker is an empty string the consumer
-    /// filters out — real chunks follow).
-    announced: bool,
-    chunks: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    inner: AcpSession,
 }
 
 impl Session {
-    /// Spawns the CLI, retrying while the kernel reports the binary as busy.
-    ///
-    /// Replacing a running binary in place leaves `ETXTBSY` on the next exec until the
-    /// last process holding it exits, and a freshly written script can be held the same
-    /// way by a child another thread forked mid-write. Neither is a real failure.
-    fn spawn_binary(config: &DevinAcpConfig) -> Result<tokio::process::Child, UpstreamError> {
-        let mut attempt = 0;
-        loop {
-            match config.command(&["acp"]).spawn() {
-                Ok(child) => return Ok(child),
-                Err(err)
-                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 20 =>
-                {
-                    attempt += 1;
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                Err(_) => return Err(UpstreamError::Connect),
-            }
-        }
-    }
-
     fn spawn(config: &DevinAcpConfig) -> Result<Self, UpstreamError> {
-        let mut child = Self::spawn_binary(config)?;
-        let stdin = child.stdin.take().ok_or(UpstreamError::Connect)?;
-        let stdout = child.stdout.take().ok_or(UpstreamError::Connect)?;
         Ok(Self {
-            child,
-            stdin,
-            lines: BufReader::new(stdout).lines(),
-            next_id: 1,
-            reply: String::new(),
-            announced: false,
-            chunks: None,
+            inner: AcpSession::spawn(&mut config.command(&["acp"]))?,
         })
     }
 
-    async fn write(&mut self, message: Value) -> Result<(), UpstreamError> {
-        let mut line = message.to_string();
-        line.push('\n');
-        self.stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|_| UpstreamError::Connect)
-    }
-
-    /// Writes a request without waiting for its response. Used for calls whose
-    /// answer is best-effort: the reply, if one arrives, lands on the shared
-    /// read loop inside `call` and is skipped by the id match.
-    async fn send(&mut self, method: &str, params: Value) -> Result<(), UpstreamError> {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.write(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
-            .await
-    }
-
-    /// Sends a request and waits for its response, collecting streamed message chunks.
-    async fn call(&mut self, method: &str, params: Value) -> Result<Value, UpstreamError> {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.write(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
-            .await?;
-        loop {
-            let line = self
-                .lines
-                .next_line()
-                .await
-                .map_err(|_| UpstreamError::Connect)?
-                .ok_or(UpstreamError::StreamBroken { bytes_sent: 0 })?;
-            let Ok(message) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if message["method"] == "session/update" {
-                if !self.announced {
-                    self.announced = true;
-                    if let Some(chunks) = &self.chunks {
-                        let _ = chunks.send(String::new());
-                    }
-                }
-                let update = &message["params"]["update"];
-                if update["sessionUpdate"] == "agent_message_chunk" {
-                    let text = update["content"]["text"].as_str().unwrap_or("");
-                    self.reply.push_str(text);
-                    if let Some(chunks) = &self.chunks {
-                        let _ = chunks.send(text.to_owned());
-                    }
-                    if self.reply.len() > MAX_REPLY_BYTES {
-                        return Err(UpstreamError::Server {
-                            status: StatusCode::BAD_GATEWAY,
-                        });
-                    }
-                }
-            } else if let (Some(server_id), Some(method)) =
-                (message.get("id"), message.get("method"))
-            {
-                // Sessions run in `ask` mode, so no tool call should arrive; any
-                // that does is refused with a real ACP outcome — an error reply
-                // would be the agent's signal to stop the turn empty-handed.
-                let reply = if method.as_str() == Some("session/request_permission") {
-                    json!({"jsonrpc":"2.0","id":server_id,
-                        "result":{"outcome":{"outcome":"cancelled"}}})
-                } else {
-                    json!({"jsonrpc":"2.0","id":server_id,
-                        "error":{"code":-32601,"message":"method not supported"}})
-                };
-                self.write(reply).await?;
-            } else if message["id"] == id {
-                if let Some(error) = message.get("error") {
-                    return Err(rpc_error(error));
-                }
-                return Ok(message["result"].clone());
-            }
-        }
+    fn set_chunks(&mut self, chunks: Option<tokio::sync::mpsc::UnboundedSender<String>>) {
+        self.inner.set_chunks(chunks);
     }
 
     /// Returns the collected reply text plus the turn usage when the agent
@@ -715,46 +344,11 @@ impl Session {
         _staged: Option<ImageStaging>,
     ) -> Result<(String, Option<Value>), UpstreamError> {
         let cwd = config.home.to_string_lossy().into_owned();
-        self.call(
-            "initialize",
-            json!({"protocolVersion":1,"clientInfo":{"name":"llmux","version":"1"},"clientCapabilities":{}}),
-        )
-        .await?;
-        let session = self
-            .call(
-                "session/new",
-                json!({"cwd":cwd,"mcpServers":[],"model":model}),
-            )
-            .await?;
-        let session_id = session["sessionId"].as_str().ok_or(UpstreamError::Server {
-            status: StatusCode::BAD_GATEWAY,
-        })?;
-        // `ask` ("answer questions without code changes") turns the internal
-        // tools off agent-side — a structural bound, unlike the prompt wording.
-        // Sent without awaiting: CLIs that predate the method never reply, and
-        // a reply that does arrive is ignored by the prompt call's id match.
-        let _ = self
-            .send(
-                "session/set_mode",
-                json!({"sessionId":session_id,"modeId":"ask"}),
-            )
-            .await;
-        let result = self
-            .call(
-                "session/prompt",
-                json!({"sessionId":session_id,"prompt":prompt}),
-            )
-            .await?;
-        let _ = self.child.start_kill();
-        if result["stopReason"] != "end_turn" {
-            return Err(UpstreamError::Server {
-                status: StatusCode::BAD_GATEWAY,
-            });
-        }
-        Ok((
-            strip_summary(&self.reply).to_owned(),
-            result.get("usage").filter(|u| u.is_object()).cloned(),
-        ))
+        self.inner.handshake().await?;
+        let result = self.inner.chat_turn(&cwd, model, prompt).await;
+        self.inner.kill();
+        let (text, usage) = result?;
+        Ok((strip_summary(&text).to_owned(), usage))
     }
 }
 
@@ -773,33 +367,7 @@ impl DevinAcp {
 }
 
 fn completion(model: &str, text: &str, stream: bool) -> Value {
-    let created = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let choice = if stream {
-        json!({"index":0,"delta":{"role":"assistant","content":text},"finish_reason":null})
-    } else {
-        json!({"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"})
-    };
-    json!({"id":format!("chatcmpl-devin-{created}"),
-        "object":if stream {"chat.completion.chunk"} else {"chat.completion"},
-        "created":created,"model":model,"choices":[choice]})
-}
-
-/// Maps the ACP `session/prompt` usage block onto the OpenAI usage shape —
-/// `prompt_tokens_details.cached_tokens` is the one detail field clients read.
-fn usage_body(usage: Option<Value>) -> Option<Value> {
-    let usage = usage?;
-    let count = |key: &str| usage[key].as_u64().unwrap_or(0);
-    let mut out = json!({
-        "prompt_tokens": count("inputTokens"),
-        "completion_tokens": count("outputTokens"),
-        "total_tokens": count("totalTokens"),
-    });
-    if let Some(cached) = usage["cachedReadTokens"].as_u64() {
-        out["prompt_tokens_details"] = json!({"cached_tokens": cached});
-    }
-    Some(out)
+    acp_completion("devin", model, text, stream)
 }
 
 /// One shot carrying the whole `tool_calls` array — the JSON must be complete
@@ -908,7 +476,7 @@ impl DevinAcp {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             let session = match Session::spawn(&config) {
                 Ok(mut session) => {
-                    session.chunks = Some(tx);
+                    session.set_chunks(Some(tx));
                     session
                 }
                 Err(err) => {
@@ -1111,7 +679,9 @@ impl DevinAcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::{rpc_error, MAX_IMAGE_BYTES};
     use base64::Engine;
+    use std::path::Path;
 
     #[test]
     fn synthesized_completion_id_is_not_an_upstream_request_id() {

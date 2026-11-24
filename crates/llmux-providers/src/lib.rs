@@ -1,5 +1,7 @@
 //! Upstream adapters and static-key / OAuth credential sources.
 
+mod acp;
+mod acp_agent;
 mod anthropic;
 mod antigravity;
 pub mod aws_quick;
@@ -16,6 +18,7 @@ mod sse;
 mod truncate;
 mod xai;
 
+pub use acp_agent::{AcpAgent, NoAuthSource};
 pub use anthropic::Anthropic;
 pub use antigravity::Antigravity;
 pub use aws_quick::{model_for as aws_quick_model_for, AwsQuick};

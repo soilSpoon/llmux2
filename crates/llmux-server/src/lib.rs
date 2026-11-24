@@ -28,12 +28,13 @@ use llmux_core::{Executor, GatewayError, InitError, LiveModels, RequestLog, Rout
 use llmux_providers::nous_portal::{NousPortalConfig, NousPortalSource};
 use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
 use llmux_providers::{
-    truncate_middle_for_format, Anthropic, Antigravity, AwsQuick, DeepAi, DevinAcp, DevinAcpConfig,
-    Freebuff, OpenAiCompat, OpenAiResponses, RequestMetadata, StaticKey, Xai,
+    truncate_middle_for_format, AcpAgent, Anthropic, Antigravity, AwsQuick, DeepAi, DevinAcp,
+    DevinAcpConfig, Freebuff, NoAuthSource, OpenAiCompat, OpenAiResponses, RequestMetadata,
+    StaticKey, Xai,
 };
 use llmux_types::{
-    provider, Billing, ContextOverflow, CredentialSource, GatewayRequest, GatewayResponse,
-    InboundFormat, ProviderRegistry, RequestId, UpstreamError,
+    provider, AcpAgentSpec, Billing, ContextOverflow, CredentialSource, GatewayRequest,
+    GatewayResponse, InboundFormat, ProviderRegistry, RequestId, UpstreamError,
 };
 use serde_json::{json, value::RawValue, Value};
 use sha2::{Digest, Sha256};
@@ -62,7 +63,10 @@ struct AppState {
     catalog: Arc<catalog::Catalog>,
 }
 
-fn provider_registry(devin: DevinAcpConfig) -> ProviderRegistry {
+fn provider_registry(
+    devin: DevinAcpConfig,
+    acp_agents: &std::collections::HashMap<Arc<str>, AcpAgentSpec>,
+) -> ProviderRegistry {
     let mut registry = ProviderRegistry::default();
     for kind in [provider::OPENAI, provider::OPENAI_COMPAT] {
         registry.register(Arc::new(OpenAiCompat::new(kind)));
@@ -75,6 +79,7 @@ fn provider_registry(devin: DevinAcpConfig) -> ProviderRegistry {
     registry.register(Arc::new(Antigravity::new()));
     registry.register(Arc::new(AwsQuick::new()));
     registry.register(Arc::new(DevinAcp::new(devin)));
+    registry.register(Arc::new(AcpAgent::new(acp_agents.clone())));
     registry
 }
 
@@ -96,12 +101,13 @@ fn static_sources(
 }
 
 pub fn validate_startup(mut config: RuntimeConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let registry = provider_registry(DevinAcpConfig::from_env());
+    let registry = provider_registry(DevinAcpConfig::from_env(), &config.acp_agents);
     let sources = static_sources(&mut config)?;
     let credentials = sources
         .keys()
         .chain(config.oauth.keys())
         .chain(config.nous.keys())
+        .chain(config.acp_agents.keys())
         .cloned()
         .collect();
     Executor::validate(&config, &registry, &credentials)?;
@@ -167,7 +173,7 @@ async fn build(
     devin: DevinAcpConfig,
     live: Arc<LiveModels>,
 ) -> Result<(Arc<RuntimeConfig>, Executor), Box<dyn Error + Send + Sync>> {
-    let registry = provider_registry(devin);
+    let registry = provider_registry(devin, &config.acp_agents);
     let mut sources = static_sources(&mut config)?;
     // Validate before starting OAuth sources: a rejected build must not
     // rotate refresh tokens the running gateway still relies on.
@@ -178,6 +184,7 @@ async fn build(
             .keys()
             .chain(config.oauth.keys())
             .chain(config.nous.keys())
+            .chain(config.acp_agents.keys())
             .cloned()
             .collect(),
     )?;
@@ -212,6 +219,11 @@ async fn build(
         nous.refresh_skew = credential.refresh_skew;
         nous.request_timeout = credential.request_timeout;
         sources.insert(id, Arc::new(NousPortalSource::start(nous).await?));
+    }
+    // acp_agent credentials name a local child process, not remote auth; the
+    // executor still requires a source per referenced credential id.
+    for id in config.acp_agents.keys() {
+        sources.insert(id.clone(), Arc::new(NoAuthSource));
     }
 
     let config = Arc::new(config);

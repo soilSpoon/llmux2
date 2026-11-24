@@ -21,6 +21,11 @@ pub const ANTIGRAVITY: &str = "antigravity";
 pub const DEVIN_ACP: &str = "devin_acp";
 /// Placeholder endpoint for deployments that have no network upstream.
 pub const DEVIN_ACP_BASE_URL: &str = "http://127.0.0.1/devin-acp";
+/// Agent CLI bridge: serves chat requests by driving a configured agent CLI
+/// child over ACP JSON-RPC on stdio. The credential declares the command.
+pub const ACP_AGENT: &str = "acp_agent";
+/// Placeholder endpoint for deployments that have no network upstream.
+pub const ACP_AGENT_BASE_URL: &str = "http://127.0.0.1/acp-agent";
 /// AWS Quick through the magpie gateway the desktop plugin exposes on loopback.
 pub const AWS_QUICK: &str = "aws_quick";
 /// Where the plugin's gateway listens, for deployments that omit `base_url`.
@@ -51,12 +56,13 @@ mod tests {
                 XAI,
                 ANTIGRAVITY,
                 DEVIN_ACP,
+                ACP_AGENT,
                 AWS_QUICK,
             ]
             .into_iter()
             .collect::<HashSet<_>>()
             .len(),
-            10
+            11
         );
         assert_eq!(ANTHROPIC_KEY_HEADER, "x-api-key");
     }
