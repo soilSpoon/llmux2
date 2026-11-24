@@ -247,6 +247,118 @@ async fn models_listing_is_filtered_by_the_requesting_key_policy() {
     );
 }
 
+fn free_only_config(url: &str, dir: &std::path::Path) -> String {
+    for (file, value) in [("owner", "owner-key"), ("ci", "ci-key")] {
+        std::fs::write(dir.join(file), value).unwrap();
+    }
+    let dir = dir.display();
+    format!(
+        r#"
+[server]
+client_keys = ["file:{dir}/owner", "file:{dir}/ci"]
+
+[[server.key_policies]]
+key = "file:{dir}/ci"
+free_only = true
+
+[[models]]
+name = "billed-only"
+[[models.deployments]]
+id = "billed"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-billed"
+billing = "billed"
+[[models]]
+name = "free-servable"
+[[models.deployments]]
+id = "free"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-free"
+billing = "free"
+[[models]]
+name = "mixed"
+[[models.deployments]]
+id = "mixed-billed"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-mixed-billed"
+billing = "billed"
+[[models.deployments]]
+id = "mixed-free"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-mixed-free"
+billing = "free"
+"#
+    )
+}
+
+#[tokio::test]
+async fn free_only_key_sees_no_billed_only_models() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let remote = TestServer::start(
+        Router::new()
+            .route("/v1/chat/completions", post(upstream))
+            .with_state(seen.clone()),
+    )
+    .await
+    .unwrap();
+    let gateway = TestServer::start(
+        llmux_server::app(RuntimeConfig::parse(&free_only_config(&remote.url(), dir.path())).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let gateway = gateway.url();
+
+    // ci key: billed-only models are treated as if they do not exist —
+    // absent from the list and unroutable — while any model with a usable
+    // free leg (including shared billed/free models) stays advertised.
+    assert_eq!(
+        listed(&gateway, "ci-key").await,
+        ["free-servable", "mixed"]
+    );
+    assert_eq!(
+        listed(&gateway, "owner-key").await,
+        ["billed-only", "free-servable", "mixed"]
+    );
+
+    let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+    let messages = |model: &str, key: &str| {
+        Request::post(format!("{gateway}/v1/chat/completions"))
+            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(
+                json!({"model":model,"messages":[{"role":"user","content":"hi"}]}).to_string(),
+            )))
+            .unwrap()
+    };
+
+    // The free-only key never spends on a billed leg — billed-only models
+    // fail without an upstream call, and mixed models hit only the free leg.
+    let response = client
+        .request(messages("billed-only", "ci-key"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(seen.lock().unwrap().is_empty(), "no upstream call");
+
+    let response = client
+        .request(messages("mixed", "ci-key"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(seen_models(&seen), ["up-mixed-free"]);
+}
+
 #[test]
 fn key_policies_must_reference_a_client_key() {
     let dir = tempfile::tempdir().unwrap();
