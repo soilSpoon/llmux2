@@ -113,6 +113,7 @@ async fn credentials(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
                 "kind": if meta.oauth { "oauth" } else { "api_key" },
                 "provider": meta.provider.0.as_ref(),
                 "disabled": active.executor.credential_disabled(id).unwrap_or(false),
+                "disabled_in_config": config.credential_disabled.contains(id),
                 "quota": config.credential_quotas.get(id),
             })
         })

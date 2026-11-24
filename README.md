@@ -139,8 +139,10 @@ With `dashboard_key` set, the same key also unlocks an HTTP admin API under
 `/admin`: `GET /admin/status`, `GET /admin/deployments`, `GET /admin/models`,
 `GET /admin/credentials`, `POST /admin/credentials/{id}/disabled`
 (`{"disabled": true}` stops routing through every deployment that draws on
-the credential; `false` resumes), and `POST /admin/reload`, which re-reads
-the config file and atomically swaps routing. A rejected reload keeps the
+the credential; `false` resumes; a credential may instead set
+`disabled = true` in config so the state survives restarts, reported as
+`disabled_in_config` on `GET /admin/credentials`), and `POST /admin/reload`,
+which re-reads the config file and atomically swaps routing. A rejected reload keeps the
 running configuration; changes to `server.listen`, `server.shutdown_timeout`
 and `server.drain_grace` only apply on restart and are reported in the
 response's `warnings`. Rotating or removing `dashboard_key` revokes the old

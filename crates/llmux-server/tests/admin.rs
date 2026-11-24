@@ -248,6 +248,73 @@ async fn disable_credential_stops_routing() {
 }
 
 #[tokio::test]
+async fn config_disabled_credential() {
+    env();
+    let upstream = upstream().await;
+    let config = config(&upstream.url()).replace(
+        "quota = { rpm = 10 }",
+        "quota = { rpm = 10 }\ndisabled = true",
+    );
+    let gateway = TestServer::start(
+        llmux_server::app(RuntimeConfig::parse(&config).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let client = Client::builder(TokioExecutor::new()).build_http();
+
+    let (status, body) = call(
+        &client,
+        "GET",
+        &format!("{}/admin/credentials", gateway.url()),
+        Some("admin-key"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cred = &body["credentials"][0];
+    assert_eq!(cred["disabled"], true);
+    assert_eq!(cred["disabled_in_config"], true);
+
+    let request = Request::post(format!("{}/v1/chat/completions", gateway.url()))
+        .header(header::AUTHORIZATION, "Bearer client-key")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec(
+                &json!({"model":"shared","messages":[{"role":"user","content":"hi"}]}),
+            )
+            .unwrap(),
+        )))
+        .unwrap();
+    let response = client.request(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let (status, _) = call(
+        &client,
+        "POST",
+        &format!("{}/admin/credentials/key/disabled", gateway.url()),
+        Some("admin-key"),
+        Some(json!({"disabled": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = call(
+        &client,
+        "GET",
+        &format!("{}/admin/credentials", gateway.url()),
+        Some("admin-key"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cred = &body["credentials"][0];
+    assert_eq!(cred["disabled"], false);
+    assert_eq!(cred["disabled_in_config"], true);
+}
+
+#[tokio::test]
 async fn reload_swaps_config_and_rejects_bad_config() {
     env();
     let upstream = upstream().await;

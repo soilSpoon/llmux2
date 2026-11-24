@@ -108,6 +108,9 @@ pub struct RuntimeConfig {
     pub acp_agents: HashMap<Arc<str>, AcpAgentSpec>,
     /// Quotas shared by every deployment that uses the credential.
     pub credential_quotas: HashMap<Arc<str>, QuotaSpec>,
+    /// Credentials that start disabled on every load; the admin API can still
+    /// toggle the live flag, but the config value re-applies on each reload.
+    pub credential_disabled: HashSet<Arc<str>>,
     pub credential_meta: HashMap<Arc<str>, CredentialMeta>,
     pub model_names: HashMap<Arc<str>, usize>,
     pub catch_all: Option<usize>,
@@ -256,6 +259,10 @@ enum RawCredential {
         key: String,
         #[serde(default)]
         quota: QuotaSpec,
+        /// Start disabled: routing skips every deployment on this credential
+        /// until the admin API re-enables it or the config changes.
+        #[serde(default)]
+        disabled: bool,
     },
     Oauth {
         id: String,
@@ -270,6 +277,10 @@ enum RawCredential {
         request_timeout_ms: Option<u64>,
         #[serde(default)]
         quota: QuotaSpec,
+        /// Start disabled: routing skips every deployment on this credential
+        /// until the admin API re-enables it or the config changes.
+        #[serde(default)]
+        disabled: bool,
     },
     NousPortal {
         id: String,
@@ -279,6 +290,10 @@ enum RawCredential {
         request_timeout_ms: Option<u64>,
         #[serde(default)]
         quota: QuotaSpec,
+        /// Start disabled: routing skips every deployment on this credential
+        /// until the admin API re-enables it or the config changes.
+        #[serde(default)]
+        disabled: bool,
     },
     /// A locally spawned agent CLI the gateway manages as a child and speaks
     /// ACP JSON-RPC to. `provider` must be `acp_agent`.
@@ -307,6 +322,10 @@ enum RawCredential {
         auth_method: Option<String>,
         #[serde(default)]
         quota: QuotaSpec,
+        /// Start disabled: routing skips every deployment on this credential
+        /// until the admin API re-enables it or the config changes.
+        #[serde(default)]
+        disabled: bool,
     },
 }
 
@@ -441,32 +460,37 @@ impl RawConfig {
         let mut nous = HashMap::new();
         let mut acp_agents = HashMap::new();
         let mut credential_quotas = HashMap::new();
+        let mut credential_disabled = HashSet::new();
         for credential in credentials {
-            let (id, provider, quota) = match &credential {
+            let (id, provider, quota, disabled) = match &credential {
                 RawCredential::ApiKey {
                     id,
                     provider,
                     quota,
+                    disabled,
                     ..
                 }
                 | RawCredential::Oauth {
                     id,
                     provider,
                     quota,
+                    disabled,
                     ..
                 }
                 | RawCredential::NousPortal {
                     id,
                     provider,
                     quota,
+                    disabled,
                     ..
                 }
                 | RawCredential::AcpAgent {
                     id,
                     provider,
                     quota,
+                    disabled,
                     ..
-                } => (id, provider, *quota),
+                } => (id, provider, *quota, *disabled),
             };
             if quota.concurrent.is_some()
                 || [quota.rpm, quota.rpd, quota.tpm, quota.tpd].contains(&Some(0))
@@ -493,6 +517,9 @@ impl RawConfig {
                     ),
                 },
             );
+            if disabled {
+                credential_disabled.insert(id.clone());
+            }
             if quota != QuotaSpec::default() {
                 credential_quotas.insert(id.clone(), quota);
             }
@@ -895,6 +922,7 @@ impl RawConfig {
 
         Ok(RuntimeConfig {
             credential_quotas,
+            credential_disabled,
             server: ServerConfig {
                 listen: server.listen,
                 client_keys,
