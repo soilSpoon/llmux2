@@ -1064,6 +1064,90 @@ fn restricted_model_lists_port_to_key_policies() {
 }
 
 #[test]
+fn restricted_dump_key_ports_lists_and_internal_fields() {
+    // SQLite dump rows store every list/object column as JSON-encoded text,
+    // and a real restricted key (cheaperinference-2) also carries
+    // OmniRoute-internal restrictions that have no llmux2 equivalent:
+    // API scopes, combo/connection allowlists, catalog scope, and the
+    // machine binding embedded in the key value. The port keeps the model
+    // lists and drops those internals with a warning.
+    let mut root: Value = serde_json::from_str(DB_FIXTURE).unwrap();
+    root["api_keys"] = json!([
+        {
+            "id": "client-uuid",
+            "key": "dump-restricted-secret",
+            "is_active": 1,
+            "model_access_mode": "restricted",
+            "allowed_models": "[\"cfpd/*\",\"deepseek-v4-flash\"]",
+            "blocked_models": "[\"zc/*\",\"dva/*\"]",
+            "scopes": "[\"self:usage\"]",
+            "allowed_combos": "[\"combo/*\",\"claude-sonnet-5.5\"]",
+            "allowed_connections": "[\"2960da9e-0b5a-4ebb-92fa-087433d0ffaf\"]",
+            "catalog_scope": "combos",
+            "machine_id": "cf3cdcc13dd47894"
+        },
+        {
+            "id": "still-strict",
+            "key": "rate-limited-secret",
+            "is_active": 1,
+            "model_access_mode": "restricted",
+            "allowed_models": "[\"cfpd/*\"]",
+            "rate_limits": "[{\"rpm\":10}]"
+        }
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+    assert_eq!(report.client_keys, 1);
+    let config = RuntimeConfig::load(&output).unwrap();
+    let idx = config
+        .server
+        .client_keys
+        .iter()
+        .position(|key| key.as_ref() == "dump-restricted-secret")
+        .expect("dump key in client_keys");
+    let policy = config.server.key_policies[idx]
+        .as_ref()
+        .expect("dump key carries a policy");
+    assert_eq!(
+        policy.models.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec!["cfpd/*", "deepseek-v4-flash"]
+    );
+    assert_eq!(
+        policy
+            .blocked
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["zc/*", "dva/*"]
+    );
+    let dropped = report
+        .warnings
+        .iter()
+        .find(|w| w.contains("dropped"))
+        .expect("warning names the dropped OmniRoute-internal fields");
+    for field in [
+        "scopes",
+        "allowedCombos",
+        "allowedConnections",
+        "catalogScope",
+        "machineId",
+    ] {
+        assert!(dropped.contains(field), "{dropped} names {field}");
+    }
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.contains("skipped restricted")));
+    let secrets: Vec<String> = fs::read_dir(dir.path().join("secrets"))
+        .unwrap()
+        .map(|e| fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect();
+    assert!(secrets.iter().any(|s| s == "dump-restricted-secret"));
+    assert!(!secrets.iter().any(|s| s == "rate-limited-secret"));
+}
+
+#[test]
 fn shared_empty_combo_diamonds_have_bounded_work() {
     let mut root: Value = serde_json::from_str(FIXTURE).unwrap();
     root["modelAliases"] = json!({});

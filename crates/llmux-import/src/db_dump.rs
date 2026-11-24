@@ -28,6 +28,33 @@ fn json_object(value: &Value, table: &str, column: &str) -> Result<Value, String
     Ok(parsed)
 }
 
+/// api_keys columns that SQLite stores as JSON-encoded text. Other dump
+/// producers emit real arrays; parsing only these columns keeps both forms
+/// identical downstream (unparseable values are left as-is so the importer's
+/// fail-closed checks still reject them).
+const API_KEY_JSON_LIST_COLUMNS: &[&str] = &[
+    "allowed_models",
+    "blocked_models",
+    "allowed_combos",
+    "allowed_connections",
+    "allowed_quotas",
+    "allowed_endpoints",
+    "ip_allowlist",
+    "rate_limits",
+    "scopes",
+    "preferred_connections",
+];
+
+fn json_list(value: &Value) -> Value {
+    match value
+        .as_str()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+    {
+        Some(parsed) if parsed.is_array() => parsed,
+        _ => value.clone(),
+    }
+}
+
 fn rows(root: &Value, table: &str) -> Result<Vec<Value>, String> {
     let Some(value) = root.get(table) else {
         return Ok(Vec::new());
@@ -42,10 +69,17 @@ fn rows(root: &Value, table: &str) -> Result<Vec<Value>, String> {
                 .ok_or_else(|| format!("{table} rows must be objects"))?;
             let mut normalized = Map::new();
             for (column, value) in fields {
+                let value = if table == "api_keys"
+                    && API_KEY_JSON_LIST_COLUMNS.contains(&column.as_str())
+                {
+                    json_list(value)
+                } else {
+                    value.clone()
+                };
                 let (name, value) = match column.as_str() {
                     "is_active" => {
                         let active = match value {
-                            Value::Bool(active) => *active,
+                            Value::Bool(active) => active,
                             value if value.as_i64() == Some(0) => false,
                             value if value.as_i64() == Some(1) => true,
                             _ => return Err(format!("{table}.is_active must be boolean or 0/1")),
@@ -53,17 +87,17 @@ fn rows(root: &Value, table: &str) -> Result<Vec<Value>, String> {
                         ("isActive".into(), Value::Bool(active))
                     }
                     "custom_headers_json" => {
-                        ("customHeaders".into(), json_object(value, table, column)?)
+                        ("customHeaders".into(), json_object(&value, table, column)?)
                     }
                     "provider_specific_data" => (
                         "providerSpecificData".into(),
-                        json_object(value, table, column)?,
+                        json_object(&value, table, column)?,
                     ),
                     "rate_limit_overrides_json" => (
                         "rateLimitOverrides".into(),
-                        json_object(value, table, column)?,
+                        json_object(&value, table, column)?,
                     ),
-                    _ => (camel_case(column), value.clone()),
+                    _ => (camel_case(column), value),
                 };
                 normalized.insert(name, value);
             }
