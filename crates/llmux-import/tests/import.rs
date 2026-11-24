@@ -1103,6 +1103,40 @@ fn overlay_expires_at_stays_a_bare_toml_datetime() {
 }
 
 #[test]
+fn overlay_header_named_like_a_datetime_field_stays_a_string() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("llmux.toml");
+    let overlay = dir.path().join("site.toml");
+    fs::write(
+        &overlay,
+        "[[credentials]]\nid = \"overlay-cred\"\nkind = \"api_key\"\nprovider = \"openai_compat\"\n\
+         key = \"env:OVERLAY_KEY\"\n\
+         [[models]]\nname = \"with-header\"\n[[models.deployments]]\nid = \"overlay-header\"\n\
+         credential = \"overlay-cred\"\nupstream_model = \"h\"\n\
+         base_url = \"https://overlay.example.com/v1\"\n\
+         headers = { expires_at = \"2030-01-01T00:00:00Z\" }\n",
+    )
+    .unwrap();
+    unsafe { std::env::set_var("OVERLAY_KEY", "synthetic") };
+    llmux_import::import_with_options(
+        DB_FIXTURE,
+        &output,
+        None,
+        &ImportOptions {
+            overlay: Some(&overlay),
+            ..ImportOptions::default()
+        },
+    )
+    .unwrap();
+    // The header is a user string inside a free-form map: it must stay
+    // quoted. A bare datetime breaks HashMap<String, String> on load.
+    assert!(fs::read_to_string(&output)
+        .unwrap()
+        .contains("expires_at = \"2030-01-01T00:00:00Z\""));
+    RuntimeConfig::load(&output).unwrap();
+}
+
+#[test]
 fn overlay_disabled_marks_an_emitted_credential_disabled() {
     unsafe { std::env::set_var("OVERLAY_KEY", "synthetic") };
     let dir = tempfile::tempdir().unwrap();

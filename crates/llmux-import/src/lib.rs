@@ -745,32 +745,42 @@ fn overlay_value(value: toml::Value) -> Result<Value, String> {
     })
 }
 
-/// Fields typed as TOML datetimes in llmux-config. `overlay_value` converts
-/// them to RFC 3339 strings for the JSON merge; `config_to_toml` restores
-/// them to bare datetimes before emission — a quoted `expires_at` fails
+/// Deployment fields typed as TOML datetimes in llmux-config — the only
+/// schema positions needing restoration. `overlay_value` converts them to
+/// RFC 3339 strings for the JSON merge; `config_to_toml` restores them to
+/// bare datetimes before emission — a quoted `expires_at` fails
 /// llmux-config's parse. Extend when the schema adds datetime fields.
-const TOML_DATETIME_KEYS: &[&str] = &["expires_at"];
+const TOML_DATETIME_KEYS: &[&str] = &["expires_at", "priority_boost_until"];
 
 fn restore_toml_datetimes(value: &mut toml::Value) {
-    match value {
-        toml::Value::Table(table) => {
-            for (key, inner) in table.iter_mut() {
-                if TOML_DATETIME_KEYS.contains(&key.as_str()) {
-                    if let toml::Value::String(stamp) = inner {
-                        if let Ok(at) = stamp.parse() {
-                            *inner = toml::Value::Datetime(at);
-                        }
+    // Restore only at the declared schema path — models[*].deployments[*].
+    // Same-named keys inside free-form maps (headers, credential env) are
+    // user strings: converting one breaks `HashMap<String, String>` on load.
+    let toml::Value::Table(root) = value else {
+        return;
+    };
+    let Some(toml::Value::Array(models)) = root.get_mut("models") else {
+        return;
+    };
+    for model in models {
+        let toml::Value::Table(model) = model else {
+            continue;
+        };
+        let Some(toml::Value::Array(deployments)) = model.get_mut("deployments") else {
+            continue;
+        };
+        for deployment in deployments {
+            let toml::Value::Table(deployment) = deployment else {
+                continue;
+            };
+            for key in TOML_DATETIME_KEYS {
+                if let Some(toml::Value::String(stamp)) = deployment.get(*key).cloned() {
+                    if let Ok(at) = stamp.parse() {
+                        deployment.insert((*key).to_owned(), toml::Value::Datetime(at));
                     }
                 }
-                restore_toml_datetimes(inner);
             }
         }
-        toml::Value::Array(items) => {
-            for item in items {
-                restore_toml_datetimes(item);
-            }
-        }
-        _ => {}
     }
 }
 
