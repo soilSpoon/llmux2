@@ -142,6 +142,50 @@ fn all_gates_absent_fails() {
     assert!(errors(&d).contains(&NO_GENUINE.into()));
 }
 #[test]
+fn differently_cased_skipped_check_run_supersedes_genuine() {
+    let mut d = fixture();
+    d["reviews"] = json!([]);
+    // A newer skipped run under a different casing must still supersede an
+    // older genuine run — dedup keys names case-sensitively, so both survive.
+    let older = check_run(
+        2,
+        "CodeSolar Review",
+        "success",
+        "codesolarlght",
+        "Looks good",
+    );
+    let newer = check_run(
+        3,
+        "codesolar review",
+        "success",
+        "codesolarlght",
+        "Full review skipped: no credits remaining",
+    );
+    d["checks"].as_array_mut().unwrap().extend([older, newer]);
+    assert!(errors(&d).contains(&NO_GENUINE.into()));
+}
+#[test]
+fn differently_cased_genuine_check_run_supersedes_skipped() {
+    let mut d = fixture();
+    d["reviews"] = json!([]);
+    let older = check_run(
+        2,
+        "codesolar review",
+        "success",
+        "codesolarlght",
+        "Full review skipped: trial expired",
+    );
+    let newer = check_run(
+        3,
+        "CodeSolar Review",
+        "success",
+        "codesolarlght",
+        "Looks good",
+    );
+    d["checks"].as_array_mut().unwrap().extend([older, newer]);
+    assert!(errors(&d).is_empty());
+}
+#[test]
 fn clean_status_and_check_run_descriptions_count() {
     let mut d = fixture();
     d["reviews"] = json!([]);

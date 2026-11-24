@@ -281,13 +281,20 @@ fn evaluate(data: &Value, required: &[String], policy: &Value) -> Result<Vec<Str
                 ));
             }
         }
-        if let Some((_, check)) = checks
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(context))
-        {
-            if normalize(optional_text(&check["app"]["slug"])) == login
-                && check["conclusion"] == "success"
+        // Latest-by-id run wins across casings: the per-name dedup above keys
+        // run names case-sensitively, so a newer skipped run under a
+        // different casing would otherwise hide behind a stale genuine one.
+        let mut run = None;
+        for check in sorted(field(data, "checks")?)? {
+            if text(field(check, "head_sha")?)? == sha
+                && text(field(check, "name")?)?.eq_ignore_ascii_case(context)
+                && normalize(optional_text(&check["app"]["slug"])) == login
             {
+                run = Some(check);
+            }
+        }
+        if let Some(check) = run {
+            if check["conclusion"] == "success" {
                 let output = [
                     optional_text(&check["output"]["title"]),
                     optional_text(&check["output"]["summary"]),
