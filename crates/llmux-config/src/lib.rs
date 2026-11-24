@@ -297,6 +297,10 @@ enum RawCredential {
         home: String,
         turn_timeout_ms: Option<u64>,
         session_mode: Option<RawAcpSessionMode>,
+        /// ACP `authenticate` method id called after `initialize`, for agents
+        /// that require authentication before `session/new` (Antigravity's
+        /// `agy acp` uses `oauth-personal`).
+        auth_method: Option<String>,
         #[serde(default)]
         quota: QuotaSpec,
     },
@@ -500,6 +504,7 @@ impl RawConfig {
                     home,
                     turn_timeout_ms,
                     session_mode,
+                    auth_method,
                     ..
                 } => {
                     if provider.0.as_ref() != provider::ACP_AGENT {
@@ -543,6 +548,15 @@ impl RawConfig {
                             Ok((name.clone(), value))
                         })
                         .collect::<Result<BTreeMap<_, _>, ConfigError>>()?;
+                    let auth_method = auth_method
+                        .map(|m| {
+                            if m.is_empty() {
+                                Err(invalid("acp_agent auth_method must be nonempty"))
+                            } else {
+                                Ok(m)
+                            }
+                        })
+                        .transpose()?;
                     acp_agents.insert(
                         id,
                         AcpAgentSpec {
@@ -556,6 +570,7 @@ impl RawConfig {
                                 RawAcpSessionMode::PerRequest => AcpSessionMode::PerRequest,
                                 RawAcpSessionMode::Persistent => AcpSessionMode::Persistent,
                             },
+                            auth_method,
                         },
                     );
                 }
@@ -1989,6 +2004,12 @@ upstream_model = "upstream"
         assert_eq!(spec.cwd.as_deref(), Some(Path::new("/tmp/agent-work")));
         assert_eq!(spec.turn_timeout, Duration::from_secs(5));
         assert_eq!(spec.mode, AcpSessionMode::Persistent);
+        let authed = RuntimeConfig::parse(&acp_config("auth_method = \"oauth-personal\"")).unwrap();
+        assert_eq!(
+            authed.acp_agents["agent"].auth_method.as_deref(),
+            Some("oauth-personal")
+        );
+        assert!(RuntimeConfig::parse(&acp_config("auth_method = \"\"")).is_err());
         assert_eq!(
             loaded.deployments[0].provider.0.as_ref(),
             provider::ACP_AGENT

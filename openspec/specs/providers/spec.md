@@ -249,7 +249,8 @@ and speaking ACP JSON-RPC on its stdio (`initialize`, `session/new`,
 `session/set_mode` "ask", `session/prompt`). The credential SHALL declare the
 child's `command` as an absolute path, plus `args`, an `env` allowlist, a
 sandbox `home`, an optional `cwd` defaulting to `home`, an optional
-`turn_timeout_ms`, and an optional `session_mode`. The child SHALL run under a
+`turn_timeout_ms`, an optional `session_mode`, and an optional `auth_method`.
+The child SHALL run under a
 scrubbed environment whose `HOME` and XDG directories point at `home` (so the
 CLI resolves its own config and sign-ins there), with only the declared `env`
 entries added on top; `env` values MAY use `env:`/`file:` references like
@@ -265,6 +266,13 @@ per credential id and multiplex `session/new` turns through it, serializing
 concurrent requests; a dead child SHALL be dropped and lazily respawned, and a
 turn that fails with a definitive RPC error response SHALL keep the child
 while any other failure drops it.
+
+`auth_method` SHALL name an ACP `authenticate` method id; when set, the
+handshake SHALL call `authenticate` with it after `initialize` and before any
+`session/new` — for an agent with cached credentials this is a silent token
+refresh, while an agent that is not signed in SHALL fail or stall the spawn
+(and thus the turn, bound by `turn_timeout`) rather than reach `session/new`
+unauthenticated.
 
 Reply chunks from `session/update` `agent_message_chunk` notifications SHALL
 stream as OpenAI deltas and aggregate into the non-streamed completion;

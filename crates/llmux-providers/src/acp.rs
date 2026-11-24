@@ -503,13 +503,24 @@ impl AcpSession {
         }
     }
 
-    /// The ACP handshake; once per child lifetime.
-    pub(crate) async fn handshake(&mut self) -> Result<(), UpstreamError> {
+    /// The ACP handshake; once per child lifetime. `auth_method` selects the
+    /// `authenticate` method the agent demands before `session/new` — for an
+    /// agent with cached credentials this is a silent token refresh, while an
+    /// unauthenticated agent errors (or stalls for an interactive sign-in the
+    /// turn timeout bounds).
+    pub(crate) async fn handshake(
+        &mut self,
+        auth_method: Option<&str>,
+    ) -> Result<(), UpstreamError> {
         self.call(
             "initialize",
             json!({"protocolVersion":1,"clientInfo":{"name":"llmux","version":"1"},"clientCapabilities":{}}),
         )
         .await?;
+        if let Some(method) = auth_method {
+            self.call("authenticate", json!({"methodId":method}))
+                .await?;
+        }
         Ok(())
     }
 
