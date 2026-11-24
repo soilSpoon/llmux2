@@ -223,8 +223,9 @@ a container-runtime host alias (`host.containers.internal`,
 `host.docker.internal`, `gateway.docker.internal`) on the emitted listen
 port — SHALL be skipped with a warning, because it is the OmniRoute-to-llmux2
 bridge and importing it would loop requests into llmux2 itself. The check
-SHALL use the `--listen` port, or 8080 when `--listen` is absent. Host aliases
-on other ports SHALL import normally.
+SHALL use the port the emitted config actually binds: the `--listen` port,
+else the site overlay's `[server].listen` port, else 8080. Host aliases on
+other ports SHALL import normally.
 
 #### Scenario: Bridge node on the listen port
 
@@ -233,9 +234,17 @@ imported listen is `127.0.0.1:8090`
 THEN the connection is skipped with a gateway warning, its combo steps report
 no eligible connection, and import succeeds.
 
+#### Scenario: Bridge node on an overlay-only listen port
+
+WHEN a node baseUrl is `http://host.containers.internal:8090/v1`, no
+`--listen` is passed, and the site overlay sets `server.listen` to
+`127.0.0.1:8090`
+THEN the connection is skipped with a gateway warning.
+
 #### Scenario: Same alias on another port
 
-WHEN a node baseUrl uses a gateway host alias on a port other than listen
+WHEN a node baseUrl uses a gateway host alias on a port other than the
+emitted listen port
 THEN the connection is not treated as self-referential.
 
 ### Requirement: Reviewed Morph official migration and logprobs order

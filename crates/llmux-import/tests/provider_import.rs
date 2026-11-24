@@ -265,6 +265,81 @@ fn gateway_self_referential_connection_is_skipped() {
     assert!(config.model_names.contains_key("baseline"));
 }
 
+// The same bridge must be recognized when the effective listen address comes
+// only from the site overlay's `[server].listen` — scheduled re-imports pass
+// no `--listen`, so the guard has to use the port the emitted config will
+// actually bind, not the 8080 default.
+#[test]
+fn overlay_listen_alone_guards_self_referential_connection() {
+    let mut root = base();
+    root["providerNodes"] = json!([
+        {"id":"openai-compatible-chat-self","prefix":"llmux","type":"openai-compatible","apiType":"chat","baseUrl":"http://host.containers.internal:8090/v1"}
+    ]);
+    root["providerConnections"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"self","provider":"openai-compatible-chat-self","authType":"none"}));
+    root["combos"][0]["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("llmux/swe-2"));
+    root["combos"].as_array_mut().unwrap().push(json!({
+        "name":"swe-2",
+        "models":["llmux/swe-2"]
+    }));
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let overlay = dir.path().join("overlay.toml");
+    std::fs::write(&overlay, "[server]\nlisten = \"127.0.0.1:8090\"\n").unwrap();
+    let options = ImportOptions {
+        overlay: Some(&overlay),
+        ..ImportOptions::default()
+    };
+    let report =
+        llmux_import::import_with_options(&root.to_string(), &output, None, &options).unwrap();
+    let warnings = report.warnings.join("\n");
+    assert!(warnings.contains("gateway"), "{warnings}");
+    let config = RuntimeConfig::load(&output).unwrap();
+    assert!(config
+        .deployments
+        .iter()
+        .all(|dep| !dep.base_url.to_string().contains("containers.internal")));
+    assert!(!config.model_names.contains_key("swe-2"));
+}
+
+// A host-alias upstream on a port this gateway does not bind is a legitimate
+// upstream (some other service on the host), not the OmniRoute -> llmux2
+// bridge: it must not be skipped just because 8080 is the emitted default.
+#[test]
+fn alias_upstream_on_a_non_listen_port_is_kept() {
+    let mut root = base();
+    root["providerNodes"] = json!([
+        {"id":"openai-compatible-chat-host","prefix":"hostsvc","type":"openai-compatible","apiType":"chat","baseUrl":"https://host.containers.internal:8080/v1"}
+    ]);
+    root["providerConnections"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"hostsvc","provider":"openai-compatible-chat-host","authType":"none"}));
+    root["combos"][0]["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("hostsvc/swe-2"));
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let overlay = dir.path().join("overlay.toml");
+    std::fs::write(&overlay, "[server]\nlisten = \"127.0.0.1:8090\"\n").unwrap();
+    let options = ImportOptions {
+        overlay: Some(&overlay),
+        ..ImportOptions::default()
+    };
+    llmux_import::import_with_options(&root.to_string(), &output, None, &options).unwrap();
+    let config = RuntimeConfig::load(&output).unwrap();
+    assert!(config.deployments.iter().any(|dep| dep
+        .base_url
+        .to_string()
+        .contains("containers.internal:8080")));
+}
+
 #[test]
 fn xai_oauth_imports_openai_compat_deployment_and_token_url() {
     let mut root = base();
