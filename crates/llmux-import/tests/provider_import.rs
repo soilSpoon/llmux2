@@ -222,6 +222,48 @@ fn keyed_loopback_bridges_import_as_openai_compat_at_their_base_url() {
     assert_eq!(direct.upstream_model.as_ref(), "meta/llama-3.1-8b-instruct");
 }
 
+// An OmniRoute node pointing back at this gateway (the OmniRoute -> llmux2
+// bridge) resolves to the emitted listen port through a container-runtime
+// host alias. Importing it would loop requests into llmux2 itself, so the
+// connection is skipped with a warning instead of producing a config the
+// validator rejects.
+#[test]
+fn gateway_self_referential_connection_is_skipped() {
+    let mut root = base();
+    root["providerNodes"] = json!([
+        {"id":"openai-compatible-chat-self","prefix":"llmux","type":"openai-compatible","apiType":"chat","baseUrl":"http://host.containers.internal:8090/v1"}
+    ]);
+    root["providerConnections"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"self","provider":"openai-compatible-chat-self","authType":"none"}));
+    root["combos"][0]["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("llmux/swe-2"));
+    root["combos"].as_array_mut().unwrap().push(json!({
+        "name":"swe-2",
+        "models":["llmux/swe-2"]
+    }));
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let options = ImportOptions {
+        listen: Some("127.0.0.1:8090"),
+        ..ImportOptions::default()
+    };
+    let report =
+        llmux_import::import_with_options(&root.to_string(), &output, None, &options).unwrap();
+    let warnings = report.warnings.join("\n");
+    assert!(warnings.contains("gateway"), "{warnings}");
+    let config = RuntimeConfig::load(&output).unwrap();
+    assert!(config
+        .deployments
+        .iter()
+        .all(|dep| !dep.base_url.to_string().contains("containers.internal")));
+    assert!(!config.model_names.contains_key("swe-2"));
+    assert!(config.model_names.contains_key("baseline"));
+}
+
 #[test]
 fn xai_oauth_imports_openai_compat_deployment_and_token_url() {
     let mut root = base();

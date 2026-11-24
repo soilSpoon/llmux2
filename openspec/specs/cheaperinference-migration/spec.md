@@ -179,6 +179,28 @@ THEN the generated deployment loads with `temperature` and `top_p` stripped.
 WHEN the upstream model is `claude-sonnet-4-6`
 THEN no field stripping is added.
 
+### Requirement: Gateway self-referential connections are skipped
+
+An OmniRoute connection whose resolved upstream URL targets this gateway —
+a container-runtime host alias (`host.containers.internal`,
+`host.docker.internal`, `gateway.docker.internal`) on the emitted listen
+port — SHALL be skipped with a warning, because it is the OmniRoute-to-llmux2
+bridge and importing it would loop requests into llmux2 itself. The check
+SHALL use the `--listen` port, or 8080 when `--listen` is absent. Host aliases
+on other ports SHALL import normally.
+
+#### Scenario: Bridge node on the listen port
+
+WHEN a node baseUrl is `http://host.containers.internal:8090/v1` and the
+imported listen is `127.0.0.1:8090`
+THEN the connection is skipped with a gateway warning, its combo steps report
+no eligible connection, and import succeeds.
+
+#### Scenario: Same alias on another port
+
+WHEN a node baseUrl uses a gateway host alias on a port other than listen
+THEN the connection is not treated as self-referential.
+
 ### Requirement: Reviewed Morph official migration and logprobs order
 The importer SHALL migrate only built-in Morph loopback connection overrides to
 `https://api.morphllm.com/v1`, warning about the reviewed endpoint substitution.

@@ -163,9 +163,8 @@ pub(super) fn validate(config: &Value, dir: &Path) -> Result<(), String> {
         let content = toml::to_string(&value).map_err(|_| "could not encode configuration")?;
         llmux_config::RuntimeConfig::parse(&content)
             .map(|_| ())
-            .map_err(|_| "generated configuration failed llmux validation (check upstream URLs)")
+            .map_err(|err| format!("generated configuration failed llmux validation: {err}"))
     })()
-    .map_err(str::to_owned)
 }
 
 #[cfg(test)]
