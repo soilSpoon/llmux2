@@ -882,12 +882,26 @@ fn classify_error_details(
                 | "credits_exhausted"
         )
     });
+    // Cloudflare Workers AI reports errors in a top-level `errors[]` array —
+    // codes 4006/3036 or the "daily free allocation" phrasing mean the
+    // account's daily neuron allocation is spent until 00:00 UTC.
+    let cf_daily = status == StatusCode::TOO_MANY_REQUESTS
+        && cloudflare_error(&body).is_some_and(|(code, message)| {
+            matches!(code, 3036 | 4006) || message.contains("daily free allocation")
+        });
+    // Monthly-plan providers (for example Morph) say so in the message.
+    let monthly = message.contains("monthly quota");
+    // A plan without an API allowance can never serve: this leg is parked
+    // until the config reloads rather than retried as a transient limit.
+    let not_provisioned =
+        [code, kind].contains(&"no_api_allowance") || message.contains("no api allowance");
     match status.as_u16() {
+        _ if not_provisioned => UpstreamError::NotProvisioned,
         402 => UpstreamError::QuotaExhausted {
-            reset_at: wait.and_then(|wait| now.checked_add(wait)),
+            reset_at: quota_reset(now, cf_daily, monthly, wait),
         },
-        429 if quota || daily => UpstreamError::QuotaExhausted {
-            reset_at: wait.and_then(|wait| now.checked_add(wait)),
+        429 if quota || daily || cf_daily || monthly => UpstreamError::QuotaExhausted {
+            reset_at: quota_reset(now, cf_daily, monthly, wait),
         },
         429 => UpstreamError::RateLimited { retry_after: wait },
         401 => UpstreamError::Auth { refreshable: true },
@@ -914,6 +928,59 @@ fn classify_error_details(
         400..=499 => UpstreamError::BadRequest { status, body },
         _ => bad_gateway(),
     }
+}
+
+/// The first entry of a Cloudflare-style `{"errors":[{"code":N,"message":M}]}`
+/// top-level array — an error envelope with no `error` object.
+fn cloudflare_error(body: &[u8]) -> Option<(i64, String)> {
+    let first = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("errors")?
+        .as_array()?
+        .first()?
+        .clone();
+    let code = first.get("code")?.as_i64()?;
+    let message = first
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    Some((code, message))
+}
+
+/// Provider-reported resets are authoritative and outrank generic retry hints:
+/// a daily quota resets at the next 00:00 UTC, a monthly quota on the first
+/// day of the next month at 00:00 UTC.
+fn quota_reset(
+    now: SystemTime,
+    daily: bool,
+    monthly: bool,
+    wait: Option<Duration>,
+) -> Option<SystemTime> {
+    if daily {
+        return Some(next_utc_midnight(now));
+    }
+    if monthly {
+        return Some(next_month(now));
+    }
+    wait.and_then(|wait| now.checked_add(wait))
+}
+
+fn next_utc_midnight(now: SystemTime) -> SystemTime {
+    let today = time::OffsetDateTime::from(now).date();
+    let tomorrow = today.next_day().unwrap_or(today);
+    SystemTime::from(tomorrow.midnight().assume_utc())
+}
+
+fn next_month(now: SystemTime) -> SystemTime {
+    let date = time::OffsetDateTime::from(now).date();
+    let (year, month) = if date.month() == time::Month::December {
+        (date.year() + 1, time::Month::January)
+    } else {
+        (date.year(), date.month().next())
+    };
+    let first = time::Date::from_calendar_date(year, month, 1).unwrap_or(date);
+    SystemTime::from(first.midnight().assume_utc())
 }
 
 #[derive(Deserialize)]
@@ -1512,6 +1579,221 @@ mod tests {
             HeaderValue::from_static("999999999999999999999999"),
         );
         check(&headers, Some(MAX_RETRY));
+    }
+
+    #[test]
+    fn cloudflare_daily_quota_is_exhausted_until_utc_midnight() {
+        // 2026-01-15T10:30:00Z — the daily neuron allocation resets at 00:00 UTC.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_768_473_000);
+        let midnight = time::Date::from_calendar_date(2026, time::Month::January, 16)
+            .unwrap()
+            .midnight()
+            .assume_utc();
+        let midnight = SystemTime::from(midnight);
+        for (code, message) in [
+            // 4006 is what the REST API emits today; 3036 is the documented
+            // internal code for the same "account limited" condition.
+            (4006, "You have used up your daily free allocation of 10,000 neurons. Please upgrade to Cloudflare's Workers Paid plan if you would like to continue usage."),
+            (3036, "You have used up your daily free allocation of 10,000 neurons. Please upgrade to Cloudflare's Workers Paid plan if you would like to continue usage."),
+            // The daily-allocation phrasing alone is just as distinctive.
+            (1000, "You have used up your daily free allocation of 10,000 neurons"),
+        ] {
+            let body = format!(
+                r#"{{"success":false,"errors":[{{"code":{code},"message":"{message}"}}],"messages":[],"result":null}}"#
+            );
+            assert!(
+                matches!(
+                    classify_error(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        &HeaderMap::new(),
+                        Bytes::from(body.clone()),
+                        now,
+                    ),
+                    UpstreamError::QuotaExhausted { reset_at: Some(reset) } if reset == midnight
+                ),
+                "{body}"
+            );
+        }
+        // A capacity 429 stays a transient rate limit, not quota exhaustion.
+        let capacity = r#"{"success":false,"errors":[{"code":3040,"message":"Capacity temporarily exceeded, please try again."}],"messages":[],"result":null}"#;
+        assert!(matches!(
+            classify_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                &HeaderMap::new(),
+                Bytes::from_static(capacity.as_bytes()),
+                now,
+            ),
+            UpstreamError::RateLimited { .. }
+        ));
+        // An unrelated `errors[]` envelope keeps the default 429 handling.
+        let other = r#"{"errors":[{"code":7003,"message":"User Input Error"}]}"#;
+        assert!(matches!(
+            classify_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                &HeaderMap::new(),
+                Bytes::from_static(other.as_bytes()),
+                now,
+            ),
+            UpstreamError::RateLimited { retry_after: None }
+        ));
+    }
+
+    #[test]
+    fn a_monthly_quota_error_resets_at_the_next_month_boundary() {
+        // 2026-01-15T10:30:00Z → reset 2026-02-01T00:00:00Z.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_768_473_000);
+        let next_month = time::Date::from_calendar_date(2026, time::Month::February, 1)
+            .unwrap()
+            .midnight()
+            .assume_utc();
+        let next_month = SystemTime::from(next_month);
+        for (status, body) in [
+            (
+                StatusCode::PAYMENT_REQUIRED,
+                r#"{"error":{"code":"insufficient_quota","message":"Monthly quota exceeded. Top up to continue."}}"#,
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"type":"quota_exceeded","message":"monthly quota exceeded for this plan"}}"#,
+            ),
+        ] {
+            assert!(
+                matches!(
+                    classify_error(status, &HeaderMap::new(), Bytes::from_static(body.as_bytes()), now),
+                    UpstreamError::QuotaExhausted { reset_at: Some(reset) } if reset == next_month
+                ),
+                "{status} {body}"
+            );
+        }
+        // A December reset rolls into January of the next year.
+        let december = time::Date::from_calendar_date(2026, time::Month::December, 15)
+            .unwrap()
+            .midnight()
+            .assume_utc();
+        let january = time::Date::from_calendar_date(2027, time::Month::January, 1)
+            .unwrap()
+            .midnight()
+            .assume_utc();
+        assert!(matches!(
+            classify_error(
+                StatusCode::PAYMENT_REQUIRED,
+                &HeaderMap::new(),
+                Bytes::from_static(br#"{"error":{"message":"monthly quota exceeded"}}"#),
+                SystemTime::from(december),
+            ),
+            UpstreamError::QuotaExhausted { reset_at: Some(reset) } if reset == SystemTime::from(january)
+        ));
+    }
+
+    #[test]
+    fn a_missing_plan_allowance_is_not_provisioned_not_throttled() {
+        for (status, body) in [
+            (
+                StatusCode::FORBIDDEN,
+                r#"{"error":{"code":"no_api_allowance","message":"Your plan has no API allowance for this model."}}"#,
+            ),
+            (
+                StatusCode::PAYMENT_REQUIRED,
+                r#"{"error":{"message":"This plan includes no API allowance."}}"#,
+            ),
+        ] {
+            assert!(
+                matches!(
+                    classify_error(
+                        status,
+                        &HeaderMap::new(),
+                        Bytes::from_static(body.as_bytes()),
+                        SystemTime::UNIX_EPOCH
+                    ),
+                    UpstreamError::NotProvisioned
+                ),
+                "{status} {body}"
+            );
+        }
+        // A plain forbidden response still classifies as an auth failure.
+        assert!(matches!(
+            classify(403, r#"{"error":{"message":"forbidden"}}"#),
+            UpstreamError::Auth { refreshable: false }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_cloudflare_429_over_the_wire_exhausts_credential_quota() {
+        use axum::{response::IntoResponse, routing::post, Json, Router};
+        use http_body_util::Full;
+        use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+        use llmux_testkit::TestServer;
+        use llmux_types::{Billing, DeploymentIdx, QuotaSpec, RequestId};
+        use serde_json::{json, Value};
+
+        let server = TestServer::start(Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(_body): Json<Value>| async move {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"success":false,"errors":[{"code":4006,"message":"You have used up your daily free allocation of 10,000 neurons."}],"messages":[],"result":null})),
+                )
+                    .into_response()
+            }),
+        ))
+        .await
+        .unwrap();
+        let adapter = OpenAiCompat::new(provider::OPENAI_COMPAT);
+        let dep = Deployment {
+            headers: Default::default(),
+            idx: DeploymentIdx(0),
+            id: "cf".into(),
+            provider: adapter.kind().clone(),
+            credential: "key".into(),
+            base_url: format!("{}/v1", server.url()).parse().unwrap(),
+            upstream_model: "@cf/meta/llama-3.3-70b".into(),
+            strip_request_fields: Box::default(),
+            priority: 0,
+            quota: QuotaSpec::default(),
+            timeout: Duration::from_secs(5),
+            max_context: None,
+            expires_at: None,
+            billing: Billing::Billed,
+            fallback: false,
+        };
+        let req = GatewayRequest {
+            format: InboundFormat::OpenAiChat,
+            model: "cf".into(),
+            stream: false,
+            body: Bytes::from_static(br#"{"model":"cf","messages":[]}"#),
+            est_input_tokens: 0,
+            anthropic_headers: HeaderMap::new(),
+            max_output_tokens: None,
+            context_overflow: None,
+            request_id: RequestId("r".into()),
+            end_user: None,
+            client_key: None,
+            image_count: 0,
+            free_only: false,
+        };
+        let request = adapter
+            .build_request(&req, &dep, &AuthMaterial::None)
+            .await
+            .unwrap();
+        let response = Client::builder(TokioExecutor::new())
+            .build_http()
+            .request(request.map(Full::new))
+            .await
+            .unwrap();
+        let Err(UpstreamError::QuotaExhausted {
+            reset_at: Some(reset),
+        }) = adapter.parse_response(&req, &dep, response).await
+        else {
+            panic!("expected a credential quota exhaustion with a reset")
+        };
+        // The reset lands at the next 00:00 UTC, never sooner.
+        let tomorrow = time::OffsetDateTime::from(SystemTime::now())
+            .date()
+            .next_day()
+            .unwrap()
+            .midnight()
+            .assume_utc();
+        assert_eq!(reset, SystemTime::from(tomorrow));
     }
 
     #[test]

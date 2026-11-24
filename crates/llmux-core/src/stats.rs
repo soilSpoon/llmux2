@@ -51,9 +51,10 @@ impl FallbackStats {
 
 pub(crate) type CatchAllCounter = Mutex<CatchAllStats>;
 
-const FAILURE_CLASSES: [&str; 10] = [
+const FAILURE_CLASSES: [&str; 11] = [
     "rate_limited",
     "quota_exhausted",
+    "not_provisioned",
     "auth",
     "bad_request",
     "context_length",
@@ -68,13 +69,14 @@ fn failure_index(kind: ErrorKind) -> usize {
     match kind {
         ErrorKind::RateLimited => 0,
         ErrorKind::QuotaExhausted => 1,
-        ErrorKind::Auth => 2,
-        ErrorKind::BadRequest => 3,
-        ErrorKind::ContextLength => 4,
-        ErrorKind::ServerError => 5,
-        ErrorKind::Timeout => 6,
-        ErrorKind::ConnectError => 7,
-        ErrorKind::StreamBroken => 8,
+        ErrorKind::NotProvisioned => 2,
+        ErrorKind::Auth => 3,
+        ErrorKind::BadRequest => 4,
+        ErrorKind::ContextLength => 5,
+        ErrorKind::ServerError => 6,
+        ErrorKind::Timeout => 7,
+        ErrorKind::ConnectError => 8,
+        ErrorKind::StreamBroken => 9,
     }
 }
 
@@ -88,9 +90,11 @@ pub(crate) enum SkipReason {
     UnsupportedConversion,
     UpstreamUnavailable,
     Expired,
+    /// The provider does not provision this deployment; parked until reload.
+    NotProvisioned,
 }
 
-const SKIP_REASONS: [&str; 8] = [
+const SKIP_REASONS: [&str; 9] = [
     "disabled",
     "unsupported_format",
     "context_length",
@@ -99,6 +103,7 @@ const SKIP_REASONS: [&str; 8] = [
     "unsupported_conversion",
     "upstream_unavailable",
     "expired",
+    "not_provisioned",
 ];
 
 fn snapshot_counts<const N: usize>(
@@ -113,6 +118,17 @@ fn snapshot_counts<const N: usize>(
             (count != 0).then_some((label, count))
         })
         .collect()
+}
+
+/// The routing-visible deployment state a snapshot reports alongside the
+/// recorded counters.
+pub(crate) struct LiveState {
+    pub disabled: bool,
+    pub not_provisioned: bool,
+    pub cooldown_ms: Option<u64>,
+    /// "credential" when the cooldown is a credential-shared quota reset.
+    pub cooldown_scope: Option<&'static str>,
+    pub in_flight: Option<u32>,
 }
 
 #[derive(Default)]
@@ -134,9 +150,12 @@ pub struct DeploymentStats<'a> {
     provider: &'a str,
     priority: i32,
     disabled: bool,
+    not_provisioned: bool,
     expired: bool,
     expires_at_unix: Option<u64>,
     cooldown_ms: Option<u64>,
+    /// "credential" when the cooldown is a credential-shared quota reset.
+    cooldown_scope: Option<&'static str>,
     rpm_limit: Option<u32>,
     concurrency_limit: Option<u32>,
     in_flight: Option<u32>,
@@ -154,7 +173,7 @@ impl AttemptStats {
             self.failed_attempts.fetch_add(1, Relaxed);
             let index = match error {
                 GatewayError::Client(error) => failure_index(error.kind()),
-                _ => 9,
+                _ => 10,
             };
             self.failure_classes[index].fetch_add(1, Relaxed);
         } else {
@@ -179,9 +198,7 @@ impl AttemptStats {
         &self,
         model: &'a str,
         dep: &'a Deployment,
-        disabled: bool,
-        cooldown_ms: Option<u64>,
-        in_flight: Option<u32>,
+        state: LiveState,
     ) -> DeploymentStats<'a> {
         DeploymentStats {
             fallback: dep.fallback,
@@ -189,7 +206,8 @@ impl AttemptStats {
             id: &dep.id,
             provider: &dep.provider.0,
             priority: dep.priority,
-            disabled,
+            disabled: state.disabled,
+            not_provisioned: state.not_provisioned,
             expired: dep
                 .expires_at
                 .is_some_and(|end| std::time::SystemTime::now() >= end),
@@ -198,10 +216,11 @@ impl AttemptStats {
                     .ok()
                     .map(|span| span.as_secs())
             }),
-            cooldown_ms,
+            cooldown_ms: state.cooldown_ms,
+            cooldown_scope: state.cooldown_scope,
             rpm_limit: dep.quota.rpm,
             concurrency_limit: dep.quota.concurrent,
-            in_flight,
+            in_flight: state.in_flight,
             routed: self.routed.load(Relaxed),
             failed_attempts: self.failed_attempts.load(Relaxed),
             stream_errors: self.stream_errors.load(Relaxed),

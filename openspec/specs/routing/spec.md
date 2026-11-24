@@ -49,8 +49,9 @@ AND its existing allowed-key restrictions remain enforced.
 ### Requirement: Eligibility before ranking
 
 The gateway SHALL skip a deployment that cannot serve right now — in cooldown,
-reporting zero remaining limit, at its concurrency cap, or past its configured
-`expires_at` — before applying priority ordering. An expired deployment SHALL
+reporting zero remaining limit, at its concurrency cap, past its configured
+`expires_at`, or parked because the provider does not provision it — before
+applying priority ordering. An expired or not-provisioned deployment SHALL
 NOT consume an attempt or quota and SHALL NOT mark a transient upstream
 failure; it stays ineligible until the config changes.
 
@@ -69,6 +70,12 @@ AND its last update to config or a reload is what restores it.
 
 WHEN an operator reads deployment state
 THEN each deployment exposes its `expires_at` and whether it has expired.
+
+#### Scenario: Unprovisioned deployment skipped
+
+WHEN a deployment is parked because the provider reported no API allowance
+THEN it is skipped as permanently ineligible until the next config reload,
+while sibling deployments on the same credential stay eligible.
 
 #### Scenario: Request cannot be converted for the first deployment
 

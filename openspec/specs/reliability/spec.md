@@ -85,7 +85,32 @@ way, the client receives the classified error, not an empty 200 stream.
 
 The gateway SHALL cool down a deployment after rate-limit or quota errors —
 including ones that arrive after a stream has started — and skip it while it
-cools down.
+cools down. Rate-limit hints and local backoffs stay capped by
+`cooldown.max_ms`. A provider-reported quota reset is authoritative instead:
+it SHALL be honored up to `cooldown.quota_max_ms` (default 32 days, always at
+least `max_ms`), so a real reset horizon is not silently shortened to the
+backoff cap. An unhinted quota exhaustion keeps the estimate cap, and a reset
+reported by rate-limit headers uses the same quota cap.
+
+#### Scenario: A Cloudflare daily quota cools until UTC midnight
+
+WHEN a 429 body carries Cloudflare Workers AI's daily-quota signature — an
+`errors[]` entry with code 4006 or 3036, or the "daily free allocation"
+phrasing —
+THEN the gateway treats it as credential quota exhaustion with an explicit
+reset at the next 00:00 UTC, not as a transient rate limit. Other `errors[]`
+codes (for example a capacity 429) keep the rate-limit path.
+
+#### Scenario: A monthly quota resets on the first of the next month
+
+WHEN a quota-exhausted error says the monthly quota is exceeded
+THEN the credential cools until the first day of the next month at 00:00 UTC,
+bounded only by `quota_max_ms`.
+
+#### Scenario: A reset beyond the quota cap is clamped there
+
+WHEN a provider reports a quota reset farther out than `cooldown.quota_max_ms`
+THEN the cooldown ends at `quota_max_ms` rather than `max_ms` or the raw reset.
 
 #### Scenario: Post-stream 429 cools down
 
@@ -114,7 +139,7 @@ THEN the gateway proactively skips that deployment until the applicable
 reset. On a 429, a positive `Retry-After` takes precedence; otherwise the
 latest future reset for an exhausted or unreported window is used. Invalid
 or stale resets are ignored, and resets are subject to the configured
-cooldown cap.
+quota-reset cap (`cooldown.quota_max_ms`).
 
 #### Scenario: Anthropic rejects an account with insufficient credit
 
@@ -124,6 +149,33 @@ THEN the gateway treats it as credential quota exhaustion without an
 upstream reset hint. It applies the existing cooldown to deployments sharing
 the credential and tries the next eligible deployment if quota fallback is
 enabled. Other HTTP 400s retain their existing behavior.
+
+### Requirement: Unprovisioned deployments park until reload
+
+When the provider reports that the credential's plan does not provision API
+access for a deployment (for example a "no API allowance" error or a
+`no_api_allowance` code), the gateway SHALL park that deployment until the
+config reloads. Retrying it can never succeed, so it gets no cooldown and is
+never re-probed; the credential itself is not disabled, and sibling
+deployments on the same credential — including ones sharing its cooldown
+bucket on a different route — stay eligible. The parked state SHALL be a
+distinct failure class and skip reason in deployment stats and request logs
+(`not_provisioned`), not a transient candidate failure, and SHALL count as
+disabled in ops alerting.
+
+#### Scenario: Missing allowance parks only that leg
+
+WHEN a deployment answers that the plan has no API allowance
+THEN the gateway marks it not-provisioned, later requests skip it without
+consuming an attempt, and the credential's other deployments keep serving.
+
+#### Scenario: Credential-scope cooling is distinguishable
+
+WHEN an operator reads deployment stats during a credential-shared quota
+cooldown
+THEN each cooled deployment reports `cooldown_scope: "credential"`,
+distinguishing the shared reset from a per-deployment backoff, and a parked
+deployment reports `not_provisioned: true`.
 
 ### Requirement: Rate-limit avoidance
 

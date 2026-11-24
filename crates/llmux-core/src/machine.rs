@@ -31,10 +31,19 @@ pub(crate) enum Built {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Success,
-    Refreshable { can_refresh: bool },
+    Refreshable {
+        can_refresh: bool,
+    },
     AuthFatal,
-    Limited { fallback: bool },
-    QuotaExhausted { fallback: bool },
+    Limited {
+        fallback: bool,
+    },
+    QuotaExhausted {
+        fallback: bool,
+    },
+    /// The credential works but the provider does not provision this
+    /// deployment: park it until reload and try the next candidate.
+    NotProvisioned,
     ModelNotFound,
     Transient,
     Fatal,
@@ -333,6 +342,16 @@ mod tests {
                 F::Apply {
                     outcome: Outcome::QuotaExhausted { fallback: false },
                     stop_groups: true,
+                },
+                P::Send,
+                1,
+            ),
+            (
+                at(P::Send, 1, false),
+                E::Result(Outcome::NotProvisioned),
+                F::Apply {
+                    outcome: Outcome::NotProvisioned,
+                    stop_groups: false,
                 },
                 P::Send,
                 1,

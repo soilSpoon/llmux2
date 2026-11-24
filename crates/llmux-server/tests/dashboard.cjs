@@ -126,8 +126,16 @@ test("rejected sign-in is localized and stops polling without newer AbortSignal 
 test("live metrics, routing state, and disconnect recovery are displayed in Korean", async () => {
   const dep = {
     model: "gateway-model", id: "primary", provider: "openai_compat",
-    priority: 0, cooldown_ms: 1_200, rpm_limit: 20, concurrency_limit: 2, in_flight: 0,
+    priority: 0, cooldown_ms: 1_200, cooldown_scope: "credential", rpm_limit: 20,
+    concurrency_limit: 2, in_flight: 0,
     routed: 1234, failed_attempts: 1, stream_errors: 0, fallback: true,
+  };
+  const parked = {
+    model: "gateway-model", id: "monthly", provider: "openai_compat",
+    priority: 1, cooldown_ms: null, cooldown_scope: null, rpm_limit: null,
+    concurrency_limit: null, in_flight: null,
+    routed: 0, failed_attempts: 0, stream_errors: 0, fallback: false,
+    not_provisioned: true,
   };
   let offline = false;
   const ui = dashboard(async () => {
@@ -138,7 +146,7 @@ test("live metrics, routing state, and disconnect recovery are displayed in Kore
         return {
           uptime_ms: 62_000,
           responses: { ok: 1234, rejected: 1, unavailable: 2, failed: 0, ready_us: 12_370_000 },
-          deployments: [dep],
+          deployments: [dep, parked],
           fallback: { routed: 2, total_routed: 5, share: 0.4 },
           catch_all: { models: { "vendor/new": 2 }, other: 3 },
         };
@@ -157,8 +165,9 @@ test("live metrics, routing state, and disconnect recovery are displayed in Kore
   assert.equal(ui.element("catch-all-other").textContent, "기타 · 3");
   assert.equal(ui.rows[1][0].children[0].textContent, "Fallback");
   assert.equal(ui.rows[0][0].textContent, "gateway-model");
-  assert.equal(ui.rows[1][2].children[0].textContent, "재시도 대기 · 2초");
+  assert.equal(ui.rows[1][2].children[0].textContent, "재시도 대기 · 자격증명 · 2초");
   assert.equal(ui.rows[1][6].textContent, "분당 최대 20건 · 처리 중 0/2");
+  assert.equal(ui.rows[2][2].children[0].textContent, "API 허용량 없음");
 
   offline = true;
   ui.tick();
