@@ -111,6 +111,10 @@ pub struct RuntimeConfig {
     pub acp_agents: HashMap<Arc<str>, AcpAgentSpec>,
     /// Quotas shared by every deployment that uses the credential.
     pub credential_quotas: HashMap<Arc<str>, QuotaSpec>,
+    /// Named account-wide quota groups: deployments that name a group draw on
+    /// one set of windows shared within its scope (credential, or provider
+    /// plus base URL for anonymous legs).
+    pub shared_quotas: HashMap<Arc<str>, QuotaSpec>,
     /// Credentials that start disabled on every load; the admin API can still
     /// toggle the live flag, but the config value re-applies on each reload.
     pub credential_disabled: HashSet<Arc<str>>,
@@ -165,7 +169,19 @@ struct RawConfig {
     cooldown: RawCooldown,
     #[serde(default)]
     credentials: Vec<RawCredential>,
+    /// `[[shared_quotas]]` — a named, account-wide quota family deployments
+    /// bind to with `shared_quota`.
+    #[serde(default)]
+    shared_quotas: Vec<RawSharedQuota>,
     models: Vec<RawModel>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSharedQuota {
+    name: String,
+    #[serde(flatten)]
+    quota: QuotaSpec,
 }
 
 #[derive(Deserialize)]
@@ -374,6 +390,9 @@ struct RawDeployment {
     priority: i32,
     #[serde(default)]
     quota: QuotaSpec,
+    /// Name of a `[[shared_quotas]]` family this leg draws on, scoped to its
+    /// credential (or provider plus base URL when anonymous).
+    shared_quota: Option<String>,
     timeout_ms: Option<u64>,
     max_context: Option<u32>,
     expires_at: Option<toml::value::Datetime>,
@@ -396,6 +415,7 @@ impl RawConfig {
             routing,
             cooldown,
             credentials,
+            shared_quotas: raw_shared_quotas,
             models,
         } = self;
         let request_timeout = timeout(server.request_timeout_ms)?;
@@ -463,6 +483,26 @@ impl RawConfig {
         let mut oauth = HashMap::new();
         let mut nous = HashMap::new();
         let mut acp_agents = HashMap::new();
+        let mut shared_quotas = HashMap::new();
+        for group in raw_shared_quotas {
+            if group.quota.concurrent.is_some()
+                || [
+                    group.quota.rpm,
+                    group.quota.rpd,
+                    group.quota.tpm,
+                    group.quota.tpd,
+                ]
+                .contains(&Some(0))
+            {
+                return Err(invalid(
+                    "shared quota supports positive rpm, rpd, tpm and tpd only",
+                ));
+            }
+            let name: Arc<str> = group.name.as_str().into();
+            if name.is_empty() || shared_quotas.insert(name.clone(), group.quota).is_some() {
+                return Err(invalid("shared quota names must be nonempty and unique"));
+            }
+        }
         let mut credential_quotas = HashMap::new();
         let mut credential_disabled = HashSet::new();
         for credential in credentials {
@@ -875,6 +915,16 @@ impl RawConfig {
                 {
                     return Err(invalid("configured limits must be positive"));
                 }
+                let shared_quota = dep
+                    .shared_quota
+                    .map(|name| {
+                        let name: Arc<str> = name.as_str().into();
+                        shared_quotas
+                            .contains_key(&name)
+                            .then_some(name)
+                            .ok_or_else(|| invalid("deployment references an unknown shared_quota"))
+                    })
+                    .transpose()?;
                 let idx = DeploymentIdx(
                     u32::try_from(deployments.len())
                         .map_err(|_| invalid("too many deployments"))?,
@@ -906,6 +956,7 @@ impl RawConfig {
                     strip_request_fields: dep.strip_request_fields,
                     priority: dep.priority,
                     quota: dep.quota,
+                    shared_quota,
                     timeout: timeout(dep.timeout_ms.unwrap_or(server.request_timeout_ms))?,
                     max_context: dep.max_context.or(model.capabilities.max_context),
                     expires_at,
@@ -925,6 +976,7 @@ impl RawConfig {
         }
 
         Ok(RuntimeConfig {
+            shared_quotas,
             credential_quotas,
             credential_disabled,
             server: ServerConfig {
@@ -1516,6 +1568,36 @@ mod tests {
                 err.to_string().contains("credential quota"),
                 "{quota}: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn shared_quota_groups_bind_deployments_and_must_be_defined() {
+        let base = config(REQUIRED);
+        let grouped = format!("[[shared_quotas]]\nname = \"fam\"\nrpm = 20\nrpd = 50\n{base}")
+            .replace(
+                "upstream_model =",
+                "shared_quota = \"fam\"\nupstream_model =",
+            );
+        let parsed = RuntimeConfig::parse(&grouped).expect("shared quota group");
+        assert_eq!(parsed.deployments[0].shared_quota.as_deref(), Some("fam"));
+        assert_eq!(parsed.shared_quotas["fam"].rpd, Some(50));
+
+        let dangling = base.replace(
+            "upstream_model =",
+            "shared_quota = \"nope\"\nupstream_model =",
+        );
+        let err = RuntimeConfig::parse(&dangling)
+            .err()
+            .expect("unknown group");
+        assert!(err.to_string().contains("shared_quota"), "{err}");
+
+        for quota in ["rpm = 0", "concurrent = 2"] {
+            let input = format!("[[shared_quotas]]\nname = \"fam\"\n{quota}\n{base}").replace(
+                "upstream_model =",
+                "shared_quota = \"fam\"\nupstream_model =",
+            );
+            assert!(RuntimeConfig::parse(&input).is_err(), "{quota}");
         }
     }
 

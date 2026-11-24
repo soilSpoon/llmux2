@@ -21,7 +21,7 @@ use llmux_config::RuntimeConfig;
 use llmux_types::{
     provider, AuthMaterial, Billing, BuildError, ContextOverflow, CredentialSource, Deployment,
     DeploymentIdx, ErrorKind, GatewayRequest, GatewayResponse, ProviderAdapter, ProviderRegistry,
-    SseCommitment, Support, UpstreamError,
+    QuotaSpec, SseCommitment, Support, UpstreamError,
 };
 use machine::{Built, Effect, Event, Outcome, Phase, State};
 pub use request_log::RequestLog;
@@ -204,6 +204,8 @@ impl Executor {
 
     fn shared_limits<'a>(
         shared: &mut Vec<(&'a Deployment, Arc<DeploymentLimits>)>,
+        shared_caps: &mut Vec<(&'a Deployment, Vec<Arc<Window>>)>,
+        group_specs: &HashMap<Arc<str>, QuotaSpec>,
         key_windows: &HashMap<Arc<str>, Vec<Arc<Window>>>,
         dep: &'a Deployment,
     ) -> Arc<DeploymentLimits> {
@@ -220,7 +222,40 @@ impl Executor {
         let key = key_windows
             .get(&dep.credential)
             .map_or(&[][..], Vec::as_slice);
-        let limits = Arc::new(DeploymentLimits::with_shared(dep.quota, key));
+        // A named shared quota is one account-wide window set: legs that bind
+        // to the same group draw on it even when they serve different upstream
+        // models (a provider's documented free allowance is per account, not
+        // per model). Scope is the credential — or, for anonymous legs, the
+        // provider plus base URL, approximating a per-IP allowance. Only the
+        // windows are shared: cooldowns, strikes and inflight stay
+        // per-deployment.
+        let shared_group = dep.shared_quota.as_ref().map(|group| {
+            let same_scope = |other: &&Deployment| {
+                other.shared_quota.as_ref() == Some(group)
+                    && if dep.credential.is_empty() {
+                        other.provider == dep.provider && other.base_url == dep.base_url
+                    } else {
+                        other.credential == dep.credential
+                    }
+            };
+            match shared_caps.iter().find(|(other, _)| same_scope(other)) {
+                Some((_, windows)) => windows.clone(),
+                None => {
+                    let windows =
+                        Window::for_quota(group_specs.get(group).copied().unwrap_or_default());
+                    shared_caps.push((dep, windows.clone()));
+                    windows
+                }
+            }
+        });
+        let limits = match shared_group {
+            Some(windows) => {
+                let extra: Vec<Arc<Window>> =
+                    windows.into_iter().chain(key.iter().cloned()).collect();
+                Arc::new(DeploymentLimits::with_shared(dep.quota, &extra))
+            }
+            None => Arc::new(DeploymentLimits::with_shared(dep.quota, key)),
+        };
         shared.push((dep, limits.clone()));
         limits
     }
@@ -238,6 +273,8 @@ impl Executor {
         let mut disabled = HashMap::<Arc<str>, Arc<AtomicBool>>::new();
         // Deployments that reach the same upstream route draw on one provider limit.
         let mut shared_limits = Vec::<(&Deployment, Arc<DeploymentLimits>)>::new();
+        // Legs bound to one named shared quota draw on one set of windows.
+        let mut shared_caps = Vec::<(&Deployment, Vec<Arc<Window>>)>::new();
         // A credential's quota is one set of windows shared by all of its deployments.
         let key_windows: HashMap<Arc<str>, Vec<Arc<Window>>> = cfg
             .credential_quotas
@@ -276,7 +313,13 @@ impl Executor {
                     adapter,
                     auth,
                     disabled,
-                    limits: Self::shared_limits(&mut shared_limits, &key_windows, dep),
+                    limits: Self::shared_limits(
+                        &mut shared_limits,
+                        &mut shared_caps,
+                        &cfg.shared_quotas,
+                        &key_windows,
+                        dep,
+                    ),
                     key_peers: Arc::default(),
                     stats: cfg.server.dashboard_key.is_some().then(Arc::default),
                 })
