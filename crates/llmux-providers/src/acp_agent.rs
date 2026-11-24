@@ -71,16 +71,21 @@ fn reusable_after(err: &UpstreamError) -> bool {
     )
 }
 
+/// One cell per credential: the inner mutex serializes that credential's
+/// turns while the outer map lock only guards cell lookup.
+type Sessions = Arc<Mutex<HashMap<Arc<str>, Arc<Mutex<Option<AcpSession>>>>>>;
+
 pub struct AcpAgent {
     kind: ProviderKind,
     /// The process spec per credential id; a deployment's `credential` selects it.
     specs: Arc<HashMap<Arc<str>, AcpAgentSpec>>,
-    /// Persistent children keyed by credential id. The map lock only guards
-    /// the checkout/return; a turn holds the session itself so concurrent
-    /// requests on other credentials do not serialize, and cancelling or
-    /// failing a turn drops (and kills) the child instead of leaving it
-    /// mid-turn for the next request.
-    sessions: Arc<Mutex<HashMap<Arc<str>, AcpSession>>>,
+    /// Persistent children keyed by credential id. The outer map lock only
+    /// guards lookup; each credential's inner mutex serializes turns on that
+    /// credential (one child, one turn at a time) while turns on different
+    /// credentials run in parallel. Cancelling or failing a turn drops the
+    /// held cell slot — and its kill_on_drop child — instead of leaving a
+    /// dead session for the next request.
+    sessions: Sessions,
 }
 
 impl AcpAgent {
@@ -96,7 +101,7 @@ impl AcpAgent {
     /// spawned, spoken to, and killed inside `turn_timeout`; for `persistent`
     /// an already-initialized child is reused (or respawned when it died).
     async fn run_turn(
-        sessions: &Mutex<HashMap<Arc<str>, AcpSession>>,
+        sessions: &Sessions,
         credential: &Arc<str>,
         spec: &AcpAgentSpec,
         model: &str,
@@ -114,11 +119,17 @@ impl AcpAgent {
                     out
                 }
                 AcpSessionMode::Persistent => {
-                    // The session is checked out of the map for the turn so
-                    // the map lock is never held across a spawn or turn —
-                    // concurrent turns on other credentials do not serialize.
-                    let removed = sessions.lock().await.remove(credential);
-                    let mut session = match removed {
+                    // The per-credential cell serializes turns on this
+                    // credential — a second request waits for the first to
+                    // return its session rather than spawning a parallel
+                    // child — while the outer map lock is released instantly
+                    // so other credentials proceed independently.
+                    let cell = {
+                        let mut map = sessions.lock().await;
+                        map.entry(credential.clone()).or_default().clone()
+                    };
+                    let mut cell = cell.lock().await;
+                    let mut session = match cell.take() {
                         // A dead child is dropped (kill_on_drop) and respawned
                         // lazily rather than failing this request.
                         Some(mut session) => {
@@ -137,13 +148,13 @@ impl AcpAgent {
                             // a session cached with a live sender holds the
                             // response stream open after its turn completes.
                             session.set_chunks(None);
-                            sessions.lock().await.insert(credential.clone(), session);
+                            *cell = Some(session);
                             Ok(out)
                         }
                         Err(err) => {
                             if reusable_after(&err) {
                                 session.set_chunks(None);
-                                sessions.lock().await.insert(credential.clone(), session);
+                                *cell = Some(session);
                             }
                             Err(err)
                         }
@@ -781,6 +792,24 @@ done
             let log =
                 std::fs::read_to_string(dir.path().join(".local/share/requests.log")).unwrap();
             assert_eq!(log.matches("session/new").count(), 2, "{log}");
+        }
+
+        #[tokio::test]
+        async fn concurrent_persistent_turns_share_one_child() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut spec = script(dir.path(), &["one", "two"]);
+            spec.mode = AcpSessionMode::Persistent;
+            let adapter = AcpAgent::new(HashMap::from([("cli".into(), spec)]));
+            let d = dep("cli", "m");
+            // Two overlapping requests on one credential must serialize on the
+            // per-credential cell, not spawn parallel children.
+            let (first, second) = tokio::join!(
+                complete(&adapter, &d, chat_body()),
+                complete(&adapter, &d, chat_body())
+            );
+            first.unwrap();
+            second.unwrap();
+            assert_eq!(pid_log(dir.path()).len(), 1, "one shared child");
         }
 
         #[tokio::test]
