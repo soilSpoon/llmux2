@@ -10,6 +10,14 @@ llmux-config.workspace = true
 llmux-types.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+hyper.workspace = true
+hyper-rustls.workspace = true
+hyper-util.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
+axum.workspace = true
+llmux-testkit.workspace = true
 tempfile = "3.27.0"
