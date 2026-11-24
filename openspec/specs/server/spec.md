@@ -18,7 +18,7 @@ name) and no `blocked` glob, on every inbound format that resolves a model;
 otherwise the gateway SHALL return 403 `model_not_allowed` before any upstream
 call, in the same error shape as per-model `allowed_keys`. Globs SHALL match
 ASCII case-sensitively with `*` spanning any substring including `/` and `?`
-matching exactly one byte.
+matching exactly one character (a Unicode scalar value, not one byte).
 
 Config SHALL reject a `key_policies` entry whose `key` does not resolve to a
 `server.client_keys` value, a repeated key, an empty pattern, and an entry with
