@@ -355,6 +355,101 @@ async fn free_only_key_sees_no_billed_only_models() {
     assert_eq!(seen_models(&seen), ["up-mixed-free"]);
 }
 
+fn free_only_cred_config(url: &str, dir: &std::path::Path) -> String {
+    for (file, value) in [
+        ("owner", "owner-key"),
+        ("ci", "ci-key"),
+        ("admin", "admin-key"),
+        ("free-cred", "synthetic-free"),
+    ] {
+        std::fs::write(dir.join(file), value).unwrap();
+    }
+    let dir = dir.display();
+    format!(
+        r#"
+[server]
+client_keys = ["file:{dir}/owner", "file:{dir}/ci"]
+dashboard_key = "file:{dir}/admin"
+
+[[server.key_policies]]
+key = "file:{dir}/ci"
+free_only = true
+
+[[credentials]]
+id = "free-cred"
+kind = "api_key"
+provider = "openai_compat"
+key = "file:{dir}/free-cred"
+
+[[models]]
+name = "free-cred-model"
+[[models.deployments]]
+id = "free-cred-dep"
+credential = "free-cred"
+base_url = "{url}/v1"
+upstream_model = "up-free-cred"
+billing = "free"
+"#
+    )
+}
+
+async fn set_disabled(gateway: &str, id: &str, disabled: bool) {
+    let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+    let response = client
+        .request(
+            Request::post(format!("{gateway}/admin/credentials/{id}/disabled"))
+                .header(header::AUTHORIZATION, "Bearer admin-key")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from(
+                    json!({"disabled": disabled}).to_string(),
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn disabling_a_free_legs_credential_removes_it_from_the_free_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let remote = TestServer::start(
+        Router::new()
+            .route("/v1/chat/completions", post(upstream))
+            .with_state(seen.clone()),
+    )
+    .await
+    .unwrap();
+    let gateway = TestServer::start(
+        llmux_server::app(
+            RuntimeConfig::parse(&free_only_cred_config(&remote.url(), dir.path())).unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let gateway = gateway.url();
+
+    // Baseline: the credential-backed free leg makes the model free for ci.
+    assert_eq!(listed(&gateway, "ci-key").await, ["free-cred-model"]);
+    assert_eq!(listed(&gateway, "owner-key").await, ["free-cred-model"]);
+
+    // Disabling the credential behind its only free leg takes the model out
+    // of the free-only key's catalog — an expired plan stops counting.
+    set_disabled(&gateway, "free-cred", true).await;
+    let empty: Vec<String> = Vec::new();
+    assert_eq!(listed(&gateway, "ci-key").await, empty);
+    // The unrestricted key still sees the model; disable is a routing state,
+    // not a config removal.
+    assert_eq!(listed(&gateway, "owner-key").await, ["free-cred-model"]);
+
+    // Re-enabling restores the leg and the model returns for the free key.
+    set_disabled(&gateway, "free-cred", false).await;
+    assert_eq!(listed(&gateway, "ci-key").await, ["free-cred-model"]);
+}
+
 #[test]
 fn key_policies_must_reference_a_client_key() {
     let dir = tempfile::tempdir().unwrap();
