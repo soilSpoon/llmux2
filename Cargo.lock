@@ -852,6 +852,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
+ "base64",
  "bytes",
  "futures-util",
  "http",

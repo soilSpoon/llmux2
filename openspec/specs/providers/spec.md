@@ -193,6 +193,54 @@ still completes.
 WHEN a stream request sets `stream_options.include_usage`
 THEN a final `choices: []` chunk carries the mapped usage before `[DONE]`.
 
+### Requirement: Devin ACP image forwarding
+
+The `devin_acp` provider SHALL forward client-supplied image parts so the agent
+can actually see them. ACP `image` content blocks are acknowledged at the
+protocol level but never shown to the model (verified on devin 3000.14.30821:
+the agent reports "no image was provided"), so inline image bytes SHALL be
+decoded and written to files under `<home>/.llmux-images/<unique>/` for the
+agent to `read` from its sandbox — the only channel that reaches the model.
+OpenAI `image_url`/`input_image` parts (string or `{url}` object) and Anthropic
+`image` source parts are detected in message order. The transcript SHALL mark
+each image's position with `[image N]` and end with an `[Images]` index listing
+`image N: <path-or-url>` in the same order, so the model can pair image and
+surrounding turn. Remote references SHALL be indexed by URL only when they are
+`http://` or `https://` — a bare path or `file://` URL is dropped, since the
+index invites the agent to `read` it and would expose sandbox files; non-base64
+`data:` URLs degrade the same way. Staged files SHALL be removed
+when the turn ends, including aborted turns. A single image whose decoded
+bytes exceed 8 MiB SHALL fail the request `413 Payload Too Large` — checked
+by encoded length before decode so the payload is never materialized — and
+malformed base64 SHALL fail `400`. Messages carrying only images SHALL still
+produce a turn.
+
+#### Scenario: Multimodal user message
+
+WHEN a user message carries `[{"type":"text","text":"what is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]`
+THEN the bytes are staged under `<home>/.llmux-images/`, the transcript text
+contains `user: what is this?\n[image 1]`, and an `[Images]` index names the
+staged file path so the agent reads it.
+
+#### Scenario: Remote image URL
+
+WHEN an image part references `https://example.test/x.png`
+THEN the transcript marks the position and indexes the URL itself — no file is
+staged — and the turn still completes.
+
+#### Scenario: Local-path image reference
+
+WHEN an image part references a non-HTTP(S) URL such as
+`file:///etc/passwd` or `.local/share/devin/credentials.toml`
+THEN the reference produces no `[image N]` index entry, so the agent is never
+invited to read a sandbox-local file it was not given.
+
+#### Scenario: Staging cleanup
+
+WHEN a turn with staged images completes or is aborted
+THEN the request's `.llmux-images/<unique>/` directory is removed, leaving no
+payload files behind.
+
 ### Requirement: Keyless deployments
 
 The gateway SHALL support explicit keyless upstreams via `auth = "none"` with

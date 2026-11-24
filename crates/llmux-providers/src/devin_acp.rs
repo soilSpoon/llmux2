@@ -14,9 +14,12 @@ use llmux_types::{
 };
 use serde_json::{json, Value};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -197,6 +200,153 @@ fn content_text(content: &Value) -> String {
     }
 }
 
+/// Where a client image lives: bytes inline (any wire spelling) or a remote URL
+/// the agent may fetch itself.
+enum ImageSource {
+    Data { mime: String, data: String },
+    Url(String),
+}
+
+/// Detects the image part spellings the bridge accepts: OpenAI `image_url` /
+/// `input_image` (string or `{url}` object) and Anthropic `image` sources.
+fn image_source(part: &Value) -> Option<ImageSource> {
+    let url_field = |key: &str| {
+        part.get(key)
+            .and_then(|v| v.get("url").and_then(Value::as_str).or_else(|| v.as_str()))
+    };
+    match part["type"].as_str() {
+        Some("image_url") | Some("input_image") => url_field("image_url").and_then(url_source),
+        Some("image") => match part["source"]["type"].as_str() {
+            Some("base64") => Some(ImageSource::Data {
+                mime: part["source"]["media_type"]
+                    .as_str()
+                    .unwrap_or("image/png")
+                    .to_owned(),
+                data: part["source"]["data"].as_str()?.to_owned(),
+            }),
+            Some("url") => part["source"]["url"].as_str().and_then(url_source),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A `data:` URL carries its bytes inline; a remote reference must be
+/// http(s) — anything else (a bare path, `file://`) would land in the
+/// `[Images]` index and invite the agent to `read` a sandbox file it was
+/// never meant to see.
+fn url_source(url: &str) -> Option<ImageSource> {
+    if let Some(rest) = url.strip_prefix("data:") {
+        if let Some((meta, data)) = rest.split_once(',') {
+            if let Some(mime) = meta.strip_suffix(";base64") {
+                return Some(ImageSource::Data {
+                    mime: mime.to_owned(),
+                    data: data.to_owned(),
+                });
+            }
+        }
+    }
+    (url.starts_with("http://") || url.starts_with("https://"))
+        .then(|| ImageSource::Url(url.to_owned()))
+}
+
+/// Decoded image bytes must not exceed this: `devin acp` accepts inline
+/// `image` blocks at the protocol level but never shows them to the model, so
+/// images reach the model only as files the agent `read`s from its sandbox —
+/// and unbounded writes are the failure to bound here.
+const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Removes the staging directory when the guard drops — including aborted
+/// turns, since the future's locals are dropped with it.
+#[derive(Debug)]
+struct ImageStaging {
+    dir: PathBuf,
+}
+
+impl Drop for ImageStaging {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Per-request uniqueness for the staging dir: a nanosecond timestamp alone
+/// can repeat on coarse clocks, so concurrent requests in this process would
+/// share a dir and each guard's cleanup would delete the other's files.
+static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Writes each inline image under `<home>/.llmux-images/<unique>/` and returns
+/// the transcript index entries — file paths for inline payloads, the URL
+/// itself for remote ones. The ACP `image` content block is intentionally not
+/// used: the agent acknowledges it but the model never sees its bytes, while
+/// a file it `read`s is rendered to the model (probed live on 3000.14.30821).
+fn stage_images(
+    home: &Path,
+    messages: &[Value],
+) -> Result<(Option<ImageStaging>, Vec<String>), UpstreamError> {
+    use base64::Engine;
+    let sources: Vec<ImageSource> = messages
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .filter_map(image_source)
+        .collect();
+    if sources.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+    let unique = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+        STAGE_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let dir = home.join(".llmux-images").join(unique);
+    std::fs::create_dir_all(&dir).map_err(|_| UpstreamError::Server {
+        status: StatusCode::BAD_GATEWAY,
+    })?;
+    // Held from here so a mid-loop failure (bad base64, oversized payload)
+    // removes the partially-written directory too.
+    let staging = ImageStaging { dir };
+    let mut entries = Vec::with_capacity(sources.len());
+    for (index, source) in sources.into_iter().enumerate() {
+        match source {
+            ImageSource::Data { mime, data } => {
+                // Base64 decodes to ~3/4 its length; reject by encoded length
+                // first so an oversized payload is never materialized.
+                if data.len() > MAX_IMAGE_BYTES * 4 / 3 + 4 {
+                    return Err(UpstreamError::BadRequest {
+                        status: StatusCode::PAYLOAD_TOO_LARGE,
+                        body: Bytes::new(),
+                    });
+                }
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&data)
+                    .map_err(|_| UpstreamError::BadRequest {
+                        status: StatusCode::BAD_REQUEST,
+                        body: Bytes::new(),
+                    })?;
+                // The encoded-length bound above is approximate; the exact cap
+                // is enforced on the decoded bytes.
+                if bytes.len() > MAX_IMAGE_BYTES {
+                    return Err(UpstreamError::BadRequest {
+                        status: StatusCode::PAYLOAD_TOO_LARGE,
+                        body: Bytes::new(),
+                    });
+                }
+                let ext = mime.strip_prefix("image/").unwrap_or("bin");
+                let path = staging.dir.join(format!("image-{}.{}", index + 1, ext));
+                std::fs::write(&path, bytes).map_err(|_| UpstreamError::Server {
+                    status: StatusCode::BAD_GATEWAY,
+                })?;
+                entries.push(path.to_string_lossy().into_owned());
+            }
+            ImageSource::Url(url) => entries.push(url),
+        }
+    }
+    Ok((Some(staging), entries))
+}
+
 /// The default agent continues whatever conversation it is given; this frame pins
 /// the bridge contract so the reply is one assistant message and nothing else.
 const FRAME: &str = "[Devin Chat Bridge]\nA conversation transcript follows under [Conversation]. Write the next assistant reply to it.\nReply with only that reply: plain text, no commentary about the conversation, no Markdown fences, and never use your own tools.\n";
@@ -251,11 +401,25 @@ fn prompt_text(
     tool_choice: &Value,
     parallel_tool_calls: bool,
 ) -> Option<String> {
+    let mut image_index = 0usize;
     let turns: Vec<(String, String)> = messages
         .iter()
         .map(|m| {
             let role = m["role"].as_str().unwrap_or("user");
-            let mut text = content_text(&m["content"]);
+            let mut text = match &m["content"] {
+                Value::Array(parts) => parts
+                    .iter()
+                    .filter_map(|part| {
+                        if image_source(part).is_some() {
+                            image_index += 1;
+                            return Some(format!("[image {image_index}]"));
+                        }
+                        part["text"].as_str().map(str::to_owned)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                other => content_text(other),
+            };
             if role == "assistant" {
                 if let Some(calls) = m["tool_calls"].as_array().filter(|c| !c.is_empty()) {
                     let calls = format!("[tool_calls: {}]", Value::Array(calls.clone()));
@@ -540,12 +704,15 @@ impl Session {
     }
 
     /// Returns the collected reply text plus the turn usage when the agent
-    /// reports it (both are needed for an OpenAI-shaped answer).
+    /// reports it (both are needed for an OpenAI-shaped answer). `prompt` is the
+    /// ACP content-block array (the transcript text block); `_staged` keeps any
+    /// image files alive until the turn — or an aborted one — ends.
     async fn turn(
         mut self,
         config: &DevinAcpConfig,
         model: &str,
-        prompt: &str,
+        prompt: &[Value],
+        _staged: Option<ImageStaging>,
     ) -> Result<(String, Option<Value>), UpstreamError> {
         let cwd = config.home.to_string_lossy().into_owned();
         self.call(
@@ -575,7 +742,7 @@ impl Session {
         let result = self
             .call(
                 "session/prompt",
-                json!({"sessionId":session_id,"prompt":[{"type":"text","text":prompt}]}),
+                json!({"sessionId":session_id,"prompt":prompt}),
             )
             .await?;
         let _ = self.child.start_kill();
@@ -731,7 +898,8 @@ impl DevinAcp {
     fn stream(
         &self,
         model: String,
-        prompt: String,
+        prompt: Vec<Value>,
+        staged: Option<ImageStaging>,
         tools_offered: bool,
         include_usage: bool,
     ) -> GatewayResponse {
@@ -752,9 +920,12 @@ impl DevinAcp {
                 let config = config.clone();
                 let model = model.clone();
                 AbortOnDrop(tokio::spawn(async move {
-                    timeout(config.turn_timeout, session.turn(&config, &model, &prompt))
-                        .await
-                        .map_err(|_| UpstreamError::Timeout)?
+                    timeout(
+                        config.turn_timeout,
+                        session.turn(&config, &model, &prompt, staged),
+                    )
+                    .await
+                    .map_err(|_| UpstreamError::Timeout)?
                 }))
             };
             let delta = |text: String| {
@@ -877,28 +1048,46 @@ impl DevinAcp {
         // advertising tools, so the protocol and schemas stay out of the prompt.
         let tools_offered = body["tools"].as_array().is_some_and(|t| !t.is_empty())
             && body["tool_choice"].as_str() != Some("none");
-        let prompt = body["messages"]
+        let messages = body["messages"]
             .as_array()
-            .and_then(|messages| {
-                prompt_text(
-                    messages,
-                    body.get("tools").filter(|_| tools_offered),
-                    &body["tool_choice"],
-                    body["parallel_tool_calls"].as_bool().unwrap_or(true),
-                )
-            })
             .ok_or(UpstreamError::BadRequest {
                 status: StatusCode::BAD_REQUEST,
                 body: Bytes::new(),
             })?;
+        let prompt = prompt_text(
+            messages,
+            body.get("tools").filter(|_| tools_offered),
+            &body["tool_choice"],
+            body["parallel_tool_calls"].as_bool().unwrap_or(true),
+        )
+        .ok_or(UpstreamError::BadRequest {
+            status: StatusCode::BAD_REQUEST,
+            body: Bytes::new(),
+        })?;
+        let (staged, image_entries) = stage_images(&self.config.home, messages)?;
+        let mut prompt = prompt;
+        if !image_entries.is_empty() {
+            prompt.push_str("\n\n[Images]");
+            for (index, entry) in image_entries.iter().enumerate() {
+                prompt.push_str(&format!("\nimage {}: {entry}", index + 1));
+            }
+            // FRAME's "never use your own tools" forbids the read the image
+            // staging depends on, so the index explicitly carves out just these
+            // files — `ask` mode already confines the tools to read-only ones.
+            prompt.push_str(
+                "\n\nYou may read the files and URLs listed under [Images] to see the \
+                 attached images; no other tool use is needed for this reply.",
+            );
+        }
+        let blocks = vec![json!({"type":"text","text":prompt})];
         let model = model_for(crate::upstream_model(req, dep), effort_tier(&body));
         if req.stream {
             let include_usage = body["stream_options"]["include_usage"].as_bool() == Some(true);
-            return Ok(self.stream(model, prompt, tools_offered, include_usage));
+            return Ok(self.stream(model, blocks, staged, tools_offered, include_usage));
         }
         let (text, usage) = timeout(
             self.config.turn_timeout,
-            Session::spawn(&self.config)?.turn(&self.config, &model, &prompt),
+            Session::spawn(&self.config)?.turn(&self.config, &model, &blocks, staged),
         )
         .await
         .map_err(|_| UpstreamError::Timeout)??;
@@ -922,6 +1111,7 @@ impl DevinAcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     #[test]
     fn synthesized_completion_id_is_not_an_upstream_request_id() {
@@ -1017,6 +1207,141 @@ mod tests {
         assert!(prompt.contains("at most one tool"), "{prompt}");
         let prompt = prompt_text(&msgs, Some(&tools), none, true).unwrap();
         assert!(!prompt.contains("at most one tool"), "{prompt}");
+    }
+
+    #[test]
+    fn image_parts_are_numbered_in_the_transcript() {
+        let none = &Value::Null;
+        let msgs = [
+            json!({"role":"user","content":[
+                {"type":"text","text":"first"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}),
+            json!({"role":"assistant","content":"a cat"}),
+            json!({"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,BB=="}},
+                {"type":"text","text":"second"}]}),
+        ];
+        let prompt = prompt_text(&msgs, None, none, true).unwrap();
+        assert!(prompt.contains("user: first\n[image 1]"), "{prompt}");
+        assert!(prompt.contains("user: [image 2]\nsecond"), "{prompt}");
+        assert!(prompt.contains("assistant: a cat"), "{prompt}");
+    }
+
+    #[test]
+    fn image_parts_are_staged_as_readable_files() {
+        let home = tempfile::tempdir().unwrap();
+        let msgs = [
+            json!({"role":"user","content":[
+                {"type":"text","text":"hi"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}),
+            json!({"role":"user","content":[
+                {"type":"input_image","image_url":"data:image/webp;base64,WQ=="}]}),
+            json!({"role":"user","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"Sko="}}]}),
+            json!({"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"https://example.test/x.png"}}]}),
+            json!({"role":"user","content":"plain"}),
+        ];
+        let (staged, entries) = stage_images(home.path(), &msgs).unwrap();
+        let staged = staged.unwrap();
+        assert_eq!(entries.len(), 4);
+        for (i, (entry, ext, bytes)) in [
+            (&entries[0], "png", vec![0x00]),
+            (&entries[1], "webp", vec![0x59]),
+            (&entries[2], "jpeg", vec![0x4a, 0x4a]),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let path = Path::new(entry.as_str());
+            assert!(path.starts_with(&staged.dir), "{entry}");
+            assert_eq!(path.extension().unwrap(), *ext, "{entry}");
+            assert_eq!(std::fs::read(path).unwrap(), *bytes, "{entry}");
+            let _ = i;
+        }
+        assert_eq!(entries[3], "https://example.test/x.png");
+        let dir = staged.dir.clone();
+        drop(staged);
+        assert!(!dir.exists(), "staging dir must be removed on drop");
+    }
+
+    #[test]
+    fn non_http_image_urls_are_dropped() {
+        let home = tempfile::tempdir().unwrap();
+        // A bare path or file:// URL would land in the [Images] index and the
+        // prompt would invite the agent to `read` it — a sandbox credential
+        // leak. Only http(s) remote refs may be indexed.
+        let msgs = [json!({"role":"user","content":[
+            {"type":"image_url","image_url":{"url":".local/share/devin/credentials.toml"}},
+            {"type":"image_url","image_url":{"url":"file:///etc/passwd"}},
+            {"type":"input_image","image_url":"./secrets"},
+            {"type":"image_url","image_url":{"url":"https://example.test/x.png"}},
+        ]})];
+        let (_staged, entries) = stage_images(home.path(), &msgs).unwrap();
+        assert_eq!(entries, ["https://example.test/x.png"]);
+    }
+
+    #[test]
+    fn concurrent_staging_dirs_do_not_collide() {
+        let home = tempfile::tempdir().unwrap();
+        let msgs = || {
+            [json!({"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]})]
+        };
+        let (a, _) = stage_images(home.path(), &msgs()).unwrap();
+        let (b, _) = stage_images(home.path(), &msgs()).unwrap();
+        let a = a.unwrap();
+        let b = b.unwrap();
+        assert_ne!(a.dir, b.dir, "concurrent requests must not share a dir");
+    }
+
+    #[test]
+    fn oversized_or_malformed_images_are_rejected() {
+        let home = tempfile::tempdir().unwrap();
+        let big = "AAAA".repeat(MAX_IMAGE_BYTES); // canonical, past the cap
+        let msgs = [json!({"role":"user","content":[
+            {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{big}")}}
+        ]})];
+        let err = stage_images(home.path(), &msgs).unwrap_err();
+        assert!(matches!(
+            err,
+            UpstreamError::BadRequest {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                ..
+            }
+        ));
+        assert_eq!(
+            std::fs::read_dir(home.path().join(".llmux-images"))
+                .map(|d| d.count())
+                .unwrap_or(0),
+            0,
+            "failed staging must leave no files behind"
+        );
+
+        let msgs = [json!({"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,!!!"}}
+        ]})];
+        assert!(matches!(
+            stage_images(home.path(), &msgs),
+            Err(UpstreamError::BadRequest {
+                status: StatusCode::BAD_REQUEST,
+                ..
+            })
+        ));
+
+        // Just under the encoded bound yet decoding to MAX+1 — the post-decode
+        // check is what actually enforces the cap.
+        let over = base64::engine::general_purpose::STANDARD.encode(vec![0u8; MAX_IMAGE_BYTES + 1]);
+        let msgs = [json!({"role":"user","content":[
+            {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{over}")}}
+        ]})];
+        assert!(matches!(
+            stage_images(home.path(), &msgs),
+            Err(UpstreamError::BadRequest {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1247,6 +1572,37 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn image_parts_reach_the_agent_as_files() {
+            let dir = tempfile::tempdir().unwrap();
+            let adapter = DevinAcp::new(script(dir.path(), "a cat"));
+            let body = json!({"model":"swe-2","messages":[
+            {"role":"user","content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}
+            ]}]});
+            adapter
+                .serve(&request(body), &dep("swe-2-high"))
+                .await
+                .unwrap();
+            let log = std::fs::read_to_string(dir.path().join(".local/share/prompts.log")).unwrap();
+            assert!(log.contains("[image 1]"), "{log}");
+            assert!(log.contains("[Images]"), "{log}");
+            assert!(
+                log.contains("image 1: ") && log.contains(".llmux-images"),
+                "{log}"
+            );
+            // The index must lift FRAME's tool ban for exactly these files —
+            // the staged path only works if the agent may read it.
+            assert!(log.contains("You may read the files"), "{log}");
+            // The staged file lives only for the turn: after the reply, the
+            // staging directory is gone even though the parent may remain.
+            let leftovers = std::fs::read_dir(dir.path().join(".llmux-images"))
+                .map(|d| d.count())
+                .unwrap_or(0);
+            assert_eq!(leftovers, 0);
+        }
+
+        #[tokio::test]
         async fn permission_requests_are_cancelled_not_errored() {
             let dir = tempfile::tempdir().unwrap();
             let config = script(dir.path(), "done");
@@ -1452,7 +1808,12 @@ done
             let config = script(dir.path(), "<summary>OK</summary>");
             let text = Session::spawn(&config)
                 .unwrap()
-                .turn(&config, "swe-2-high", "hi")
+                .turn(
+                    &config,
+                    "swe-2-high",
+                    &[json!({"type":"text","text":"hi"})],
+                    None,
+                )
                 .await;
             assert_eq!(text.unwrap().0, "OK");
         }
@@ -1461,9 +1822,13 @@ done
             use futures_util::StreamExt;
             let dir = tempfile::tempdir().unwrap();
             let adapter = DevinAcp::new(chunked_script(dir.path(), replies));
-            let GatewayResponse::Stream(events) =
-                adapter.stream("m".into(), "hi".into(), false, false)
-            else {
+            let GatewayResponse::Stream(events) = adapter.stream(
+                "m".into(),
+                vec![json!({"type":"text","text":"hi"})],
+                None,
+                false,
+                false,
+            ) else {
                 panic!("expected a stream");
             };
             let events: Vec<_> = events.collect().await;
@@ -1536,7 +1901,7 @@ done
             config.turn_timeout = Duration::from_secs(5);
             let err = Session::spawn(&config)
                 .unwrap()
-                .turn(&config, "m", "p")
+                .turn(&config, "m", &[json!("p")], None)
                 .await
                 .unwrap_err();
             assert!(matches!(
