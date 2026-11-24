@@ -2049,3 +2049,76 @@ async fn stream_error_frames_on_every_deployment_return_classified_429() {
     assert_eq!(payload["error"]["type"], "rate_limit_error");
     assert_eq!(fixture.counts(), [1, 1]);
 }
+
+/// Antigravity's `/v1internal:streamGenerateContent` never emits `data: [DONE]` —
+/// the stream just ends after the final `finishReason` frame (verified against
+/// the live upstream on the OCI key, 2026-11-25). The gateway must treat a clean
+/// EOF as end-of-stream instead of `stream_broken`, and must send a current
+/// client User-Agent: `antigravity/cli/1.0.0` now earns a 200 whose only content
+/// is a "CLI no longer supported" notice.
+#[tokio::test]
+async fn antigravity_stream_ending_without_done_frame_still_completes() {
+    let upstream = TestServer::start(Router::new().route(
+        "/v1internal:streamGenerateContent",
+        post(|headers: HeaderMap| async move {
+            let ua = headers[header::USER_AGENT].to_str().unwrap();
+            assert!(
+                ua.starts_with("antigravity/") && !ua.contains("cli/1.0.0"),
+                "stale gated UA: {ua}"
+            );
+            let body = concat!(
+                "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"thought\":true,\"text\":\"\"}]}}],\"usageMetadata\":{\"promptTokenCount\":3,\"totalTokenCount\":3}}}\r\n\r\n",
+                "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":1,\"totalTokenCount\":4}}}\r\n\r\n"
+            );
+            ([(header::CONTENT_TYPE, "text/event-stream")], body)
+        }),
+    ))
+    .await
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("client"), "test-client\n").unwrap();
+    fs::write(dir.path().join("upstream"), "synthetic-token\n").unwrap();
+    let config = format!(
+        r#"
+[server]
+client_keys = ["file:{}/client"]
+[[credentials]]
+id = "ag"
+kind = "api_key"
+provider = "antigravity"
+key = "file:{}/upstream"
+[[models]]
+name = "antigravity/gemini-3-flash"
+[[models.deployments]]
+id = "ag"
+credential = "ag"
+base_url = "{}"
+upstream_model = "gemini-3-flash"
+headers = {{ x-llmux-project = "synthetic-project" }}
+"#,
+        dir.path().display(),
+        dir.path().display(),
+        upstream.url()
+    );
+    let gateway = TestServer::start(
+        llmux_server::app(RuntimeConfig::parse(&config).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+    let request = Request::post(format!("{}/v1/chat/completions", gateway.url()))
+        .header(header::AUTHORIZATION, "Bearer test-client")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from_static(
+            br#"{"model":"antigravity/gemini-3-flash","stream":false,"messages":[{"role":"user","content":"hi"}]}"#,
+        )))
+        .unwrap();
+    let response = client.request(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(payload["choices"][0]["message"]["content"], "ok");
+    assert_eq!(payload["usage"]["total_tokens"], 4);
+}
