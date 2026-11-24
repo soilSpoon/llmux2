@@ -2,12 +2,13 @@
 
 use http::{HeaderName, Uri};
 use llmux_types::{
-    provider, Billing, CanonicalModel, Capabilities, ChatRequestField, ContextOverflow, Deployment,
-    DeploymentIdx, ErrorKind, NousState, ProviderKind, QuotaSpec,
+    provider, AcpAgentSpec, AcpSessionMode, Billing, CanonicalModel, Capabilities,
+    ChatRequestField, ContextOverflow, Deployment, DeploymentIdx, ErrorKind, NousState,
+    ProviderKind, QuotaSpec,
 };
 use serde::Deserialize;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -100,6 +101,9 @@ pub struct RuntimeConfig {
     pub api_keys: HashMap<Arc<str>, ApiKey>,
     pub oauth: HashMap<Arc<str>, OAuthCredential>,
     pub nous: HashMap<Arc<str>, NousPortalCredential>,
+    /// Agent-CLI process specs keyed by credential id; the `acp_agent` adapter
+    /// spawns the declared child per credential.
+    pub acp_agents: HashMap<Arc<str>, AcpAgentSpec>,
     /// Quotas shared by every deployment that uses the credential.
     pub credential_quotas: HashMap<Arc<str>, QuotaSpec>,
     pub credential_meta: HashMap<Arc<str>, CredentialMeta>,
@@ -272,6 +276,37 @@ enum RawCredential {
         #[serde(default)]
         quota: QuotaSpec,
     },
+    /// A locally spawned agent CLI the gateway manages as a child and speaks
+    /// ACP JSON-RPC to. `provider` must be `acp_agent`.
+    AcpAgent {
+        id: String,
+        provider: String,
+        /// The CLI executable: an absolute path (the child's environment is
+        /// scrubbed, so there is no PATH to search).
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        /// Extra environment variables; `env:`/`file:` references resolve like
+        /// deployment header values, everything else is literal.
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+        /// Working directory for the child and the ACP session; defaults to `home`.
+        cwd: Option<String>,
+        /// Sandbox home: the child's HOME and XDG dirs point here so the CLI
+        /// reads its own config and credentials from this directory.
+        home: String,
+        turn_timeout_ms: Option<u64>,
+        session_mode: Option<RawAcpSessionMode>,
+        #[serde(default)]
+        quota: QuotaSpec,
+    },
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawAcpSessionMode {
+    PerRequest,
+    Persistent,
 }
 
 #[derive(Deserialize)]
@@ -390,6 +425,7 @@ impl RawConfig {
         let mut api_keys = HashMap::new();
         let mut oauth = HashMap::new();
         let mut nous = HashMap::new();
+        let mut acp_agents = HashMap::new();
         let mut credential_quotas = HashMap::new();
         for credential in credentials {
             let (id, provider, quota) = match &credential {
@@ -406,6 +442,12 @@ impl RawConfig {
                     ..
                 }
                 | RawCredential::NousPortal {
+                    id,
+                    provider,
+                    quota,
+                    ..
+                }
+                | RawCredential::AcpAgent {
                     id,
                     provider,
                     quota,
@@ -447,6 +489,68 @@ impl RawConfig {
                         ApiKey {
                             provider,
                             key: resolve_secret(&key)?,
+                        },
+                    );
+                }
+                RawCredential::AcpAgent {
+                    command,
+                    args,
+                    env,
+                    cwd,
+                    home,
+                    turn_timeout_ms,
+                    session_mode,
+                    ..
+                } => {
+                    if provider.0.as_ref() != provider::ACP_AGENT {
+                        return Err(invalid(
+                            "acp_agent credentials must set provider = \"acp_agent\"",
+                        ));
+                    }
+                    let absolute = |value: &str, field: &str| -> Result<PathBuf, ConfigError> {
+                        let path = PathBuf::from(value);
+                        if value.is_empty() || !path.is_absolute() {
+                            return Err(invalid(&format!(
+                                "acp_agent {field} must be an absolute path"
+                            )));
+                        }
+                        Ok(path)
+                    };
+                    let command = absolute(&command, "command")?;
+                    let home = absolute(&home, "home")?;
+                    let cwd = cwd.as_deref().map(|cwd| absolute(cwd, "cwd")).transpose()?;
+                    let env = env
+                        .iter()
+                        .map(|(name, value)| {
+                            if name.is_empty() || name.bytes().any(|b| b == b'=' || b == 0) {
+                                return Err(invalid(
+                                    "acp_agent env names must be nonempty and must not contain '='",
+                                ));
+                            }
+                            let value = if value.starts_with("env:") || value.starts_with("file:") {
+                                resolve_reference(value)?
+                            } else {
+                                value.clone()
+                            };
+                            if value.bytes().any(|b| b == 0) {
+                                return Err(invalid("acp_agent env values must not contain NUL"));
+                            }
+                            Ok((name.clone(), value))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, ConfigError>>()?;
+                    acp_agents.insert(
+                        id,
+                        AcpAgentSpec {
+                            command,
+                            args,
+                            env,
+                            cwd,
+                            home,
+                            turn_timeout: timeout(turn_timeout_ms.unwrap_or(120_000))?,
+                            mode: match session_mode.unwrap_or(RawAcpSessionMode::PerRequest) {
+                                RawAcpSessionMode::PerRequest => AcpSessionMode::PerRequest,
+                                RawAcpSessionMode::Persistent => AcpSessionMode::Persistent,
+                            },
                         },
                     );
                 }
@@ -686,6 +790,10 @@ impl RawConfig {
                             .then_some(provider::DEVIN_ACP_BASE_URL)
                     })
                     .or_else(|| {
+                        (provider.0.as_ref() == provider::ACP_AGENT)
+                            .then_some(provider::ACP_AGENT_BASE_URL)
+                    })
+                    .or_else(|| {
                         (provider.0.as_ref() == provider::AWS_QUICK)
                             .then_some(provider::AWS_QUICK_BASE_URL)
                     })
@@ -774,6 +882,7 @@ impl RawConfig {
             api_keys,
             oauth,
             nous,
+            acp_agents,
             credential_meta,
             model_names,
             catch_all,
@@ -1747,6 +1856,30 @@ upstream_model = "upstream"
         std::fs::remove_file(path).unwrap();
     }
 
+    fn acp_config(fields: &str) -> String {
+        format!(
+            r#"
+[server]
+client_keys = ["env:LLMUX_CONFIG_OAUTH_TEST_SECRET"]
+[[credentials]]
+id = "agent"
+kind = "acp_agent"
+provider = "acp_agent"
+command = "/usr/bin/env"
+args = ["--acp"]
+env = {{ AGENT_FLAG = "on", AGENT_KEY = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET" }}
+home = "/tmp/agent-home"
+{fields}
+[[models]]
+name = "model"
+[[models.deployments]]
+id = "deployment"
+credential = "agent"
+upstream_model = "upstream"
+"#
+        )
+    }
+
     #[test]
     fn key_policies_parse_align_with_client_keys_and_validate() {
         for (name, value) in [
@@ -1831,5 +1964,96 @@ upstream_model = "upstream"
         ))
         .contains("repeat"));
         assert!(RuntimeConfig::parse(&base(&policy(ci, "models = [\"a\"]\nunknown = 1"))).is_err());
+    }
+
+    #[test]
+    fn acp_agent_credentials_parse_into_process_specs() {
+        let loaded = RuntimeConfig::parse(&acp_config(
+            "turn_timeout_ms = 5000\nsession_mode = \"persistent\"\ncwd = \"/tmp/agent-work\"",
+        ))
+        .expect("an acp_agent credential must load");
+        let spec = loaded.acp_agents.get("agent").expect("the spec is stored");
+        assert_eq!(spec.command, PathBuf::from("/usr/bin/env"));
+        assert_eq!(spec.args, vec!["--acp".to_owned()]);
+        assert_eq!(spec.env["AGENT_FLAG"], "on");
+        assert_eq!(spec.env["AGENT_KEY"], "test-secret");
+        assert_eq!(spec.home, PathBuf::from("/tmp/agent-home"));
+        assert_eq!(spec.cwd.as_deref(), Some(Path::new("/tmp/agent-work")));
+        assert_eq!(spec.turn_timeout, Duration::from_secs(5));
+        assert_eq!(spec.mode, AcpSessionMode::Persistent);
+        assert_eq!(
+            loaded.deployments[0].provider.0.as_ref(),
+            provider::ACP_AGENT
+        );
+        assert_eq!(
+            loaded.deployments[0].base_url.to_string(),
+            provider::ACP_AGENT_BASE_URL
+        );
+        assert_eq!(loaded.deployments[0].credential.as_ref(), "agent");
+
+        // Defaults: cwd falls back to home, per-request children, request-level
+        // turn bound; base_url can still be given explicitly.
+        let defaults = RuntimeConfig::parse(&acp_config("")).unwrap();
+        let spec = defaults.acp_agents.get("agent").unwrap();
+        assert!(spec.cwd.is_none());
+        assert_eq!(spec.cwd(), Path::new("/tmp/agent-home"));
+        assert_eq!(spec.mode, AcpSessionMode::PerRequest);
+        assert_eq!(spec.turn_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn acp_agent_credentials_are_validated() {
+        let swap = |from: &str, to: &str| RuntimeConfig::parse(&acp_config("").replace(from, to));
+        for (from, to) in [
+            ("provider = \"acp_agent\"", "provider = \"openai_compat\""),
+            ("command = \"/usr/bin/env\"", "command = \"env\""),
+            ("command = \"/usr/bin/env\"", "command = \"\""),
+            ("home = \"/tmp/agent-home\"", "home = \"agent-home\""),
+            ("home = \"/tmp/agent-home\"", "home = \"\""),
+        ] {
+            let err = swap(from, to)
+                .err()
+                .unwrap_or_else(|| panic!("accepted {to}"));
+            assert!(err.to_string().contains("acp_agent"), "{to}: {err}");
+        }
+        for bad in [
+            "cwd = \"work\"",
+            "turn_timeout_ms = 0",
+            "session_mode = \"forever\"",
+        ] {
+            assert!(
+                RuntimeConfig::parse(&acp_config(bad)).is_err(),
+                "accepted {bad}"
+            );
+        }
+        // Env values may also come from file: references; bad names are rejected.
+        let path = std::env::temp_dir().join(format!(
+            "llmux-acp-env-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "from-file\n").unwrap();
+        let loaded = RuntimeConfig::parse(&acp_config("").replace(
+            "AGENT_FLAG = \"on\"",
+            &format!("AGENT_FLAG = \"file:{}\"", path.display()),
+        ))
+        .unwrap();
+        assert_eq!(loaded.acp_agents["agent"].env["AGENT_FLAG"], "from-file");
+        std::fs::remove_file(path).unwrap();
+        assert!(RuntimeConfig::parse(
+            &acp_config("").replace("AGENT_FLAG = \"on\"", "\"BAD=NAME\" = \"x\"")
+        )
+        .is_err());
+        // Credential values never leak into error messages.
+        let err = RuntimeConfig::parse(&acp_config("").replace(
+            "AGENT_KEY = \"env:LLMUX_CONFIG_OAUTH_TEST_SECRET\"",
+            "AGENT_KEY = \"env:LLMUX_CONFIG_MISSING_ACP_SECRET\"",
+        ))
+        .map(|_| ())
+        .unwrap_err();
+        assert!(!err.to_string().contains("LLMUX_CONFIG_MISSING_ACP_SECRET"));
     }
 }

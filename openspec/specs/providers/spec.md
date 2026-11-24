@@ -241,6 +241,84 @@ WHEN a turn with staged images completes or is aborted
 THEN the request's `.llmux-images/<unique>/` directory is removed, leaving no
 payload files behind.
 
+### Requirement: ACP agent CLIs as managed children
+
+The `acp_agent` provider SHALL serve an OpenAI chat request by spawning the
+agent CLI named by the deployment's `acp_agent` credential as a child process
+and speaking ACP JSON-RPC on its stdio (`initialize`, `session/new`,
+`session/set_mode` "ask", `session/prompt`). The credential SHALL declare the
+child's `command` as an absolute path, plus `args`, an `env` allowlist, a
+sandbox `home`, an optional `cwd` defaulting to `home`, an optional
+`turn_timeout_ms`, and an optional `session_mode`. The child SHALL run under a
+scrubbed environment whose `HOME` and XDG directories point at `home` (so the
+CLI resolves its own config and sign-ins there), with only the declared `env`
+entries added on top; `env` values MAY use `env:`/`file:` references like
+deployment headers. The credential SHALL map an API-key-less credential id to
+the `acp_agent` provider kind, and a deployment referencing it SHALL default
+its `base_url` to the placeholder endpoint.
+
+`session_mode` SHALL default to `per_request`: a fresh child is spawned,
+handshaken, spoken to, and killed inside `turn_timeout` for each request, and
+the child SHALL also be killed when the attempt's deadline or cancellation
+drops the turn. `session_mode = "persistent"` SHALL keep one initialized child
+per credential id and multiplex `session/new` turns through it, serializing
+concurrent requests; a dead child SHALL be dropped and lazily respawned, and a
+turn that fails with a definitive RPC error response SHALL keep the child
+while any other failure drops it.
+
+Reply chunks from `session/update` `agent_message_chunk` notifications SHALL
+stream as OpenAI deltas and aggregate into the non-streamed completion;
+`session/request_permission` SHALL be answered `cancelled` like the Devin
+bridge, and a `session/prompt` usage block SHALL map to OpenAI `usage`. A
+spawn failure SHALL surface as a connect-class error, the child exiting or
+closing stdio mid-turn as a stream-broken error, the turn exceeding
+`turn_timeout` as a timeout error, a `{`-led line that is not valid JSON-RPC
+as a server error rather than a hang, and a well-formed RPC error response
+SHALL map to its failover class (rate-limited, quota-exhausted, model-not-found,
+or server). Non-JSON noise lines (banners) SHALL be skipped. Credential values
+— including resolved `env` secrets — SHALL NOT appear in errors, logs, or
+other output.
+
+Agent CLIs speaking a different JSON-RPC dialect (Codex `app-server`'s
+`thread/start`/`turn/start`, zcode) SHALL NOT be claimed by this provider;
+they are a separate protocol family.
+
+#### Scenario: Per-request spawn and cleanup
+
+WHEN a chat request hits an `acp_agent` deployment in the default mode
+THEN a fresh child runs the credential's command and args under the sandboxed
+environment, the ACP handshake and prompt complete, the reply maps to an
+OpenAI completion, and the child is no longer running afterwards.
+
+#### Scenario: Child exits non-zero
+
+WHEN the CLI exits before answering (for example on a missing sign-in)
+THEN the request fails with a stream-broken or connect-class error and no
+request hangs.
+
+#### Scenario: Turn timeout
+
+WHEN the child never answers within `turn_timeout`
+THEN the request fails with a timeout error and the child is killed.
+
+#### Scenario: Malformed JSON-RPC frame
+
+WHEN the child emits a `{`-led line that is not valid JSON-RPC
+THEN the request fails with a server error instead of waiting for a well-formed
+response that cannot come.
+
+#### Scenario: Persistent reuse
+
+WHEN a credential sets `session_mode = "persistent"` and serves two requests
+THEN one child is initialized once and both turns run through it; when the
+child has died, the next request respawns it.
+
+#### Scenario: Sandbox home
+
+WHEN the credential declares `home` and `env` entries
+THEN the child sees `HOME` and the XDG dirs inside `home`, plus exactly the
+declared variables, with the parent's other environment scrubbed.
+
 ### Requirement: Keyless deployments
 
 The gateway SHALL support explicit keyless upstreams via `auth = "none"` with

@@ -114,3 +114,31 @@ timeout_ms = 120000
 # upstream_model = "swe-2-high-lightning"
 # priority = 10
 # timeout_ms = 120000
+
+# Any agent CLI that speaks ACP JSON-RPC on stdio (for example `auggie --acp`)
+# can serve a model through the `acp_agent` provider. The credential declares
+# the managed child: an absolute command path, its args, an env allowlist, and
+# a sandbox home the child's HOME/XDG dirs point at (put the CLI's own config
+# and sign-ins there). A fresh child runs per request; session_mode =
+# "persistent" keeps one initialized child per credential and multiplexes
+# turns. env values accept env:/file: references like deployment headers.
+# [[credentials]]
+# id = "auggie"
+# kind = "acp_agent"
+# provider = "acp_agent"
+# command = "/usr/local/bin/auggie"
+# args = ["--acp"]
+# env = { AUGMENT_API_TOKEN = "env:AUGMENT_API_TOKEN" }
+# home = "/var/lib/llmux/auggie-home"
+# turn_timeout_ms = 120000
+# session_mode = "per_request"
+#
+# [[models]]
+# name = "auggie"
+# capabilities = { stream = true }
+#
+# [[models.deployments]]
+# id = "auggie-local"
+# credential = "auggie"
+# upstream_model = "default"
+# timeout_ms = 120000

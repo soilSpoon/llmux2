@@ -1,5 +1,6 @@
 //! Shared contracts for routing, configuration, and upstream adapters.
 
+mod acp;
 mod adapter;
 mod devin;
 mod error;
@@ -10,6 +11,7 @@ pub mod provider;
 mod request;
 mod upstream;
 
+pub use acp::*;
 pub use adapter::*;
 pub use devin::*;
 pub use error::*;
