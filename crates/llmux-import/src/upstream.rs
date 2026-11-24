@@ -8,7 +8,6 @@ use serde_json::{json, Value};
 use std::net::IpAddr;
 
 pub(super) const DEEPAI_BASE: &str = "https://api.deepai.org/api";
-const DEEPAI_CODE_SIDECAR: &str = "http://127.0.0.1:8790/deepai/v1";
 
 pub(super) const PROVIDER_ALIASES: &[(&str, &str)] = &[
     ("ds", "deepseek"),
@@ -313,7 +312,7 @@ pub(super) fn resolve(
         return Err("DeepAI requires its official text API base URL");
     }
     if kind == KIND_OPENAI_COMPAT
-        && url == DEEPAI_CODE_SIDECAR
+        && crate::deepai_code::is_bridge_url(url)
         && (provider.is_builtin("deepai-code")
             || node.is_some_and(|node| {
                 string(node, "prefix") == "deepai" && string(node, "type") == "openai-compatible"

@@ -39,6 +39,10 @@ pub(super) fn billed(connection: &Connection, model: &str, policy: &Policy) -> b
                     .filter_map(|e| e.and_then(|m| m.as_ref()))
                     .any(|models| models.contains(model))
         }),
+        ProviderIdentity::Builtin(id) if id == "deepai-code" => policy
+            .deepai_code
+            .as_ref()
+            .is_none_or(|state| !crate::deepai_code::free(state, model)),
         ProviderIdentity::Builtin(id) if id == "devin-cli-agentic" => !policy
             .devin_free
             .as_ref()
@@ -102,6 +106,12 @@ pub(super) struct Policy {
     /// `--free-providers`. A `None` model set marks the whole provider free;
     /// a `Some` set marks only the listed upstream model ids free.
     pub free_custom: Option<HashMap<String, Option<HashSet<String>>>>,
+    /// DeepAI Code discovery state (`--deepai-code-state`): its `free` set
+    /// marks catalog ids free on the deepai-code connection.
+    pub deepai_code: Option<crate::deepai_code::State>,
+    /// `file:` reference to the DeepAI Code session token
+    /// (`--deepai-code-token-file`), rotated per harness session.
+    pub deepai_code_token: Option<String>,
 }
 
 fn reference(path: &Path) -> Result<String, String> {
@@ -255,6 +265,9 @@ impl Policy {
                     .into(),
             );
         }
+        if options.deepai_code_token_file.is_some() && options.deepai_code_state.is_none() {
+            return Err("--deepai-code-token-file requires --deepai-code-state".into());
+        }
         Ok(Self {
             workers,
             workers_rpm: options.workers_ai_rpm.unwrap_or(WORKERS_DEFAULT_RPM),
@@ -267,6 +280,11 @@ impl Policy {
                 .map(crate::devin::free_models)
                 .transpose()?,
             free_custom,
+            deepai_code: options
+                .deepai_code_state
+                .map(crate::deepai_code::State::load)
+                .transpose()?,
+            deepai_code_token: options.deepai_code_token_file.map(reference).transpose()?,
         })
     }
 
@@ -408,6 +426,8 @@ mod tests {
             openrouter_replacements: false,
             devin_free,
             free_custom,
+            deepai_code: None,
+            deepai_code_token: None,
         }
     }
 
