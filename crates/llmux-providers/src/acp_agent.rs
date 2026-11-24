@@ -603,7 +603,10 @@ done
                         std::time::Instant::now() < deadline,
                         "pid {pid} still alive"
                     );
-                    std::thread::sleep(Duration::from_millis(10));
+                    // The runtime must stay free to reap the zombie child —
+                    // a blocking sleep would stall the process driver and
+                    // `kill -0` would keep succeeding on the defunct pid.
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
         }
