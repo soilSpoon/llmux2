@@ -9,7 +9,8 @@
 //! are a separate protocol family and do not go through this adapter.
 
 use crate::acp::{
-    cli_command, completion as acp_completion, labelled_turns, usage_body, AbortOnDrop, AcpSession,
+    cli_command, completion as acp_completion, labelled_turns, stage_images, usage_body,
+    AbortOnDrop, AcpSession, ImageStaging,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -112,8 +113,11 @@ impl AcpAgent {
                     out
                 }
                 AcpSessionMode::Persistent => {
-                    let mut sessions = sessions.lock().await;
-                    let mut session = match sessions.remove(credential) {
+                    // The session is checked out of the map for the turn so
+                    // the map lock is never held across a spawn or turn —
+                    // concurrent turns on other credentials do not serialize.
+                    let removed = sessions.lock().await.remove(credential);
+                    let mut session = match removed {
                         // A dead child is dropped (kill_on_drop) and respawned
                         // lazily rather than failing this request.
                         Some(mut session) => {
@@ -128,12 +132,17 @@ impl AcpAgent {
                     session.set_chunks(chunks);
                     match session.chat_turn(&cwd, model, prompt).await {
                         Ok(out) => {
-                            sessions.insert(credential.clone(), session);
+                            // The stream sender must be dropped before caching:
+                            // a session cached with a live sender holds the
+                            // response stream open after its turn completes.
+                            session.set_chunks(None);
+                            sessions.lock().await.insert(credential.clone(), session);
                             Ok(out)
                         }
                         Err(err) => {
                             if reusable_after(&err) {
-                                sessions.insert(credential.clone(), session);
+                                session.set_chunks(None);
+                                sessions.lock().await.insert(credential.clone(), session);
                             }
                             Err(err)
                         }
@@ -155,9 +164,13 @@ impl AcpAgent {
         model: String,
         prompt: Vec<Value>,
         include_usage: bool,
+        // Held until the stream ends: the staged image files must outlive the
+        // turn, including an aborted one — the guard's locals drop with it.
+        _staged: Option<ImageStaging>,
     ) -> GatewayResponse {
         let sessions = self.sessions.clone();
         GatewayResponse::Stream(Box::pin(async_stream::stream! {
+            let _staged = _staged;
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             let mut task = {
                 let model = model.clone();
@@ -226,12 +239,26 @@ impl AcpAgent {
                 status: StatusCode::BAD_REQUEST,
                 body: Bytes::new(),
             })?;
-        let prompt = prompt_text(body["messages"].as_array().map_or(&[][..], |m| m)).ok_or(
+        let mut prompt = prompt_text(body["messages"].as_array().map_or(&[][..], |m| m)).ok_or(
             UpstreamError::BadRequest {
                 status: StatusCode::BAD_REQUEST,
                 body: Bytes::new(),
             },
         )?;
+        let (_staged, entries) = stage_images(
+            &spec.home,
+            body["messages"].as_array().map_or(&[][..], |m| m),
+        )?;
+        if !entries.is_empty() {
+            prompt.push_str("\n\n[Images]");
+            for (index, entry) in entries.iter().enumerate() {
+                prompt.push_str(&format!("\nimage {}: {entry}", index + 1));
+            }
+            prompt.push_str(
+                "\n\nYou may read the files and URLs listed under [Images] to see the \
+                 attached images; no other tool use is needed for this reply.",
+            );
+        }
         let prompt = vec![json!({"type":"text","text":prompt})];
         let model = crate::upstream_model(req, dep).to_owned();
         if req.stream {
@@ -242,6 +269,7 @@ impl AcpAgent {
                 model,
                 prompt,
                 include_usage,
+                _staged,
             ));
         }
         let (text, usage) =
@@ -714,7 +742,7 @@ done
             assert_eq!(out["choices"][0]["message"]["content"], "done");
             let log =
                 std::fs::read_to_string(dir.path().join(".local/share/perm_reply.log")).unwrap();
-            assert!(log.contains(r#""outcome":"cancelled""#), "{log}");
+            assert!(log.contains(r#""result":{"outcome":"cancelled"}"#), "{log}");
             assert!(!log.contains("-32601"), "{log}");
         }
 
@@ -846,6 +874,51 @@ done
                 .map(|d| serde_json::from_str::<Value>(d).unwrap_or_default())
                 .any(|v| v["choices"][0]["finish_reason"] == "stop");
             assert!(finish, "{data:?}");
+        }
+
+        #[tokio::test]
+        async fn a_persistent_stream_closes_after_the_turn() {
+            let dir = tempfile::tempdir().unwrap();
+            use futures_util::StreamExt;
+            let mut spec = script(dir.path(), &["hi"]);
+            spec.mode = AcpSessionMode::Persistent;
+            let adapter = AcpAgent::new(HashMap::from([("cli".into(), spec)]));
+            let mut req = request(chat_body());
+            req.stream = true;
+            let GatewayResponse::Stream(events) =
+                adapter.serve(&req, &dep("cli", "m")).await.unwrap()
+            else {
+                panic!("expected a stream");
+            };
+            // A session cached with a live chunk sender holds the receiver
+            // open forever: the stream must still end once the turn does.
+            let data = timeout(Duration::from_secs(10), events.collect::<Vec<_>>())
+                .await
+                .expect("a cached session must not hold the stream open")
+                .into_iter()
+                .map(|e| e.unwrap().data)
+                .collect::<Vec<_>>();
+            assert_eq!(data.last().unwrap(), "[DONE]");
+        }
+
+        #[tokio::test]
+        async fn images_are_staged_as_files_and_indexed_in_the_prompt() {
+            let dir = tempfile::tempdir().unwrap();
+            let spec = script(dir.path(), &["ok"]);
+            let adapter = AcpAgent::new(HashMap::from([("cli".into(), spec)]));
+            let body = json!({"model":"agent","messages":[{"role":"user","content":[
+                {"type":"text","text":"look"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}
+            ]}]});
+            complete(&adapter, &dep("cli", "m"), body).await.unwrap();
+            let log = std::fs::read_to_string(dir.path().join(".local/share/prompts.log")).unwrap();
+            assert!(log.contains("[Images]"), "{log}");
+            assert_eq!(log.matches(".llmux-images/").count(), 1, "{log}");
+            // The staging dir is removed once the turn completes.
+            let leftover = std::fs::read_dir(dir.path().join(".llmux-images"))
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false);
+            assert!(!leftover, "staged image dir must be cleaned up");
         }
 
         #[tokio::test]

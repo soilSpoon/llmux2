@@ -4,8 +4,8 @@
 //! fell back to emitting conversation summaries instead of a reply.
 
 use crate::acp::{
-    cli_command, completion as acp_completion, image_source, labelled_turns, usage_body,
-    AbortOnDrop, AcpSession, ImageSource,
+    cli_command, completion as acp_completion, labelled_turns, stage_images, usage_body,
+    AbortOnDrop, AcpSession, ImageStaging,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -17,15 +17,7 @@ use llmux_types::{
     SseEvent, Support, UpstreamError,
 };
 use serde_json::{json, Value};
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 
 const MAX_CATALOG_BYTES: u64 = 4 * 1024 * 1024;
@@ -165,103 +157,6 @@ impl Unwrapper {
         };
         rest.to_owned()
     }
-}
-
-/// Decoded image bytes must not exceed this: `devin acp` accepts inline
-/// `image` blocks at the protocol level but never shows them to the model, so
-/// images reach the model only as files the agent `read`s from its sandbox —
-/// and unbounded writes are the failure to bound here.
-const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
-
-/// Removes the staging directory when the guard drops — including aborted
-/// turns, since the future's locals are dropped with it.
-#[derive(Debug)]
-struct ImageStaging {
-    dir: PathBuf,
-}
-
-impl Drop for ImageStaging {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// Per-request uniqueness for the staging dir: a nanosecond timestamp alone
-/// can repeat on coarse clocks, so concurrent requests in this process would
-/// share a dir and each guard's cleanup would delete the other's files.
-static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Writes each inline image under `<home>/.llmux-images/<unique>/` and returns
-/// the transcript index entries — file paths for inline payloads, the URL
-/// itself for remote ones. The ACP `image` content block is intentionally not
-/// used: the agent acknowledges it but the model never sees its bytes, while
-/// a file it `read`s is rendered to the model (probed live on 3000.14.30821).
-fn stage_images(
-    home: &Path,
-    messages: &[Value],
-) -> Result<(Option<ImageStaging>, Vec<String>), UpstreamError> {
-    use base64::Engine;
-    let sources: Vec<ImageSource> = messages
-        .iter()
-        .filter_map(|m| m["content"].as_array())
-        .flatten()
-        .filter_map(image_source)
-        .collect();
-    if sources.is_empty() {
-        return Ok((None, Vec::new()));
-    }
-    let unique = format!(
-        "{}-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos()),
-        STAGE_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
-    let dir = home.join(".llmux-images").join(unique);
-    std::fs::create_dir_all(&dir).map_err(|_| UpstreamError::Server {
-        status: StatusCode::BAD_GATEWAY,
-    })?;
-    // Held from here so a mid-loop failure (bad base64, oversized payload)
-    // removes the partially-written directory too.
-    let staging = ImageStaging { dir };
-    let mut entries = Vec::with_capacity(sources.len());
-    for (index, source) in sources.into_iter().enumerate() {
-        match source {
-            ImageSource::Data { mime, data } => {
-                // Base64 decodes to ~3/4 its length; reject by encoded length
-                // first so an oversized payload is never materialized.
-                if data.len() > MAX_IMAGE_BYTES * 4 / 3 + 4 {
-                    return Err(UpstreamError::BadRequest {
-                        status: StatusCode::PAYLOAD_TOO_LARGE,
-                        body: Bytes::new(),
-                    });
-                }
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(&data)
-                    .map_err(|_| UpstreamError::BadRequest {
-                        status: StatusCode::BAD_REQUEST,
-                        body: Bytes::new(),
-                    })?;
-                // The encoded-length bound above is approximate; the exact cap
-                // is enforced on the decoded bytes.
-                if bytes.len() > MAX_IMAGE_BYTES {
-                    return Err(UpstreamError::BadRequest {
-                        status: StatusCode::PAYLOAD_TOO_LARGE,
-                        body: Bytes::new(),
-                    });
-                }
-                let ext = mime.strip_prefix("image/").unwrap_or("bin");
-                let path = staging.dir.join(format!("image-{}.{}", index + 1, ext));
-                std::fs::write(&path, bytes).map_err(|_| UpstreamError::Server {
-                    status: StatusCode::BAD_GATEWAY,
-                })?;
-                entries.push(path.to_string_lossy().into_owned());
-            }
-            ImageSource::Url(url) => entries.push(url),
-        }
-    }
-    Ok((Some(staging), entries))
 }
 
 /// The default agent continues whatever conversation it is given; this frame pins
@@ -784,8 +679,9 @@ impl DevinAcp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::rpc_error;
+    use crate::acp::{rpc_error, MAX_IMAGE_BYTES};
     use base64::Engine;
+    use std::path::Path;
 
     #[test]
     fn synthesized_completion_id_is_not_an_upstream_request_id() {
