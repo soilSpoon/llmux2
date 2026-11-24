@@ -169,7 +169,7 @@ async fn scan_free_cli_lists_candidates_and_verdicts() {
         .route(
             "/models",
             axum::routing::get(|| async {
-                r#"{"promotion":"Free as gpt-test-alpha:free"} Free as deepseek-v4.1-flash-uncensored-fast:free"#
+                r#"{"promotion":"Free as gpt-test-alpha:free"} Free as deepseek-v4.1-flash"#
             }),
         )
         .route(
@@ -205,9 +205,8 @@ async fn scan_free_cli_lists_candidates_and_verdicts() {
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("candidate gpt-test-alpha:free\tlisted=false\tverdict=free"));
-    // deepseek-v4.1-flash-uncensored-fast:free is in the reviewed FREE map.
-    assert!(stdout
-        .contains("candidate deepseek-v4.1-flash-uncensored-fast:free\tlisted=true\tverdict=free"));
+    // A promo id already in the reviewed FREE map is marked listed.
+    assert!(stdout.contains("candidate deepseek-v4.1-flash\tlisted=true\tverdict=free"));
     assert_eq!(
         probed.lock().unwrap().len(),
         2,
