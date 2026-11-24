@@ -277,3 +277,22 @@ AND the other deployment can serve.
 WHEN every deployment of the requested model is a stale `devin_acp` deployment
 THEN the gateway returns the existing exhausted error
 AND does not route the request to a different model.
+
+### Requirement: Adaptive free-leg advertising
+
+The gateway SHALL advertise a canonical model to clients only while at least
+one free (non-billed) deployment exists for it. A model whose every leg is
+billed SHALL NOT appear in the advertised model list, while a model shared
+between free and billed legs stays listed as long as a free leg remains
+configured. Advertising SHALL be recomputed automatically whenever the
+deployment set or billing classification changes — never maintained by hand.
+
+#### Scenario: Billed-only model hidden
+
+WHEN every deployment of a model is billed
+THEN it is absent from the advertised list until a free leg is added.
+
+#### Scenario: One free leg keeps the model listed
+
+WHEN a model has one free deployment alongside billed ones
+THEN it stays advertised, and requests use the free leg first.

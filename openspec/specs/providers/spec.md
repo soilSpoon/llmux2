@@ -27,6 +27,22 @@ WHEN a provider only offers a free tier with a request cap
 THEN it is configured as a normal deployment and its limits are tracked like
 any other.
 
+### Requirement: Free-only use of mixed providers
+
+A provider that offers free and paid models on one credit balance SHALL serve
+the gateway only with its free models. Paid-model legs on such a provider
+SHALL be marked billed and SHALL NOT be emitted or enabled without explicit
+owner opt-in; a credit balance SHALL NOT by itself make a paid leg eligible.
+Each provider's free-model conditions — plan tier, free model list, `:free`
+suffixes, quota classes — SHALL be recorded so billing classification stays
+accurate per model, not per provider.
+
+#### Scenario: Credit does not unlock paid legs
+
+WHEN a mixed free/paid provider account holds paid credit
+THEN only its free models carry deployments, and paid models are never served
+on that credit — even when every free leg is exhausted.
+
 ### Requirement: DeepAI text API
 
 The gateway SHALL convert non-streaming Chat Completions requests with one
