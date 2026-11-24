@@ -994,6 +994,76 @@ fn restricted_client_policies_fail_closed() {
 }
 
 #[test]
+fn restricted_model_lists_port_to_key_policies() {
+    let mut root: Value = serde_json::from_str(FIXTURE).unwrap();
+    root["apiKeys"] = json!([
+        {
+            "key": "ported-secret",
+            "name": "buyer",
+            "isActive": true,
+            "modelAccessMode": "restricted",
+            "allowedModels": ["cfpd/*", "deepseek-v4-flash"],
+            "blockedModels": ["zc/*", "dva/*"]
+        },
+        {
+            "key": "untranslatable-secret",
+            "isActive": true,
+            "modelAccessMode": "restricted",
+            "allowedModels": ["cfpd/*"],
+            "ipAllowlist": ["127.0.0.1"]
+        },
+        {
+            "key": "deny-all-secret",
+            "isActive": true,
+            "modelAccessMode": "restricted",
+            "allowedModels": []
+        }
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
+    assert_eq!(report.client_keys, 1);
+    let config = RuntimeConfig::load(&output).unwrap();
+    let idx = config
+        .server
+        .client_keys
+        .iter()
+        .position(|key| key.as_ref() == "ported-secret")
+        .expect("ported key in client_keys");
+    let policy = config.server.key_policies[idx]
+        .as_ref()
+        .expect("restricted key carries a policy");
+    assert_eq!(
+        policy.models.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec!["cfpd/*", "deepseek-v4-flash"]
+    );
+    assert_eq!(
+        policy
+            .blocked
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["zc/*", "dva/*"]
+    );
+    let secrets: Vec<String> = fs::read_dir(dir.path().join("secrets"))
+        .unwrap()
+        .map(|e| fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect();
+    assert!(secrets.iter().any(|s| s == "ported-secret"));
+    for skipped in ["untranslatable-secret", "deny-all-secret"] {
+        assert!(!secrets.iter().any(|s| s == skipped), "{skipped}");
+    }
+    assert_eq!(
+        report
+            .warnings
+            .iter()
+            .filter(|w| w.contains("skipped restricted"))
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn shared_empty_combo_diamonds_have_bounded_work() {
     let mut root: Value = serde_json::from_str(FIXTURE).unwrap();
     root["modelAliases"] = json!({});

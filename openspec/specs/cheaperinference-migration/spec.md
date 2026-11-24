@@ -418,6 +418,31 @@ WHEN an enabled Codex-routing mapping pattern cannot be expressed as an exact
 ID or a prefix with a single trailing `*`
 THEN import fails clearly without writing the output configuration.
 
+### Requirement: Restricted client keys keep their model policy
+
+An export API key SHALL be imported as a `client_keys` entry when its only
+restrictions are `model_access_mode = restricted` plus `allowed_models` and
+`blocked_models` glob lists, and the importer SHALL emit a matching
+`server.key_policies` entry with `models` from `allowed_models` and `blocked`
+from `blocked_models`. A key carrying any other restricted field SHALL stay
+skipped — importing it unrestricted would silently widen access — and a
+restricted key with an empty `allowed_models` list SHALL stay skipped because
+it denies every model.
+
+#### Scenario: Model-list restriction is ported
+
+WHEN an export key is `restricted` with `allowed_models = ["cfpd/*", "m"]`
+and `blocked_models = ["zc/*"]`
+THEN the emitted config authenticates the key and binds it to a
+`key_policies` entry with `models = ["cfpd/*", "m"]` and
+`blocked = ["zc/*"]`.
+
+#### Scenario: Untranslatable restriction stays closed
+
+WHEN an export key combines model lists with a restriction llmux2 cannot
+express, such as `ip_allowlist` or `scopes`
+THEN the key is skipped with a warning and no secret file is written for it.
+
 ### Requirement: Revenue-oriented allocation
 
 Provider and capacity allocation SHALL favor increasing CheaperInference
