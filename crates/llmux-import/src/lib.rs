@@ -745,6 +745,67 @@ fn overlay_value(value: toml::Value) -> Result<Value, String> {
     })
 }
 
+/// Fields typed as TOML datetimes in llmux-config. `overlay_value` converts
+/// them to RFC 3339 strings for the JSON merge; `config_to_toml` restores
+/// them to bare datetimes before emission — a quoted `expires_at` fails
+/// llmux-config's parse. Extend when the schema adds datetime fields.
+const TOML_DATETIME_KEYS: &[&str] = &["expires_at"];
+
+fn restore_toml_datetimes(value: &mut toml::Value) {
+    match value {
+        toml::Value::Table(table) => {
+            for (key, inner) in table.iter_mut() {
+                if TOML_DATETIME_KEYS.contains(&key.as_str()) {
+                    if let toml::Value::String(stamp) = inner {
+                        if let Ok(at) = stamp.parse() {
+                            *inner = toml::Value::Datetime(at);
+                        }
+                    }
+                }
+                restore_toml_datetimes(inner);
+            }
+        }
+        toml::Value::Array(items) => {
+            for item in items {
+                restore_toml_datetimes(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// JSON config → `toml::Value` for validation and emission, with the
+/// overlay's datetime fields restored so they serialize bare.
+pub(crate) fn config_to_toml(config: &Value) -> Result<toml::Value, String> {
+    let mut value = toml::Value::try_from(config).map_err(|_| "could not encode configuration")?;
+    restore_toml_datetimes(&mut value);
+    Ok(value)
+}
+
+/// Overlay `[[credentials]]` rows upsert by `id`: a row naming an emitted
+/// credential merges its fields into that row (e.g. `disabled = true`),
+/// while a new id appends. Without this a site could never mark an emitted
+/// credential disabled — a second row with the same id fails config
+/// validation on duplicate ids.
+fn merge_credentials(existing: &mut Vec<Value>, extra: &[Value]) {
+    for row in extra {
+        let id = row["id"].as_str();
+        match existing
+            .iter_mut()
+            .find(|current| id.is_some() && current["id"].as_str() == id)
+        {
+            Some(current) => {
+                if let (Some(current), Some(patch)) = (current.as_object_mut(), row.as_object()) {
+                    for (field, value) in patch {
+                        current.insert(field.clone(), value.clone());
+                    }
+                }
+            }
+            None => existing.push(row.clone()),
+        }
+    }
+}
+
 fn merge_overlay(config: &mut Value, overlay: Value) -> Result<(), String> {
     let (config, overlay) = match (config.as_object_mut(), overlay.as_object()) {
         (Some(config), Some(overlay)) => (config, overlay),
@@ -758,7 +819,11 @@ fn merge_overlay(config: &mut Value, overlay: Value) -> Result<(), String> {
                 }
             }
             (Some(Value::Array(existing)), Value::Array(extra)) => {
-                existing.extend(extra.iter().cloned());
+                if key == "credentials" {
+                    merge_credentials(existing, extra);
+                } else {
+                    existing.extend(extra.iter().cloned());
+                }
             }
             (_, value) => {
                 config.insert(key.clone(), value.clone());
@@ -1647,7 +1712,7 @@ pub fn import_with_options(
     if let Some(path) = options.canonical_map {
         write_canonical_map(path, &config, &dropped_suffixed, &dead)?;
     }
-    let value = toml::Value::try_from(&config).map_err(|_| "could not encode configuration")?;
+    let value = config_to_toml(&config)?;
     let content = toml::to_string_pretty(&value).map_err(|_| "could not encode configuration")?;
     let mut file = OpenOptions::new()
         .write(true)
