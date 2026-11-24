@@ -215,6 +215,7 @@ impl Executor {
                 && other.base_url == dep.base_url
                 && other.upstream_model == dep.upstream_model
                 && other.quota == dep.quota
+                && other.shared_quota == dep.shared_quota
         };
         if let Some((_, limits)) = shared.iter().find(|(other, _)| same_route(other)) {
             return limits.clone();
@@ -233,7 +234,9 @@ impl Executor {
             let same_scope = |other: &&Deployment| {
                 other.shared_quota.as_ref() == Some(group)
                     && if dep.credential.is_empty() {
-                        other.provider == dep.provider && other.base_url == dep.base_url
+                        other.credential.is_empty()
+                            && other.provider == dep.provider
+                            && other.base_url == dep.base_url
                     } else {
                         other.credential == dep.credential
                     }

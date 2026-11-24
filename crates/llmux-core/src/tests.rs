@@ -915,15 +915,15 @@ async fn local_rpm_budget_is_shared_by_models_on_the_same_upstream_route() {
     assert_eq!(calls, ["dep0", "dep2"]);
 }
 
-/// Deployments 0 and 1 serve different upstream models; `bound[i]` marks
-/// dep i as drawing on the `[[shared_quotas]]` family `group`. `creds[i]`
-/// sets each leg's credential ("" is anonymous) and `dep2_base_url` moves
-/// dep2 to a second upstream for anonymous-scope tests.
+/// `fams[i]` binds dep i to the `[[shared_quotas]]` family of that name;
+/// `creds[i]` sets its credential ("" is anonymous), `upstreams[i]` its
+/// upstream model, and `dep2_base_url` moves dep2 to a second upstream.
 async fn fixture_shared_group(
     models: &[(&str, &[u32])],
-    group: Option<(&'static str, llmux_types::QuotaSpec)>,
-    bound: [bool; 3],
+    groups: &[(&'static str, llmux_types::QuotaSpec)],
+    fams: [Option<&'static str>; 3],
     creds: [&str; 3],
+    upstreams: [&str; 3],
     dep2_base_url: Option<&str>,
 ) -> Fixture {
     let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
@@ -968,13 +968,11 @@ async fn fixture_shared_group(
                 provider: adapter.kind.clone(),
                 credential: creds[i as usize].into(),
                 base_url: base_url.parse().unwrap(),
-                upstream_model: if i == 1 { "upstream-1" } else { "upstream" }.into(),
+                upstream_model: upstreams[i as usize].into(),
                 strip_request_fields: Box::default(),
                 priority: i as i32,
                 quota: Default::default(),
-                shared_quota: bound[i as usize]
-                    .then(|| group.map(|(name, _)| name.into()))
-                    .flatten(),
+                shared_quota: fams[i as usize].map(Into::into),
                 timeout: Duration::from_secs(1),
                 max_context: None,
                 expires_at: None,
@@ -1014,9 +1012,10 @@ async fn fixture_shared_group(
             quota_max: Duration::from_secs(10 * 86_400),
         },
         api_keys: HashMap::new(),
-        shared_quotas: group
-            .map(|(name, spec)| HashMap::from([(name.into(), spec)]))
-            .unwrap_or_default(),
+        shared_quotas: groups
+            .iter()
+            .map(|(name, spec)| (Arc::from(*name), *spec))
+            .collect(),
         credential_quotas: HashMap::new(),
         credential_meta: HashMap::new(),
         oauth: HashMap::new(),
@@ -1070,15 +1069,16 @@ async fn shared_quota_binds_legs_on_one_scope_to_one_window() {
     // account-wide window across different upstream models.
     let (executor, adapter, _, _server) = fixture_shared_group(
         &[("a", &[0, 2]), ("b", &[1, 2])],
-        Some((
+        &[(
             "fam",
             llmux_types::QuotaSpec {
                 rpm: Some(1),
                 ..Default::default()
             },
-        )),
-        [true, true, false],
+        )],
+        [Some("fam"), Some("fam"), None],
         ["first", "first", "second"],
+        ["upstream", "upstream-1", "upstream"],
         None,
     )
     .await;
@@ -1116,15 +1116,16 @@ async fn shared_quota_scopes_anonymous_legs_by_provider_and_base_url() {
     let other_url = other.url();
     let (executor, adapter, _, _server) = fixture_shared_group(
         &[("a", &[0, 2]), ("b", &[1, 2])],
-        Some((
+        &[(
             "fam",
             llmux_types::QuotaSpec {
                 rpm: Some(1),
                 ..Default::default()
             },
-        )),
-        [true, true, true],
+        )],
+        [Some("fam"), Some("fam"), Some("fam")],
         ["", "", ""],
+        ["upstream", "upstream-1", "upstream"],
         Some(&other_url),
     )
     .await;
@@ -1154,15 +1155,16 @@ async fn unbound_legs_on_the_same_credential_keep_independent_windows() {
     // by the family's allowance.
     let (executor, adapter, _, _server) = fixture_shared_group(
         &[("a", &[0, 2]), ("b", &[1, 2])],
-        Some((
+        &[(
             "fam",
             llmux_types::QuotaSpec {
                 rpm: Some(1),
                 ..Default::default()
             },
-        )),
-        [true, false, false],
+        )],
+        [Some("fam"), None, None],
         ["first", "first", "second"],
+        ["upstream", "upstream-1", "upstream"],
         None,
     )
     .await;
@@ -1170,6 +1172,199 @@ async fn unbound_legs_on_the_same_credential_keep_independent_windows() {
         executor
             .execute(GatewayRequest {
                 model: model.into(),
+                ..request()
+            })
+            .await
+            .unwrap();
+    }
+    let calls: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(calls, ["dep0", "dep1"]);
+}
+
+#[tokio::test]
+async fn bound_then_unbound_siblings_on_one_route_do_not_share_family_windows() {
+    // dep0 and dep1 sit on the same upstream route except dep0 binds "fam":
+    // processing dep0 first must not hand dep1 the family's drained window.
+    let (executor, adapter, _, _server) = fixture_shared_group(
+        &[("a", &[0, 1, 2])],
+        &[(
+            "fam",
+            llmux_types::QuotaSpec {
+                rpm: Some(1),
+                ..Default::default()
+            },
+        )],
+        [Some("fam"), None, None],
+        ["first", "first", "second"],
+        ["upstream", "upstream", "upstream"],
+        None,
+    )
+    .await;
+    for _ in 0..2 {
+        executor
+            .execute(GatewayRequest {
+                model: "a".into(),
+                ..request()
+            })
+            .await
+            .unwrap();
+    }
+    let calls: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(calls, ["dep0", "dep1"]);
+}
+
+#[tokio::test]
+async fn unbound_then_bound_siblings_on_one_route_keep_the_family_cap() {
+    // Mirror order: dep0 unbound processes first, dep1 same route bound
+    // "fam". dep1 must still count against the family window it shares with
+    // dep2 — a detached limits object would let the cap double silently.
+    let (executor, _, _, _server) = fixture_shared_group(
+        &[("a", &[1]), ("b", &[2])],
+        &[(
+            "fam",
+            llmux_types::QuotaSpec {
+                rpm: Some(2),
+                ..Default::default()
+            },
+        )],
+        [None, Some("fam"), Some("fam")],
+        ["first", "first", "first"],
+        ["upstream", "upstream", "upstream-2"],
+        None,
+    )
+    .await;
+    for model in ["a", "b"] {
+        executor
+            .execute(GatewayRequest {
+                model: model.into(),
+                ..request()
+            })
+            .await
+            .unwrap();
+    }
+    // dep1 and dep2 spend the fam rpm=2 window; a second request on model a
+    // must find dep1 out of family allowance, not serve on dep0's free pass.
+    assert!(matches!(
+        executor
+            .execute(GatewayRequest {
+                model: "a".into(),
+                ..request()
+            })
+            .await,
+        Err(GatewayError::AllCandidatesExhausted { .. })
+    ));
+}
+
+#[tokio::test]
+async fn legs_bound_to_different_families_on_one_route_do_not_conflate() {
+    // dep0 binds "fam-a", dep1 the same route bound "fam-b": dep1 draws on
+    // fam-b's fresh window, never dep0's spent fam-a window.
+    let spec = llmux_types::QuotaSpec {
+        rpm: Some(1),
+        ..Default::default()
+    };
+    let (executor, adapter, _, _server) = fixture_shared_group(
+        &[("a", &[0, 1, 2])],
+        &[("fam-a", spec), ("fam-b", spec)],
+        [Some("fam-a"), Some("fam-b"), None],
+        ["first", "first", "second"],
+        ["upstream", "upstream", "upstream"],
+        None,
+    )
+    .await;
+    for _ in 0..2 {
+        executor
+            .execute(GatewayRequest {
+                model: "a".into(),
+                ..request()
+            })
+            .await
+            .unwrap();
+    }
+    let calls: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(calls, ["dep0", "dep1"]);
+}
+
+#[tokio::test]
+async fn credentialed_leg_does_not_claim_the_anonymous_scope_window() {
+    // dep0 credentialed, dep1/dep2 anonymous — all bound "fam" on one
+    // base_url. The anonymous legs' per-IP scope must not merge into dep0's
+    // credential scope when dep0 is processed first.
+    let (executor, adapter, _, _server) = fixture_shared_group(
+        &[("a", &[0, 1, 2])],
+        &[(
+            "fam",
+            llmux_types::QuotaSpec {
+                rpm: Some(1),
+                ..Default::default()
+            },
+        )],
+        [Some("fam"), Some("fam"), Some("fam")],
+        ["first", "", ""],
+        ["upstream", "upstream", "upstream"],
+        None,
+    )
+    .await;
+    for _ in 0..2 {
+        executor
+            .execute(GatewayRequest {
+                model: "a".into(),
+                ..request()
+            })
+            .await
+            .unwrap();
+    }
+    let calls: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(calls, ["dep0", "dep1"]);
+}
+
+#[tokio::test]
+async fn anonymous_leg_does_not_claim_the_credential_scope_window() {
+    // Mirror order: anonymous dep0 first; credentialed dep1/dep2 on "first"
+    // share the credential scope, never dep0's anonymous window.
+    let (executor, adapter, _, _server) = fixture_shared_group(
+        &[("a", &[0, 1, 2])],
+        &[(
+            "fam",
+            llmux_types::QuotaSpec {
+                rpm: Some(1),
+                ..Default::default()
+            },
+        )],
+        [Some("fam"), Some("fam"), Some("fam")],
+        ["", "first", "first"],
+        ["upstream", "upstream", "upstream"],
+        None,
+    )
+    .await;
+    for _ in 0..2 {
+        executor
+            .execute(GatewayRequest {
+                model: "a".into(),
                 ..request()
             })
             .await
