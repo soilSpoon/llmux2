@@ -64,8 +64,10 @@ The direct name, aliases, and combo legs use all eligible built-in Gemini
 connections in priority order. Antigravity source connection pins/allowlists
 cannot transfer to Gemini and are replaced with that eligible set, with a warning;
 step `usable: false` and malformed restrictions still fail closed.
-Antigravity OAuth connections remain skipped; no other Antigravity models are
-mapped. Without an eligible Gemini connection, no native replacement is emitted.
+An imported native Antigravity OAuth connection takes precedence over the
+Gemini rewrite and serves the requested model id unchanged; without either an
+imported Antigravity connection or an eligible Gemini connection, no native
+replacement is emitted. No other Antigravity models are mapped.
 The optional OmniRoute fallback follows native deployments using the normal
 fallback rules; omitting the fallback flags leaves only Gemini deployments.
 These use the existing Gemini accounts' quota/billing, not a free-tier guarantee.
@@ -249,9 +251,16 @@ invented. xAI refreshes at `https://auth.x.ai/oauth2/token` and serves
 `https://api.x.ai/v1`. Codex refreshes at `https://auth.openai.com/oauth/token`,
 serves `https://chatgpt.com/backend-api/codex` through `openai_responses`, and
 is limited to the imported gateway keys. Antigravity also requires a project
-id, refreshes at `https://oauth2.googleapis.com/token`, and serves
-`https://daily-cloudcode-pa.googleapis.com` with the same model id. The
-reviewed Gemini rewrite still applies only when no complete Antigravity OAuth
+id (OmniRoute persists it at OAuth time, and the adapter cannot serve without
+it), refreshes at `https://oauth2.googleapis.com/token`, and serves
+`https://daily-cloudcode-pa.googleapis.com` with the same model id. When the
+export omits the Antigravity OAuth client pair — OmniRoute stores only
+per-connection tokens — the importer fills in the public client id and secret
+the upstream Antigravity CLI embeds; export-supplied values still win and any
+client secret is written to a secrets file like other credentials. Each
+imported Antigravity connection gets its own credential and one deployment per
+`antigravity` step in connection priority order. The
+reviewed Gemini rewrite still applies only when no Antigravity OAuth
 connection was imported. Factory is excluded because its organization is
 deactivated. Augment (`auggie`) and Z.AI (`zcode`) are excluded because those
 accounts are not being recharged. Inactive `lmarena` and `uncloseai` rows stay

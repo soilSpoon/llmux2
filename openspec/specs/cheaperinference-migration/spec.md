@@ -43,11 +43,14 @@ gemini-3-flash-preview and antigravity/gemini-3.1-flash-lite to the GA
 gemini-3.1-flash-lite on all eligible built-in Gemini API-key connections in
 priority order, preserving aliases and combo references. Source Antigravity
 connection restrictions SHALL be replaced by the eligible Gemini set with a
-warning. An Antigravity OAuth connection that lacks a refresh token, client
-id, or project id SHALL remain skipped. A complete connection SHALL be imported
+warning. An Antigravity OAuth connection that lacks a refresh token or a
+project id SHALL remain skipped; when the export omits the OAuth client pair
+the importer SHALL use the public client id and secret the Antigravity CLI
+embeds (OmniRoute stores only per-connection tokens). A complete connection
+SHALL be imported
 as the native `antigravity` provider and SHALL serve the requested model id,
 not a rewritten Gemini id. The reviewed Gemini rewrite SHALL apply only when
-no complete Antigravity OAuth connection was imported. Ordinary OmniRoute
+no Antigravity OAuth connection was imported. Ordinary OmniRoute
 fallback semantics SHALL apply after native deployments when enabled.
 No other Antigravity models SHALL be mapped. Both reviewed routes SHALL receive
 the Gemini endpoint's seed/user request-field stripping.
@@ -80,7 +83,11 @@ refreshing at `https://auth.x.ai/oauth2/token` with deployments at
 imported gateway keys. It SHALL import a complete Antigravity OAuth connection
 at `https://daily-cloudcode-pa.googleapis.com` without rewriting the model id.
 A missing refresh token or client id SHALL skip that row with a counted
-warning and SHALL NOT panic. The importer SHALL NOT invent a client secret.
+warning and SHALL NOT panic, except for Antigravity where the public embedded
+client id and secret are the default when the export omits them and a missing
+project id still skips the row. The importer SHALL NOT invent a client secret:
+export-supplied secrets win and remain secrets-file references, and only the
+upstream-published Antigravity pair may fill an empty field.
 A keyed OpenAI-compatible `deepai`/`deepai-code` or `cloudflare-direct`/`cfpd`
 node with a baseUrl SHALL import as `openai_compat` at that baseUrl, including
 loopback. DuckDuckGo and Cloudflare Playground have no native adapter. Without
@@ -115,6 +122,36 @@ THEN import skips that row with a missing-refresh-token warning and continues.
 
 WHEN a DeepAI Code node has a valid API key and `http://127.0.0.1:8790/deepai/v1`
 THEN its deployment uses `openai_compat` at that URL and the same model id.
+
+#### Scenario: Antigravity connection without a stored client pair
+
+WHEN an `antigravity` connection has a refresh token and project id but no
+client id or client secret
+THEN the generated OAuth credential uses the public embedded Antigravity
+client pair, the refresh token is written to a secrets file, and its
+deployments carry the connection's `x-llmux-project` header.
+
+### Requirement: Native Gemini and Antigravity connection mapping
+
+An active, usable `gemini` connection with `auth_type = apikey` and a
+plaintext key SHALL produce an `api_key` credential whose key is written to a
+secrets file, and every usable combo step with `providerId = "gemini"` SHALL
+emit a native `openai_compat` deployment at
+`https://generativelanguage.googleapis.com/v1beta/openai` serving the step's
+own model id on an eligible imported Gemini connection. Likewise, every
+usable combo step with `providerId = "antigravity"` SHALL emit a native
+`antigravity` deployment at `https://daily-cloudcode-pa.googleapis.com` on
+each imported Antigravity connection. With N imported connections of one
+provider, each step SHALL produce one deployment per connection ordered by
+the connections' priorities, and an enabled OmniRoute fallback SHALL remain
+after every native leg.
+
+#### Scenario: Multi-account step order
+
+WHEN a combo step names `gemini` or `antigravity` and two connections of that
+provider imported in priority order
+THEN the model carries both native deployments in that order before any
+OmniRoute fallback leg.
 
 ### Requirement: Custom provider headers
 
