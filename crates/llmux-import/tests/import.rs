@@ -1017,12 +1017,20 @@ fn restricted_model_lists_port_to_key_policies() {
             "isActive": true,
             "modelAccessMode": "restricted",
             "allowedModels": []
+        },
+        {
+            "key": "snake-secret",
+            "is_active": true,
+            "model_access_mode": "restricted",
+            "allowed_models": ["cfpd/*"],
+            "allowed_connections": ["conn-1"],
+            "machine_id": "abc123"
         }
     ]);
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("out.toml");
     let report = llmux_import::import(&root.to_string(), &output, None).unwrap();
-    assert_eq!(report.client_keys, 1);
+    assert_eq!(report.client_keys, 2);
     let config = RuntimeConfig::load(&output).unwrap();
     let idx = config
         .server
@@ -1053,6 +1061,7 @@ fn restricted_model_lists_port_to_key_policies() {
     for skipped in ["untranslatable-secret", "deny-all-secret"] {
         assert!(!secrets.iter().any(|s| s == skipped), "{skipped}");
     }
+    assert!(secrets.iter().any(|s| s == "snake-secret"));
     assert_eq!(
         report
             .warnings
@@ -1061,6 +1070,14 @@ fn restricted_model_lists_port_to_key_policies() {
             .count(),
         2
     );
+    let dropped = report
+        .warnings
+        .iter()
+        .find(|w| w.contains("dropped"))
+        .expect("warning names dropped fields for snake_case keys too");
+    for field in ["allowed_connections", "machine_id"] {
+        assert!(dropped.contains(field), "{dropped} names {field}");
+    }
 }
 
 #[test]

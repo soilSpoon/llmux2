@@ -470,10 +470,10 @@ fn portable_key_policy(key: &Value) -> Option<(Vec<String>, Vec<String>, Vec<Str
     }
     let mut dropped = Vec::new();
     let mut stripped = key.clone();
-    stripped.as_object_mut()?.retain(|field, _| {
+    stripped.as_object_mut()?.retain(|field, value| {
         let name = field.replace('_', "").to_ascii_lowercase();
         if OMNIROUTE_INTERNAL_FIELDS.contains(&name.as_str()) {
-            if !value_is_unset(key_field(key, field)) {
+            if !value_is_unset(Some(value)) {
                 dropped.push(field.clone());
             }
             return false;
