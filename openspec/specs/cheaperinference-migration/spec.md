@@ -440,7 +440,7 @@ THEN the emitted config authenticates the key and binds it to a
 #### Scenario: Untranslatable restriction stays closed
 
 WHEN an export key combines model lists with a restriction llmux2 cannot
-express, such as `ip_allowlist` or `scopes`
+express, such as `ip_allowlist` or `rate_limits`
 THEN the key is skipped with a warning and no secret file is written for it.
 
 ### Requirement: SQLite dump key fields normalize before the port
