@@ -326,6 +326,14 @@ fn stage_images(
                         status: StatusCode::BAD_REQUEST,
                         body: Bytes::new(),
                     })?;
+                // The encoded-length bound above is approximate; the exact cap
+                // is enforced on the decoded bytes.
+                if bytes.len() > MAX_IMAGE_BYTES {
+                    return Err(UpstreamError::BadRequest {
+                        status: StatusCode::PAYLOAD_TOO_LARGE,
+                        body: Bytes::new(),
+                    });
+                }
                 let ext = mime.strip_prefix("image/").unwrap_or("bin");
                 let path = staging.dir.join(format!("image-{}.{}", index + 1, ext));
                 std::fs::write(&path, bytes).map_err(|_| UpstreamError::Server {
@@ -1103,6 +1111,7 @@ impl DevinAcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     #[test]
     fn synthesized_completion_id_is_not_an_upstream_request_id() {
@@ -1316,6 +1325,20 @@ mod tests {
             stage_images(home.path(), &msgs),
             Err(UpstreamError::BadRequest {
                 status: StatusCode::BAD_REQUEST,
+                ..
+            })
+        ));
+
+        // Just under the encoded bound yet decoding to MAX+1 — the post-decode
+        // check is what actually enforces the cap.
+        let over = base64::engine::general_purpose::STANDARD.encode(vec![0u8; MAX_IMAGE_BYTES + 1]);
+        let msgs = [json!({"role":"user","content":[
+            {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{over}")}}
+        ]})];
+        assert!(matches!(
+            stage_images(home.path(), &msgs),
+            Err(UpstreamError::BadRequest {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
                 ..
             })
         ));
