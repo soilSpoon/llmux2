@@ -131,9 +131,16 @@ fn evaluate(data: &Value, required: &[String], policy: &Value) -> Result<Vec<Str
             }
         }
     }
-    for key in ["devin_review_markers", "verifier_logins"] {
-        for value in array(field(policy, key)?)? {
-            text(value)?;
+    for value in array(field(policy, "verifier_logins")?)? {
+        text(value)?;
+    }
+    for gate in array(field(policy, "review_gates")?)? {
+        text(field(gate, "context")?)?;
+        text(field(gate, "creator_login")?)?;
+        for key in ["status_skip_markers", "review_markers"] {
+            for marker in array(field(gate, key)?)? {
+                text(marker)?;
+            }
         }
     }
     for item in std::iter::once(field(data, "pr")?)
@@ -178,7 +185,7 @@ fn evaluate(data: &Value, required: &[String], policy: &Value) -> Result<Vec<Str
             ));
         }
     }
-    for (name, check) in checks {
+    for &(ref name, check) in &checks {
         if text(field(check, "status")?)? != "completed" {
             errors.push(format!("check {name} still running"));
         }
@@ -196,7 +203,7 @@ fn evaluate(data: &Value, required: &[String], policy: &Value) -> Result<Vec<Str
         ) {
             errors.push(format!(
                 "Check {} failed: {}.",
-                quoted(&name),
+                quoted(name),
                 text(conclusion)?
             ));
         }
@@ -214,48 +221,87 @@ fn evaluate(data: &Value, required: &[String], policy: &Value) -> Result<Vec<Str
         .into_iter()
         .filter(|r| !matches!(r["state"].as_str(), Some("PENDING" | "DISMISSED")))
         .collect::<Vec<_>>();
-    let mut marked_review = false;
-    for review in &reviews {
-        text(field(review, "state")?)?;
-        if reviewer_login(review)? == "devin-ai-integration"
-            && review["commit_id"] == sha
-            && !unavailable(review, policy)?
-            && array(field(policy, "devin_review_markers")?)?
-                .iter()
-                .map(text)
-                .collect::<Result<Vec<_>>>()?
-                .iter()
-                .any(|m| optional_text(&review["body"]).contains(m))
-        {
-            marked_review = true;
-        }
-    }
-    let context = text(field(policy, "devin_review_status_context")?)?;
-    let mut statuses = vec![];
-    for status in array(field(data, "statuses")?)? {
-        if text(field(status, "context")?)?.to_lowercase() == context.to_lowercase()
-            && reviewer_login(&json!({"user":status.get("creator")}))? == "devin-ai-integration"
-        {
-            statuses.push((id(status)?, optional_text(&status["created_at"]), status));
-        }
-    }
-    let status = statuses
-        .into_iter()
-        .reduce(|first, next| {
-            if (next.0, next.1) > (first.0, first.1) {
-                next
-            } else {
-                first
+    // Each configured review gate can produce genuine head evidence three
+    // ways: a review by the gate's creator containing a configured marker, a
+    // latest commit status success, or a latest check-run success. A success
+    // whose description or output carries a skip marker is a dead review —
+    // it ran nothing — and does not count.
+    let mut genuine = false;
+    for gate in array(field(policy, "review_gates")?)? {
+        let context = text(field(gate, "context")?)?;
+        let login = normalize(text(field(gate, "creator_login")?)?);
+        let skip_markers = field(gate, "status_skip_markers")?;
+        let review_markers = field(gate, "review_markers")?;
+        let mut marked = false;
+        for review in &reviews {
+            text(field(review, "state")?)?;
+            if reviewer_login(review)? == login
+                && review["commit_id"] == sha
+                && !unavailable(review, policy)?
+                && array(review_markers)?
+                    .iter()
+                    .map(text)
+                    .collect::<Result<Vec<_>>>()?
+                    .iter()
+                    .any(|m| optional_text(&review["body"]).contains(m))
+            {
+                marked = true;
             }
-        })
-        .map(|(_, _, s)| s);
-    if let Some(status) = status.filter(|s| s["state"] != "success") {
-        errors.push(format!(
-            "Devin Review status is {}",
-            text(field(status, "state")?)?
-        ));
-    } else if !marked_review && status.is_none() {
-        errors.push("Devin Review has not submitted a review on the head SHA.".into());
+        }
+        if marked {
+            genuine = true;
+        }
+        let mut statuses = vec![];
+        for status in array(field(data, "statuses")?)? {
+            if text(field(status, "context")?)?.to_lowercase() == context.to_lowercase()
+                && reviewer_login(&json!({"user":status.get("creator")}))? == login
+            {
+                statuses.push((id(status)?, optional_text(&status["created_at"]), status));
+            }
+        }
+        if let Some(status) = statuses
+            .into_iter()
+            .reduce(|first, next| {
+                if (next.0, next.1) > (first.0, first.1) {
+                    next
+                } else {
+                    first
+                }
+            })
+            .map(|(_, _, s)| s)
+        {
+            if status["state"] == "success" {
+                if !contains_marker(optional_text(&status["description"]), skip_markers)? {
+                    genuine = true;
+                }
+            } else {
+                errors.push(format!(
+                    "{context} status is {}",
+                    text(field(status, "state")?)?
+                ));
+            }
+        }
+        if let Some((_, check)) = checks
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(context))
+        {
+            if normalize(optional_text(&check["app"]["slug"])) == login
+                && check["conclusion"] == "success"
+            {
+                let output = [
+                    optional_text(&check["output"]["title"]),
+                    optional_text(&check["output"]["summary"]),
+                    optional_text(&check["output"]["text"]),
+                ]
+                .join("\n");
+                if !contains_marker(&output, skip_markers)? {
+                    genuine = true;
+                }
+            }
+        }
+    }
+    if !genuine {
+        errors.push("No review gate produced a genuine review on the head SHA.".into());
     }
     let mut latest = vec![];
     for review in reviews {
