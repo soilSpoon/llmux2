@@ -16,7 +16,10 @@ use serde_json::{json, Value};
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -207,7 +210,10 @@ enum ImageSource {
 /// Detects the image part spellings the bridge accepts: OpenAI `image_url` /
 /// `input_image` (string or `{url}` object) and Anthropic `image` sources.
 fn image_source(part: &Value) -> Option<ImageSource> {
-    let url_field = |key: &str| part[key]["url"].as_str().or_else(|| part[key].as_str());
+    let url_field = |key: &str| {
+        part.get(key)
+            .and_then(|v| v.get("url").and_then(Value::as_str).or_else(|| v.as_str()))
+    };
     match part["type"].as_str() {
         Some("image_url") | Some("input_image") => url_field("image_url").and_then(url_source),
         Some("image") => match part["source"]["type"].as_str() {
@@ -260,6 +266,11 @@ impl Drop for ImageStaging {
     }
 }
 
+/// Per-request uniqueness for the staging dir: a nanosecond timestamp alone
+/// can repeat on coarse clocks, so concurrent requests in this process would
+/// share a dir and each guard's cleanup would delete the other's files.
+static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Writes each inline image under `<home>/.llmux-images/<unique>/` and returns
 /// the transcript index entries — file paths for inline payloads, the URL
 /// itself for remote ones. The ACP `image` content block is intentionally not
@@ -279,12 +290,15 @@ fn stage_images(
     if sources.is_empty() {
         return Ok((None, Vec::new()));
     }
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let dir = home
-        .join(".llmux-images")
-        .join(format!("{}-{unique}", std::process::id()));
+    let unique = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+        STAGE_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let dir = home.join(".llmux-images").join(unique);
     std::fs::create_dir_all(&dir).map_err(|_| UpstreamError::Server {
         status: StatusCode::BAD_GATEWAY,
     })?;
@@ -1237,6 +1251,20 @@ mod tests {
         let dir = staged.dir.clone();
         drop(staged);
         assert!(!dir.exists(), "staging dir must be removed on drop");
+    }
+
+    #[test]
+    fn concurrent_staging_dirs_do_not_collide() {
+        let home = tempfile::tempdir().unwrap();
+        let msgs = || {
+            [json!({"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]})]
+        };
+        let (a, _) = stage_images(home.path(), &msgs()).unwrap();
+        let (b, _) = stage_images(home.path(), &msgs()).unwrap();
+        let a = a.unwrap();
+        let b = b.unwrap();
+        assert_ne!(a.dir, b.dir, "concurrent requests must not share a dir");
     }
 
     #[test]
