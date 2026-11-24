@@ -1000,6 +1000,63 @@ async fn committed_stream_quota_cools_shared_credential_without_replay() {
 }
 
 #[tokio::test]
+async fn committed_stream_not_provisioned_parks_the_leg_without_replay() {
+    // The plan-missing error can arrive after the response commits: it must
+    // reach the client unreplayed, park only that leg, and leave the sibling
+    // on the same credential eligible.
+    let (executor, adapter, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("a", &[0, 2]), ("b", &[1, 2])],
+        Default::default(),
+        Default::default(),
+        true,
+        None,
+        [None; 3],
+    )
+    .await;
+    adapter
+        .stream_errors
+        .lock()
+        .unwrap()
+        .push_back(UpstreamError::NotProvisioned);
+    let routed = executor
+        .execute(GatewayRequest {
+            model: "a".into(),
+            stream: true,
+            ..request()
+        })
+        .await
+        .unwrap();
+    assert_eq!(routed.deployment.as_ref(), "dep0");
+    let GatewayResponse::Stream(events) = routed.response else {
+        panic!("expected stream")
+    };
+    let events: Vec<_> = events.collect().await;
+    assert!(matches!(
+        events.as_slice(),
+        [Ok(_), Err(UpstreamError::NotProvisioned)]
+    ));
+    assert_eq!(adapter.calls.lock().unwrap().len(), 1, "no stream replay");
+    assert!(executor.bindings[0].limits.not_provisioned());
+
+    let next = executor
+        .execute(GatewayRequest {
+            model: "b".into(),
+            ..request()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next.deployment.as_ref(),
+        "dep1",
+        "the parked leg is skipped; the sibling stays eligible"
+    );
+    assert_eq!(adapter.calls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn repeated_limit_errors_after_stream_start_back_off() {
     let (executor, adapter, _, _server) = fixture(Vec::new(), false).await;
     let streaming = || GatewayRequest {
