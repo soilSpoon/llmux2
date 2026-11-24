@@ -252,6 +252,7 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         None
     };
     let ids = catalog::listed_ids(&active.config, live.as_deref());
+    let deny = &active.config.server.deny;
     let key_policy = active
         .config
         .server
@@ -260,6 +261,7 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         .and_then(Option::as_ref);
     let data: Vec<_> = ids
         .into_iter()
+        .filter(|&id| !policy::model_denied(deny, id))
         .filter(|&id| key_policy.is_none_or(|p| policy::allows_model(p, id)))
         .map(|id| {
             // `free` only when the model has at least one non-fallback leg and
@@ -472,6 +474,15 @@ async fn route_request(
         }
     };
     let model: Arc<str> = Arc::from(metadata.model.as_ref());
+    // The global deny list wins over everything — checked on the requested id
+    // before any alias, canonical, or catch-all resolution, for every key.
+    if policy::model_denied(&active.config.server.deny, &model) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "model_not_allowed",
+            "Model is denied by gateway policy",
+        );
+    }
     // A listed key may request only names its policy allows — checked on the
     // requested id before any alias, canonical, or catch-all resolution.
     if active

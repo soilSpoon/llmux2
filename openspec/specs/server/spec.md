@@ -58,6 +58,45 @@ AND `*` is not listed for any key.
 WHEN `key_policies[].key` resolves to a secret absent from `client_keys`
 THEN config load fails with a `client_keys` validation error.
 
+### Requirement: Global model deny
+
+`[server]` SHALL accept an optional `deny` list of glob patterns. The
+requested `model` field — before alias, canonical, or catch-all resolution —
+SHALL match no `deny` glob on every inbound format that resolves a model,
+for every key including ones without a `key_policies` entry; otherwise the
+gateway SHALL return 403 `model_not_allowed` before any upstream call, in the
+same error shape as per-model `allowed_keys`. Deny globs use the same
+matching semantics as `key_policies` patterns. Config SHALL reject an empty
+`deny` pattern.
+
+A denied name cannot be requested by any key, so `GET /v1/models` SHALL hide
+denied names for every caller. This is the guard against auto-resolve
+bypass: a `provider/model` id that no configured model names would otherwise
+ride the `*` catch-all to a billed upstream; listing it in `deny` closes that
+route without touching the catch-all itself.
+
+#### Scenario: Denied name rejected for every key
+
+WHEN any key requests a model matching a `deny` glob, including an
+unrestricted key with no `key_policies` entry
+THEN the gateway returns 403 `model_not_allowed` without an upstream call.
+
+#### Scenario: Denied unknown name does not reach the catch-all
+
+WHEN the requested name is not configured, matches a `deny` glob, and would
+otherwise resolve through the `*` catch-all
+THEN the request is rejected 403 and no upstream call is made.
+
+#### Scenario: Listing hides denied names
+
+WHEN any key calls `GET /v1/models`
+THEN configured names matching a `deny` glob do not appear.
+
+#### Scenario: Empty pattern rejected
+
+WHEN a `deny` entry is an empty string
+THEN config load fails with a validation error.
+
 ### Requirement: Hashed end-user identity
 
 The gateway SHALL leave end-user attribution off unless `[server]
