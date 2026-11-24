@@ -895,6 +895,36 @@ pub fn import_with_options(
         connections.push(Connection {headers:json!({}),source_id:"workers-ai-opt-in".into(),provider:upstream::ProviderIdentity::Builtin("workers-ai".into()),credential:Some(id.clone()),kind:"openai_compat".into(),base_url:workers.base_url.clone(),priority:i64::MAX,policy:policy::ModelPolicy::Workers});
         id
     });
+    // The site overlay is read once here: the self-referential guard below
+    // needs the emitted listen port, which comes from --listen, else the
+    // overlay's [server].listen, else the 8080 default — and the merged
+    // config reuses the same parsed value later.
+    let overlay = options
+        .overlay
+        .map(|path| {
+            overlay_value(
+                toml::from_str::<toml::Value>(
+                    &fs::read_to_string(path)
+                        .map_err(|_| "could not read site overlay TOML".to_owned())?,
+                )
+                .map_err(|_| "invalid site overlay TOML".to_owned())?,
+            )
+        })
+        .transpose()?;
+    // Connections resolving to this gateway's own listen port through a
+    // container host alias are the OmniRoute -> llmux2 bridge; importing
+    // them would loop requests. Guard the port the emitted config actually
+    // binds: --listen, else the overlay's [server].listen, else 8080.
+    let listen_port = match options.listen {
+        Some(listen) => listen
+            .parse::<std::net::SocketAddr>()
+            .map_or(8080, |addr| addr.port()),
+        None => overlay
+            .as_ref()
+            .and_then(|value| value["server"]["listen"].as_str())
+            .and_then(|listen| listen.parse::<std::net::SocketAddr>().ok())
+            .map_or(8080, |addr| addr.port()),
+    };
     for (index, c) in array(&root, "providerConnections").iter().enumerate() {
         let label = format!("connection {index} ({})", string(c, "id"));
         let identity = connection::identity(c, array(&root, "providerNodes"));
@@ -932,6 +962,7 @@ pub fn import_with_options(
                 array(&root, "providerNodes"),
                 matches!(auth, connection::SelectedAuth::Key(_)),
                 &mut warnings,
+                listen_port,
             )
         } {
             Ok(provider) => provider,
@@ -1556,14 +1587,7 @@ pub fn import_with_options(
         }
     }
     let mut config = json!({"server":{"listen":options.listen.unwrap_or("127.0.0.1:8080"),"client_keys":client_keys},"credentials":credentials,"models":models});
-    if let Some(path) = options.overlay {
-        let overlay = overlay_value(
-            toml::from_str::<toml::Value>(
-                &fs::read_to_string(path)
-                    .map_err(|_| "could not read site overlay TOML".to_owned())?,
-            )
-            .map_err(|_| "invalid site overlay TOML".to_owned())?,
-        )?;
+    if let Some(overlay) = overlay {
         // An overlay [server].listen is a site choice when no --listen was
         // passed, but it must never silently override the deployed address a
         // scheduled re-import was told to keep.
