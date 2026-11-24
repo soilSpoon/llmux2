@@ -1046,6 +1046,13 @@ impl DevinAcp {
             for (index, entry) in image_entries.iter().enumerate() {
                 prompt.push_str(&format!("\nimage {}: {entry}", index + 1));
             }
+            // FRAME's "never use your own tools" forbids the read the image
+            // staging depends on, so the index explicitly carves out just these
+            // files — `ask` mode already confines the tools to read-only ones.
+            prompt.push_str(
+                "\n\nYou may read the files and URLs listed under [Images] to see the \
+                 attached images; no other tool use is needed for this reply.",
+            );
         }
         let blocks = vec![json!({"type":"text","text":prompt})];
         let model = model_for(crate::upstream_model(req, dep), effort_tier(&body));
@@ -1514,6 +1521,9 @@ mod tests {
                 log.contains("image 1: ") && log.contains(".llmux-images"),
                 "{log}"
             );
+            // The index must lift FRAME's tool ban for exactly these files —
+            // the staged path only works if the agent may read it.
+            assert!(log.contains("You may read the files"), "{log}");
             // The staged file lives only for the turn: after the reply, the
             // staging directory is gone even though the parent may remain.
             let leftovers = std::fs::read_dir(dir.path().join(".llmux-images"))
