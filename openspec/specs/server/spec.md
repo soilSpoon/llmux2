@@ -76,3 +76,25 @@ THEN the client receives 413 and the upstream is not called.
 
 WHEN the options are unset
 THEN an https `image_url` is forwarded as before.
+
+### Requirement: Per-key model policy
+
+`[[server.key_policies]]` entries MAY restrict which model names a client key
+can request. `key` SHALL name an entry of `server.client_keys`; `models` SHALL
+be a nonempty glob list whose presence makes the key restricted, and `blocked`
+SHALL be a glob list subtracted after `models` matches. A key with no policy
+entry is unrestricted. Restricted keys SHALL get 403 `model_not_allowed` for a
+non-matching or blocked name on every model-resolving endpoint, evaluated on
+the requested name before alias resolution, and `/v1/models` SHALL list only
+names the key may request.
+
+#### Scenario: Restricted key allowed and denied
+
+WHEN key `ci` has `models = ["claude-*"]` and `blocked = ["*-billed"]`
+THEN `claude-sonnet-5.5` proceeds, `gpt-5` and `claude-opus-billed` return 403,
+and `/v1/models` for `ci` shows only the surviving names.
+
+#### Scenario: Unrestricted key unchanged
+
+WHEN a key has no `key_policies` entry
+THEN all names resolve exactly as before, including the catch-all.
