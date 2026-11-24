@@ -529,6 +529,7 @@ while read -r line; do
         printf '%s\n' "$reply" >> "$XDG_DATA_HOME/perm_reply.log"
       fi
       cat "$XDG_DATA_HOME/chunks.txt"
+      if [ -f "$XDG_DATA_HOME/stall" ]; then sleep 60; fi
       if [ -f "$XDG_DATA_HOME/with_usage" ]; then
         printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn","usage":{"inputTokens":11,"outputTokens":7,"totalTokens":18,"cachedReadTokens":5}}}\n' "$id"
       else
@@ -932,6 +933,49 @@ done
                 .map(|e| e.unwrap().data)
                 .collect::<Vec<_>>();
             assert_eq!(data.last().unwrap(), "[DONE]");
+        }
+
+        #[tokio::test]
+        async fn dropping_a_stream_mid_turn_kills_the_child() {
+            let dir = tempfile::tempdir().unwrap();
+            use futures_util::StreamExt;
+            // Emits one chunk then stalls before the result: the turn is still
+            // running when the response stream is dropped.
+            let spec = script(dir.path(), &["partial"]);
+            std::fs::write(dir.path().join(".local/share/stall"), "").unwrap();
+            let adapter = AcpAgent::new(HashMap::from([("cli".into(), spec)]));
+            let mut req = request(chat_body());
+            req.stream = true;
+            let GatewayResponse::Stream(mut events) =
+                adapter.serve(&req, &dep("cli", "m")).await.unwrap()
+            else {
+                panic!("expected a stream");
+            };
+            events.next().await.unwrap().unwrap();
+            drop(events);
+            let pid: i32 = std::fs::read_to_string(dir.path().join(".local/share/pids.log"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            // kill_on_drop + the aborted turn task must reap the child.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let alive = std::process::Command::new("kill")
+                    .arg("-0")
+                    .arg(pid.to_string())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "child survived stream drop"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
 
         #[tokio::test]
