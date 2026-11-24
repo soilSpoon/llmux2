@@ -414,6 +414,50 @@ THEN every listed model marked `free` is probed exactly once, billed
 models are skipped without an upstream call, and the rotation cursor is
 unchanged, so recurring probes keep their place.
 
+### Requirement: Free-model discovery scan
+
+`llmux-import --scan-free PROVIDER` SHALL list candidate free-model ids
+discovered for a connected provider. The scan SHALL use a per-provider
+adapter (promotion markers on the provider's models page); an unsupported
+provider name SHALL fail with a nonzero exit. Each output row SHALL report
+the candidate id, whether the id is already in the provider's reviewed free
+map (`listed`), and a verdict, so an operator can tell a genuinely new free
+model from one already deployed.
+
+Without `--scan-key-file` the scan SHALL make no authenticated upstream
+call and every verdict SHALL be `unverified`. With a key it SHALL probe
+each candidate with a minimal chat completion and classify by the
+response's `usage.cost`: zero or less is `free`, positive is `billed`,
+a model-not-found answer is `unavailable`. A quota or rate-limit class
+answer — status 429 or a quota/rate-limit code in any error field —
+SHALL be `unknown` (a parked leg), never `billed` or `unavailable`, so
+temporary caps never remove a model.
+
+The probe carries the key in the Authorization header; the probe base
+SHALL be https or loopback http (any other scheme/host SHALL fail the
+probe as `unknown`), probes SHALL obey a 20-second deadline, and probe
+bodies SHALL be capped at 64 KiB. The page fetch SHALL be capped at 20
+seconds and 1 MiB.
+
+#### Scenario: Scan reports a new free model
+
+WHEN a provider's page advertises `Free as <id>:free` for an id not in
+the reviewed free map and the probe answers `usage.cost = 0`
+THEN the row reports `listed=false` and `verdict=free`, so the id is a
+candidate for a new free deployment.
+
+#### Scenario: Quota exhaustion parks the candidate
+
+WHEN a probe answers 429 or an error whose code is a quota class
+THEN the verdict is `unknown`, never `billed`, so a temporarily capped
+free model is parked rather than treated as billed or removed.
+
+#### Scenario: No key, no probe
+
+WHEN `--scan-free` runs without `--scan-key-file`
+THEN candidates are reported with `verdict=unverified` and no upstream
+request is made.
+
 ### Requirement: Simple and extensible
 
 The codebase SHALL stay simple with low overhead, and be easy to extend and

@@ -9,13 +9,21 @@
 //! through a free signal.
 
 use bytes::Bytes;
-use http::{Request, StatusCode};
-use http_body_util::{BodyExt, Full};
-use llmux_types::{http_client, HttpClient};
+use http::{Request, StatusCode, Uri};
+use http_body_util::{BodyExt, Full, Limited};
+use llmux_types::{http_client, is_https_or_loopback_http, HttpClient};
 use serde_json::{json, Value};
+use std::time::Duration;
 
 pub const EXPERLABS_PAGE: &str = "https://platform.experientiallabs.ai/models";
 pub const EXPERLABS_API: &str = "https://api.experientiallabs.ai/v1";
+
+/// A stalled page or probe endpoint must not wedge the whole scan.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const PAGE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Body caps: a streaming or oversized response must not exhaust memory.
+const MAX_PROBE_BODY: usize = 64 * 1024;
+const MAX_PAGE_BODY: usize = 1024 * 1024;
 
 pub fn client() -> Result<HttpClient, String> {
     Ok(http_client())
@@ -82,7 +90,29 @@ pub async fn probe_model(
     key: &str,
     model: &str,
 ) -> ProbeVerdict {
+    probe_model_with_deadline(client, base_url, key, model, PROBE_TIMEOUT).await
+}
+
+/// `probe_model` with an explicit deadline, so tests can use a short one.
+pub async fn probe_model_with_deadline(
+    client: &HttpClient,
+    base_url: &str,
+    key: &str,
+    model: &str,
+    timeout: Duration,
+) -> ProbeVerdict {
+    // The key rides the Authorization header: plaintext HTTP to a
+    // non-loopback host would leak it — the same https-or-loopback policy
+    // as upstream_uri.
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    match url.parse::<Uri>() {
+        Ok(uri) if is_https_or_loopback_http(&uri) => {}
+        _ => {
+            return ProbeVerdict::Unknown(format!(
+                "probe base must be https or loopback http: {base_url}"
+            ));
+        }
+    }
     let payload = json!({
         "model": model,
         "messages": [{"role": "user", "content": "hi"}],
@@ -97,18 +127,46 @@ pub async fn probe_model(
         Ok(request) => request,
         Err(e) => return ProbeVerdict::Unknown(e.to_string()),
     };
-    let response = match client.request(request).await {
-        Ok(response) => response,
-        Err(e) => return ProbeVerdict::Unknown(e.to_string()),
+    let exchange = async {
+        let response = client.request(request).await.map_err(|e| e.to_string())?;
+        let status = response.status();
+        let bytes = Limited::new(response.into_body(), MAX_PROBE_BODY)
+            .collect()
+            .await
+            .map(|c| c.to_bytes())
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>((status, bytes))
     };
-    let status = response.status();
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .map(|c| c.to_bytes())
-        .unwrap_or_default();
-    let body = serde_json::from_slice::<Value>(&bytes).ok();
+    match tokio::time::timeout(timeout, exchange).await {
+        Ok(Ok((status, bytes))) => classify(status, &bytes),
+        Ok(Err(e)) => ProbeVerdict::Unknown(e),
+        Err(_) => ProbeVerdict::Unknown(format!("probe timed out after {timeout:?}")),
+    }
+}
+
+/// Error text for classification: providers put the machine code in
+/// different fields — `code`, `type`, or only `message` — and a numeric
+/// `code` must not hide a `type: insufficient_quota`.
+fn error_text(body: &Value) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let error = &body["error"];
+    for field in [
+        &error["code"],
+        &error["type"],
+        &error["message"],
+        &body["code"],
+        &body["type"],
+        &body["message"],
+    ] {
+        if let Some(s) = field.as_str() {
+            parts.push(s);
+        }
+    }
+    parts.join(" ").to_ascii_lowercase()
+}
+
+fn classify(status: StatusCode, bytes: &[u8]) -> ProbeVerdict {
+    let body = serde_json::from_slice::<Value>(bytes).ok();
     if status.is_success() {
         return match body
             .as_ref()
@@ -120,15 +178,7 @@ pub async fn probe_model(
             None => ProbeVerdict::Unknown(format!("{status}: no usage.cost")),
         };
     }
-    let code = body
-        .as_ref()
-        .and_then(|v| {
-            v["error"]["code"]
-                .as_str()
-                .or_else(|| v["error"]["message"].as_str())
-        })
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let code = body.as_ref().map(error_text).unwrap_or_default();
     // Quota/rate-limit class first: a shared free tier's daily cap can
     // surface as 429 or a code like `insufficient_quota` — a parked leg,
     // never a billing verdict. Checking it before the billed heuristics
@@ -168,18 +218,23 @@ pub struct ScanRow {
 }
 
 async fn fetch_text(client: &HttpClient, url: &str) -> Result<String, String> {
-    let request = Request::get(url)
-        .header("user-agent", "llmux-free-scan")
-        .body(Full::new(Bytes::new()))
-        .map_err(|e| e.to_string())?;
-    let response = client.request(request).await.map_err(|e| e.to_string())?;
-    let status = response.status();
-    let bytes = response
-        .into_body()
-        .collect()
+    let fetch = async {
+        let request = Request::get(url)
+            .header("user-agent", "llmux-free-scan")
+            .body(Full::new(Bytes::new()))
+            .map_err(|e| e.to_string())?;
+        let response = client.request(request).await.map_err(|e| e.to_string())?;
+        let status = response.status();
+        let bytes = Limited::new(response.into_body(), MAX_PAGE_BODY)
+            .collect()
+            .await
+            .map(|c| c.to_bytes())
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>((status, bytes))
+    };
+    let (status, bytes) = tokio::time::timeout(PAGE_TIMEOUT, fetch)
         .await
-        .map(|c| c.to_bytes())
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| format!("GET {url}: timed out after {PAGE_TIMEOUT:?}"))??;
     if !status.is_success() {
         return Err(format!("GET {url}: {status}"));
     }
