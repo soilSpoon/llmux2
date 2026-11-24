@@ -468,27 +468,34 @@ conditions (`src/free_conditions.rs`), each row citing its official source,
 and SHALL stamp what the table documents onto emitted free legs: `quota`
 fields the `QuotaSpec` shape can express (rpm/rpd/tpm/tpd — hourly, monthly,
 and wall-clock-anchored caps are documented in the row but not emitted), and
-`expires_at` for time-boxed free offers. A leg whose row only covers a
-specific plan SHALL keep its existing billing decision — the table caps, it
-does not assert free — while a row for a plan-independent offer (a
-provider-documented `:free` model variant, a per-IP anonymous allowance)
-SHALL mark the leg `billing = "free"` without `--free-providers`. Anonymous
-allowances SHALL apply only to credential-less legs, and
-plan-independent assertions SHALL never apply where a key could sit on a
-paid plan.
+`expires_at` for time-boxed free offers. A row whose documented cap is one
+account-wide (or per-IP) allowance SHALL instead name a `[[shared_quotas]]`
+family: the emitted config carries one `[[shared_quotas]]` row per family
+and each matching leg binds it with `shared_quota`, so two legs on the same
+credential — or on the same provider and base URL for anonymous legs — draw
+on one window rather than duplicating the allowance per leg. A leg whose
+row only covers a specific plan SHALL keep its existing billing decision —
+the table caps, it does not assert free — while a row for a
+plan-independent offer (a provider-documented `:free` model variant, a
+per-IP anonymous allowance) SHALL mark the leg `billing = "free"` without
+`--free-providers`. Anonymous allowances SHALL apply only to credential-less
+legs, and plan-independent assertions SHALL never apply where a key could
+sit on a paid plan.
 
 #### Scenario: Documented caps emitted on free legs
 
 WHEN a combo leg maps to a model the conditions table covers and the leg is
 free
-THEN its deployment carries the documented `quota` fields, so the gateway
-throttles the leg instead of learning the cap from a 429.
+THEN its deployment carries the documented `quota` fields — or a
+`shared_quota` binding when the row's cap is one account allowance — so the
+gateway throttles the leg instead of learning the cap from a 429.
 
 #### Scenario: Free variant marks itself
 
 WHEN an OpenRouter leg's upstream model id ends in `:free`
-THEN it emits `billing = "free"` with `rpm = 20` and `rpd = 50` and needs no
-`--free-providers` entry.
+THEN it emits `billing = "free"` with `shared_quota = "openrouter-free"`
+under a `[[shared_quotas]]` row carrying `rpm = 20` and `rpd = 50`, and
+needs no `--free-providers` entry.
 
 #### Scenario: Time-boxed offer expires
 
