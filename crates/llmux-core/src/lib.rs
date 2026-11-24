@@ -205,6 +205,7 @@ impl Executor {
     fn shared_limits<'a>(
         shared: &mut Vec<(&'a Deployment, Arc<DeploymentLimits>)>,
         shared_caps: &mut Vec<(&'a Deployment, Vec<Arc<Window>>)>,
+        local_windows: &mut Vec<(&'a Deployment, Vec<Arc<Window>>)>,
         group_specs: &HashMap<Arc<str>, QuotaSpec>,
         key_windows: &HashMap<Arc<str>, Vec<Arc<Window>>>,
         dep: &'a Deployment,
@@ -223,6 +224,28 @@ impl Executor {
         let key = key_windows
             .get(&dep.credential)
             .map_or(&[][..], Vec::as_slice);
+        // Route-local quota budgets the route, not each binding variant:
+        // siblings differing only in `shared_quota` draw on one local window
+        // set — separate windows would double the route's allowance. The
+        // family windows below stay per-binding by contrast.
+        let same_local_route = |other: &&Deployment| {
+            other.provider == dep.provider
+                && other.credential == dep.credential
+                && other.base_url == dep.base_url
+                && other.upstream_model == dep.upstream_model
+                && other.quota == dep.quota
+        };
+        let local = match local_windows
+            .iter()
+            .find(|(other, _)| same_local_route(other))
+        {
+            Some((_, windows)) => windows.clone(),
+            None => {
+                let windows = Window::for_quota(dep.quota);
+                local_windows.push((dep, windows.clone()));
+                windows
+            }
+        };
         // A named shared quota is one account-wide window set: legs that bind
         // to the same group draw on it even when they serve different upstream
         // models (a provider's documented free allowance is per account, not
@@ -270,14 +293,20 @@ impl Executor {
                 }
             }
         });
-        let limits = match shared_group {
-            Some(windows) => {
-                let extra: Vec<Arc<Window>> =
-                    windows.into_iter().chain(key.iter().cloned()).collect();
-                Arc::new(DeploymentLimits::with_shared(dep.quota, &extra))
-            }
-            None => Arc::new(DeploymentLimits::with_shared(dep.quota, key)),
-        };
+        let mut windows = local;
+        windows.extend(key.iter().cloned());
+        if let Some(family) = shared_group {
+            windows.extend(family);
+        }
+        // `with_shared` would rebuild private local windows from `dep.quota`;
+        // pass only `concurrent` so the deduped route-local set is used.
+        let limits = Arc::new(DeploymentLimits::with_shared(
+            QuotaSpec {
+                concurrent: dep.quota.concurrent,
+                ..Default::default()
+            },
+            &windows,
+        ));
         shared.push((dep, limits.clone()));
         limits
     }
@@ -297,6 +326,8 @@ impl Executor {
         let mut shared_limits = Vec::<(&Deployment, Arc<DeploymentLimits>)>::new();
         // Legs bound to one named shared quota draw on one set of windows.
         let mut shared_caps = Vec::<(&Deployment, Vec<Arc<Window>>)>::new();
+        // Route-local quota windows are shared across bindings on one route.
+        let mut local_windows = Vec::<(&Deployment, Vec<Arc<Window>>)>::new();
         // A credential's quota is one set of windows shared by all of its deployments.
         let key_windows: HashMap<Arc<str>, Vec<Arc<Window>>> = cfg
             .credential_quotas
@@ -338,6 +369,7 @@ impl Executor {
                     limits: Self::shared_limits(
                         &mut shared_limits,
                         &mut shared_caps,
+                        &mut local_windows,
                         &cfg.shared_quotas,
                         &key_windows,
                         dep,

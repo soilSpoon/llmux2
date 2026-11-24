@@ -924,6 +924,7 @@ async fn fixture_shared_group(
     fams: [Option<&'static str>; 3],
     creds: [&str; 3],
     upstreams: [&str; 3],
+    quotas: [llmux_types::QuotaSpec; 3],
     dep2_base_url: Option<&str>,
 ) -> Fixture {
     let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
@@ -971,7 +972,7 @@ async fn fixture_shared_group(
                 upstream_model: upstreams[i as usize].into(),
                 strip_request_fields: Box::default(),
                 priority: i as i32,
-                quota: Default::default(),
+                quota: quotas[i as usize],
                 shared_quota: fams[i as usize].map(Into::into),
                 timeout: Duration::from_secs(1),
                 max_context: None,
@@ -1079,6 +1080,7 @@ async fn shared_quota_binds_legs_on_one_scope_to_one_window() {
         [Some("fam"), Some("fam"), None],
         ["first", "first", "second"],
         ["upstream", "upstream-1", "upstream"],
+        [Default::default(); 3],
         None,
     )
     .await;
@@ -1126,6 +1128,7 @@ async fn shared_quota_scopes_anonymous_legs_by_provider_and_base_url() {
         [Some("fam"), Some("fam"), Some("fam")],
         ["", "", ""],
         ["upstream", "upstream-1", "upstream"],
+        [Default::default(); 3],
         Some(&other_url),
     )
     .await;
@@ -1149,6 +1152,167 @@ async fn shared_quota_scopes_anonymous_legs_by_provider_and_base_url() {
 }
 
 #[tokio::test]
+async fn unbound_leg_shares_route_local_window_with_bound_sibling() {
+    // dep0 (unbound) and dep1 (bound to fam) sit on the same route — same
+    // provider, credential, base URL, upstream model, and local rpm=1.
+    // The family binding must not split the route's local budget: dep0's
+    // spend drains the window dep1 draws on, so call 2 exhausts.
+    let (executor, adapter, _, _server) = fixture_shared_group(
+        &[("a", &[0, 1])],
+        &[(
+            "fam",
+            llmux_types::QuotaSpec {
+                rpm: Some(100),
+                ..Default::default()
+            },
+        )],
+        [None, Some("fam"), Some("fam")],
+        ["first", "first", "first"],
+        ["upstream", "upstream", "upstream-2"],
+        [
+            llmux_types::QuotaSpec {
+                rpm: Some(1),
+                ..Default::default()
+            },
+            llmux_types::QuotaSpec {
+                rpm: Some(1),
+                ..Default::default()
+            },
+            Default::default(),
+        ],
+        None,
+    )
+    .await;
+    executor
+        .execute(GatewayRequest {
+            model: "a".into(),
+            ..request()
+        })
+        .await
+        .unwrap();
+    let Err(GatewayError::AllCandidatesExhausted { .. }) = executor
+        .execute(GatewayRequest {
+            model: "a".into(),
+            ..request()
+        })
+        .await
+    else {
+        panic!("expected exhaustion")
+    };
+    assert_eq!(adapter.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn bound_leg_shares_route_local_window_with_unbound_sibling() {
+    // Mirror order: dep0 is bound, dep1 unbound. The shared local window
+    // must hold in both processing directions.
+    let (executor, adapter, _, _server) = fixture_shared_group(
+        &[("a", &[0, 1])],
+        &[(
+            "fam",
+            llmux_types::QuotaSpec {
+                rpm: Some(100),
+                ..Default::default()
+            },
+        )],
+        [Some("fam"), None, Some("fam")],
+        ["first", "first", "first"],
+        ["upstream", "upstream", "upstream-2"],
+        [
+            llmux_types::QuotaSpec {
+                rpm: Some(1),
+                ..Default::default()
+            },
+            llmux_types::QuotaSpec {
+                rpm: Some(1),
+                ..Default::default()
+            },
+            Default::default(),
+        ],
+        None,
+    )
+    .await;
+    executor
+        .execute(GatewayRequest {
+            model: "a".into(),
+            ..request()
+        })
+        .await
+        .unwrap();
+    let Err(GatewayError::AllCandidatesExhausted { .. }) = executor
+        .execute(GatewayRequest {
+            model: "a".into(),
+            ..request()
+        })
+        .await
+    else {
+        panic!("expected exhaustion")
+    };
+    assert_eq!(adapter.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn bound_leg_still_spends_family_window_alongside_shared_local() {
+    // dep0 (bound, fam rpm=1) shares its route-local window with unbound
+    // dep1, but its calls must still charge the family: dep2 binds the same
+    // fam on a different route and finds the allowance already spent.
+    let (executor, adapter, _, _server) = fixture_shared_group(
+        &[("a", &[0, 1]), ("b", &[2])],
+        &[(
+            "fam",
+            llmux_types::QuotaSpec {
+                rpm: Some(1),
+                ..Default::default()
+            },
+        )],
+        [Some("fam"), None, Some("fam")],
+        ["first", "first", "first"],
+        ["upstream", "upstream", "upstream-2"],
+        [
+            llmux_types::QuotaSpec {
+                rpm: Some(2),
+                ..Default::default()
+            },
+            llmux_types::QuotaSpec {
+                rpm: Some(2),
+                ..Default::default()
+            },
+            Default::default(),
+        ],
+        None,
+    )
+    .await;
+    for _ in 0..2 {
+        executor
+            .execute(GatewayRequest {
+                model: "a".into(),
+                ..request()
+            })
+            .await
+            .unwrap();
+    }
+    let Err(GatewayError::AllCandidatesExhausted { .. }) = executor
+        .execute(GatewayRequest {
+            model: "b".into(),
+            ..request()
+        })
+        .await
+    else {
+        panic!("expected exhaustion")
+    };
+    // Call 2 lands on unbound dep1 — dep0's fam window is already spent —
+    // drawing only on the shared local window, never the family.
+    let calls: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(calls, ["dep0", "dep1"]);
+}
+
+#[tokio::test]
 async fn shared_quota_family_cap_rejects_oversized_request_on_empty_window() {
     // A family allowance is an account-wide ceiling like a credential cap:
     // a single request whose cost alone exceeds it must be refused even
@@ -1166,6 +1330,7 @@ async fn shared_quota_family_cap_rejects_oversized_request_on_empty_window() {
         [Some("fam"), None, Some("fam")],
         ["first", "first", "second"],
         ["upstream", "upstream-1", "upstream"],
+        [Default::default(); 3],
         None,
     )
     .await;
@@ -1199,6 +1364,7 @@ async fn unbound_legs_on_the_same_credential_keep_independent_windows() {
         [Some("fam"), None, None],
         ["first", "first", "second"],
         ["upstream", "upstream-1", "upstream"],
+        [Default::default(); 3],
         None,
     )
     .await;
@@ -1237,6 +1403,7 @@ async fn bound_then_unbound_siblings_on_one_route_do_not_share_family_windows() 
         [Some("fam"), None, None],
         ["first", "first", "second"],
         ["upstream", "upstream", "upstream"],
+        [Default::default(); 3],
         None,
     )
     .await;
@@ -1276,6 +1443,7 @@ async fn unbound_then_bound_siblings_on_one_route_keep_the_family_cap() {
         [None, Some("fam"), Some("fam")],
         ["first", "first", "first"],
         ["upstream", "upstream", "upstream-2"],
+        [Default::default(); 3],
         None,
     )
     .await;
@@ -1315,6 +1483,7 @@ async fn legs_bound_to_different_families_on_one_route_do_not_conflate() {
         [Some("fam-a"), Some("fam-b"), None],
         ["first", "first", "second"],
         ["upstream", "upstream", "upstream"],
+        [Default::default(); 3],
         None,
     )
     .await;
@@ -1354,6 +1523,7 @@ async fn credentialed_leg_does_not_claim_the_anonymous_scope_window() {
         [Some("fam"), Some("fam"), Some("fam")],
         ["first", "", ""],
         ["upstream", "upstream", "upstream"],
+        [Default::default(); 3],
         None,
     )
     .await;
@@ -1392,6 +1562,7 @@ async fn anonymous_leg_does_not_claim_the_credential_scope_window() {
         [Some("fam"), Some("fam"), Some("fam")],
         ["", "first", "first"],
         ["upstream", "upstream", "upstream"],
+        [Default::default(); 3],
         None,
     )
     .await;
