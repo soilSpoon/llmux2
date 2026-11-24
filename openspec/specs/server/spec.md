@@ -11,7 +11,10 @@ per-key model restrictions, and image intake.
 
 `[server]` SHALL accept optional `[[server.key_policies]]` entries, each naming
 one `server.client_keys` secret reference as `key` plus glob lists `models` and
-`blocked`. A client key with no entry SHALL be unrestricted. For a listed key,
+`blocked` and an optional `free_only` flag. A client key with no entry SHALL be
+unrestricted. A `free_only = true` entry SHALL force free-leg-only routing for
+that key's requests and SHALL filter `GET /v1/models` to models with a usable
+free leg (see the routing spec's adaptive free-leg advertising). For a listed key,
 the requested `model` field — before alias, canonical, or catch-all resolution —
 SHALL match at least one `models` glob (an absent or empty `models` allows every
 name) and no `blocked` glob, on every inbound format that resolves a model;
@@ -22,7 +25,8 @@ matching exactly one character (a Unicode scalar value, not one byte).
 
 Config SHALL reject a `key_policies` entry whose `key` does not resolve to a
 `server.client_keys` value, a repeated key, an empty pattern, and an entry with
-no `models` and no `blocked` (allow-all minus nothing is meaningless). The
+no `models`, no `blocked`, and no `free_only` (allow-all minus nothing is
+meaningless). The
 check SHALL use the same matched-key identity as authentication and
 `allowed_keys`, so it covers chat completions, `/v1/responses`, and Anthropic
 `/v1/messages` keys presented as bearer or `x-api-key` credentials.

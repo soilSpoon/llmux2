@@ -70,6 +70,9 @@ pub enum RemoteImages {
 pub struct KeyPolicy {
     pub models: Box<[String]>,
     pub blocked: Box<[String]>,
+    /// Free-only key: requests never route to billed legs, and `/v1/models`
+    /// advertises only models with at least one usable free leg.
+    pub free_only: bool,
 }
 
 pub struct RoutingConfig {
@@ -213,6 +216,7 @@ struct RawKeyPolicy {
     key: String,
     models: Option<Vec<String>>,
     blocked: Option<Vec<String>>,
+    free_only: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -988,7 +992,8 @@ fn resolve_key_policies(
         };
         let models = entry.models.unwrap_or_default();
         let blocked = entry.blocked.unwrap_or_default();
-        if models.is_empty() && blocked.is_empty() {
+        let free_only = entry.free_only.unwrap_or(false);
+        if models.is_empty() && blocked.is_empty() && !free_only {
             return Err(invalid(
                 "server.key_policies entries need a nonempty models or blocked list",
             ));
@@ -1004,6 +1009,7 @@ fn resolve_key_policies(
             .replace(KeyPolicy {
                 models: models.into(),
                 blocked: blocked.into(),
+                free_only,
             })
             .is_some()
         {

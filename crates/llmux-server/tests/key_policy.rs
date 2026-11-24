@@ -311,9 +311,11 @@ async fn free_only_key_sees_no_billed_only_models() {
     .await
     .unwrap();
     let gateway = TestServer::start(
-        llmux_server::app(RuntimeConfig::parse(&free_only_config(&remote.url(), dir.path())).unwrap())
-            .await
-            .unwrap(),
+        llmux_server::app(
+            RuntimeConfig::parse(&free_only_config(&remote.url(), dir.path())).unwrap(),
+        )
+        .await
+        .unwrap(),
     )
     .await
     .unwrap();
@@ -322,10 +324,7 @@ async fn free_only_key_sees_no_billed_only_models() {
     // ci key: billed-only models are treated as if they do not exist —
     // absent from the list and unroutable — while any model with a usable
     // free leg (including shared billed/free models) stays advertised.
-    assert_eq!(
-        listed(&gateway, "ci-key").await,
-        ["free-servable", "mixed"]
-    );
+    assert_eq!(listed(&gateway, "ci-key").await, ["free-servable", "mixed"]);
     assert_eq!(
         listed(&gateway, "owner-key").await,
         ["billed-only", "free-servable", "mixed"]
@@ -351,10 +350,7 @@ async fn free_only_key_sees_no_billed_only_models() {
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(seen.lock().unwrap().is_empty(), "no upstream call");
 
-    let response = client
-        .request(messages("mixed", "ci-key"))
-        .await
-        .unwrap();
+    let response = client.request(messages("mixed", "ci-key")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(seen_models(&seen), ["up-mixed-free"]);
 }

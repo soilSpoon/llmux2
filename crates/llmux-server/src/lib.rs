@@ -259,10 +259,23 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         .key_policies
         .get(client_key.index)
         .and_then(Option::as_ref);
+    // A usable free leg is a non-fallback deployment marked free whose
+    // credential is not disabled — the same legs a free-only request could
+    // actually route to right now.
+    let has_usable_free_leg = |id: &str| match active.config.model_names.get(id) {
+        Some(&index) => active.config.models[index].deployments.iter().any(|idx| {
+            let dep = &active.config.deployments[idx.0 as usize];
+            !dep.fallback
+                && dep.billing == Billing::Free
+                && active.executor.credential_disabled(&dep.credential) != Some(true)
+        }),
+        None => false,
+    };
     let data: Vec<_> = ids
         .into_iter()
         .filter(|&id| !policy::model_denied(deny, id))
         .filter(|&id| key_policy.is_none_or(|p| policy::allows_model(p, id)))
+        .filter(|&id| !key_policy.is_some_and(|p| p.free_only) || has_usable_free_leg(id))
         .map(|id| {
             // `free` only when the model has at least one non-fallback leg and
             // every non-fallback leg is marked free; a missing marker is billed.
@@ -484,15 +497,16 @@ async fn route_request(
         );
     }
     // A listed key may request only names its policy allows — checked on the
-    // requested id before any alias, canonical, or catch-all resolution.
-    if active
+    // requested id before any alias, canonical, or catch-all resolution. A
+    // free-only key never routes to a billed leg, header or not.
+    let key_policy = active
         .config
         .server
         .key_policies
         .get(client_key.index)
-        .and_then(Option::as_ref)
-        .is_some_and(|key_policy| !policy::allows_model(key_policy, &model))
-    {
+        .and_then(Option::as_ref);
+    let free_only = free_only || key_policy.is_some_and(|p| p.free_only);
+    if key_policy.is_some_and(|key_policy| !policy::allows_model(key_policy, &model)) {
         return error(
             StatusCode::FORBIDDEN,
             "model_not_allowed",

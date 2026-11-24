@@ -280,19 +280,33 @@ AND does not route the request to a different model.
 
 ### Requirement: Adaptive free-leg advertising
 
-The gateway SHALL advertise a canonical model to clients only while at least
-one free (non-billed) deployment exists for it. A model whose every leg is
-billed SHALL NOT appear in the advertised model list, while a model shared
-between free and billed legs stays listed as long as a free leg remains
-configured. Advertising SHALL be recomputed automatically whenever the
-deployment set or billing classification changes — never maintained by hand.
+A client key whose `key_policies` entry sets `free_only = true` SHALL be
+advertised a canonical model only while at least one usable free
+(non-billed) deployment exists for it, and SHALL never have a request routed
+to a billed leg — equivalent to `x-llmux-free-only: true` on every request.
+A model whose every leg is billed, or whose free legs all sit on disabled
+credentials, SHALL NOT appear in that key's `/v1/models` list, while a model
+shared between free and billed legs stays listed as long as a usable free
+leg remains. "Free" covers any leg with zero per-request cost — promotional
+free tiers and subscription/plan-covered legs alike — and advertising SHALL
+be recomputed automatically whenever the deployment set, billing
+classification, or credential-disabled state changes, never maintained by
+hand. Keys without the flag see every configured name their policy allows.
 
-#### Scenario: Billed-only model hidden
+#### Scenario: Billed-only model hidden from a free-only key
 
 WHEN every deployment of a model is billed
-THEN it is absent from the advertised list until a free leg is added.
+THEN a free-only key's `/v1/models` omits it and its requests fail without
+an upstream call.
 
 #### Scenario: One free leg keeps the model listed
 
 WHEN a model has one free deployment alongside billed ones
-THEN it stays advertised, and requests use the free leg first.
+THEN it stays advertised to a free-only key, and requests use the free leg
+first.
+
+#### Scenario: Expired plan leg stops counting
+
+WHEN a model's only free deployment draws on a disabled credential
+THEN the model drops out of a free-only key's `/v1/models` list until a
+usable free leg returns.
