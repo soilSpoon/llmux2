@@ -422,6 +422,58 @@ fn unrestricted_client_key(key: &Value) -> bool {
     })
 }
 
+/// Field lookup accepting the export's `camelCase` and `snake_case`
+/// spellings alike, normalized the same way `unrestricted_client_key` does.
+fn key_field<'a>(key: &'a Value, name: &str) -> Option<&'a Value> {
+    key.as_object()?.iter().find_map(|(field, value)| {
+        field
+            .replace('_', "")
+            .eq_ignore_ascii_case(name)
+            .then_some(value)
+    })
+}
+
+fn glob_list(value: Option<&Value>) -> Option<Vec<String>> {
+    value?
+        .as_array()?
+        .iter()
+        .map(|item| item.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// A restricted key is portable only when its whole restriction is
+/// `model_access_mode = restricted` plus `allowed_models`/`blocked_models`
+/// glob lists, which `server.key_policies` expresses exactly (blocked
+/// matches always win). Any other restricted field — ip allowlists, scopes,
+/// quotas, rate limits, combos, schedules — has no llmux2 equivalent, so
+/// the key keeps the fail-closed skip rather than silently widening access.
+fn portable_key_policy(key: &Value) -> Option<(Vec<String>, Vec<String>)> {
+    if key_field(key, "modelaccessmode").and_then(Value::as_str) != Some("restricted") {
+        return None;
+    }
+    let mut stripped = key.clone();
+    stripped.as_object_mut()?.retain(|field, _| {
+        !matches!(
+            field.replace('_', "").to_ascii_lowercase().as_str(),
+            "allowedmodels" | "blockedmodels" | "modelaccessmode"
+        )
+    });
+    if !unrestricted_client_key(&stripped) {
+        return None;
+    }
+    let allowed = glob_list(key_field(key, "allowedmodels"))?;
+    // Restricted mode with an empty allow list denies every model; there is
+    // no usable key policy to port.
+    if allowed.is_empty() {
+        return None;
+    }
+    let blocked = match key_field(key, "blockedmodels") {
+        None | Some(Value::Null) => Vec::new(),
+        value => glob_list(value)?,
+    };
+    Some((allowed, blocked))
+}
+
 fn write_secret(dir: &Path, id: &str, secret: &str) -> Result<String, String> {
     let path = dir.join(id);
     // Scheduled re-imports regenerate the same credentials into a shared
@@ -1652,6 +1704,7 @@ pub fn import_with_options(
         return Err("no importable models; no configuration written".into());
     }
     let mut client_keys = Vec::new();
+    let mut key_policies = Vec::new();
     for (i, key) in array(&root, "apiKeys").iter().enumerate() {
         if key["isActive"] == false || !valid_secret(key["key"].as_str().unwrap_or("")) {
             warnings.push(format!(
@@ -1659,12 +1712,26 @@ pub fn import_with_options(
             ));
             continue;
         }
-        if !unrestricted_client_key(key) {
-            warnings.push(format!("client key {i}: skipped restricted or malformed per-key access policy; llmux keys grant unrestricted access"));
-            continue;
-        }
+        let policy = if unrestricted_client_key(key) {
+            None
+        } else {
+            match portable_key_policy(key) {
+                Some(policy) => Some(policy),
+                None => {
+                    warnings.push(format!("client key {i}: skipped restricted or malformed per-key access policy; llmux keys grant unrestricted access"));
+                    continue;
+                }
+            }
+        };
         let id = unique(&format!("client-{i}"), &mut ids);
-        client_keys.push(write_secret(&dir, &id, key["key"].as_str().unwrap())?);
+        let key_ref = write_secret(&dir, &id, key["key"].as_str().unwrap())?;
+        if let Some((models, blocked)) = policy {
+            key_policies.push(json!({"key": key_ref, "models": models, "blocked": blocked}));
+            warnings.push(format!(
+                "client key {i}: restricted model lists ported to server.key_policies"
+            ));
+        }
+        client_keys.push(key_ref);
     }
     let client_count = client_keys.len();
     if client_keys.is_empty() {
@@ -1692,6 +1759,9 @@ pub fn import_with_options(
         }
     }
     let mut config = json!({"server":{"listen":options.listen.unwrap_or("127.0.0.1:8080"),"client_keys":client_keys},"credentials":credentials,"models":models});
+    if !key_policies.is_empty() {
+        config["server"]["key_policies"] = json!(key_policies);
+    }
     if let Some(overlay) = overlay {
         // An overlay [server].listen is a site choice when no --listen was
         // passed, but it must never silently override the deployed address a
