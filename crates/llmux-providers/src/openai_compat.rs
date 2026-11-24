@@ -9,9 +9,9 @@ use http::{
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use llmux_types::{
-    provider, AuthError, AuthMaterial, BoxStream, BuildError, ChatRequestField, CredentialSource,
-    Deployment, GatewayRequest, GatewayResponse, InboundFormat, LimitObservation, ProviderAdapter,
-    ProviderKind, SseEvent, Support, UpstreamError,
+    provider, AuthError, AuthMaterial, Billing, BoxStream, BuildError, ChatRequestField,
+    CredentialSource, Deployment, GatewayRequest, GatewayResponse, InboundFormat, LimitObservation,
+    ProviderAdapter, ProviderKind, SseEvent, Support, UpstreamError,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -376,6 +376,32 @@ pub(crate) fn rewrite_model(body: &Bytes, model: &str) -> Result<Bytes, BuildErr
     Ok(rewritten.freeze())
 }
 
+/// Client-controlled spend knobs — paid model fallbacks (`models`), billed
+/// addons (`plugins`, `web_search_options`), and provider/tier overrides
+/// (`provider`, `service_tier`) — can cost money even when the rewritten
+/// `model` is free, so free legs always drop them on top of the deployment's
+/// configured strips.
+const FREE_STRIP_FIELDS: &[ChatRequestField] = &[
+    ChatRequestField::Models,
+    ChatRequestField::Plugins,
+    ChatRequestField::Provider,
+    ChatRequestField::ServiceTier,
+    ChatRequestField::WebSearchOptions,
+];
+
+fn strip_fields(dep: &Deployment) -> Cow<'_, [ChatRequestField]> {
+    if dep.billing != Billing::Free {
+        return Cow::Borrowed(&dep.strip_request_fields[..]);
+    }
+    let mut strip = dep.strip_request_fields.to_vec();
+    for field in FREE_STRIP_FIELDS {
+        if !strip.contains(field) {
+            strip.push(*field);
+        }
+    }
+    Cow::Owned(strip)
+}
+
 pub(crate) fn strip_request_fields(
     body: Bytes,
     strip: &[ChatRequestField],
@@ -397,6 +423,11 @@ pub(crate) fn strip_request_fields(
             ChatRequestField::Temperature => "temperature",
             ChatRequestField::TopP => "top_p",
             ChatRequestField::TopK => "top_k",
+            ChatRequestField::Models => "models",
+            ChatRequestField::Plugins => "plugins",
+            ChatRequestField::Provider => "provider",
+            ChatRequestField::ServiceTier => "service_tier",
+            ChatRequestField::WebSearchOptions => "web_search_options",
             ChatRequestField::ReasoningEffort => {
                 if let Some(mut object) = fields
                     .get("reasoning")
@@ -573,7 +604,7 @@ impl ProviderAdapter for OpenAiCompat {
                     "application/json"
                 },
             )
-            .body(strip_request_fields(body, &dep.strip_request_fields)?)?;
+            .body(strip_request_fields(body, &strip_fields(dep))?)?;
 
         request.headers_mut().extend(dep.headers.clone());
         llmux_types::default_user_agent(request.headers_mut());
@@ -2065,6 +2096,95 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn free_billing_legs_drop_client_fallback_models() {
+        use llmux_types::{Billing, DeploymentIdx, QuotaSpec, RequestId};
+        let adapter = OpenAiCompat::new("openai_compat");
+        let deployment = Deployment {
+            headers: Default::default(),
+            idx: DeploymentIdx(0),
+            id: "d".into(),
+            provider: adapter.kind().clone(),
+            credential: "key".into(),
+            base_url: "https://openrouter.ai/v1".parse().unwrap(),
+            upstream_model: "google/test:free".into(),
+            strip_request_fields: Box::default(),
+            priority: 0,
+            quota: QuotaSpec::default(),
+            timeout: Duration::from_secs(5),
+            max_context: None,
+            expires_at: None,
+            priority_boost: None,
+            priority_boost_until: None,
+            billing: Billing::Free,
+            fallback: false,
+        };
+        let req = GatewayRequest {
+            format: InboundFormat::OpenAiChat,
+            model: "alias".into(),
+            stream: false,
+            body: Bytes::from_static(
+                br#"{"model":"alias","models":["google/test:free","openai/paid-model"],"plugins":[{"id":"web","engine":"exa"}],"provider":{"only":["PaidProvider"],"allow_fallbacks":true},"service_tier":"priority","web_search_options":{"search_context_size":"high"},"transforms":["middle-out"],"messages":[]}"#,
+            ),
+            est_input_tokens: 0,
+            anthropic_headers: HeaderMap::new(),
+            max_output_tokens: None,
+            context_overflow: None,
+            request_id: RequestId("r".into()),
+            end_user: None,
+            client_key: None,
+            image_count: 0,
+            free_only: true,
+        };
+        let upstream = adapter
+            .build_request(&req, &deployment, &AuthMaterial::None)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(upstream.body()).unwrap();
+        // Paid fallbacks in `models`, billed addons in `plugins`, and
+        // route/provider/tier overrides would spend money on a leg classified
+        // free — none reaches upstream.
+        assert_eq!(body["model"], "google/test:free");
+        for field in [
+            "models",
+            "plugins",
+            "provider",
+            "service_tier",
+            "web_search_options",
+        ] {
+            assert!(body.get(field).is_none(), "{field}");
+        }
+        // Free features like transforms stay.
+        assert_eq!(body["transforms"], serde_json::json!(["middle-out"]));
+        // A billed leg keeps client fallbacks untouched.
+        let billed_dep = Deployment {
+            billing: Billing::Billed,
+            ..deployment
+        };
+        let upstream = adapter
+            .build_request(&req, &billed_dep, &AuthMaterial::None)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(upstream.body()).unwrap();
+        assert_eq!(
+            body["models"],
+            serde_json::json!(["google/test:free", "openai/paid-model"])
+        );
+        assert_eq!(
+            body["plugins"],
+            serde_json::json!([{"id": "web", "engine": "exa"}])
+        );
+        assert_eq!(
+            body["provider"],
+            serde_json::json!({"only": ["PaidProvider"], "allow_fallbacks": true})
+        );
+        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(
+            body["web_search_options"],
+            serde_json::json!({"search_context_size": "high"})
+        );
     }
 
     #[test]

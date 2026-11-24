@@ -16,7 +16,9 @@ const FREE_PROVIDERS: &[&str] = &["aihorde", "duckduckgo-web", "github-models"];
 
 /// Whether the emitted leg can spend money or shared quota when probed.
 /// Every leg bills unless the config metadata marks it free: builtin legs on
-/// the community endpoints in FREE_PROVIDERS, reviewed free subsets (Kilo
+/// the community endpoints in FREE_PROVIDERS, plan-independent offers the
+/// reviewed `free_conditions` table names (`:free` variants, anonymous
+/// allowances), reviewed free subsets (Kilo
 /// verified-free models, XPLabs free routes — billed XPLabs routes never
 /// reach this point — and Devin models the free-models list names), and
 /// custom provider legs only when --free-providers lists the provider-node id
@@ -28,6 +30,11 @@ pub(super) fn billed(connection: &Connection, model: &str, policy: &Policy) -> b
         return true;
     }
     if connection.policy == ModelPolicy::KiloFree || connection.base_url == xplabs::BASE_URL {
+        return false;
+    }
+    // Plan-independent free offers the reviewed conditions table names —
+    // provider-documented `:free` variants and per-IP anonymous allowances.
+    if crate::free_conditions::asserts_free(&connection.base_url, model, connection.anonymous()) {
         return false;
     }
     match &connection.provider {
@@ -47,7 +54,7 @@ pub(super) fn billed(connection: &Connection, model: &str, policy: &Policy) -> b
     }
 }
 
-fn host(base_url: &str) -> String {
+pub(super) fn host(base_url: &str) -> String {
     let authority = base_url
         .split("://")
         .nth(1)

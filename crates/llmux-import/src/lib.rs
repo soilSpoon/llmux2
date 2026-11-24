@@ -9,6 +9,7 @@ mod devin;
 mod direct;
 pub mod discovery;
 mod fallback;
+mod free_conditions;
 mod morph;
 mod nous;
 mod policy;
@@ -106,6 +107,23 @@ struct Connection {
     base_url: String,
     priority: i64,
     policy: policy::ModelPolicy,
+}
+
+impl Connection {
+    /// True only when the leg reaches upstream with no authentication — the
+    /// sole case a per-IP anonymous offer can apply. A custom node may carry
+    /// headers that authenticate upstream (`Authorization`, cookies, tokens)
+    /// with `auth_type = "none"` and no credential; rather than enumerate
+    /// every auth-bearing header name, any custom header marks the leg
+    /// authenticated — a false positive only forgoes a free tag, never admits
+    /// a keyed leg into a per-IP allowance.
+    fn anonymous(&self) -> bool {
+        self.credential.is_none()
+            && !self
+                .headers
+                .as_object()
+                .is_some_and(|headers| !headers.is_empty())
+    }
 }
 
 // OmniRoute registry/<id>/index.ts; Gemini uses Google's documented OpenAI compatibility API.
@@ -804,6 +822,17 @@ impl Expander<'_> {
                 }
                 if c.policy == policy::ModelPolicy::Workers {
                     deployment["quota"] = json!({"rpm":self.policy.workers_rpm});
+                }
+                if deployment["billing"] == "free" {
+                    if let Some(cond) = free_conditions::lookup(&c.base_url, &model, c.anonymous())
+                    {
+                        for &(field, value) in cond.quota {
+                            deployment["quota"][field] = value.into();
+                        }
+                        if let Some(stamp) = cond.expires_at {
+                            deployment["expires_at"] = stamp.into();
+                        }
+                    }
                 }
                 if let Some(credential) = &c.credential {
                     deployment["credential"] = credential.clone().into();

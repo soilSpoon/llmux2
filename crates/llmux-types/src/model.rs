@@ -52,6 +52,11 @@ pub enum ChatRequestField {
     Temperature,
     TopP,
     TopK,
+    Models,
+    Plugins,
+    Provider,
+    ServiceTier,
+    WebSearchOptions,
 }
 
 #[derive(Debug)]
