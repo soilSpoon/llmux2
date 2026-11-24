@@ -231,8 +231,10 @@ fn image_source(part: &Value) -> Option<ImageSource> {
     }
 }
 
-/// A `data:` URL carries its bytes inline; anything else stays a URL for the
-/// agent to resolve.
+/// A `data:` URL carries its bytes inline; a remote reference must be
+/// http(s) — anything else (a bare path, `file://`) would land in the
+/// `[Images]` index and invite the agent to `read` a sandbox file it was
+/// never meant to see.
 fn url_source(url: &str) -> Option<ImageSource> {
     if let Some(rest) = url.strip_prefix("data:") {
         if let Some((meta, data)) = rest.split_once(',') {
@@ -244,7 +246,8 @@ fn url_source(url: &str) -> Option<ImageSource> {
             }
         }
     }
-    (!url.is_empty()).then(|| ImageSource::Url(url.to_owned()))
+    (url.starts_with("http://") || url.starts_with("https://"))
+        .then(|| ImageSource::Url(url.to_owned()))
 }
 
 /// Decoded image bytes must not exceed this: `devin acp` accepts inline
@@ -1251,6 +1254,22 @@ mod tests {
         let dir = staged.dir.clone();
         drop(staged);
         assert!(!dir.exists(), "staging dir must be removed on drop");
+    }
+
+    #[test]
+    fn non_http_image_urls_are_dropped() {
+        let home = tempfile::tempdir().unwrap();
+        // A bare path or file:// URL would land in the [Images] index and the
+        // prompt would invite the agent to `read` it — a sandbox credential
+        // leak. Only http(s) remote refs may be indexed.
+        let msgs = [json!({"role":"user","content":[
+            {"type":"image_url","image_url":{"url":".local/share/devin/credentials.toml"}},
+            {"type":"image_url","image_url":{"url":"file:///etc/passwd"}},
+            {"type":"input_image","image_url":"./secrets"},
+            {"type":"image_url","image_url":{"url":"https://example.test/x.png"}},
+        ]})];
+        let (_staged, entries) = stage_images(home.path(), &msgs).unwrap();
+        assert_eq!(entries, ["https://example.test/x.png"]);
     }
 
     #[test]

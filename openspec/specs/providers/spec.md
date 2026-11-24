@@ -205,8 +205,10 @@ OpenAI `image_url`/`input_image` parts (string or `{url}` object) and Anthropic
 `image` source parts are detected in message order. The transcript SHALL mark
 each image's position with `[image N]` and end with an `[Images]` index listing
 `image N: <path-or-url>` in the same order, so the model can pair image and
-surrounding turn. Remote URLs are indexed by URL (the agent may fetch them);
-non-base64 `data:` URLs degrade the same way. Staged files SHALL be removed
+surrounding turn. Remote references SHALL be indexed by URL only when they are
+`http://` or `https://` — a bare path or `file://` URL is dropped, since the
+index invites the agent to `read` it and would expose sandbox files; non-base64
+`data:` URLs degrade the same way. Staged files SHALL be removed
 when the turn ends, including aborted turns. A single image whose decoded
 bytes exceed 8 MiB SHALL fail the request `413 Payload Too Large` — checked
 by encoded length before decode so the payload is never materialized — and
@@ -225,6 +227,13 @@ staged file path so the agent reads it.
 WHEN an image part references `https://example.test/x.png`
 THEN the transcript marks the position and indexes the URL itself — no file is
 staged — and the turn still completes.
+
+#### Scenario: Local-path image reference
+
+WHEN an image part references a non-HTTP(S) URL such as
+`file:///etc/passwd` or `.local/share/devin/credentials.toml`
+THEN the reference produces no `[image N]` index entry, so the agent is never
+invited to read a sandbox-local file it was not given.
 
 #### Scenario: Staging cleanup
 
