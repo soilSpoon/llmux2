@@ -75,10 +75,11 @@ pub struct AcpAgent {
     kind: ProviderKind,
     /// The process spec per credential id; a deployment's `credential` selects it.
     specs: Arc<HashMap<Arc<str>, AcpAgentSpec>>,
-    /// Persistent children keyed by credential id. The lock is held for a whole
-    /// turn, serializing requests through the one connection; a turn takes the
-    /// session out of the map so cancelling or failing it drops (and kills)
-    /// the child instead of leaving it mid-turn for the next request.
+    /// Persistent children keyed by credential id. The map lock only guards
+    /// the checkout/return; a turn holds the session itself so concurrent
+    /// requests on other credentials do not serialize, and cancelling or
+    /// failing a turn drops (and kills) the child instead of leaving it
+    /// mid-turn for the next request.
     sessions: Arc<Mutex<HashMap<Arc<str>, AcpSession>>>,
 }
 
@@ -742,7 +743,10 @@ done
             assert_eq!(out["choices"][0]["message"]["content"], "done");
             let log =
                 std::fs::read_to_string(dir.path().join(".local/share/perm_reply.log")).unwrap();
-            assert!(log.contains(r#""result":{"outcome":"cancelled"}"#), "{log}");
+            assert!(
+                log.contains(r#""result":{"outcome":{"outcome":"cancelled"}}"#),
+                "{log}"
+            );
             assert!(!log.contains("-32601"), "{log}");
         }
 

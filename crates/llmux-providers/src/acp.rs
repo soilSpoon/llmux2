@@ -488,7 +488,7 @@ impl AcpSession {
                 // would be the agent's signal to stop the turn empty-handed.
                 let reply = if method.as_str() == Some("session/request_permission") {
                     json!({"jsonrpc":"2.0","id":server_id,
-                        "result":{"outcome":"cancelled"}})
+                        "result":{"outcome":{"outcome":"cancelled"}}})
                 } else {
                     json!({"jsonrpc":"2.0","id":server_id,
                         "error":{"code":-32601,"message":"method not supported"}})
