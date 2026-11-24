@@ -1654,9 +1654,10 @@ pub fn import_with_options(
 }
 
 /// `canonical-map.json`: every spelling that resolves to each emitted model
-/// name. Spellings the suffix rule kept distinct (effort/`-fast`/`-no-think`)
-/// get their own entry keyed by themselves — a request for one reaches the
-/// catch-all, which forwards the literal id to the real suffixed upstream.
+/// name. Each value leads with the name itself, then the spellings resolving
+/// to it; spellings the suffix rule kept distinct (effort/`-fast`/`-no-think`)
+/// get their own entry — a request for one reaches the catch-all, which
+/// forwards the literal id to the real suffixed upstream.
 /// `clusters` counts merged groups (a name plus at least one other spelling);
 /// `entries_before`/`entries_after` are spelling rows in vs canonical names out.
 fn write_canonical_map(
@@ -1666,10 +1667,11 @@ fn write_canonical_map(
 ) -> Result<(), String> {
     let mut map = serde_json::Map::new();
     for model in array(config, "models") {
-        map.insert(
-            string(model, "name").to_owned(),
-            Value::Array(array(model, "aliases").to_vec()),
-        );
+        let name = string(model, "name");
+        let spellings = std::iter::once(json!(name))
+            .chain(array(model, "aliases").iter().cloned())
+            .collect();
+        map.insert(name.to_owned(), Value::Array(spellings));
     }
     for name in dropped_suffixed {
         map.entry(name.clone()).or_insert_with(|| json!([name]));
@@ -1683,7 +1685,7 @@ fn write_canonical_map(
             .values()
             .filter(|names| names.as_array().is_some_and(|names| names.len() > 1))
             .count(),
-        "entries_before": map.len() + spellings,
+        "entries_before": spellings,
         "entries_after": map.len(),
         "map": Value::Object(map),
     });

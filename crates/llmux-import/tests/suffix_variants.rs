@@ -87,11 +87,31 @@ fn canonical_map_keeps_suffixed_names_as_distinct_entries() {
     };
     llmux_import::import_with_options(&root.to_string(), &output, None, &options).unwrap();
     let doc: Value = serde_json::from_str(&std::fs::read_to_string(&map_path).unwrap()).unwrap();
-    let fable = doc["map"]["claude-fable-5"].as_array().unwrap();
+    let map = &doc["map"];
+    // Values uniformly lead with the name itself, then the spellings that
+    // resolve to it — so the metadata counts are consistent across entries.
+    let fable = map["claude-fable-5"].as_array().unwrap();
+    assert_eq!(fable[0], "claude-fable-5");
     assert!(fable.iter().any(|name| name == "vendor/claude-fable-5"));
     assert!(!fable.iter().any(|name| name == "vendor/claude-fable-5-low"));
     assert_eq!(
-        doc["map"]["vendor/claude-fable-5-low"],
+        map["vendor/claude-fable-5-low"],
         json!(["vendor/claude-fable-5-low"])
     );
+    let spellings: usize = map
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|names| names.as_array().unwrap().len())
+        .sum();
+    assert_eq!(doc["entries_before"], json!(spellings));
+    assert_eq!(doc["entries_after"], json!(map.as_object().unwrap().len()));
+    // A cluster is a name plus at least one other spelling.
+    let merged: usize = map
+        .as_object()
+        .unwrap()
+        .values()
+        .filter(|names| names.as_array().unwrap().len() > 1)
+        .count();
+    assert_eq!(doc["clusters"], json!(merged));
 }
