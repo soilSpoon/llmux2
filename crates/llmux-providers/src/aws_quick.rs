@@ -245,6 +245,7 @@ mod tests {
             base_url: DEFAULT_BASE.parse().unwrap(),
             upstream_model: mode.into(),
             strip_request_fields: Box::default(),
+            shared_quota: None,
             priority: 0,
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(30),
