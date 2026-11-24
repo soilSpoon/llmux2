@@ -1063,6 +1063,98 @@ fn overlay_merges_site_settings_into_the_emitted_config() {
 }
 
 #[test]
+fn overlay_expires_at_stays_a_bare_toml_datetime() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("llmux.toml");
+    let overlay = dir.path().join("site.toml");
+    fs::write(
+        &overlay,
+        "[[credentials]]\nid = \"overlay-cred\"\nkind = \"api_key\"\nprovider = \"openai_compat\"\n\
+         key = \"env:OVERLAY_KEY\"\n\
+         [[models]]\nname = \"expiring\"\n[[models.deployments]]\nid = \"overlay-expiring\"\n\
+         credential = \"overlay-cred\"\nupstream_model = \"expiring\"\n\
+         base_url = \"https://overlay.example.com/v1\"\nexpires_at = 2030-01-01T00:00:00Z\n",
+    )
+    .unwrap();
+    unsafe { std::env::set_var("OVERLAY_KEY", "synthetic") };
+    llmux_import::import_with_options(
+        DB_FIXTURE,
+        &output,
+        None,
+        &ImportOptions {
+            overlay: Some(&overlay),
+            ..ImportOptions::default()
+        },
+    )
+    .unwrap();
+    // The emitted field must be a bare TOML datetime — a quoted string fails
+    // llmux-config's `expires_at` parse entirely.
+    assert!(fs::read_to_string(&output)
+        .unwrap()
+        .contains("expires_at = 2030-01-01T00:00:00Z"));
+    let config = RuntimeConfig::load(&output).unwrap();
+    assert!(config
+        .deployments
+        .iter()
+        .find(|dep| dep.id.as_ref() == "overlay-expiring")
+        .unwrap()
+        .expires_at
+        .is_some());
+}
+
+#[test]
+fn overlay_disabled_marks_an_emitted_credential_disabled() {
+    unsafe { std::env::set_var("OVERLAY_KEY", "synthetic") };
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("llmux.toml");
+    let overlay = dir.path().join("site.toml");
+    // A site decision: upstream-fast is parked but stays configured — the
+    // overlay row names an emitted credential id and only adds the flag.
+    fs::write(
+        &overlay,
+        "[[credentials]]\nid = \"upstream-fast\"\ndisabled = true\n",
+    )
+    .unwrap();
+    llmux_import::import_with_options(
+        DB_FIXTURE,
+        &output,
+        None,
+        &ImportOptions {
+            overlay: Some(&overlay),
+            ..ImportOptions::default()
+        },
+    )
+    .unwrap();
+    let emitted = fs::read_to_string(&output).unwrap();
+    assert_eq!(emitted.matches("id = \"upstream-fast\"").count(), 1);
+    let config = RuntimeConfig::load(&output).unwrap();
+    assert!(config.credential_disabled.contains("upstream-fast"));
+    // An unknown id still appends as a new row, and ids are unique either way.
+    let overlay_extra = dir.path().join("site-extra.toml");
+    fs::write(
+        &overlay_extra,
+        "[[credentials]]\nid = \"upstream-fast\"\ndisabled = true\n\
+         [[credentials]]\nid = \"overlay-only\"\nkind = \"api_key\"\n\
+         provider = \"openai_compat\"\nkey = \"env:OVERLAY_KEY\"\ndisabled = true\n",
+    )
+    .unwrap();
+    let output_extra = dir.path().join("llmux-extra.toml");
+    llmux_import::import_with_options(
+        DB_FIXTURE,
+        &output_extra,
+        None,
+        &ImportOptions {
+            overlay: Some(&overlay_extra),
+            ..ImportOptions::default()
+        },
+    )
+    .unwrap();
+    let config = RuntimeConfig::load(&output_extra).unwrap();
+    assert!(config.credential_disabled.contains("upstream-fast"));
+    assert!(config.credential_disabled.contains("overlay-only"));
+}
+
+#[test]
 fn cli_overlay_reaches_the_emitted_config() {
     unsafe { std::env::set_var("OVERLAY_KEY", "synthetic") };
     let dir = tempfile::tempdir().unwrap();
