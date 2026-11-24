@@ -18,6 +18,25 @@ WHEN canonical model `m` maps to deployments on two providers with different
 upstream model IDs
 THEN a client requesting `m` is served by whichever deployment routing selects.
 
+### Requirement: Same-model serving only
+
+Every deployment under one canonical model SHALL serve that same model.
+Same-family variant upstream IDs (`A-1`, `A-2` under canonical `A`) MAY map to
+it; a different model (`B-1`) SHALL NOT. When no deployment of the requested
+model can serve, the gateway SHALL return the existing exhausted error rather
+than substituting another canonical model — even a stronger one.
+
+#### Scenario: Variant upstream ID serves the canonical
+
+WHEN canonical `A` maps a deployment whose upstream ID is `A-2`
+THEN a request for `A` may be served by that deployment.
+
+#### Scenario: Exhausted model never substitutes
+
+WHEN every deployment of the requested model is ineligible
+THEN the gateway returns the exhausted error and does not route the request to
+a different canonical model.
+
 ### Requirement: Configured catch-all route
 
 The gateway SHALL optionally route unknown model IDs through a single model
@@ -88,6 +107,29 @@ or recording an upstream failure, and considers the next deployment.
 WHEN no eligible-format deployment can convert the request, including those
 temporarily rate-limited
 THEN the gateway returns an invalid-request error rather than a rate-limit error.
+
+### Requirement: Quota window tracking
+
+The gateway SHALL model each periodic quota as a window bound to a
+(credential, quota-family) pair, tracking its reset time — provider-reported
+resets are authoritative even beyond the configured cooldown cap — the
+remaining amount, and whether the current window has started but seen no
+usage. An exhausted window SHALL park its deployments until the reset rather
+than dropping or hammering them. A reset window with no recorded usage SHALL
+be treated as full allowance. Daily caps, per-minute limits, and expiry dates
+on free deployments SHALL be tracked the same way, so a temporarily exhausted
+leg is never pruned for today's exhaustion alone.
+
+#### Scenario: Parked leg revives at reset
+
+WHEN a deployment's daily-quota window resets at UTC midnight
+THEN it is skipped until the reset and becomes eligible again afterwards.
+
+#### Scenario: Fresh window counts as full
+
+WHEN a credential's weekly window has reset but recorded no usage yet
+THEN the gateway ranks it as holding its full allowance rather than assuming
+it is spent.
 
 ### Requirement: Quota-expiry-first priority
 
@@ -235,3 +277,22 @@ AND the other deployment can serve.
 WHEN every deployment of the requested model is a stale `devin_acp` deployment
 THEN the gateway returns the existing exhausted error
 AND does not route the request to a different model.
+
+### Requirement: Adaptive free-leg advertising
+
+The gateway SHALL advertise a canonical model to clients only while at least
+one free (non-billed) deployment exists for it. A model whose every leg is
+billed SHALL NOT appear in the advertised model list, while a model shared
+between free and billed legs stays listed as long as a free leg remains
+configured. Advertising SHALL be recomputed automatically whenever the
+deployment set or billing classification changes — never maintained by hand.
+
+#### Scenario: Billed-only model hidden
+
+WHEN every deployment of a model is billed
+THEN it is absent from the advertised list until a free leg is added.
+
+#### Scenario: One free leg keeps the model listed
+
+WHEN a model has one free deployment alongside billed ones
+THEN it stays advertised, and requests use the free leg first.

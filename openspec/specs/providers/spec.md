@@ -27,6 +27,22 @@ WHEN a provider only offers a free tier with a request cap
 THEN it is configured as a normal deployment and its limits are tracked like
 any other.
 
+### Requirement: Free-only use of mixed providers
+
+A provider that offers free and paid models on one credit balance SHALL serve
+the gateway only with its free models. Paid-model legs on such a provider
+SHALL be marked billed and SHALL NOT be emitted or enabled without explicit
+owner opt-in; a credit balance SHALL NOT by itself make a paid leg eligible.
+Each provider's free-model conditions — plan tier, free model list, `:free`
+suffixes, quota classes — SHALL be recorded so billing classification stays
+accurate per model, not per provider.
+
+#### Scenario: Credit does not unlock paid legs
+
+WHEN a mixed free/paid provider account holds paid credit
+THEN only its free models carry deployments, and paid models are never served
+on that credit — even when every free leg is exhausted.
+
 ### Requirement: DeepAI text API
 
 The gateway SHALL convert non-streaming Chat Completions requests with one
@@ -411,10 +427,23 @@ WHEN a native Messages request supplies Anthropic protocol headers
 THEN the Anthropic upstream receives them, with the gateway's default version
 used only if the client omitted a version.
 
+### Requirement: Multiple accounts per provider
+
+The gateway SHALL support several credentials of one provider — multiple
+accounts or plans — each as its own deployment with its own quota tracking.
+Ordering between them follows the normal routing rules, since two accounts of
+one provider can carry different plans; they are never pooled into one limit.
+
+#### Scenario: Two accounts of one provider
+
+WHEN two OAuth connections of the same provider are imported
+THEN the model carries one deployment per connection, each tracked against
+its own account quota window rather than a shared one.
+
 ### Requirement: Excluded providers and practices
 
-The gateway SHALL NOT integrate OpenRouter, Factory, Augment, Z.AI,
-multi-account pooling, or multi-IP distribution to raise limits, and SHALL NOT
+The gateway SHALL NOT integrate OpenRouter, Factory, Augment, Z.AI, or
+multi-IP distribution to raise limits, and SHALL NOT
 add paid paths that cost provider fees unless the owner explicitly asks.
 DuckDuckGo and Cloudflare Playground have no key-based HTTP API and SHALL NOT
 be integrated by copying a session cookie, solving a browser challenge, or
