@@ -67,6 +67,21 @@ WHEN `qwen3-14b-free` and `qwen3-14b` both exist
 THEN they remain separate entries; the `-free` entry may carry only
 verified-free deployments.
 
+#### Scenario: Suffixed mapping stays unmerged at import
+
+WHEN a `modelComboMappings` row points a spelling carrying an effort,
+`-fast`, or `no-think`/`nothink`/`thinking` suffix at a combo whose leaf
+does not carry the same suffixes
+THEN the importer does not attach the spelling as an alias, emits no model
+entry for it, and warns, so a request for it reaches the `*` catch-all,
+which forwards the literal suffixed id to the real suffixed upstream.
+
+#### Scenario: Matching suffix stays an alias
+
+WHEN a mapping points `factory/claude-fable-5-low` at the `claude-fable-5-low`
+combo
+THEN the spelling attaches to that model's aliases normally.
+
 ### Requirement: Identity mapping is reviewable data
 
 The name-cluster → canonical assignment SHALL be produced by a tool or import
@@ -78,6 +93,13 @@ can correct over-merges before deploy.
 WHEN the tool groups two names an operator knows are different models
 THEN editing the mapping file and re-running produces separate entries without
 code changes.
+
+#### Scenario: Canonical map regeneration
+
+WHEN `llmux-import` runs with `--canonical-map <path>`
+THEN it writes `canonical-map.json` mapping every emitted model name to the
+spellings resolving to it; a spelling kept distinct by the suffix rule
+appears as its own entry keyed by itself.
 
 ### Requirement: Name resolution costs O(1) on the request path
 

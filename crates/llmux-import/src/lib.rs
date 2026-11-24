@@ -77,6 +77,11 @@ pub struct ImportOptions<'a> {
     /// operator confirmed the provider is free (a plan or pricing page, or
     /// the account usage API). Custom legs bill unless listed.
     pub free_providers: Option<&'a Path>,
+    /// Optional path for `canonical-map.json`, the review artifact listing
+    /// every spelling that resolves to each emitted model name. Suffixed
+    /// ids (effort/`-fast`/`-no-think`) are distinct entries — they never
+    /// merge into a differently-suffixed name.
+    pub canonical_map: Option<&'a Path>,
 }
 
 #[derive(Clone, Copy)]
@@ -865,6 +870,18 @@ pub fn import_with_options(
     if fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err("secrets directory must not be a symlink".into());
     }
+    // The map artifact is a plain truncating write: it must not be able to
+    // stand in for the output configuration or overwrite a credential file.
+    if let Some(path) = options.canonical_map {
+        let path =
+            std::path::absolute(path).map_err(|_| "could not resolve --canonical-map path")?;
+        if path == output || path.starts_with(&dir) {
+            return Err(
+                "--canonical-map must not collide with the output configuration or secrets directory"
+                    .into(),
+            );
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -1273,7 +1290,7 @@ pub fn import_with_options(
             }
         }
     }
-    let (mut aliases, mut synthetic, unavailable_aliases) = aliases::prepare(
+    let prepared = aliases::prepare(
         &root,
         &combos,
         &combo_ids,
@@ -1284,6 +1301,12 @@ pub fn import_with_options(
             .openrouter_replacements
             .then_some(&unavailable_combos),
     );
+    let aliases::Prepared {
+        resolved: mut aliases,
+        mut synthetic,
+        unavailable: unavailable_aliases,
+        dropped_suffixed,
+    } = prepared;
     // Aliases into a dead route die with it and join the exclusion set so the
     // catch-all cannot resurrect them either.
     aliases.retain(|alias, target| {
@@ -1621,6 +1644,9 @@ pub fn import_with_options(
         }
     }
     validation::validate(&config, &dir)?;
+    if let Some(path) = options.canonical_map {
+        write_canonical_map(path, &config, &dropped_suffixed, &dead)?;
+    }
     let value = toml::Value::try_from(&config).map_err(|_| "could not encode configuration")?;
     let content = toml::to_string_pretty(&value).map_err(|_| "could not encode configuration")?;
     let mut file = OpenOptions::new()
@@ -1637,6 +1663,53 @@ pub fn import_with_options(
         credentials: credentials.len(),
         client_keys: client_count,
     })
+}
+
+/// `canonical-map.json`: every spelling that resolves to each emitted model
+/// name. Each value leads with the name itself, then the spellings resolving
+/// to it; spellings the suffix rule kept distinct (effort/`-fast`/`-no-think`)
+/// get their own entry — a request for one reaches the catch-all, which
+/// forwards the literal id to the real suffixed upstream.
+/// `clusters` counts merged groups (a name plus at least one other spelling);
+/// `entries_before`/`entries_after` are spelling rows in vs canonical names out.
+fn write_canonical_map(
+    path: &Path,
+    config: &Value,
+    dropped_suffixed: &[String],
+    dead: &HashSet<String>,
+) -> Result<(), String> {
+    let mut map = serde_json::Map::new();
+    for model in array(config, "models") {
+        let name = string(model, "name");
+        let spellings = std::iter::once(json!(name))
+            .chain(array(model, "aliases").iter().cloned())
+            .collect();
+        map.insert(name.to_owned(), Value::Array(spellings));
+    }
+    for name in dropped_suffixed {
+        if dead.contains(name) {
+            continue;
+        }
+        map.entry(name.clone()).or_insert_with(|| json!([name]));
+    }
+    let spellings: usize = map
+        .values()
+        .map(|names| names.as_array().map_or(0, Vec::len))
+        .sum();
+    let doc = json!({
+        "clusters": map
+            .values()
+            .filter(|names| names.as_array().is_some_and(|names| names.len() > 1))
+            .count(),
+        "entries_before": spellings,
+        "entries_after": map.len(),
+        "map": Value::Object(map),
+    });
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&doc).map_err(|_| "could not encode canonical map")?,
+    )
+    .map_err(|_| format!("could not write canonical map {}", path.display()))
 }
 
 #[cfg(test)]

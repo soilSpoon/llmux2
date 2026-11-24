@@ -6,6 +6,28 @@ fn exact(name: &str) -> bool {
     !name.is_empty() && !name.contains(['*', '?'])
 }
 
+// Suffixes that change what a request actually gets: effort levels
+// (`-low`/`-medium`/`-high`/`-xhigh`), `-fast`, and `no-think` spellings.
+// They stack (e.g. `-fast-low`), so strip greedily from the leaf.
+const MEANINGFUL_SUFFIXES: &[&str] = &[
+    "low", "medium", "high", "xhigh", "fast", "no-think", "nothink", "thinking",
+];
+
+/// Ordered meaningful suffixes on a name's leaf (last `/` segment), matched
+/// outermost-first — `vendor/x-fast-low` yields `["low", "fast"]`.
+pub(super) fn meaningful_suffixes(name: &str) -> Vec<&'static str> {
+    let mut leaf = name.rsplit('/').next().unwrap_or_default().to_lowercase();
+    let mut suffixes = Vec::new();
+    while let Some(suffix) = MEANINGFUL_SUFFIXES
+        .iter()
+        .find(|suffix| leaf.len() > suffix.len() + 1 && leaf.ends_with(&format!("-{suffix}")))
+    {
+        suffixes.push(*suffix);
+        leaf.truncate(leaf.len() - suffix.len() - 1);
+    }
+    suffixes
+}
+
 fn target(value: &Value) -> Option<String> {
     if let Some(value) = value.as_str() {
         return Some(value.to_owned());
@@ -84,6 +106,13 @@ pub(super) fn mapping_target<'a>(
     })
 }
 
+pub(super) struct Prepared {
+    pub resolved: BTreeMap<String, String>,
+    pub synthetic: HashMap<String, Value>,
+    pub unavailable: HashSet<String>,
+    pub dropped_suffixed: Vec<String>,
+}
+
 pub(super) fn prepare(
     root: &Value,
     combos: &HashMap<String, Value>,
@@ -92,11 +121,7 @@ pub(super) fn prepare(
     order: &mut Vec<String>,
     warnings: &mut Vec<String>,
     unavailable_combos: Option<&HashSet<String>>,
-) -> (
-    BTreeMap<String, String>,
-    HashMap<String, Value>,
-    HashSet<String>,
-) {
+) -> Prepared {
     let official_replacements = unavailable_combos.is_some();
     let mut aliases = alias_map(root, warnings);
     let mappings = sorted_mappings(root);
@@ -173,6 +198,7 @@ pub(super) fn prepare(
     }
     let mut resolved = BTreeMap::new();
     let mut direct_targets = BTreeSet::new();
+    let mut dropped_suffixed = Vec::new();
     for name in aliases.keys() {
         if !exact(name) {
             warnings.push(format!("alias {name}: skipped wildcard or empty alias"));
@@ -208,6 +234,23 @@ pub(super) fn prepare(
             }
         };
         let Some(terminal) = terminal else { continue };
+        // A suffixed spelling must not collapse onto a differently-suffixed
+        // target: the suffix is part of the model id, so the name stays
+        // distinct and falls through to the catch-all, which forwards it to
+        // the real suffixed upstream. Suffix-free renames (a plain alias to
+        // a suffixed model) still resolve, and so does the same suffix set in
+        // a different order — sets compare equal regardless of strip order.
+        let mut name_suffixes = meaningful_suffixes(name);
+        name_suffixes.sort_unstable();
+        let mut target_suffixes = meaningful_suffixes(&terminal);
+        target_suffixes.sort_unstable();
+        if !name_suffixes.is_empty() && name_suffixes != target_suffixes {
+            warnings.push(format!(
+                "alias {name}: suffix differs from target {terminal}; left unmerged"
+            ));
+            dropped_suffixed.push(name.clone());
+            continue;
+        }
         if !combos.contains_key(&terminal) {
             let direct = terminal
                 .split_once('/')
@@ -228,7 +271,12 @@ pub(super) fn prepare(
         );
         order.push(terminal);
     }
-    (resolved, synthetic, unavailable)
+    Prepared {
+        resolved,
+        synthetic,
+        unavailable,
+        dropped_suffixed,
+    }
 }
 
 pub(super) fn attach(
