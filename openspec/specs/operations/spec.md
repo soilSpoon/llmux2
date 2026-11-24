@@ -14,7 +14,9 @@ bodies, account identifiers, or request data. A failed attempt that moves the
 request to a different deployment SHALL also increment the departing
 deployment's `handoffs` counter; a retry on the same deployment is not a
 handoff. An expired deployment gets the `expired` skip reason, not a failed
-attempt.
+attempt. A deployment the provider does not provision gets the
+`not_provisioned` skip reason and failure class, and a cooldown shared by the
+credential reports `cooldown_scope: "credential"` rather than `"deployment"`.
 
 #### Scenario: A routed request fails
 
@@ -80,7 +82,10 @@ admin endpoints SHALL themselves be breaches.
 `alerts.toml` (default `$HOME/llmux2/alerts.toml`, overridable with `--config`)
 SHALL support `listen`, `key_file`, `failure_ratio`, `min_attempts`,
 `max_cooldowns` and `max_disabled`; a missing file uses defaults (only
-reachability checks). An unset threshold disables its check. `failure_ratio`
+reachability checks). An unset threshold disables its check. `max_disabled`
+SHALL count deployments the provider left unprovisioned alongside
+admin-disabled ones, since a parked leg can serve no traffic until a reload.
+`failure_ratio`
 SHALL compare against the previous counter snapshot persisted atomically in
 `alert-state.json`, counting `failed_attempts` plus `stream_errors` over new
 attempts per deployment, and SHALL apply only when new attempts reach
@@ -250,8 +255,9 @@ THEN `/admin` routes do not exist.
 ### Requirement: Runtime management operations
 
 The admin API SHALL expose gateway status (uptime, version, counters),
-deployment state (provider, priority, limits, disabled, cooldown, in-flight,
-counters), credential state (id, kind, provider — never secrets), and the
+deployment state (provider, priority, limits, disabled, cooldown and its
+scope, in-flight, counters, and whether the provider left it unprovisioned),
+credential state (id, kind, provider — never secrets), and the
 canonical model map. It SHALL allow enabling or disabling a credential's
 routing state, which affects every deployment drawing on it.
 

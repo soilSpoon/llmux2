@@ -10,6 +10,12 @@ pub enum UpstreamError {
     RateLimited { retry_after: Option<Duration> },
     #[error("quota exhausted")]
     QuotaExhausted { reset_at: Option<SystemTime> },
+    /// The credential is valid but the provider does not provision API
+    /// access for this deployment (for example a plan without an API
+    /// allowance). Retrying can never succeed until the config or the
+    /// plan changes, so the deployment is parked until a reload.
+    #[error("deployment not provisioned")]
+    NotProvisioned,
     #[error("auth failed")]
     Auth { refreshable: bool },
     #[error("bad request")]
@@ -33,6 +39,7 @@ pub enum UpstreamError {
 pub enum ErrorKind {
     RateLimited,
     QuotaExhausted,
+    NotProvisioned,
     Auth,
     BadRequest,
     ContextLength,
@@ -47,6 +54,7 @@ impl UpstreamError {
         match self {
             Self::RateLimited { .. } => ErrorKind::RateLimited,
             Self::QuotaExhausted { .. } => ErrorKind::QuotaExhausted,
+            Self::NotProvisioned => ErrorKind::NotProvisioned,
             Self::Auth { .. } => ErrorKind::Auth,
             Self::BadRequest { .. } | Self::ModelNotFound { .. } => ErrorKind::BadRequest,
             Self::ContextLength => ErrorKind::ContextLength,

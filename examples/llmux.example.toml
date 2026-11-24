@@ -23,6 +23,8 @@ fallback_on = ["rate_limited", "quota_exhausted"]
 [cooldown]
 default_ms = 30000
 max_ms = 3600000
+# Cap for provider-reported quota resets (daily/monthly); must be >= max_ms.
+# quota_max_ms = 2764800000 # 32 days
 
 [[credentials]]
 id = "groq-key"

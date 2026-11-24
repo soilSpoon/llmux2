@@ -265,6 +265,7 @@ async fn fixture_full(
         cooldown: llmux_config::CooldownConfig {
             default: Duration::from_secs(1),
             max: Duration::from_secs(5),
+            quota_max: Duration::from_secs(10 * 86_400),
         },
         api_keys: HashMap::new(),
         credential_quotas: HashMap::from([("second".into(), second_quota)]),
@@ -690,6 +691,34 @@ async fn rejects_requests_that_fit_no_deployment_without_calling_upstream() {
 }
 
 #[tokio::test]
+async fn context_preflight_ignores_parked_deployments() {
+    // dep0's 4000-token window is parked by a missing allowance; a request
+    // that fits only it must be rejected by the preflight instead of
+    // routing into legs that cannot serve it.
+    // split_routes gives dep1 its own upstream model so dep0's missing
+    // allowance parks only dep0's leg.
+    let (executor, adapter, _, _server) = fixture_full(
+        vec![UpstreamError::NotProvisioned],
+        false,
+        [Some(4000), Some(100), Some(100)],
+        &[("model", &[0, 1])],
+        Default::default(),
+        Default::default(),
+        true,
+        None,
+        [None; 3],
+    )
+    .await;
+    executor.execute(sized_request(50, Some(10))).await.unwrap();
+    assert!(executor.bindings[0].limits.not_provisioned());
+    assert!(matches!(
+        executor.execute(sized_request(200, Some(10))).await,
+        Err(GatewayError::ContextLengthExceeded { limit: 100, .. })
+    ));
+    assert_eq!(adapter.calls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn exhaustion_retry_hint_ignores_deployments_that_do_not_fit() {
     let (executor, _, _, _server) = fixture_with_context(
         vec![UpstreamError::RateLimited {
@@ -972,6 +1001,63 @@ async fn committed_stream_quota_cools_shared_credential_without_replay() {
 }
 
 #[tokio::test]
+async fn committed_stream_not_provisioned_parks_the_leg_without_replay() {
+    // The plan-missing error can arrive after the response commits: it must
+    // reach the client unreplayed, park only that leg, and leave the sibling
+    // on the same credential eligible.
+    let (executor, adapter, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("a", &[0, 2]), ("b", &[1, 2])],
+        Default::default(),
+        Default::default(),
+        true,
+        None,
+        [None; 3],
+    )
+    .await;
+    adapter
+        .stream_errors
+        .lock()
+        .unwrap()
+        .push_back(UpstreamError::NotProvisioned);
+    let routed = executor
+        .execute(GatewayRequest {
+            model: "a".into(),
+            stream: true,
+            ..request()
+        })
+        .await
+        .unwrap();
+    assert_eq!(routed.deployment.as_ref(), "dep0");
+    let GatewayResponse::Stream(events) = routed.response else {
+        panic!("expected stream")
+    };
+    let events: Vec<_> = events.collect().await;
+    assert!(matches!(
+        events.as_slice(),
+        [Ok(_), Err(UpstreamError::NotProvisioned)]
+    ));
+    assert_eq!(adapter.calls.lock().unwrap().len(), 1, "no stream replay");
+    assert!(executor.bindings[0].limits.not_provisioned());
+
+    let next = executor
+        .execute(GatewayRequest {
+            model: "b".into(),
+            ..request()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next.deployment.as_ref(),
+        "dep1",
+        "the parked leg is skipped; the sibling stays eligible"
+    );
+    assert_eq!(adapter.calls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn repeated_limit_errors_after_stream_start_back_off() {
     let (executor, adapter, _, _server) = fixture(Vec::new(), false).await;
     let streaming = || GatewayRequest {
@@ -1249,6 +1335,196 @@ async fn credential_peers_cool_only_until_the_quota_resets() {
         ["dep0", "dep1"],
         "dep0's own route limit is not the key's"
     );
+}
+
+#[tokio::test]
+async fn an_explicit_quota_reset_outlasts_the_backoff_cap() {
+    // fixture cooldown: default 1s, max 5s, quota_max 10d. A provider reset
+    // three days out is authoritative and must not clamp to `max`.
+    // split_routes gives dep1 its own upstream model so the credential peer
+    // path (not the shared-limits alias) carries the cooldown.
+    let (executor, adapter, _, _server) = fixture_full(
+        vec![UpstreamError::QuotaExhausted {
+            reset_at: Some(SystemTime::now() + Duration::from_secs(3 * 86_400)),
+        }],
+        false,
+        [None; 3],
+        &[("model", &[0, 1, 2])],
+        Default::default(),
+        Default::default(),
+        true,
+        None,
+        [None; 3],
+    )
+    .await;
+    // dep0's credential quota is exhausted; dep1 shares the credential so dep2 serves.
+    let response = executor.execute(request()).await.unwrap();
+    assert_eq!(response.deployment.as_ref(), "dep2");
+    let now = Instant::now();
+    for idx in [0, 1] {
+        let until = executor.bindings[idx]
+            .limits
+            .cooldown_until(now)
+            .expect("the credential's deployments cool together");
+        assert!(
+            until.duration_since(now) > Duration::from_secs(86_400),
+            "an authoritative reset is honored beyond the backoff cap"
+        );
+        assert_eq!(
+            executor.bindings[idx].limits.cooldown_scope(now),
+            Some("credential"),
+            "the cooldown reports the credential's shared reset"
+        );
+    }
+    assert!(executor.bindings[2].limits.cooldown_until(now).is_none());
+    assert_eq!(adapter.calls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_quota_reset_beyond_the_quota_cap_is_clamped_there() {
+    let (executor, _, _, _server) = fixture_full(
+        vec![UpstreamError::QuotaExhausted {
+            reset_at: Some(SystemTime::now() + Duration::from_secs(40 * 86_400)),
+        }],
+        false,
+        [None; 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        None,
+        [None; 3],
+    )
+    .await;
+    assert!(executor.execute(request()).await.is_err());
+    let now = Instant::now();
+    let until = executor.bindings[0].limits.cooldown_until(now).unwrap();
+    let wait = until.duration_since(now);
+    assert!(
+        wait > Duration::from_secs(9 * 86_400) && wait <= Duration::from_secs(10 * 86_400),
+        "a reset beyond the quota cap clamps there, not at the backoff cap: {wait:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_rate_limit_never_cools_credential_peers() {
+    // split_routes gives dep1 its own upstream model: dep0 and dep1 draw on
+    // the same credential but not the same rate-limit bucket.
+    let (executor, adapter, _, _server) = fixture_full(
+        vec![UpstreamError::RateLimited {
+            retry_after: Some(Duration::from_secs(60)),
+        }],
+        false,
+        [None; 3],
+        &[("model", &[0, 1, 2])],
+        Default::default(),
+        Default::default(),
+        true,
+        None,
+        [None; 3],
+    )
+    .await;
+    let response = executor.execute(request()).await.unwrap();
+    assert_eq!(response.deployment.as_ref(), "dep1");
+    let now = Instant::now();
+    // The failing deployment cools — capped at the backoff cap, not the hint.
+    let until = executor.bindings[0].limits.cooldown_until(now).unwrap();
+    assert!(until.duration_since(now) <= Duration::from_secs(5));
+    assert_eq!(
+        executor.bindings[0].limits.cooldown_scope(now),
+        Some("deployment")
+    );
+    // A rate limit is the deployment's own: the credential's other legs stay ready.
+    assert!(executor.bindings[1].limits.cooldown_until(now).is_none());
+    assert!(executor.bindings[2].limits.cooldown_until(now).is_none());
+    // And dep1 serves the next request without waiting.
+    executor.execute(request()).await.unwrap();
+    let served: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(served, ["dep0", "dep1", "dep1"]);
+}
+
+#[tokio::test]
+async fn a_not_provisioned_deployment_is_skipped_until_reload() {
+    // split_routes gives dep1 its own upstream model: a missing allowance on
+    // dep0 parks only dep0, even though both draw on credential "first".
+    let (mut executor, adapter, _, _server) = fixture_full(
+        vec![UpstreamError::NotProvisioned],
+        false,
+        [None; 3],
+        &[("model", &[0, 1, 2])],
+        Default::default(),
+        Default::default(),
+        true,
+        None,
+        [None; 3],
+    )
+    .await;
+    // dep0's plan does not cover it; the same credential's dep1 still serves.
+    let response = executor.execute(request()).await.unwrap();
+    assert_eq!(response.deployment.as_ref(), "dep1");
+    assert!(executor.bindings[0].limits.not_provisioned());
+    assert!(!executor.bindings[1].limits.not_provisioned());
+    // The next request skips dep0 without spending an attempt on it.
+    let response = executor.execute(request()).await.unwrap();
+    assert_eq!(response.deployment.as_ref(), "dep1");
+    assert_eq!(response.attempts, 1);
+    let served: Vec<_> = adapter
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(dep, _)| dep.to_string())
+        .collect();
+    assert_eq!(served, ["dep0", "dep1", "dep1"]);
+    // Stats record the distinct class, not a transient 429.
+    for binding in executor.bindings.iter_mut() {
+        binding.stats = Some(Arc::default());
+    }
+    executor.execute(request()).await.unwrap();
+    let stats = serde_json::to_value(executor.deployment_stats()).unwrap();
+    let dep0 = stats
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|dep| dep["id"] == "dep0")
+        .unwrap();
+    assert_eq!(dep0["not_provisioned"], true);
+    assert_eq!(dep0["skip_reasons"]["not_provisioned"], 1);
+}
+
+#[tokio::test]
+async fn an_all_not_provisioned_model_exhausts_immediately() {
+    let (executor, adapter, _, _server) = fixture_full(
+        vec![UpstreamError::NotProvisioned],
+        false,
+        [None; 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        None,
+        [None; 3],
+    )
+    .await;
+    assert!(matches!(
+        executor.execute(request()).await,
+        Err(GatewayError::Client(UpstreamError::NotProvisioned))
+    ));
+    // Later requests short-circuit: no attempt, no retry hint.
+    assert!(matches!(
+        executor.execute(request()).await,
+        Err(GatewayError::AllCandidatesExhausted {
+            attempts: 0,
+            retry_after: None
+        })
+    ));
+    assert_eq!(adapter.calls.lock().unwrap().len(), 1);
 }
 
 #[tokio::test(start_paused = true)]

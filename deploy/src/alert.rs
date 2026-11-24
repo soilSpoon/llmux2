@@ -95,9 +95,11 @@ pub fn evaluate(
 ) -> Vec<String> {
     let mut alerts = Vec::new();
     if let Some(max) = thresholds.max_disabled {
+        // A deployment the provider does not provision can never serve either,
+        // so it counts here: it is parked until the next config reload.
         let disabled: Vec<&str> = deployments
             .iter()
-            .filter(|entry| entry["disabled"] == true)
+            .filter(|entry| entry["disabled"] == true || entry["not_provisioned"] == true)
             .filter_map(|entry| entry["id"].as_str())
             .collect();
         if disabled.len() as u32 > max {
@@ -354,10 +356,14 @@ mod tests {
             dep("a", 0, 0, 0, true, false),
             dep("b", 0, 0, 0, true, false),
             dep("c", 0, 0, 0, false, true),
+            // A parked deployment counts as disabled even without a cooldown.
+            json!({"id": "d", "routed": 0, "failed_attempts": 0,
+                "stream_errors": 0, "disabled": false,
+                "not_provisioned": true, "cooldown_ms": Value::Null}),
         ];
         let alerts = evaluate(&now, None, &thresholds);
         assert_eq!(alerts.len(), 2);
-        assert!(alerts[0].contains("disabled") && alerts[0].contains("a, b"));
+        assert!(alerts[0].contains("disabled") && alerts[0].contains("a, b, d"));
         assert!(alerts[1].contains("cooldown") && alerts[1].contains('c'));
     }
 

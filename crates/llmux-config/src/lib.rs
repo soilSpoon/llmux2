@@ -77,6 +77,9 @@ pub struct RoutingConfig {
 pub struct CooldownConfig {
     pub default: Duration,
     pub max: Duration,
+    /// Cap for authoritative quota resets. Provider-reported resets (daily,
+    /// monthly) can outlast `max` by days; estimates never do.
+    pub quota_max: Duration,
 }
 
 pub struct ApiKey {
@@ -222,6 +225,7 @@ impl Default for RawRouting {
 struct RawCooldown {
     default_ms: u64,
     max_ms: u64,
+    quota_max_ms: u64,
 }
 
 impl Default for RawCooldown {
@@ -229,6 +233,8 @@ impl Default for RawCooldown {
         Self {
             default_ms: 30_000,
             max_ms: 3_600_000,
+            // 32 days — beyond any plausible daily or monthly reset horizon.
+            quota_max_ms: 2_764_800_000,
         }
     }
 }
@@ -372,9 +378,10 @@ impl RawConfig {
         if cooldown.default_ms == 0
             || cooldown.max_ms < cooldown.default_ms
             || cooldown.max_ms > MAX_TIMEOUT_MS
+            || cooldown.quota_max_ms < cooldown.max_ms
         {
             return Err(invalid(
-                "cooldown must satisfy 0 < default_ms <= max_ms <= 86400000",
+                "cooldown must satisfy 0 < default_ms <= max_ms <= 86400000 and quota_max_ms >= max_ms",
             ));
         }
 
@@ -762,6 +769,7 @@ impl RawConfig {
             cooldown: CooldownConfig {
                 default: Duration::from_millis(cooldown.default_ms),
                 max: Duration::from_millis(cooldown.max_ms),
+                quota_max: Duration::from_millis(cooldown.quota_max_ms),
             },
             api_keys,
             oauth,
@@ -1405,6 +1413,41 @@ refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
             .unwrap()
             .to_string()
             .contains("drain_grace_ms"));
+    }
+
+    #[test]
+    fn cooldown_quota_max_defaults_to_32_days_and_must_cover_max_ms() {
+        let parsed = RuntimeConfig::parse(&config(REQUIRED)).unwrap();
+        assert_eq!(parsed.cooldown.default, Duration::from_secs(30));
+        assert_eq!(parsed.cooldown.max, Duration::from_secs(3_600));
+        assert_eq!(parsed.cooldown.quota_max, Duration::from_secs(32 * 86_400));
+        let with_quota_max = |quota_max_ms: u64| {
+            config(REQUIRED).replace(
+                "[[credentials]]",
+                &format!("[cooldown]\nquota_max_ms = {quota_max_ms}\n[[credentials]]"),
+            )
+        };
+        assert_eq!(
+            RuntimeConfig::parse(&with_quota_max(60 * 86_400_000))
+                .unwrap()
+                .cooldown
+                .quota_max,
+            Duration::from_secs(60 * 86_400)
+        );
+        assert_eq!(
+            RuntimeConfig::parse(&with_quota_max(3_600_000))
+                .unwrap()
+                .cooldown
+                .quota_max,
+            Duration::from_secs(3_600),
+            "quota_max_ms may equal max_ms"
+        );
+        for invalid in [3_599_999, 0] {
+            let err = RuntimeConfig::parse(&with_quota_max(invalid))
+                .err()
+                .expect("quota_max_ms below max_ms is invalid");
+            assert!(err.to_string().contains("cooldown"), "{invalid}: {err}");
+        }
     }
 
     fn error(fields: &str) -> String {

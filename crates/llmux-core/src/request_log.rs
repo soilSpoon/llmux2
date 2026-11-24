@@ -158,6 +158,7 @@ pub fn upstream_error_kind(error: &llmux_types::UpstreamError) -> &'static str {
     match error.kind() {
         ErrorKind::RateLimited => "rate_limited",
         ErrorKind::QuotaExhausted => "quota_exhausted",
+        ErrorKind::NotProvisioned => "not_provisioned",
         ErrorKind::Auth => "auth",
         ErrorKind::BadRequest => "bad_request",
         ErrorKind::ContextLength => "context_length",

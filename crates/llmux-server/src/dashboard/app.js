@@ -216,7 +216,8 @@ function renderDeployments(deployments) {
     cell(row, dep.priority, "priority");
     let state;
     if (dep.disabled) state = stateLabel("인증 비활성", "bad");
-    else if (dep.cooldown_ms !== null) state = stateLabel("재시도 대기 · " + fmt.format(Math.ceil(dep.cooldown_ms / 1000)) + "초", "warn");
+    else if (dep.not_provisioned) state = stateLabel("API 허용량 없음", "bad");
+    else if (dep.cooldown_ms !== null) state = stateLabel("재시도 대기" + (dep.cooldown_scope === "credential" ? " · 자격증명" : "") + " · " + fmt.format(Math.ceil(dep.cooldown_ms / 1000)) + "초", "warn");
     else if (dep.in_flight !== null && dep.in_flight >= dep.concurrency_limit) state = stateLabel("동시 처리 한도 도달", "warn");
     else state = stateLabel("대기 없음", "neutral");
     cell(row, "").append(state);

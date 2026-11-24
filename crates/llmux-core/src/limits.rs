@@ -16,6 +16,11 @@ const CONCURRENCY_RETRY: Duration = Duration::from_secs(1);
 pub(super) struct DeploymentLimits {
     baseline: Instant,
     cooldown_until_ns: AtomicU64,
+    /// Whether the current cooldown is a credential-shared quota reset.
+    credential_cooldown: AtomicBool,
+    /// The provider does not provision this deployment at all: it stays
+    /// parked until a config reload replaces this `DeploymentLimits`.
+    not_provisioned: AtomicBool,
     concurrent: Option<u32>,
     inflight: AtomicU32,
     windows: Box<[Arc<Window>]>,
@@ -56,6 +61,8 @@ impl DeploymentLimits {
         Self {
             baseline: Instant::now(),
             cooldown_until_ns: AtomicU64::new(0),
+            credential_cooldown: AtomicBool::new(false),
+            not_provisioned: AtomicBool::new(false),
             concurrent: spec.concurrent,
             inflight: AtomicU32::new(0),
             windows: Window::for_quota(spec)
@@ -70,6 +77,30 @@ impl DeploymentLimits {
     /// Cools down after a 429. Without a provider hint, each consecutive limit doubles the wait;
     /// a limit that lands while the deployment is already cooling does not count as another one.
     pub fn limited(&self, hint: Option<Duration>, default: Duration, max: Duration) -> Instant {
+        let backoff = self.strike_backoff(default);
+        self.cool_down_with_scope(hint.unwrap_or(backoff).min(max), false)
+    }
+
+    /// Cools down after a credential-quota exhaustion. An explicit reset is
+    /// authoritative — it is honored up to `quota_max` rather than the
+    /// estimate cap `max` — and the cooldown is marked credential-scope
+    /// either way since quotas belong to the key, not the model.
+    pub fn quota_limited(
+        &self,
+        hint: Option<Duration>,
+        default: Duration,
+        max: Duration,
+        quota_max: Duration,
+    ) -> Instant {
+        let backoff = self.strike_backoff(default);
+        let wait = match hint {
+            Some(reset) => reset.min(quota_max),
+            None => backoff.min(max),
+        };
+        self.cool_down_with_scope(wait, true)
+    }
+
+    fn strike_backoff(&self, default: Duration) -> Duration {
         let counted = self.limit_strikes.load(Ordering::Relaxed);
         let strikes = if counted > 0 && self.cooldown_until(Instant::now()).is_some() {
             counted
@@ -78,11 +109,11 @@ impl DeploymentLimits {
                 .fetch_add(1, Ordering::Relaxed)
                 .saturating_add(1)
         };
-        let backoff = default.saturating_mul(1u32.checked_shl(strikes - 1).unwrap_or(u32::MAX));
-        self.cool_down(hint.unwrap_or(backoff).min(max))
+        default.saturating_mul(1u32.checked_shl(strikes - 1).unwrap_or(u32::MAX))
     }
 
     /// Skips the deployment until reset when the provider reports no requests or tokens left.
+    /// The reset is authoritative: `max` should be the quota cap, not the backoff cap.
     pub fn observe(&self, observed: LimitObservation, max: Duration) {
         for (remaining, reset) in [
             (observed.remaining_requests, observed.reset_requests),
@@ -107,16 +138,45 @@ impl DeploymentLimits {
     }
 
     pub fn cool_down(&self, wait: Duration) -> Instant {
+        self.cool_down_with_scope(wait, false)
+    }
+
+    /// Cools down every deployment that shares the credential's quota.
+    pub fn cool_down_credential(&self, wait: Duration) -> Instant {
+        self.cool_down_with_scope(wait, true)
+    }
+
+    fn cool_down_with_scope(&self, wait: Duration, credential: bool) -> Instant {
         let offset = self.baseline.elapsed() + wait;
         let offset_ns = offset.as_nanos().min(u64::MAX as u128) as u64;
         let previous = self
             .cooldown_until_ns
             .fetch_max(offset_ns, Ordering::Relaxed);
+        if offset_ns > previous {
+            self.credential_cooldown
+                .store(credential, Ordering::Relaxed);
+        }
         self.baseline + Duration::from_nanos(offset_ns.max(previous))
     }
 
-    pub fn cool_down_until(&self, until: Instant) {
-        self.cool_down(until.saturating_duration_since(Instant::now()));
+    /// Whether the active cooldown is a credential-shared quota reset
+    /// (`"credential"`) or only this deployment's (`"deployment"`).
+    pub fn cooldown_scope(&self, now: Instant) -> Option<&'static str> {
+        self.cooldown_until(now)?;
+        Some(if self.credential_cooldown.load(Ordering::Relaxed) {
+            "credential"
+        } else {
+            "deployment"
+        })
+    }
+
+    pub fn mark_not_provisioned(&self) {
+        self.not_provisioned.store(true, Ordering::Relaxed);
+    }
+
+    /// A not-provisioned deployment can never serve until a config reload.
+    pub fn not_provisioned(&self) -> bool {
+        self.not_provisioned.load(Ordering::Relaxed)
     }
 
     pub fn available_at(&self, now: Instant, tokens: u64) -> Instant {
@@ -350,6 +410,77 @@ mod tests {
         );
         assert_eq!(limits.cooldown_until(now), Some(now + cap));
         assert_eq!(limits.cooldown_until(now + cap), None);
+    }
+
+    /// A provider's explicit quota reset is authoritative: it can outlast the
+    /// backoff cap and is only bounded by `quota_max`. Estimated backoffs and
+    /// rate-limit hints still stop at `max`.
+    #[tokio::test(start_paused = true)]
+    async fn quota_resets_use_the_quota_cap_and_mark_the_scope() {
+        let (default, max, quota_max) = (
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            Duration::from_secs(86_400),
+        );
+        let now = Instant::now();
+        let limits = DeploymentLimits::new(QuotaSpec::default());
+        assert_eq!(
+            limits.quota_limited(Some(Duration::from_secs(3_600)), default, max, quota_max),
+            now + Duration::from_secs(3_600),
+            "an explicit reset is honored beyond the backoff cap"
+        );
+        assert_eq!(limits.cooldown_scope(now), Some("credential"));
+
+        let limits = DeploymentLimits::new(QuotaSpec::default());
+        assert_eq!(
+            limits.quota_limited(
+                Some(Duration::from_secs(30 * 86_400)),
+                default,
+                max,
+                quota_max
+            ),
+            now + quota_max,
+            "the quota cap — not the backoff cap — bounds an explicit reset"
+        );
+
+        let limits = DeploymentLimits::new(QuotaSpec::default());
+        assert_eq!(
+            limits.quota_limited(None, default, max, quota_max),
+            now + default,
+            "an unhinted quota exhaustion keeps the estimate cap"
+        );
+
+        let limits = DeploymentLimits::new(QuotaSpec::default());
+        assert_eq!(
+            limits.limited(Some(Duration::from_secs(3_600)), default, max),
+            now + max,
+            "a rate-limit hint still clamps to the backoff cap"
+        );
+        assert_eq!(limits.cooldown_scope(now), Some("deployment"));
+
+        // A proactive reset from observed headers is just as authoritative.
+        let limits = DeploymentLimits::new(QuotaSpec::default());
+        limits.observe(
+            LimitObservation {
+                remaining_requests: Some(0),
+                reset_requests: Some(Duration::from_secs(3_600)),
+                ..LimitObservation::default()
+            },
+            quota_max,
+        );
+        assert_eq!(
+            limits.cooldown_until(now),
+            Some(now + Duration::from_secs(3_600))
+        );
+
+        // A shorter cooldown landing later does not erase the scope marker.
+        limits.cool_down(Duration::from_secs(1));
+        assert_eq!(limits.cooldown_scope(now), Some("deployment"));
+        let before = DeploymentLimits::new(QuotaSpec::default());
+        before.cool_down_credential(Duration::from_secs(600));
+        before.cool_down(Duration::from_secs(1));
+        assert_eq!(before.cooldown_scope(now), Some("credential"));
+        assert_eq!(before.cooldown_scope(now + Duration::from_secs(601)), None);
     }
 
     #[test]

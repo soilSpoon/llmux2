@@ -132,6 +132,8 @@ impl Binding {
     ) -> Option<SkipReason> {
         if self.disabled.load(Ordering::Relaxed) {
             Some(SkipReason::Disabled)
+        } else if self.limits.not_provisioned() {
+            Some(SkipReason::NotProvisioned)
         } else if support == Support::No {
             Some(SkipReason::UnsupportedFormat)
         } else if expires_at.is_some_and(|end| SystemTime::now() >= end) {
@@ -392,12 +394,16 @@ impl Executor {
                         binding.stats.as_ref()?.snapshot(
                             &model.name,
                             dep,
-                            binding.disabled.load(Ordering::Relaxed),
-                            binding
-                                .limits
-                                .cooldown_until(now)
-                                .map(|end| (end.duration_since(now).as_millis() as u64).max(1)),
-                            binding.limits.inflight(),
+                            stats::LiveState {
+                                disabled: binding.disabled.load(Ordering::Relaxed),
+                                not_provisioned: binding.limits.not_provisioned(),
+                                cooldown_ms: binding
+                                    .limits
+                                    .cooldown_until(now)
+                                    .map(|end| (end.duration_since(now).as_millis() as u64).max(1)),
+                                cooldown_scope: binding.limits.cooldown_scope(now),
+                                in_flight: binding.limits.inflight(),
+                            },
                         ),
                     )
                 })
@@ -514,6 +520,7 @@ impl Executor {
                 let dep = &self.cfg.deployments[index(idx)];
                 let binding = &self.bindings[index(idx)];
                 if binding.disabled.load(Ordering::Relaxed)
+                    || binding.limits.not_provisioned()
                     || binding.adapter.supports(req.format) == Support::No
                     || dep.expires_at.is_some_and(|end| SystemTime::now() >= end)
                 {
@@ -738,6 +745,9 @@ impl Executor {
                                         .fallback_on
                                         .contains(&ErrorKind::QuotaExhausted),
                                 },
+                                Err(GatewayError::Client(UpstreamError::NotProvisioned)) => {
+                                    Outcome::NotProvisioned
+                                }
                                 Err(GatewayError::Client(UpstreamError::ModelNotFound {
                                     ..
                                 })) => Outcome::ModelNotFound,
@@ -823,7 +833,15 @@ impl Executor {
                                         reset_at,
                                         self.cfg.cooldown.default,
                                         self.cfg.cooldown.max,
+                                        self.cfg.cooldown.quota_max,
                                     );
+                                }
+                                (Outcome::NotProvisioned, Err(GatewayError::Client(err))) => {
+                                    // The credential itself works: only this
+                                    // leg is parked, until the config reloads.
+                                    binding.limits.mark_not_provisioned();
+                                    incompatible.push(idx);
+                                    last_transient = Some(err);
                                 }
                                 (Outcome::ModelNotFound, Err(GatewayError::Client(err))) => {
                                     incompatible.push(idx);
@@ -865,6 +883,7 @@ impl Executor {
             .map(|idx| &self.bindings[index(*idx)])
             .filter(|binding| {
                 !binding.disabled.load(Ordering::Relaxed)
+                    && !binding.limits.not_provisioned()
                     && binding.adapter.supports(req.format) != Support::No
             })
             .map(|binding| binding.limits.available_at(now, needed))
@@ -936,7 +955,9 @@ impl Executor {
                         .then(|| binding.adapter.observe_limits(response.headers()))
                         .flatten()
                     {
-                        binding.limits.observe(observed, self.cfg.cooldown.max);
+                        binding
+                            .limits
+                            .observe(observed, self.cfg.cooldown.quota_max);
                     }
                     trace.upstream_request_id = binding
                         .adapter
@@ -999,7 +1020,11 @@ impl Executor {
                     }
                 };
                 let idle_timeout = self.cfg.server.request_timeout.min(dep.timeout);
-                let cooldown = (self.cfg.cooldown.default, self.cfg.cooldown.max);
+                let cooldown = (
+                    self.cfg.cooldown.default,
+                    self.cfg.cooldown.max,
+                    self.cfg.cooldown.quota_max,
+                );
                 let events = stream::unfold(
                     Some((
                         events,
@@ -1039,7 +1064,11 @@ impl Executor {
                             UpstreamError::QuotaExhausted { reset_at } => {
                                 cool_credential(
                                     &limits, &key_peers, *reset_at, cooldown.0, cooldown.1,
+                                    cooldown.2,
                                 );
+                            }
+                            UpstreamError::NotProvisioned => {
+                                limits.mark_not_provisioned();
                             }
                             _ => {}
                         }
@@ -1064,15 +1093,20 @@ fn cool_credential(
     reset_at: Option<SystemTime>,
     default: Duration,
     max: Duration,
+    quota_max: Duration,
 ) {
     let hint = reset_at.map(|reset| reset.duration_since(SystemTime::now()).unwrap_or_default());
-    let until = limits.limited(hint, default, max);
+    let until = limits.quota_limited(hint, default, max, quota_max);
     for peer in peers {
         match hint {
+            // An explicit reset is authoritative: the peers' cooldowns follow
+            // the same quota cap, not the backoff estimate cap.
             Some(wait) => {
-                peer.cool_down(wait.min(max));
+                peer.cool_down_credential(wait.min(quota_max));
             }
-            None => peer.cool_down_until(until),
+            None => {
+                peer.cool_down_credential(until.saturating_duration_since(Instant::now()));
+            }
         }
     }
 }
