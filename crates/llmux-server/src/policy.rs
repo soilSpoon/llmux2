@@ -567,6 +567,7 @@ mod tests {
         let policy = |models: &[&str], blocked: &[&str]| KeyPolicy {
             models: models.iter().map(|s| s.to_string()).collect(),
             blocked: blocked.iter().map(|s| s.to_string()).collect(),
+            free_only: false,
         };
         let p = policy(&["claude-*", "vendor/*"], &["vendor/blocked-*"]);
         assert!(allows_model(&p, "claude-x"));

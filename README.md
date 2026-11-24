@@ -285,6 +285,15 @@ allow-all-minus-`blocked`; an entry with neither is a config error, as is a
 `*` catch-all is never listed for any key. Older binaries reject
 `key_policies`; remove it when rolling back.
 
+`free_only = true` makes a key free-only: every request behaves as if it sent
+`x-llmux-free-only: true` (billed legs are never eligible), and
+`GET /v1/models` advertises only models with at least one usable free leg — a
+non-fallback deployment marked `billing = "free"` whose credential is not
+disabled. "Free" means zero per-request cost, so subscription- or plan-covered
+legs count too; a model drops from the list when its last free leg is removed
+or its credential is disabled. A `free_only`-only entry needs no `models` or
+`blocked` lists.
+
 ## Credentials
 
 OpenAI-compatible deployments can explicitly opt into anonymous access with
