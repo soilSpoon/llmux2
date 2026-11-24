@@ -192,20 +192,26 @@ THEN the `pr-policy` check fails.
 
 Devin bots SHALL merge only after the merge gate verifies an open, non-draft,
 conflict-free PR targeting the default branch, successful required head checks,
-no failed head checks or unresolved review threads, a head-specific Devin Review,
-no blocking latest reviews, and a passing head-specific independent session attestation.
+no failed head checks or unresolved review threads, a genuine head-specific
+review-gate pass, no blocking latest reviews, and a passing head-specific
+independent session attestation.
 Verification comments SHALL come from a policy-allowlisted account.
-Devin Review evidence SHALL be either a head-specific review from the Devin app
-containing a configured real-review body marker, or a successful latest head
-commit status for the configured context created by that app. A latest pending,
-failed, or errored status SHALL block even if a marked review exists.
-Author thread replies SHALL NOT satisfy that evidence.
-Statuses from other creators SHALL be ignored before selecting the latest Devin status.
-The configured commit status context SHALL be matched case-insensitively.
+Review evidence SHALL come from at least one configured `review_gates` entry:
+a head-specific review from the gate's creator containing a configured
+real-review body marker, a successful latest head commit status for the
+gate's context created by that creator, or a successful latest head check-run
+for the gate's context run by that creator's app. A success whose status
+description or check-run output contains a configured skip marker SHALL NOT
+count — the reviewer ran nothing. All gates absent or all-skipped SHALL fail.
+A latest pending, failed, or errored status SHALL block even if a marked
+review exists. Author thread replies SHALL NOT satisfy that evidence.
+Statuses from other creators SHALL be ignored before selecting a gate's
+latest status. The configured commit status context SHALL be matched
+case-insensitively, as SHALL the check-run name.
 Empty-body COMMENTED reviews SHALL NOT supersede a reviewer's blocking review.
 Only the latest run of each head check name SHALL determine its outcome.
 Every latest head check SHALL be completed before merging.
-Required checks SHALL come from the checked-in ruleset and review markers from
+Required checks SHALL come from the checked-in ruleset and review gates from
 the merge policy. Fetch failures SHALL block merging.
 
 #### Scenario: Rust merge preflight

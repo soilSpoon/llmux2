@@ -1,6 +1,18 @@
 {
-  "devin_review_status_context": "Devin Review",
-  "devin_review_markers": ["<!-- devin-review-summary -->", "<!-- devin-review-session-triaged -->"],
+  "review_gates": [
+    {
+      "context": "Devin Review",
+      "creator_login": "devin-ai-integration",
+      "status_skip_markers": ["Full review skipped", "trial expired", "no credits"],
+      "review_markers": ["<!-- devin-review-summary -->", "<!-- devin-review-session-triaged -->"]
+    },
+    {
+      "context": "CodeSolar Review",
+      "creator_login": "codesolarlght",
+      "status_skip_markers": ["Full review skipped", "trial expired", "no credits"],
+      "review_markers": []
+    }
+  ],
   "verifier_logins": ["devin-ai-integration", "soilspoon", "capy-ai"],
   "blocking_markers": {
     "codesolarlght": ["Changes recommended"]

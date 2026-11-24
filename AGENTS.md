@@ -40,7 +40,7 @@ cargo test --locked -p llmux-bench
 
 ## Merge
 
-- Head-specific Devin Review evidence is either a marked review from `devin-ai-integration` or a successful latest `Devin Review` commit status created by that app. A pending, failed, or errored latest status blocks even with a marked review. The context and body markers are configured in `.github/merge-policy.json`.
+- Head-specific review evidence is a genuine pass from at least one `review_gates` entry in `.github/merge-policy.json`: a marked review from the gate's creator, a successful latest commit status, or a successful latest check-run for the gate's context. A success whose description or output carries a configured skip marker does not count — the reviewer ran nothing. A pending, failed, or errored latest status blocks even with a marked review.
 - Run the gate from a trusted, up-to-date `main` checkout so a PR cannot weaken its own policy. Bootstrap changes to the gate require independent review before using the updated gate.
 - Verification markers count only from accounts in `.github/merge-policy.json`'s `verifier_logins` allowlist (`devin-ai-integration`, `soilspoon`, and `capy-ai`, case-insensitive with `[bot]` stripped). `capy-ai` is the Capy app that posts a Captain's review; the bot flag does not make it less independent than `devin-ai-integration` was.
 - The owner never merges. Devin bots merge as the `devin-ai-integration` app, only after `cargo xtask merge-gate <n>` succeeds; then run `command gh pr merge <n> --squash --match-head-commit <sha>` using the exact SHA the gate passed. Until the ruleset is imported, this gate is the enforcement; do not bypass it.

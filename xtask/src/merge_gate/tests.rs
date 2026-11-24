@@ -55,7 +55,7 @@ fn marker(hash: &str, verdict: &str, reviewer: &str) -> String {
     format!("<!-- llmux-verify:v1 sha={hash} verdict={verdict} reviewer={reviewer} -->")
 }
 fn policy() -> Value {
-    json!({"blocking_markers":{"codesolarlght":["Changes recommended"]},"devin_review_status_context":"Devin Review","devin_review_markers":["<!-- devin-review-summary -->","<!-- devin-review-session-triaged -->"],"verifier_logins":["devin-ai-integration","soilspoon"],"unable_to_review_markers":{"copilot":["quota exceeded"]}})
+    json!({"blocking_markers":{"codesolarlght":["Changes recommended"]},"review_gates":[{"context":"Devin Review","creator_login":"devin-ai-integration","status_skip_markers":["Full review skipped","trial expired","no credits"],"review_markers":["<!-- devin-review-summary -->","<!-- devin-review-session-triaged -->"]},{"context":"CodeSolar Review","creator_login":"codesolarlght","status_skip_markers":["Full review skipped","trial expired","no credits"],"review_markers":[]}],"verifier_logins":["devin-ai-integration","soilspoon"],"unable_to_review_markers":{"copilot":["quota exceeded"]}})
 }
 fn fixture() -> Value {
     json!({"pr":{"state":"open","draft":false,"base":{"ref":"main"},"mergeable":true,"head":{"sha":sha()},"body":"Author-Session: author"},"default_branch":"main","checks":[{"name":"check","status":"completed","conclusion":"success","head_sha":sha()}],"threads":[{"isResolved":true}],"statuses":[],"reviews":[{"id":1,"user":{"login":"devin-ai-integration"},"commit_id":sha(),"state":"COMMENTED","body":"<!-- devin-review-summary -->"}],"comments":[{"id":1,"user":{"login":"devin-ai-integration[bot]"},"body":marker(&sha(),"pass","independent")}]})
@@ -65,6 +65,148 @@ fn errors(data: &Value) -> Vec<String> {
 }
 fn status(id: u64, state: &str, context: &str, login: &str) -> Value {
     json!({"id":id,"state":state,"context":context,"creator":{"login":login}})
+}
+fn status_desc(id: u64, state: &str, context: &str, login: &str, description: &str) -> Value {
+    let mut s = status(id, state, context, login);
+    s["description"] = json!(description);
+    s
+}
+fn check_run(id: u64, name: &str, conclusion: &str, slug: &str, summary: &str) -> Value {
+    json!({"id":id,"name":name,"status":"completed","conclusion":conclusion,"head_sha":sha(),"app":{"slug":slug},"output":{"title":"CodeSolar","summary":summary}})
+}
+const NO_GENUINE: &str = "No review gate produced a genuine review on the head SHA.";
+#[test]
+fn live_review_gate_via_check_run() {
+    let mut d = fixture();
+    d["reviews"] = json!([]);
+    // A dead Devin status does not block when a live gate passes.
+    d["statuses"] = json!([status_desc(
+        1,
+        "success",
+        "Devin Review",
+        "devin-ai-integration[bot]",
+        "Full review skipped: trial expired and no credits remaining"
+    )]);
+    d["checks"].as_array_mut().unwrap().push(check_run(
+        2,
+        "CodeSolar Review",
+        "success",
+        "codesolarlght",
+        "Looks good",
+    ));
+    assert!(errors(&d).is_empty());
+}
+#[test]
+fn skipped_review_status_is_not_genuine() {
+    let mut d = fixture();
+    d["reviews"] = json!([]);
+    d["statuses"] = json!([status_desc(
+        1,
+        "success",
+        "Devin Review",
+        "devin-ai-integration[bot]",
+        "Full review skipped: trial expired and no credits remaining"
+    )]);
+    assert!(errors(&d).contains(&NO_GENUINE.into()));
+}
+#[test]
+fn skipped_check_run_output_is_not_genuine() {
+    let mut d = fixture();
+    d["reviews"] = json!([]);
+    d["checks"].as_array_mut().unwrap().push(check_run(
+        2,
+        "CodeSolar Review",
+        "success",
+        "codesolarlght",
+        "Full review skipped: no credits remaining",
+    ));
+    assert!(errors(&d).contains(&NO_GENUINE.into()));
+}
+#[test]
+fn untrusted_check_run_app_is_ignored() {
+    let mut d = fixture();
+    d["reviews"] = json!([]);
+    d["checks"].as_array_mut().unwrap().push(check_run(
+        2,
+        "CodeSolar Review",
+        "success",
+        "some-other-app",
+        "Looks good",
+    ));
+    assert!(errors(&d).contains(&NO_GENUINE.into()));
+}
+#[test]
+fn all_gates_absent_fails() {
+    let mut d = fixture();
+    d["reviews"] = json!([]);
+    assert!(errors(&d).contains(&NO_GENUINE.into()));
+}
+#[test]
+fn differently_cased_skipped_check_run_supersedes_genuine() {
+    let mut d = fixture();
+    d["reviews"] = json!([]);
+    // A newer skipped run under a different casing must still supersede an
+    // older genuine run — dedup keys names case-sensitively, so both survive.
+    let older = check_run(
+        2,
+        "CodeSolar Review",
+        "success",
+        "codesolarlght",
+        "Looks good",
+    );
+    let newer = check_run(
+        3,
+        "codesolar review",
+        "success",
+        "codesolarlght",
+        "Full review skipped: no credits remaining",
+    );
+    d["checks"].as_array_mut().unwrap().extend([older, newer]);
+    assert!(errors(&d).contains(&NO_GENUINE.into()));
+}
+#[test]
+fn differently_cased_genuine_check_run_supersedes_skipped() {
+    let mut d = fixture();
+    d["reviews"] = json!([]);
+    let older = check_run(
+        2,
+        "codesolar review",
+        "success",
+        "codesolarlght",
+        "Full review skipped: trial expired",
+    );
+    let newer = check_run(
+        3,
+        "CodeSolar Review",
+        "success",
+        "codesolarlght",
+        "Looks good",
+    );
+    d["checks"].as_array_mut().unwrap().extend([older, newer]);
+    assert!(errors(&d).is_empty());
+}
+#[test]
+fn clean_status_and_check_run_descriptions_count() {
+    let mut d = fixture();
+    d["reviews"] = json!([]);
+    d["statuses"] = json!([status_desc(
+        1,
+        "success",
+        "Devin Review",
+        "devin-ai-integration[bot]",
+        "Reviewed 5 files"
+    )]);
+    assert!(errors(&d).is_empty());
+    let mut d = fixture();
+    d["reviews"] = json!([]);
+    d["checks"].as_array_mut().unwrap().push(check_run(
+        2,
+        "CodeSolar Review",
+        "success",
+        "codesolarlght",
+        "Reviewed with findings resolved",
+    ));
+    assert!(errors(&d).is_empty());
 }
 #[test]
 fn devin_status_context_is_case_insensitive() {
@@ -163,11 +305,12 @@ fn devin_review_requires_real_body_marker() {
     for body in ["", "Fixed in abc123", "Devin Review", "<!-- unrelated -->"] {
         let mut d = fixture();
         d["reviews"][0]["body"] = json!(body);
-        assert!(
-            errors(&d).contains(&"Devin Review has not submitted a review on the head SHA.".into())
-        );
+        assert!(errors(&d).contains(&NO_GENUINE.into()));
     }
-    for body in policy()["devin_review_markers"].as_array().unwrap() {
+    for body in policy()["review_gates"][0]["review_markers"]
+        .as_array()
+        .unwrap()
+    {
         let mut d = fixture();
         d["reviews"][0]["body"] = body.clone();
         assert!(errors(&d).is_empty());
@@ -384,7 +527,7 @@ fn malformed_inputs_fail_closed() {
         "blocking_markers",
         "unable_to_review_markers",
         "verifier_logins",
-        "devin_review_markers",
+        "review_gates",
     ] {
         let mut p = policy();
         p[key] = json!(42);
