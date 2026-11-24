@@ -53,6 +53,10 @@ fn reviewed_free_xplabs_model_is_prepended_ahead_of_paid_legs() {
         ("gpt-6-luna", "gpt-6-luna"),
         ("deepseek-v4.1-flash", "deepseek-v4.1-flash"),
         ("deepseek-v4.1-flash-fast", "deepseek-v4.1-flash"),
+        (
+            "deepseek-v4.1-flash-1017-uncensored",
+            "deepseek-v4.1-flash-uncensored-fast:free",
+        ),
     ] {
         let (actual, warnings) = routes(&fixture(name, json!(["paid/a", "paid/b"])));
         assert_eq!(
