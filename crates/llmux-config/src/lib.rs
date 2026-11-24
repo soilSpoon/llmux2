@@ -35,6 +35,8 @@ pub struct ServerConfig {
     pub client_keys: Box<[Arc<str>]>,
     /// Model-name policy per `client_keys` entry; `None` leaves the key unrestricted.
     pub key_policies: Box<[Option<KeyPolicy>]>,
+    /// Glob patterns matching requested model names no key may use.
+    pub deny: Box<[String]>,
     pub request_timeout: Duration,
     pub shutdown_timeout: Duration,
     pub drain_grace: Duration,
@@ -177,6 +179,7 @@ struct RawServer {
     remote_images: RemoteImages,
     max_image_bytes: Option<u64>,
     key_policies: Vec<RawKeyPolicy>,
+    deny: Vec<String>,
 }
 
 impl Default for RawServer {
@@ -196,6 +199,7 @@ impl Default for RawServer {
             remote_images: RemoteImages::Allow,
             max_image_bytes: None,
             key_policies: Vec::new(),
+            deny: Vec::new(),
         }
     }
 }
@@ -400,6 +404,10 @@ impl RawConfig {
         }
         let end_user = end_user_settings(&server)?;
         let key_policies = resolve_key_policies(server.key_policies, &client_keys)?;
+        if server.deny.iter().any(|pattern| pattern.is_empty()) {
+            return Err(invalid("server.deny patterns must be nonempty"));
+        }
+        let deny = server.deny;
         let max_image_bytes = match server.max_image_bytes {
             Some(0) => return Err(invalid("max_image_bytes must be positive")),
             other => other,
@@ -891,6 +899,7 @@ impl RawConfig {
                 listen: server.listen,
                 client_keys,
                 key_policies,
+                deny: deny.into_boxed_slice(),
                 request_timeout,
                 shutdown_timeout: timeout(server.shutdown_timeout_ms)?,
                 drain_grace: Duration::from_millis(server.drain_grace_ms),

@@ -309,6 +309,12 @@ fn is_b64(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'-' | b'_' | b'=')
 }
 
+/// Whether the global `[server] deny` globs reject `model`. The check runs
+/// on the requested name for every key, before any resolution.
+pub(crate) fn model_denied(deny: &[String], model: &str) -> bool {
+    deny.iter().any(|pattern| glob_match(pattern, model))
+}
+
 /// Whether a restricted key may request `model`. An empty `models` list
 /// allows every name; a `blocked` match always wins.
 pub(crate) fn allows_model(policy: &KeyPolicy, model: &str) -> bool {
@@ -370,6 +376,7 @@ mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             client_keys: Box::new([]),
             key_policies: Box::new([]),
+            deny: Box::new([]),
             request_timeout: Duration::from_secs(1),
             shutdown_timeout: Duration::from_secs(1),
             drain_grace: Duration::from_millis(0),
@@ -575,5 +582,17 @@ mod tests {
         // blocked glob.
         assert!(!allows_model(&p, "zc/*sneaky"));
         assert!(!allows_model(&p, "zc/é"));
+    }
+
+    #[test]
+    fn global_deny_matches_globs() {
+        let deny =
+            |patterns: &[&str]| -> Vec<String> { patterns.iter().map(|s| s.to_string()).collect() };
+        let d = deny(&["omniroute/*", "billed-?ne"]);
+        assert!(model_denied(&d, "omniroute/gpt-4"));
+        assert!(model_denied(&d, "billed-one"));
+        assert!(!model_denied(&d, "omniroute-x/gpt"));
+        assert!(!model_denied(&d, "claude-good"));
+        assert!(!model_denied(&deny(&[]), "anything"));
     }
 }
