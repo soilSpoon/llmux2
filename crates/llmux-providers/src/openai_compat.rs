@@ -27,6 +27,10 @@ const MAX_COMPLETE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
 const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_RETRY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Provider reset hints are authoritative and can span months; `quota_max`
+/// in the cooldown policy applies the real bound. This cap only keeps the
+/// f64 duration maths finite.
+const MAX_RESET_HINT: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 
 /// Which rate-limit family a 429 belongs to, to pick the matching reset header.
 enum Scope {
@@ -727,7 +731,7 @@ fn parse_duration(mut value: &str) -> Option<Duration> {
         value = &value[unit..];
     }
     Some(Duration::from_secs_f64(
-        seconds.min(MAX_RETRY.as_secs_f64()),
+        seconds.min(MAX_RESET_HINT.as_secs_f64()),
     ))
 }
 
@@ -811,7 +815,7 @@ fn gemini_retry_delay(value: &str) -> Option<Duration> {
         return None;
     }
     let duration = Duration::new(seconds.parse().ok()?, nanos);
-    (!duration.is_zero()).then_some(duration.min(MAX_RETRY))
+    (!duration.is_zero()).then_some(duration.min(MAX_RESET_HINT))
 }
 
 fn classify_error_details(
@@ -855,20 +859,21 @@ fn classify_error_details(
     } else {
         (false, None)
     };
-    let wait = gemini_wait
-        .or_else(|| retry_after(headers, now))
+    let wait_raw = gemini_wait
+        .or_else(|| retry_after_cap(headers, now))
         .or_else(|| {
             header_text(headers, "retry-after-ms")?
                 .parse::<f64>()
                 .ok()
                 .filter(|n| n.is_finite() && *n >= 0.0)
-                .map(|n| Duration::from_secs_f64((n / 1000.0).min(MAX_RETRY.as_secs_f64())))
+                .map(|n| Duration::from_secs_f64((n / 1000.0).min(MAX_RESET_HINT.as_secs_f64())))
         })
         .or_else(|| match scope {
             Scope::Requests => header_text(headers, LIMIT_RESET_REQUESTS).and_then(parse_duration),
             Scope::Tokens => header_text(headers, LIMIT_RESET_TOKENS).and_then(parse_duration),
             Scope::Unknown => None,
         });
+    let wait = wait_raw.map(|wait| wait.min(MAX_RETRY));
     let quota = [code, kind].iter().any(|marker| {
         matches!(
             *marker,
@@ -898,10 +903,10 @@ fn classify_error_details(
     match status.as_u16() {
         _ if not_provisioned => UpstreamError::NotProvisioned,
         402 => UpstreamError::QuotaExhausted {
-            reset_at: quota_reset(now, cf_daily, monthly, wait),
+            reset_at: quota_reset(now, cf_daily, monthly, wait_raw),
         },
         429 if quota || daily || cf_daily || monthly => UpstreamError::QuotaExhausted {
-            reset_at: quota_reset(now, cf_daily, monthly, wait),
+            reset_at: quota_reset(now, cf_daily, monthly, wait_raw),
         },
         429 => UpstreamError::RateLimited { retry_after: wait },
         401 => UpstreamError::Auth { refreshable: true },
@@ -1115,12 +1120,22 @@ pub(crate) fn bad_gateway() -> UpstreamError {
 }
 
 pub(crate) fn retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+    retry_after_cap(headers, now).map(|wait| wait.min(MAX_RETRY))
+}
+
+/// The raw provider reset hint, capped only by `MAX_RESET_HINT` so quota
+/// paths see the full reported window; `quota_max` bounds it downstream.
+fn retry_after_cap(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
     let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
     if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)).min(MAX_RETRY));
+        return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)).min(MAX_RESET_HINT));
     }
     let date = httpdate::parse_http_date(value).ok()?;
-    Some(date.duration_since(now).unwrap_or_default().min(MAX_RETRY))
+    Some(
+        date.duration_since(now)
+            .unwrap_or_default()
+            .min(MAX_RESET_HINT),
+    )
 }
 
 #[cfg(test)]
@@ -1544,7 +1559,10 @@ mod tests {
         for value in ["", "-1s", "NaNs", "1", "1s garbage", "1.2.3s", "1xs"] {
             assert_eq!(parse_duration(value), None, "{value}");
         }
-        assert_eq!(parse_duration("999999999999999999999999h"), Some(MAX_RETRY));
+        assert_eq!(
+            parse_duration("999999999999999999999999h"),
+            Some(MAX_RESET_HINT)
+        );
     }
 
     #[test]
@@ -1579,6 +1597,27 @@ mod tests {
             HeaderValue::from_static("999999999999999999999999"),
         );
         check(&headers, Some(MAX_RETRY));
+    }
+
+    #[test]
+    fn quota_reset_hints_longer_than_a_week_survive_parsing() {
+        let now = SystemTime::UNIX_EPOCH;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("2592000"));
+        // A 402 with a 30-day hint parks for the reported window; the
+        // cooldown policy's quota_max — not the generic retry cap — bounds it.
+        assert!(matches!(
+            classify_error(StatusCode::PAYMENT_REQUIRED, &headers, Bytes::from_static(br#"{"error":{"message":"quota"}}"#), now),
+            UpstreamError::QuotaExhausted { reset_at: Some(reset) } if reset == now + Duration::from_secs(2_592_000)
+        ));
+        // Proactive reset headers keep their full length too.
+        let adapter = OpenAiCompat::new("test");
+        let mut headers = HeaderMap::new();
+        headers.insert(LIMIT_RESET_REQUESTS, HeaderValue::from_static("30d"));
+        assert_eq!(
+            adapter.observe_limits(&headers).unwrap().reset_requests,
+            Some(Duration::from_secs(30 * 86_400))
+        );
     }
 
     #[test]

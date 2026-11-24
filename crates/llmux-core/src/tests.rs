@@ -690,6 +690,34 @@ async fn rejects_requests_that_fit_no_deployment_without_calling_upstream() {
 }
 
 #[tokio::test]
+async fn context_preflight_ignores_parked_deployments() {
+    // dep0's 4000-token window is parked by a missing allowance; a request
+    // that fits only it must be rejected by the preflight instead of
+    // routing into legs that cannot serve it.
+    // split_routes gives dep1 its own upstream model so dep0's missing
+    // allowance parks only dep0's leg.
+    let (executor, adapter, _, _server) = fixture_full(
+        vec![UpstreamError::NotProvisioned],
+        false,
+        [Some(4000), Some(100), Some(100)],
+        &[("model", &[0, 1])],
+        Default::default(),
+        Default::default(),
+        true,
+        None,
+        [None; 3],
+    )
+    .await;
+    executor.execute(sized_request(50, Some(10))).await.unwrap();
+    assert!(executor.bindings[0].limits.not_provisioned());
+    assert!(matches!(
+        executor.execute(sized_request(200, Some(10))).await,
+        Err(GatewayError::ContextLengthExceeded { limit: 100, .. })
+    ));
+    assert_eq!(adapter.calls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn exhaustion_retry_hint_ignores_deployments_that_do_not_fit() {
     let (executor, _, _, _server) = fixture_with_context(
         vec![UpstreamError::RateLimited {

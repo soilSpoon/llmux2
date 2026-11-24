@@ -520,6 +520,7 @@ impl Executor {
                 let dep = &self.cfg.deployments[index(idx)];
                 let binding = &self.bindings[index(idx)];
                 if binding.disabled.load(Ordering::Relaxed)
+                    || binding.limits.not_provisioned()
                     || binding.adapter.supports(req.format) == Support::No
                     || dep.expires_at.is_some_and(|end| SystemTime::now() >= end)
                 {
