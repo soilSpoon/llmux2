@@ -440,6 +440,21 @@ WHEN two OAuth connections of the same provider are imported
 THEN the model carries one deployment per connection, each tracked against
 its own account quota window rather than a shared one.
 
+### Requirement: Persistent credential disable
+
+A credential MAY set `disabled = true`; the gateway SHALL treat it exactly
+like an admin-API disable — its deployments never route — and the state
+SHALL survive reloads because it is re-applied on every config load. The
+admin credential surface SHALL report the live flag and whether the config
+requests the disabled state; the admin API MAY still re-enable a
+config-disabled credential until the next reload restores the flag.
+
+#### Scenario: Disabled credential survives reload
+
+WHEN a credential carries `disabled = true` and the config reloads
+THEN the credential stays disabled and its deployments never serve traffic,
+while the admin list reports the config-sourced state.
+
 ### Requirement: Excluded providers and practices
 
 The gateway SHALL NOT integrate OpenRouter, Factory, Augment, Z.AI, or

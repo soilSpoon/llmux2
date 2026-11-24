@@ -263,7 +263,14 @@ impl Executor {
                     .transpose()?;
                 let disabled = credential.map_or_else(
                     || Arc::new(AtomicBool::new(false)),
-                    |id| disabled.entry(id.clone()).or_default().clone(),
+                    |id| {
+                        disabled
+                            .entry(id.clone())
+                            .or_insert_with(|| {
+                                Arc::new(AtomicBool::new(cfg.credential_disabled.contains(id)))
+                            })
+                            .clone()
+                    },
                 );
                 Ok(Binding {
                     adapter,
@@ -296,7 +303,9 @@ impl Executor {
         // A credential without deployments is still manageable: keep a
         // flag for every configured credential, not only deployed ones.
         for id in credentials.keys() {
-            disabled.entry(id.clone()).or_default();
+            disabled
+                .entry(id.clone())
+                .or_insert_with(|| Arc::new(AtomicBool::new(cfg.credential_disabled.contains(id))));
         }
 
         let orders = cfg
