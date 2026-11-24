@@ -350,6 +350,8 @@ struct RawDeployment {
     timeout_ms: Option<u64>,
     max_context: Option<u32>,
     expires_at: Option<toml::value::Datetime>,
+    priority_boost: Option<i32>,
+    priority_boost_until: Option<toml::value::Datetime>,
     #[serde(default)]
     billing: Billing,
 }
@@ -840,6 +842,15 @@ impl RawConfig {
                 );
                 candidates.push(idx);
                 let expires_at = dep.expires_at.map(|stamp| expiry(&id, stamp)).transpose()?;
+                let priority_boost_until = dep
+                    .priority_boost_until
+                    .map(|stamp| boost_until(&id, stamp))
+                    .transpose()?;
+                if dep.priority_boost.is_some() && priority_boost_until.is_none() {
+                    return Err(invalid(&format!(
+                        "deployment {id} priority_boost requires priority_boost_until"
+                    )));
+                }
                 deployments.push(Deployment {
                     headers: deployment_headers(
                         dep.headers,
@@ -859,6 +870,8 @@ impl RawConfig {
                     timeout: timeout(dep.timeout_ms.unwrap_or(server.request_timeout_ms))?,
                     max_context: dep.max_context.or(model.capabilities.max_context),
                     expires_at,
+                    priority_boost: dep.priority_boost,
+                    priority_boost_until,
                     billing: dep.billing,
                 });
             }
@@ -1029,18 +1042,29 @@ fn end_user_header_name(name: &str) -> Result<HeaderName, ConfigError> {
 }
 
 fn expiry(deployment: &str, stamp: toml::value::Datetime) -> Result<SystemTime, ConfigError> {
+    rfc3339(deployment, "expires_at", stamp)
+}
+
+fn boost_until(deployment: &str, stamp: toml::value::Datetime) -> Result<SystemTime, ConfigError> {
+    rfc3339(deployment, "priority_boost_until", stamp)
+}
+
+fn rfc3339(
+    deployment: &str,
+    field: &str,
+    stamp: toml::value::Datetime,
+) -> Result<SystemTime, ConfigError> {
     let text = stamp.to_string();
     let parsed = time::OffsetDateTime::parse(&text, &time::format_description::well_known::Rfc3339)
         .map_err(|_| {
             invalid(&format!(
-                "deployment {deployment} expires_at must be an RFC 3339 timestamp"
+                "deployment {deployment} {field} must be an RFC 3339 timestamp"
             ))
         })?;
-    let seconds: u64 = parsed.unix_timestamp().try_into().map_err(|_| {
-        invalid(&format!(
-            "deployment {deployment} expires_at is out of range"
-        ))
-    })?;
+    let seconds: u64 = parsed
+        .unix_timestamp()
+        .try_into()
+        .map_err(|_| invalid(&format!("deployment {deployment} {field} is out of range")))?;
     Ok(SystemTime::UNIX_EPOCH + Duration::new(seconds, parsed.nanosecond()))
 }
 
@@ -1324,6 +1348,29 @@ mod tests {
             "freemodel-claude-fable-5",
         ] {
             assert!(seen.contains(id), "example config is missing {id}");
+        }
+    }
+
+    #[test]
+    fn priority_boost_parses_and_requires_a_deadline() {
+        let base = config(REQUIRED);
+        let parsed = RuntimeConfig::parse(&base.replace(
+            "upstream_model = \"upstream\"",
+            "priority_boost = -1\npriority_boost_until = 2030-01-01T00:00:00Z\nupstream_model = \"upstream\"",
+        ))
+        .expect("boost with deadline");
+        assert_eq!(parsed.deployments[0].priority_boost, Some(-1));
+        assert!(parsed.deployments[0].priority_boost_until.is_some());
+        // A promotion without its deadline is meaningless; an unparseable
+        // deadline is rejected the same way expires_at is.
+        for bad in [
+            "priority_boost = -1\nupstream_model = \"upstream\"",
+            "priority_boost_until = \"soon\"\nupstream_model = \"upstream\"",
+        ] {
+            assert!(
+                RuntimeConfig::parse(&base.replace("upstream_model = \"upstream\"", bad)).is_err(),
+                "{bad}"
+            );
         }
     }
 

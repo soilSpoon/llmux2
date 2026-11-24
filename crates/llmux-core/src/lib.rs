@@ -554,7 +554,38 @@ impl Executor {
                 });
             }
         }
-        let sequence = if order.groups.iter().any(|group| group.len() > 1) {
+        // A leg whose quota dies at a deadline promotes itself until then:
+        // `priority_boost_until` reprioritizes per request, so regrouping is
+        // recomputed only for models that carry one.
+        let boosted = model.deployments.iter().any(|idx| {
+            self.cfg.deployments[index(*idx)]
+                .priority_boost_until
+                .is_some()
+        });
+        let ordered;
+        let (deployments, groups): (&[DeploymentIdx], &[Range<usize>]) = if boosted {
+            let now = SystemTime::now();
+            let mut legs: Vec<DeploymentIdx> = model.deployments.to_vec();
+            legs.sort_by_key(|idx| effective_priority(&self.cfg.deployments[index(*idx)], now));
+            let mut start = 0;
+            let groups: Vec<Range<usize>> = legs
+                .chunk_by(|a, b| {
+                    effective_priority(&self.cfg.deployments[index(*a)], now)
+                        == effective_priority(&self.cfg.deployments[index(*b)], now)
+                })
+                .map(|group| {
+                    let end = start + group.len();
+                    let range = start..end;
+                    start = end;
+                    range
+                })
+                .collect();
+            ordered = (legs, groups);
+            (&ordered.0[..], &ordered.1[..])
+        } else {
+            (&model.deployments[..], &order.groups[..])
+        };
+        let sequence = if groups.iter().any(|group| group.len() > 1) {
             order.next.fetch_add(1, Ordering::Relaxed)
         } else {
             0
@@ -564,9 +595,9 @@ impl Executor {
         let mut incompatible = Vec::new();
         let mut unavailable = false;
         let mut machine = State::new(self.cfg.routing.max_attempts as u32);
-        'groups: for group in &order.groups {
+        'groups: for group in groups {
             let shift = sequence % group.len();
-            let (before, after) = model.deployments[group.clone()].split_at(shift);
+            let (before, after) = deployments[group.clone()].split_at(shift);
             for &idx in after.iter().chain(before) {
                 let idx = index(idx);
                 let dep = &self.cfg.deployments[idx];
@@ -1125,4 +1156,13 @@ fn hold_permit(response: GatewayResponse, permit: Permit) -> GatewayResponse {
 
 fn index(idx: DeploymentIdx) -> usize {
     idx.0 as usize
+}
+
+/// Priority a deployment competes with right now: `priority_boost` while its
+/// `priority_boost_until` deadline is still ahead, `priority` otherwise.
+fn effective_priority(dep: &Deployment, now: SystemTime) -> i32 {
+    match dep.priority_boost_until {
+        Some(until) if now < until => dep.priority_boost.unwrap_or(0),
+        _ => dep.priority,
+    }
 }

@@ -102,6 +102,19 @@ Among eligible deployments the gateway SHALL order by:
 WHEN deployment A's quota expires in 1 hour and deployment B's resets daily
 THEN A is tried first.
 
+A deployment MAY declare `priority_boost` (default `0`) with
+`priority_boost_until` (an RFC 3339 timestamp) to rank by a quota deadline
+the provider cannot report: while the timestamp is in the future the
+deployment competes at its boost value instead of `priority`; once it passes
+the deployment reverts to `priority` and stays eligible. `priority_boost`
+without `priority_boost_until` SHALL be rejected at parse.
+
+#### Scenario: Deadline boost promotes then reverts
+
+WHEN a priority-1 deployment boosts to -1 until a future timestamp
+THEN it outranks a priority-0 deployment until that time
+AND reverts to the configured order afterward.
+
 ### Requirement: Remaining-amount scoring
 
 The gateway SHALL score expiring-quota deployments by remaining amount
