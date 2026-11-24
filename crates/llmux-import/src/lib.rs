@@ -9,6 +9,7 @@ mod devin;
 mod direct;
 pub mod discovery;
 mod fallback;
+mod free_conditions;
 mod morph;
 mod nous;
 mod policy;
@@ -767,6 +768,18 @@ impl Expander<'_> {
                 }
                 if c.policy == policy::ModelPolicy::Workers {
                     deployment["quota"] = json!({"rpm":self.policy.workers_rpm});
+                }
+                if deployment["billing"] == "free" {
+                    if let Some(cond) =
+                        free_conditions::lookup(&c.base_url, &model, c.credential.is_none())
+                    {
+                        for &(field, value) in cond.quota {
+                            deployment["quota"][field] = value.into();
+                        }
+                        if let Some(stamp) = cond.expires_at {
+                            deployment["expires_at"] = stamp.into();
+                        }
+                    }
                 }
                 if let Some(credential) = &c.credential {
                     deployment["credential"] = credential.clone().into();
