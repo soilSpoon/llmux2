@@ -10,7 +10,7 @@ const PREFIX: &str = "experlabs";
 // `uncensored-fast:free` promotion returned usage.cost 0 on 2026-11-24 while the plain
 // `deepseek-v4.1-flash-uncensored` and `…-fast` ids stay billed — the :free suffix is
 // what marks the promo leg. Reviewed combo -> XPLabs model id.
-const FREE: &[(&str, &str)] = &[
+pub(crate) const FREE: &[(&str, &str)] = &[
     ("gpt-6-luna", "gpt-6-luna"),
     ("deepseek-v4.1-flash", "deepseek-v4.1-flash"),
     ("deepseek-v4.1-flash-fast", "deepseek-v4.1-flash"),

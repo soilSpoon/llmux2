@@ -791,11 +791,19 @@ dependencies = [
 name = "llmux-import"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "bytes",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "llmux-config",
+ "llmux-testkit",
  "llmux-types",
  "serde_json",
  "tempfile",
+ "tokio",
  "toml",
 ]
 

@@ -7,6 +7,7 @@ mod context;
 mod db_dump;
 mod devin;
 mod direct;
+pub mod discovery;
 mod fallback;
 mod morph;
 mod nous;
@@ -16,6 +17,12 @@ mod secondary;
 mod upstream;
 mod validation;
 mod xplabs;
+
+/// Upstream ids in the reviewed XPLabs free map — the "already listed"
+/// baseline for free-model discovery scans.
+pub fn xplabs_free_ids() -> impl Iterator<Item = &'static str> {
+    xplabs::FREE.iter().map(|(_, id)| *id)
+}
 
 use llmux_types::provider::{
     ANTHROPIC as KIND_ANTHROPIC, DEEPAI as KIND_DEEPAI, DEVIN_ACP as KIND_DEVIN_ACP,

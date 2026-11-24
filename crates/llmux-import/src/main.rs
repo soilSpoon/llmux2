@@ -21,6 +21,10 @@ fn run() -> Result<(), String> {
     let mut free_providers = None;
     let mut canonical_map = None;
     let mut workers_rpm: Option<u32> = None;
+    let mut scan_free = None;
+    let mut scan_page_url = None;
+    let mut scan_probe_base = None;
+    let mut scan_key_file = None;
     let mut args = env::args_os().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--openrouter-replacements" {
@@ -63,8 +67,12 @@ fn run() -> Result<(), String> {
             Some("--overlay") => &mut overlay,
             Some("--free-providers") => &mut free_providers,
             Some("--canonical-map") => &mut canonical_map,
+            Some("--scan-free") => &mut scan_free,
+            Some("--scan-page-url") => &mut scan_page_url,
+            Some("--scan-probe-base") => &mut scan_probe_base,
+            Some("--scan-key-file") => &mut scan_key_file,
             _ => return Err(
-                "usage: llmux-import --input export.json --output llmux.toml [--secrets-dir DIR] [--cloudflare-account-id-file PATH --cloudflare-token-file PATH] [--workers-ai-models PATH] [--kilo-free-models PATH] [--kilo-key-file PATH] [--devin-models PATH] [--nous-state PATH --nous-models PATH] [--openrouter-replacements] [--workers-ai-rpm RPM] [--omniroute-fallback BASE_URL --omniroute-key SECRET_REF] [--exclude-models PATH] [--listen HOST:PORT] [--overlay PATH] [--free-providers PATH] [--canonical-map PATH]"
+                "usage: llmux-import --input export.json --output llmux.toml [--secrets-dir DIR] [--cloudflare-account-id-file PATH --cloudflare-token-file PATH] [--workers-ai-models PATH] [--kilo-free-models PATH] [--kilo-key-file PATH] [--devin-models PATH] [--nous-state PATH --nous-models PATH] [--openrouter-replacements] [--workers-ai-rpm RPM] [--omniroute-fallback BASE_URL --omniroute-key SECRET_REF] [--exclude-models PATH] [--listen HOST:PORT] [--overlay PATH] [--free-providers PATH] [--canonical-map PATH] | llmux-import --scan-free PROVIDER [--scan-page-url URL] [--scan-probe-base URL] [--scan-key-file PATH]"
                     .into(),
             ),
         };
@@ -72,6 +80,9 @@ fn run() -> Result<(), String> {
             return Err("duplicate argument".into());
         }
         *target = Some(PathBuf::from(args.next().ok_or("missing argument value")?));
+    }
+    if let Some(provider) = scan_free {
+        return scan_free_candidates(&provider, scan_page_url, scan_probe_base, scan_key_file);
     }
     let input = input.ok_or("--input is required")?;
     let output = output.ok_or("--output is required")?;
@@ -113,6 +124,62 @@ fn run() -> Result<(), String> {
         "imported {} models, {} deployments, {} credentials, {} client keys",
         report.models, report.deployments, report.credentials, report.client_keys
     );
+    Ok(())
+}
+
+fn scan_free_candidates(
+    provider: &std::path::Path,
+    page_url: Option<PathBuf>,
+    probe_base: Option<PathBuf>,
+    key_file: Option<PathBuf>,
+) -> Result<(), String> {
+    use llmux_import::discovery;
+    let provider = provider
+        .to_str()
+        .ok_or("--scan-free provider must be UTF-8")?;
+    let url_of = |value: Option<PathBuf>, default: &str| -> Result<String, String> {
+        match value {
+            Some(path) => path
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "scan urls must be UTF-8".to_string()),
+            None => Ok(default.to_string()),
+        }
+    };
+    let key = key_file
+        .map(|path| {
+            fs::read_to_string(&path)
+                .map_err(|_| "could not read --scan-key-file".to_string())
+                .map(|key| key.trim().to_string())
+        })
+        .transpose()?;
+    let (scan, known) = match provider {
+        "experlabs" | "xplabs" => {
+            let page = url_of(page_url, discovery::EXPERLABS_PAGE)?;
+            let base = url_of(probe_base, discovery::EXPERLABS_API)?;
+            let known: Vec<String> = llmux_import::xplabs_free_ids()
+                .map(|id| id.to_string())
+                .collect();
+            (discovery::ScanPlan::Experlabs { page, base }, known)
+        }
+        other => return Err(format!("--scan-free has no adapter for provider {other:?}")),
+    };
+    let client = discovery::client()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let rows = runtime.block_on(scan.run(&client, key.as_deref(), &known))?;
+    for row in rows {
+        let verdict = row
+            .verdict
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unverified".to_string());
+        println!(
+            "candidate {}\tlisted={}\tverdict={}\tevidence={}",
+            row.id, row.listed, verdict, row.evidence
+        );
+    }
     Ok(())
 }
 
