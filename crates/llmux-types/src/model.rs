@@ -74,6 +74,13 @@ pub struct Deployment {
     /// When this deployment stops being eligible, for time-limited offers.
     /// `None` means it never expires.
     pub expires_at: Option<SystemTime>,
+    /// Effective priority while `priority_boost_until` is in the future;
+    /// promotes legs carrying quota that dies at a deadline. `None` leaves
+    /// ordering to `priority` alone.
+    pub priority_boost: Option<i32>,
+    /// Deadline after which `priority_boost` stops applying. Unlike
+    /// `expires_at` the leg stays eligible — it only loses its promotion.
+    pub priority_boost_until: Option<SystemTime>,
     /// Whether probing this leg can spend money or quota; `Billed` is the
     /// safe default when the config does not say.
     pub billing: Billing,

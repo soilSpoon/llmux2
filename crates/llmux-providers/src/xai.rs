@@ -109,6 +109,8 @@ impl ProviderAdapter for Xai {
             timeout: dep.timeout,
             max_context: dep.max_context,
             expires_at: dep.expires_at,
+            priority_boost: dep.priority_boost,
+            priority_boost_until: dep.priority_boost_until,
             billing: dep.billing,
         };
         if responses(&model) {
@@ -177,6 +179,8 @@ mod tests {
             timeout: Duration::from_secs(30),
             max_context: None,
             expires_at: None,
+            priority_boost: None,
+            priority_boost_until: None,
             billing: Billing::Billed,
         }
     }

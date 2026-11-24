@@ -1166,6 +1166,8 @@ mod tests {
             timeout: Duration::from_secs(10),
             max_context: None,
             expires_at: None,
+            priority_boost: None,
+            priority_boost_until: None,
             billing: Billing::Billed,
         };
         let mut req = GatewayRequest {
@@ -1286,6 +1288,8 @@ mod tests {
             timeout: Duration::from_secs(10),
             max_context: None,
             expires_at: None,
+            priority_boost: None,
+            priority_boost_until: None,
             billing: Billing::Billed,
         };
         for (format, body) in [
@@ -1379,6 +1383,8 @@ mod tests {
             timeout: Duration::from_secs(10),
             max_context: None,
             expires_at: None,
+            priority_boost: None,
+            priority_boost_until: None,
             billing: Billing::Billed,
         };
         let hash = "31ca399bfc61dac0b442a6bef7c00cd06cf9682c11b9192fb26a918b4a9130f8";

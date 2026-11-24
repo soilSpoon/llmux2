@@ -164,6 +164,7 @@ async fn fixture_with_models(
         false,
         None,
         [None; 3],
+        [None; 3],
     )
     .await
 }
@@ -180,6 +181,7 @@ async fn fixture_full(
     split_routes: bool,
     request_log: Option<std::path::PathBuf>,
     expiry: [Option<SystemTime>; 3],
+    boost: [Option<(i32, SystemTime)>; 3],
 ) -> Fixture {
     let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
     let served_status = status.clone();
@@ -237,6 +239,8 @@ async fn fixture_full(
             timeout: Duration::from_secs(1),
             max_context: max_context[i as usize],
             expires_at: expiry[i as usize],
+            priority_boost: boost[i as usize].map(|(priority, _)| priority),
+            priority_boost_until: boost[i as usize].map(|(_, until)| until),
             billing: Billing::Billed,
         })
         .collect();
@@ -438,6 +442,7 @@ async fn expired_deployments_are_skipped() {
             Some(SystemTime::now() + Duration::from_secs(3600)),
             None,
         ],
+        [None; 3],
     )
     .await;
     let response = executor.execute(request()).await.unwrap();
@@ -446,6 +451,54 @@ async fn expired_deployments_are_skipped() {
     assert_eq!(
         *adapter.calls.lock().unwrap(),
         vec![("dep1".into(), "0".into())]
+    );
+}
+
+#[tokio::test]
+async fn priority_boost_promotes_until_deadline_then_reverts() {
+    let future = SystemTime::now() + Duration::from_secs(3600);
+    let past = SystemTime::now() - Duration::from_secs(60);
+    // While dep1's deadline is ahead, its boosted rank wins over dep0's lower
+    // configured priority; dep2's lapsed boost keeps it last.
+    let (executor, adapter, _, _server) = fixture_full(
+        vec![],
+        false,
+        [None; 3],
+        &[("model", &[0, 1, 2])],
+        Default::default(),
+        Default::default(),
+        false,
+        None,
+        [None; 3],
+        [None, Some((-1, future)), Some((-1, past))],
+    )
+    .await;
+    let response = executor.execute(request()).await.unwrap();
+    assert_eq!(response.deployment.as_ref(), "dep1");
+    assert_eq!(
+        *adapter.calls.lock().unwrap(),
+        vec![("dep1".into(), "0".into())]
+    );
+
+    // With every deadline behind it, the configured order returns.
+    let (executor, adapter, _, _server) = fixture_full(
+        vec![],
+        false,
+        [None; 3],
+        &[("model", &[0, 1, 2])],
+        Default::default(),
+        Default::default(),
+        false,
+        None,
+        [None; 3],
+        [None, Some((-1, past)), Some((-1, past))],
+    )
+    .await;
+    let response = executor.execute(request()).await.unwrap();
+    assert_eq!(response.deployment.as_ref(), "dep0");
+    assert_eq!(
+        *adapter.calls.lock().unwrap(),
+        vec![("dep0".into(), "0".into())]
     );
 }
 
@@ -467,6 +520,7 @@ async fn exhaustion_retry_hint_ignores_expired_deployments() {
             Some(SystemTime::now() - Duration::from_secs(60)),
             None,
         ],
+        [None; 3],
     )
     .await;
     let Err(GatewayError::AllCandidatesExhausted { retry_after, .. }) =
@@ -547,6 +601,7 @@ async fn retry_after_excludes_a_deployment_that_does_not_have_the_model() {
         },
         false,
         None,
+        [None; 3],
         [None; 3],
     )
     .await;
@@ -707,6 +762,7 @@ async fn context_preflight_ignores_parked_deployments() {
         Default::default(),
         true,
         None,
+        [None; 3],
         [None; 3],
     )
     .await;
@@ -970,6 +1026,7 @@ async fn committed_stream_quota_cools_shared_credential_without_replay() {
             true,
             None,
             [None; 3],
+            [None; 3],
         )
         .await;
         adapter.stream_errors.lock().unwrap().push_back(error);
@@ -1015,6 +1072,7 @@ async fn committed_stream_not_provisioned_parks_the_leg_without_replay() {
         Default::default(),
         true,
         None,
+        [None; 3],
         [None; 3],
     )
     .await;
@@ -1215,6 +1273,7 @@ async fn oversized_request_skips_deployment_on_a_full_or_empty_credential_window
         false,
         None,
         [None; 3],
+        [None; 3],
     )
     .await;
     let oversized = || GatewayRequest {
@@ -1252,6 +1311,7 @@ async fn credential_quota_limits_the_credentials_deployments() {
         false,
         None,
         [None; 3],
+        [None; 3],
     )
     .await;
     executor.execute(request()).await.unwrap();
@@ -1273,6 +1333,7 @@ async fn exhausted_quota_cools_every_deployment_on_the_credential() {
         Default::default(),
         true,
         None,
+        [None; 3],
         [None; 3],
     )
     .await;
@@ -1309,6 +1370,7 @@ async fn credential_peers_cool_only_until_the_quota_resets() {
         Default::default(),
         true,
         None,
+        [None; 3],
         [None; 3],
     )
     .await;
@@ -1356,6 +1418,7 @@ async fn an_explicit_quota_reset_outlasts_the_backoff_cap() {
         true,
         None,
         [None; 3],
+        [None; 3],
     )
     .await;
     // dep0's credential quota is exhausted; dep1 shares the credential so dep2 serves.
@@ -1395,6 +1458,7 @@ async fn a_quota_reset_beyond_the_quota_cap_is_clamped_there() {
         false,
         None,
         [None; 3],
+        [None; 3],
     )
     .await;
     assert!(executor.execute(request()).await.is_err());
@@ -1422,6 +1486,7 @@ async fn a_rate_limit_never_cools_credential_peers() {
         Default::default(),
         true,
         None,
+        [None; 3],
         [None; 3],
     )
     .await;
@@ -1463,6 +1528,7 @@ async fn a_not_provisioned_deployment_is_skipped_until_reload() {
         Default::default(),
         true,
         None,
+        [None; 3],
         [None; 3],
     )
     .await;
@@ -1511,6 +1577,7 @@ async fn an_all_not_provisioned_model_exhausts_immediately() {
         false,
         None,
         [None; 3],
+        [None; 3],
     )
     .await;
     assert!(matches!(
@@ -1543,6 +1610,7 @@ async fn request_log_records_each_request() {
         Default::default(),
         false,
         Some(path.clone()),
+        [None; 3],
         [None; 3],
     )
     .await;
@@ -1622,6 +1690,7 @@ async fn request_log_lists_every_attempt_leg() {
         false,
         Some(path.clone()),
         [None; 3],
+        [None; 3],
     )
     .await;
 
@@ -1667,6 +1736,7 @@ async fn request_log_omits_legs_when_nothing_was_sent() {
         false,
         Some(path.clone()),
         [None; 3],
+        [None; 3],
     )
     .await;
 
@@ -1710,6 +1780,7 @@ async fn request_log_lists_repair_resends_for_one_attempt() {
         false,
         Some(path.clone()),
         [None; 3],
+        [None; 3],
     )
     .await;
     // Repair without cooling dep0 itself.
@@ -1751,6 +1822,7 @@ async fn request_log_omits_legs_when_the_build_never_sent() {
         Default::default(),
         false,
         Some(path.clone()),
+        [None; 3],
         [None; 3],
     )
     .await;
@@ -1796,6 +1868,7 @@ async fn deployment_stats_count_outgoing_handoffs() {
         false,
         None,
         [None; 3],
+        [None; 3],
     )
     .await;
     for binding in &mut executor.bindings {
@@ -1838,6 +1911,7 @@ async fn request_log_prefers_response_header_over_error_body() {
         Default::default(),
         false,
         Some(path.clone()),
+        [None; 3],
         [None; 3],
     )
     .await;

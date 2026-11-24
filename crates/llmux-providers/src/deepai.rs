@@ -439,6 +439,8 @@ mod tests {
             timeout: Duration::from_secs(10),
             max_context: None,
             expires_at: None,
+            priority_boost: None,
+            priority_boost_until: None,
             billing: Billing::Billed,
         }
     }
