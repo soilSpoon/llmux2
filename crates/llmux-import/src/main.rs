@@ -19,6 +19,7 @@ fn run() -> Result<(), String> {
     let mut listen = None;
     let mut overlay = None;
     let mut free_providers = None;
+    let mut canonical_map = None;
     let mut workers_rpm: Option<u32> = None;
     let mut args = env::args_os().skip(1);
     while let Some(arg) = args.next() {
@@ -61,8 +62,9 @@ fn run() -> Result<(), String> {
             Some("--listen") => &mut listen,
             Some("--overlay") => &mut overlay,
             Some("--free-providers") => &mut free_providers,
+            Some("--canonical-map") => &mut canonical_map,
             _ => return Err(
-                "usage: llmux-import --input export.json --output llmux.toml [--secrets-dir DIR] [--cloudflare-account-id-file PATH --cloudflare-token-file PATH] [--workers-ai-models PATH] [--kilo-free-models PATH] [--kilo-key-file PATH] [--devin-models PATH] [--nous-state PATH --nous-models PATH] [--openrouter-replacements] [--workers-ai-rpm RPM] [--omniroute-fallback BASE_URL --omniroute-key SECRET_REF] [--exclude-models PATH] [--listen HOST:PORT] [--overlay PATH] [--free-providers PATH]"
+                "usage: llmux-import --input export.json --output llmux.toml [--secrets-dir DIR] [--cloudflare-account-id-file PATH --cloudflare-token-file PATH] [--workers-ai-models PATH] [--kilo-free-models PATH] [--kilo-key-file PATH] [--devin-models PATH] [--nous-state PATH --nous-models PATH] [--openrouter-replacements] [--workers-ai-rpm RPM] [--omniroute-fallback BASE_URL --omniroute-key SECRET_REF] [--exclude-models PATH] [--listen HOST:PORT] [--overlay PATH] [--free-providers PATH] [--canonical-map PATH]"
                     .into(),
             ),
         };
@@ -100,6 +102,7 @@ fn run() -> Result<(), String> {
         exclude_models: excluded.as_deref(),
         overlay: overlay.as_deref(),
         free_providers: free_providers.as_deref(),
+        canonical_map: canonical_map.as_deref(),
     };
     let report =
         llmux_import::import_with_options(&content, &output, secrets.as_deref(), &options)?;
