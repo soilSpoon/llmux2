@@ -246,10 +246,11 @@ impl Executor {
                 None => {
                     // Parse rejects dangling `shared_quota` names; a hand-built
                     // RuntimeConfig must still fail closed, never unlimited.
-                    // Non-hard windows admit an oversized request on an empty
-                    // window, so the fallback uses hard zero-cap windows.
+                    // Family caps are account-wide ceilings, so they use the
+                    // hard credential variant — soft windows would admit one
+                    // oversized request to an idle scope and blow the cap.
                     let windows = match group_specs.get(group) {
-                        Some(spec) => Window::for_quota(*spec),
+                        Some(spec) => Window::for_credential(*spec),
                         None => {
                             debug_assert!(
                                 false,

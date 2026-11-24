@@ -1149,6 +1149,40 @@ async fn shared_quota_scopes_anonymous_legs_by_provider_and_base_url() {
 }
 
 #[tokio::test]
+async fn shared_quota_family_cap_rejects_oversized_request_on_empty_window() {
+    // A family allowance is an account-wide ceiling like a credential cap:
+    // a single request whose cost alone exceeds it must be refused even
+    // when nothing has been spent. Soft deployment windows would admit one
+    // oversized call to an idle scope and blow the allowance.
+    let (executor, adapter, _, _server) = fixture_shared_group(
+        &[("a", &[0, 2])],
+        &[(
+            "fam",
+            llmux_types::QuotaSpec {
+                tpm: Some(5),
+                ..Default::default()
+            },
+        )],
+        [Some("fam"), None, Some("fam")],
+        ["first", "first", "second"],
+        ["upstream", "upstream-1", "upstream"],
+        None,
+    )
+    .await;
+    let Err(GatewayError::AllCandidatesExhausted { .. }) = executor
+        .execute(GatewayRequest {
+            model: "a".into(),
+            est_input_tokens: 10,
+            ..request()
+        })
+        .await
+    else {
+        panic!("expected exhaustion")
+    };
+    assert!(adapter.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn unbound_legs_on_the_same_credential_keep_independent_windows() {
     // dep0 alone binds the drained "fam" window; dep1 on the same credential
     // is not in the group, so a paid leg on a shared key is never throttled
