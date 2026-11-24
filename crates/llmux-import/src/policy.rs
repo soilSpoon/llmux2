@@ -34,11 +34,7 @@ pub(super) fn billed(connection: &Connection, model: &str, policy: &Policy) -> b
     }
     // Plan-independent free offers the reviewed conditions table names —
     // provider-documented `:free` variants and per-IP anonymous allowances.
-    if crate::free_conditions::asserts_free(
-        &connection.base_url,
-        model,
-        connection.credential.is_none(),
-    ) {
+    if crate::free_conditions::asserts_free(&connection.base_url, model, connection.anonymous()) {
         return false;
     }
     match &connection.provider {

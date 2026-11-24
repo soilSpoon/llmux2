@@ -109,6 +109,22 @@ struct Connection {
     policy: policy::ModelPolicy,
 }
 
+impl Connection {
+    /// True only when the leg reaches upstream with no authentication — the
+    /// sole case a per-IP anonymous offer can apply. A custom node may carry
+    /// an `Authorization`-style custom header with `auth_type = "none"` and
+    /// no credential; it is authenticated, not anonymous.
+    fn anonymous(&self) -> bool {
+        const AUTH_HEADERS: &[&str] = &["authorization", "x-api-key", "api-key"];
+        self.credential.is_none()
+            && !self.headers.as_object().is_some_and(|headers| {
+                headers
+                    .keys()
+                    .any(|name| AUTH_HEADERS.contains(&name.to_ascii_lowercase().as_str()))
+            })
+    }
+}
+
 // OmniRoute registry/<id>/index.ts; Gemini uses Google's documented OpenAI compatibility API.
 pub const PROVIDERS: &[(&str, &str, &str)] = &[
     ("openai", KIND_OPENAI, "https://api.openai.com/v1"),
@@ -770,8 +786,7 @@ impl Expander<'_> {
                     deployment["quota"] = json!({"rpm":self.policy.workers_rpm});
                 }
                 if deployment["billing"] == "free" {
-                    if let Some(cond) =
-                        free_conditions::lookup(&c.base_url, &model, c.credential.is_none())
+                    if let Some(cond) = free_conditions::lookup(&c.base_url, &model, c.anonymous())
                     {
                         for &(field, value) in cond.quota {
                             deployment["quota"][field] = value.into();

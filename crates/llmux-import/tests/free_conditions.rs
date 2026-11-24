@@ -47,6 +47,10 @@ fn fixture() -> Value {
 }
 
 fn import(free_providers: &[(&str, &str)]) -> RuntimeConfig {
+    import_fixture(&fixture(), free_providers)
+}
+
+fn import_fixture(dump: &Value, free_providers: &[(&str, &str)]) -> RuntimeConfig {
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("llmux.toml");
     let free = dir.path().join("free-providers.json");
@@ -56,7 +60,7 @@ fn import(free_providers: &[(&str, &str)]) -> RuntimeConfig {
         .collect();
     fs::write(&free, serde_json::to_string(&entries).unwrap()).unwrap();
     llmux_import::import_with_options(
-        &fixture().to_string(),
+        &dump.to_string(),
         &output,
         None,
         &ImportOptions {
@@ -155,6 +159,34 @@ fn hosts_containing_a_table_row_as_substring_do_not_match() {
     let evil = deps["x/evil-model:free"];
     assert_eq!(evil.billing, Billing::Billed);
     assert_eq!(evil.quota.rpm, None);
+}
+
+#[test]
+fn header_authenticated_connections_are_not_anonymous() {
+    // A custom node with `authType = "none"` but an `Authorization` custom
+    // header is authenticated upstream, not per-IP anonymous — neither
+    // free-by-definition billing nor the anonymous cap applies.
+    let mut dump = fixture();
+    dump["provider_nodes"].as_array_mut().unwrap().push(json!(
+        {"id":"node-kilokeyed","type":"openai-compatible","prefix":"kk","api_type":"chat","base_url":"https://ai-gateway.kilo.ai/v1","chat_path":"","custom_headers_json":"{\"Authorization\":\"Bearer test-kilo-header\"}"}
+    ));
+    dump["provider_connections"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(
+            {"id":"kkc","provider":"node-kilokeyed","auth_type":"none","is_active":1,"priority":0}
+        ));
+    dump["combos"][0]["data"]["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(
+            {"kind":"model","providerId":"node-kilokeyed","model":"minimax/keyed-model","connectionId":"kkc"}
+        ));
+    let config = import_fixture(&dump, &[]);
+    let deps = by_model(&config);
+    let keyed = deps["minimax/keyed-model"];
+    assert_eq!(keyed.billing, Billing::Billed);
+    assert_eq!(keyed.quota.rpm, None);
 }
 
 #[test]
