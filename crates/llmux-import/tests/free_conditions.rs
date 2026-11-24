@@ -15,7 +15,8 @@ fn fixture() -> Value {
             {"id":"node-freemodel","type":"openai-compatible","prefix":"fm","api_type":"chat","base_url":"https://freemodel.in/v1","chat_path":"","custom_headers_json":"{}"},
             {"id":"node-cohere","type":"openai-compatible","prefix":"coh","api_type":"chat","base_url":"https://api.cohere.ai/compatibility/v1","chat_path":"","custom_headers_json":"{}"},
             {"id":"node-packet","type":"openai-compatible","prefix":"pk","api_type":"chat","base_url":"https://api.packet.ai/v1","chat_path":"","custom_headers_json":"{}"},
-            {"id":"node-samba","type":"openai-compatible","prefix":"sb","api_type":"chat","base_url":"https://api.sambanova.ai/v1","chat_path":"","custom_headers_json":"{}"}
+            {"id":"node-samba","type":"openai-compatible","prefix":"sb","api_type":"chat","base_url":"https://api.sambanova.ai/v1","chat_path":"","custom_headers_json":"{}"},
+            {"id":"node-evil","type":"openai-compatible","prefix":"ev","api_type":"chat","base_url":"https://openrouter.ai.evil.com/v1","chat_path":"","custom_headers_json":"{}"}
         ],
         "provider_connections": [
             {"id":"or","provider":"openrouter","auth_type":"apikey","is_active":1,"api_key":"test-or-secret","priority":0},
@@ -23,7 +24,8 @@ fn fixture() -> Value {
             {"id":"fmc","provider":"node-freemodel","auth_type":"apikey","is_active":1,"api_key":"test-fm-secret","priority":0},
             {"id":"cohc","provider":"node-cohere","auth_type":"apikey","is_active":1,"api_key":"test-coh-secret","priority":0},
             {"id":"pkc","provider":"node-packet","auth_type":"apikey","is_active":1,"api_key":"test-pk-secret","priority":0},
-            {"id":"sbc","provider":"node-samba","auth_type":"apikey","is_active":1,"api_key":"test-sb-secret","priority":0}
+            {"id":"sbc","provider":"node-samba","auth_type":"apikey","is_active":1,"api_key":"test-sb-secret","priority":0},
+            {"id":"evc","provider":"node-evil","auth_type":"apikey","is_active":1,"api_key":"test-ev-secret","priority":0}
         ],
         "combos": [
             {"id":"c1","name":"free-mix","data":{"name":"free-mix","strategy":"priority","models":[
@@ -32,8 +34,10 @@ fn fixture() -> Value {
                 {"kind":"model","providerId":"kilo","model":"minimax/minimax-m2.1","connectionId":"kiloanon"},
                 {"kind":"model","providerId":"node-freemodel","model":"claude-fable-5","connectionId":"fmc"},
                 {"kind":"model","providerId":"node-cohere","model":"command-a","connectionId":"cohc"},
+                {"kind":"model","providerId":"node-cohere","model":"command-r","connectionId":"cohc"},
                 {"kind":"model","providerId":"node-packet","model":"nvidia/DeepSeek-V4.1-Flash-NVFP4","connectionId":"pkc"},
-                {"kind":"model","providerId":"node-samba","model":"gpt-oss-120b","connectionId":"sbc"}
+                {"kind":"model","providerId":"node-samba","model":"gpt-oss-120b","connectionId":"sbc"},
+                {"kind":"model","providerId":"node-evil","model":"x/evil-model:free","connectionId":"evc"}
             ]}}
         ],
         "api_keys": [{"id":"client","key":"test-db-client-secret","is_active":1,"allowed_models":[]}],
@@ -133,10 +137,24 @@ fn key_gated_free_legs_get_caps_only_with_evidence() {
     assert_eq!(fm.quota.tpm, Some(100_000));
     let cohere = deps["command-a"];
     assert_eq!(cohere.quota.rpm, Some(20));
+    // [C1] covers the Command A family only — a `command-r` leg on the same
+    // host keeps no free-tier cap.
+    assert_eq!(deps["command-r"].quota.rpm, None);
     let samba = deps["gpt-oss-120b"];
     assert_eq!(samba.quota.rpm, Some(20));
     assert_eq!(samba.quota.rpd, Some(20));
     assert_eq!(samba.quota.tpd, Some(200_000));
+}
+
+#[test]
+fn hosts_containing_a_table_row_as_substring_do_not_match() {
+    // `openrouter.ai.evil.com` contains `openrouter.ai` but is a different
+    // host: no `:free` free-by-definition, no documented caps.
+    let config = import(&[]);
+    let deps = by_model(&config);
+    let evil = deps["x/evil-model:free"];
+    assert_eq!(evil.billing, Billing::Billed);
+    assert_eq!(evil.quota.rpm, None);
 }
 
 #[test]

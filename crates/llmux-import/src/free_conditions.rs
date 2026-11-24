@@ -13,13 +13,17 @@
 //! emitted bound is the closest safe one.
 
 /// One provider's documented free-tier conditions, keyed on the connection's
-/// base URL host substring.
+/// base URL host.
 pub(super) struct Conditions {
-    /// Host substring matched against `Connection.base_url`.
+    /// Exact base URL host the row applies to — substring matches would let
+    /// `notfreemodel.in` or `openrouter.ai.evil.com` take another host's caps.
     pub host: &'static str,
     /// Only legs whose upstream model leaf ends with this suffix qualify
     /// (OpenRouter `*:free` variants).
     pub model_suffix: Option<&'static str>,
+    /// Only legs whose upstream model leaf starts with this prefix qualify
+    /// (Cohere's Command A family, per [C1]).
+    pub model_prefix: Option<&'static str>,
     /// Only legs without a credential qualify (per-IP anonymous allowances).
     pub anonymous_only: bool,
     /// Whether matching alone marks the leg `billing = "free"` — only for
@@ -40,6 +44,7 @@ const TABLE: &[Conditions] = &[
     Conditions {
         host: "openrouter.ai",
         model_suffix: Some(":free"),
+        model_prefix: None,
         anonymous_only: false,
         asserts_free: true,
         quota: &[("rpm", 20), ("rpd", 50)],
@@ -52,6 +57,7 @@ const TABLE: &[Conditions] = &[
     Conditions {
         host: "ai-gateway.kilo.ai",
         model_suffix: None,
+        model_prefix: None,
         anonymous_only: true,
         asserts_free: true,
         quota: &[("rpm", 3)],
@@ -63,16 +69,19 @@ const TABLE: &[Conditions] = &[
     Conditions {
         host: "freemodel.in",
         model_suffix: None,
+        model_prefix: None,
         anonymous_only: false,
         asserts_free: false,
         quota: &[("rpm", 60), ("tpm", 100_000)],
         expires_at: None,
     },
     // Cohere trial Command A family: 20 RPM [C1]. The 1,000 calls/month cap
-    // is not expressible.
+    // is not expressible. [C1] rates the Command A family only, so the row
+    // is scoped to `command-a*` leaves.
     Conditions {
         host: "api.cohere.ai",
         model_suffix: None,
+        model_prefix: Some("command-a"),
         anonymous_only: false,
         asserts_free: false,
         quota: &[("rpm", 20)],
@@ -82,6 +91,7 @@ const TABLE: &[Conditions] = &[
     Conditions {
         host: "api.sambanova.ai",
         model_suffix: None,
+        model_prefix: None,
         anonymous_only: false,
         asserts_free: false,
         quota: &[("rpm", 20), ("rpd", 20), ("tpd", 200_000)],
@@ -92,6 +102,7 @@ const TABLE: &[Conditions] = &[
     Conditions {
         host: "api.packet.ai",
         model_suffix: None,
+        model_prefix: None,
         anonymous_only: false,
         asserts_free: false,
         quota: &[],
@@ -101,12 +112,17 @@ const TABLE: &[Conditions] = &[
 
 /// The conditions matching a leg, if any row applies.
 pub(super) fn lookup(base_url: &str, model: &str, anonymous: bool) -> Option<&'static Conditions> {
+    let host = crate::policy::host(base_url);
+    let leaf = model.rsplit('/').next().unwrap_or(model);
     TABLE.iter().find(|cond| {
-        base_url.contains(cond.host)
+        host == cond.host
             && (!cond.anonymous_only || anonymous)
             && cond
                 .model_suffix
-                .is_none_or(|suffix| model.rsplit('/').next().unwrap_or(model).ends_with(suffix))
+                .is_none_or(|suffix| leaf.ends_with(suffix))
+            && cond
+                .model_prefix
+                .is_none_or(|prefix| leaf.starts_with(prefix))
     })
 }
 

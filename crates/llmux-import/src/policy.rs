@@ -58,7 +58,7 @@ pub(super) fn billed(connection: &Connection, model: &str, policy: &Policy) -> b
     }
 }
 
-fn host(base_url: &str) -> String {
+pub(super) fn host(base_url: &str) -> String {
     let authority = base_url
         .split("://")
         .nth(1)
