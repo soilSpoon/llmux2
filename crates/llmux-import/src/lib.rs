@@ -441,23 +441,49 @@ fn glob_list(value: Option<&Value>) -> Option<Vec<String>> {
         .collect()
 }
 
+/// Restricted fields OmniRoute enforces outside model access that have no
+/// llmux2 equivalent and do not change which models a key may call: API
+/// scopes (llmux2 keys are chat-only), combo/connection allowlists
+/// (OmniRoute object ids — the objects they name cease to exist
+/// post-migration, and the emitted `models`/`blocked` lists are the access
+/// gate), the catalog-scope flag (the `models` list already gates /models),
+/// and the machine binding (embedded in the key value itself).
+const OMNIROUTE_INTERNAL_FIELDS: &[&str] = &[
+    "scopes",
+    "allowedcombos",
+    "allowedconnections",
+    "catalogscope",
+    "machineid",
+];
+
 /// A restricted key is portable only when its whole restriction is
 /// `model_access_mode = restricted` plus `allowed_models`/`blocked_models`
 /// glob lists, which `server.key_policies` expresses exactly (blocked
-/// matches always win). Any other restricted field — ip allowlists, scopes,
-/// quotas, rate limits, combos, schedules — has no llmux2 equivalent, so
-/// the key keeps the fail-closed skip rather than silently widening access.
-fn portable_key_policy(key: &Value) -> Option<(Vec<String>, Vec<String>)> {
+/// matches always win), and OmniRoute-internal fields — the model lists are
+/// ported, the internals are dropped and named in a warning. Any other
+/// restricted field — ip allowlists, quotas, rate limits, schedules —
+/// has no llmux2 equivalent, so the key keeps the fail-closed skip rather
+/// than silently widening access.
+fn portable_key_policy(key: &Value) -> Option<(Vec<String>, Vec<String>, Vec<String>)> {
     if key_field(key, "modelaccessmode").and_then(Value::as_str) != Some("restricted") {
         return None;
     }
+    let mut dropped = Vec::new();
     let mut stripped = key.clone();
-    stripped.as_object_mut()?.retain(|field, _| {
+    stripped.as_object_mut()?.retain(|field, value| {
+        let name = field.replace('_', "").to_ascii_lowercase();
+        if OMNIROUTE_INTERNAL_FIELDS.contains(&name.as_str()) {
+            if !value_is_unset(Some(value)) {
+                dropped.push(field.clone());
+            }
+            return false;
+        }
         !matches!(
-            field.replace('_', "").to_ascii_lowercase().as_str(),
+            name.as_str(),
             "allowedmodels" | "blockedmodels" | "modelaccessmode"
         )
     });
+    dropped.sort_unstable();
     if !unrestricted_client_key(&stripped) {
         return None;
     }
@@ -471,7 +497,18 @@ fn portable_key_policy(key: &Value) -> Option<(Vec<String>, Vec<String>)> {
         None | Some(Value::Null) => Vec::new(),
         value => glob_list(value)?,
     };
-    Some((allowed, blocked))
+    Some((allowed, blocked, dropped))
+}
+
+fn value_is_unset(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => true,
+        Some(Value::Array(items)) => items.is_empty(),
+        Some(Value::String(text)) => text.is_empty(),
+        Some(Value::Bool(flag)) => !*flag,
+        Some(Value::Number(number)) => number.as_f64() == Some(0.0),
+        _ => false,
+    }
 }
 
 fn write_secret(dir: &Path, id: &str, secret: &str) -> Result<String, String> {
@@ -1725,11 +1762,17 @@ pub fn import_with_options(
         };
         let id = unique(&format!("client-{i}"), &mut ids);
         let key_ref = write_secret(&dir, &id, key["key"].as_str().unwrap())?;
-        if let Some((models, blocked)) = policy {
+        if let Some((models, blocked, dropped)) = policy {
             key_policies.push(json!({"key": key_ref, "models": models, "blocked": blocked}));
-            warnings.push(format!(
-                "client key {i}: restricted model lists ported to server.key_policies"
-            ));
+            let mut warning =
+                format!("client key {i}: restricted model lists ported to server.key_policies");
+            if !dropped.is_empty() {
+                warning.push_str(&format!(
+                    "; dropped OmniRoute-internal fields {}",
+                    dropped.join(", ")
+                ));
+            }
+            warnings.push(warning);
         }
         client_keys.push(key_ref);
     }

@@ -440,8 +440,37 @@ THEN the emitted config authenticates the key and binds it to a
 #### Scenario: Untranslatable restriction stays closed
 
 WHEN an export key combines model lists with a restriction llmux2 cannot
-express, such as `ip_allowlist` or `scopes`
+express, such as `ip_allowlist` or `rate_limits`
 THEN the key is skipped with a warning and no secret file is written for it.
+
+### Requirement: SQLite dump key fields normalize before the port
+
+API key rows from a SQLite table dump SHALL have their JSON-encoded text
+columns (`allowed_models`, `blocked_models`, `allowed_combos`,
+`allowed_connections`, `allowed_quotas`, `allowed_endpoints`,
+`ip_allowlist`, `rate_limits`, `scopes`, `preferred_connections`) parsed
+into arrays during normalization so dump-form and export-form rows behave
+identically downstream.
+
+A restricted key that also carries OmniRoute-internal fields — `scopes`,
+`allowedCombos`, `allowedConnections`, `catalogScope`, `machineId` — SHALL
+still port its model lists; the importer drops those fields and emits a
+warning naming each dropped field. A restricted field outside that list
+(ip allowlists, quotas, rate limits, schedules, forced models) keeps the
+fail-closed skip.
+
+#### Scenario: Dump row with internal fields still ports
+
+WHEN a dump `api_keys` row is `restricted` with string-encoded
+`allowed_models`/`blocked_models` and non-empty `scopes`,
+`allowed_combos`, `allowed_connections`, `catalog_scope`, `machine_id`
+THEN the key imports, `server.key_policies` carries the parsed model
+lists, and a warning names the dropped fields.
+
+#### Scenario: Real restriction outside the internal list stays closed
+
+WHEN a dump `api_keys` row is `restricted` with a `rate_limits` entry
+THEN the key is skipped with a warning and no secret file is written.
 
 ### Requirement: Revenue-oriented allocation
 
