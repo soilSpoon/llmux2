@@ -403,7 +403,10 @@ immediately), feeding
 routes are dropped without manual pruning. The scheduled import SHALL carry
 the site's supplemental importer options, the deployed slot's listen
 address, and the site's overlay (`--overlay`, merging `[server]`/`[routing]`
-settings and site-added credentials/models), and SHALL never delete secrets
+settings and site-added credentials/models; a `[[credentials]]` overlay row
+whose `id` matches an emitted credential SHALL merge its fields into that
+row — this is how a site marks an emitted credential `disabled`), and SHALL
+never delete secrets
 the deployed config still references. The prune SHALL shred the credential
 export on every exit — success, failure, or abort — and deploy the installed release binary.
 

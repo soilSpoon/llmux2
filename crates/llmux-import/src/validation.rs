@@ -159,7 +159,7 @@ pub(super) fn validate(config: &Value, dir: &Path) -> Result<(), String> {
     let mut markers: HashMap<String, ValidationMarker> = HashMap::new();
     substitute_refs(&mut config, dir, &mut markers)?;
     (|| {
-        let value = toml::Value::try_from(&config).map_err(|_| "could not encode configuration")?;
+        let value = super::config_to_toml(&config)?;
         let content = toml::to_string(&value).map_err(|_| "could not encode configuration")?;
         llmux_config::RuntimeConfig::parse(&content)
             .map(|_| ())
