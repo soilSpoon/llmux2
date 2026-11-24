@@ -2114,6 +2114,7 @@ mod tests {
             base_url: "https://openrouter.ai/v1".parse().unwrap(),
             upstream_model: "google/test:free".into(),
             strip_request_fields: Box::default(),
+            shared_quota: None,
             priority: 0,
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(5),
