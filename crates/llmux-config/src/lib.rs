@@ -527,6 +527,11 @@ impl RawConfig {
                                     "acp_agent env names must be nonempty and must not contain '='",
                                 ));
                             }
+                            if name == "HOME" || name.starts_with("XDG_") {
+                                return Err(invalid(
+                                    "acp_agent env may not override the sandbox HOME or XDG_* dirs",
+                                ));
+                            }
                             let value = if value.starts_with("env:") || value.starts_with("file:") {
                                 resolve_reference(value)?
                             } else {
@@ -1857,6 +1862,9 @@ upstream_model = "upstream"
     }
 
     fn acp_config(fields: &str) -> String {
+        // nextest runs each test in its own process: the env ref must be
+        // populated here, not leaked from another test's fixture.
+        std::env::set_var("LLMUX_CONFIG_OAUTH_TEST_SECRET", "test-secret");
         format!(
             r#"
 [server]
@@ -2010,6 +2018,8 @@ upstream_model = "upstream"
             ("command = \"/usr/bin/env\"", "command = \"\""),
             ("home = \"/tmp/agent-home\"", "home = \"agent-home\""),
             ("home = \"/tmp/agent-home\"", "home = \"\""),
+            ("AGENT_FLAG = \"on\"", "HOME = \"/elsewhere\""),
+            ("AGENT_FLAG = \"on\"", "XDG_DATA_HOME = \"/elsewhere\""),
         ] {
             let err = swap(from, to)
                 .err()
