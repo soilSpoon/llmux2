@@ -117,6 +117,28 @@ fn canonical_map_keeps_suffixed_names_as_distinct_entries() {
 }
 
 #[test]
+fn suffixed_mapping_alias_is_kept_when_stacked_suffixes_match_unordered() {
+    let mut root = fixture();
+    root["combos"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"fable-fast-low-id","name":"claude-fable-5-fast-low","models":["vendor/claude-fable-5-fast-low"]}));
+    root["modelComboMappings"] = json!([
+        {"pattern":"vendor/claude-fable-5-low-fast","comboId":"fable-fast-low-id","enabled":true}
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let config = RuntimeConfig::load(&output).unwrap();
+    // Same suffix set in a different order: still the same model, so the
+    // spelling resolves onto the combo rather than staying distinct.
+    assert_eq!(
+        config.model_names["vendor/claude-fable-5-low-fast"],
+        config.model_names["claude-fable-5-fast-low"]
+    );
+}
+
+#[test]
 fn canonical_map_drops_suffixed_names_excluded_from_the_import() {
     let mut root = fixture();
     root["modelComboMappings"] =

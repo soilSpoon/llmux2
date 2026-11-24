@@ -238,9 +238,13 @@ pub(super) fn prepare(
         // target: the suffix is part of the model id, so the name stays
         // distinct and falls through to the catch-all, which forwards it to
         // the real suffixed upstream. Suffix-free renames (a plain alias to
-        // a suffixed model) still resolve.
-        let name_suffixes = meaningful_suffixes(name);
-        if !name_suffixes.is_empty() && name_suffixes != meaningful_suffixes(&terminal) {
+        // a suffixed model) still resolve, and so does the same suffix set in
+        // a different order — sets compare equal regardless of strip order.
+        let mut name_suffixes = meaningful_suffixes(name);
+        name_suffixes.sort_unstable();
+        let mut target_suffixes = meaningful_suffixes(&terminal);
+        target_suffixes.sort_unstable();
+        if !name_suffixes.is_empty() && name_suffixes != target_suffixes {
             warnings.push(format!(
                 "alias {name}: suffix differs from target {terminal}; left unmerged"
             ));
