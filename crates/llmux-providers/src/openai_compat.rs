@@ -376,16 +376,29 @@ pub(crate) fn rewrite_model(body: &Bytes, model: &str) -> Result<Bytes, BuildErr
     Ok(rewritten.freeze())
 }
 
-/// A client-supplied `models` fallback array (OpenRouter paid fallbacks) can
-/// spend money even when the rewritten `model` is free, so free legs always
-/// drop it on top of the deployment's configured strips.
+/// Client-controlled spend knobs — paid model fallbacks (`models`), billed
+/// addons (`plugins`, `web_search_options`), and provider/tier overrides
+/// (`provider`, `service_tier`) — can cost money even when the rewritten
+/// `model` is free, so free legs always drop them on top of the deployment's
+/// configured strips.
+const FREE_STRIP_FIELDS: &[ChatRequestField] = &[
+    ChatRequestField::Models,
+    ChatRequestField::Plugins,
+    ChatRequestField::Provider,
+    ChatRequestField::ServiceTier,
+    ChatRequestField::WebSearchOptions,
+];
+
 fn strip_fields(dep: &Deployment) -> Cow<'_, [ChatRequestField]> {
-    if dep.billing != Billing::Free || dep.strip_request_fields.contains(&ChatRequestField::Models)
-    {
+    if dep.billing != Billing::Free {
         return Cow::Borrowed(&dep.strip_request_fields[..]);
     }
     let mut strip = dep.strip_request_fields.to_vec();
-    strip.push(ChatRequestField::Models);
+    for field in FREE_STRIP_FIELDS {
+        if !strip.contains(field) {
+            strip.push(*field);
+        }
+    }
     Cow::Owned(strip)
 }
 
@@ -411,6 +424,10 @@ pub(crate) fn strip_request_fields(
             ChatRequestField::TopP => "top_p",
             ChatRequestField::TopK => "top_k",
             ChatRequestField::Models => "models",
+            ChatRequestField::Plugins => "plugins",
+            ChatRequestField::Provider => "provider",
+            ChatRequestField::ServiceTier => "service_tier",
+            ChatRequestField::WebSearchOptions => "web_search_options",
             ChatRequestField::ReasoningEffort => {
                 if let Some(mut object) = fields
                     .get("reasoning")
@@ -2109,7 +2126,7 @@ mod tests {
             model: "alias".into(),
             stream: false,
             body: Bytes::from_static(
-                br#"{"model":"alias","models":["google/test:free","openai/paid-model"],"messages":[]}"#,
+                br#"{"model":"alias","models":["google/test:free","openai/paid-model"],"plugins":[{"id":"web","engine":"exa"}],"provider":{"only":["PaidProvider"],"allow_fallbacks":true},"service_tier":"priority","web_search_options":{"search_context_size":"high"},"transforms":["middle-out"],"messages":[]}"#,
             ),
             est_input_tokens: 0,
             anthropic_headers: HeaderMap::new(),
@@ -2126,10 +2143,21 @@ mod tests {
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(upstream.body()).unwrap();
-        // A paid fallback in the client `models` array would spend money on a
-        // leg classified free — the array never reaches upstream.
+        // Paid fallbacks in `models`, billed addons in `plugins`, and
+        // route/provider/tier overrides would spend money on a leg classified
+        // free — none reaches upstream.
         assert_eq!(body["model"], "google/test:free");
-        assert!(body.get("models").is_none());
+        for field in [
+            "models",
+            "plugins",
+            "provider",
+            "service_tier",
+            "web_search_options",
+        ] {
+            assert!(body.get(field).is_none(), "{field}");
+        }
+        // Free features like transforms stay.
+        assert_eq!(body["transforms"], serde_json::json!(["middle-out"]));
         // A billed leg keeps client fallbacks untouched.
         let billed_dep = Deployment {
             billing: Billing::Billed,
@@ -2143,6 +2171,19 @@ mod tests {
         assert_eq!(
             body["models"],
             serde_json::json!(["google/test:free", "openai/paid-model"])
+        );
+        assert_eq!(
+            body["plugins"],
+            serde_json::json!([{"id": "web", "engine": "exa"}])
+        );
+        assert_eq!(
+            body["provider"],
+            serde_json::json!({"only": ["PaidProvider"], "allow_fallbacks": true})
+        );
+        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(
+            body["web_search_options"],
+            serde_json::json!({"search_context_size": "high"})
         );
     }
 

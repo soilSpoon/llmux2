@@ -112,16 +112,17 @@ struct Connection {
 impl Connection {
     /// True only when the leg reaches upstream with no authentication — the
     /// sole case a per-IP anonymous offer can apply. A custom node may carry
-    /// an `Authorization`-style custom header with `auth_type = "none"` and
-    /// no credential; it is authenticated, not anonymous.
+    /// headers that authenticate upstream (`Authorization`, cookies, tokens)
+    /// with `auth_type = "none"` and no credential; rather than enumerate
+    /// every auth-bearing header name, any custom header marks the leg
+    /// authenticated — a false positive only forgoes a free tag, never admits
+    /// a keyed leg into a per-IP allowance.
     fn anonymous(&self) -> bool {
-        const AUTH_HEADERS: &[&str] = &["authorization", "x-api-key", "api-key"];
         self.credential.is_none()
-            && !self.headers.as_object().is_some_and(|headers| {
-                headers
-                    .keys()
-                    .any(|name| AUTH_HEADERS.contains(&name.to_ascii_lowercase().as_str()))
-            })
+            && !self
+                .headers
+                .as_object()
+                .is_some_and(|headers| !headers.is_empty())
     }
 }
 

@@ -190,6 +190,36 @@ fn header_authenticated_connections_are_not_anonymous() {
 }
 
 #[test]
+fn any_custom_header_makes_a_credentialess_connection_authenticated() {
+    // Non-standard auth headers (cookie, session, auth-token) authenticate
+    // upstream just like Authorization — a per-IP anonymous offer never
+    // applies to a leg carrying custom headers at all.
+    for (index, header) in ["X-Auth-Token", "Cookie", "X-Session"].iter().enumerate() {
+        let mut dump = fixture();
+        dump["provider_nodes"].as_array_mut().unwrap().push(json!(
+            {"id":format!("node-h{index}"),"type":"openai-compatible","prefix":format!("h{index}"),"api_type":"chat","base_url":"https://ai-gateway.kilo.ai/v1","chat_path":"","custom_headers_json":format!("{{\"{header}\":\"test-value\"}}")}
+        ));
+        dump["provider_connections"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(
+                {"id":format!("h{index}c"),"provider":format!("node-h{index}"),"auth_type":"none","is_active":1,"priority":0}
+            ));
+        dump["combos"][0]["data"]["models"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(
+                {"kind":"model","providerId":format!("node-h{index}"),"model":format!("minimax/h{index}-model"),"connectionId":format!("h{index}c")}
+            ));
+        let config = import_fixture(&dump, &[]);
+        let deps = by_model(&config);
+        let leg = deps[&format!("minimax/h{index}-model")];
+        assert_eq!(leg.billing, Billing::Billed, "{header}");
+        assert_eq!(leg.quota.rpm, None, "{header}");
+    }
+}
+
+#[test]
 fn time_boxed_free_legs_get_expires_at() {
     let config = import(&[(
         "api.packet.ai",
