@@ -3,7 +3,7 @@
 //! The raw identifier is never logged and never copied into an error string.
 
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
-use llmux_config::{RemoteImages, ServerConfig};
+use llmux_config::{KeyPolicy, RemoteImages, ServerConfig};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -309,6 +309,48 @@ fn is_b64(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'-' | b'_' | b'=')
 }
 
+/// Whether a restricted key may request `model`. An empty `models` list
+/// allows every name; a `blocked` match always wins.
+pub(crate) fn allows_model(policy: &KeyPolicy, model: &str) -> bool {
+    (policy.models.is_empty()
+        || policy
+            .models
+            .iter()
+            .any(|pattern| glob_match(pattern, model)))
+        && !policy
+            .blocked
+            .iter()
+            .any(|pattern| glob_match(pattern, model))
+}
+
+/// Byte-wise glob: `*` spans any run (including `/`), `?` one byte, other
+/// bytes literal. Case-sensitive: model ids keep their case end to end.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let (pattern, text) = (pattern.as_bytes(), text.as_bytes());
+    let (mut p, mut t) = (0, 0);
+    let (mut star, mut star_t) = (usize::MAX, 0);
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = p;
+            star_t = t;
+            p += 1;
+        } else if star != usize::MAX {
+            p = star + 1;
+            star_t += 1;
+            t = star_t;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +366,7 @@ mod tests {
         ServerConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             client_keys: Box::new([]),
+            key_policies: Box::new([]),
             request_timeout: Duration::from_secs(1),
             shutdown_timeout: Duration::from_secs(1),
             drain_grace: Duration::from_millis(0),
@@ -470,5 +513,55 @@ mod tests {
         let allow = server(RemoteImages::Allow, None, true);
         assert!(check_images(remote, &allow).is_ok());
         assert!(check_images(too_big, &allow).is_ok());
+    }
+
+    #[test]
+    fn glob_match_semantics() {
+        for (pattern, text) in [
+            ("*", ""),
+            ("*", "any.thing/at all"),
+            ("claude-*", "claude-good"),
+            ("claude-*", "claude-"),
+            ("a/*", "a/b/c"), // `*` spans `/`
+            ("a?c", "abc"),
+            ("a?c", "a/c"), // `?` matches `/` too
+            ("exact?y", "exactly"),
+            ("abc", "abc"),
+            ("a**b", "ab"), // consecutive stars collapse
+            ("a*b*c", "aXYZbZc"),
+        ] {
+            assert!(glob_match(pattern, text), "{pattern} ~ {text}");
+        }
+        for (pattern, text) in [
+            ("", "x"),
+            ("claude-*", "Claude-good"), // case-sensitive
+            ("claude-*", "claude"),
+            ("a/*", "a"),
+            ("a?c", "ac"), // `?` must match exactly one byte
+            ("a?c", "abbc"),
+            ("abc", "abd"),
+            ("a*b", "ac"),
+            ("b", "abc"),
+        ] {
+            assert!(!glob_match(pattern, text), "{pattern} ~ {text}");
+        }
+    }
+
+    #[test]
+    fn key_policy_allows_except_blocked() {
+        let policy = |models: &[&str], blocked: &[&str]| KeyPolicy {
+            models: models.iter().map(|s| s.to_string()).collect(),
+            blocked: blocked.iter().map(|s| s.to_string()).collect(),
+        };
+        let p = policy(&["claude-*", "vendor/*"], &["vendor/blocked-*"]);
+        assert!(allows_model(&p, "claude-x"));
+        assert!(allows_model(&p, "vendor/ok"));
+        assert!(!allows_model(&p, "vendor/blocked-x"));
+        assert!(!allows_model(&p, "gpt-4"));
+
+        // Blocked-only means allow-all minus blocked.
+        let p = policy(&[], &["zc/*"]);
+        assert!(allows_model(&p, "anything"));
+        assert!(!allows_model(&p, "zc/one"));
     }
 }

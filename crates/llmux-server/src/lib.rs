@@ -222,9 +222,14 @@ async fn build(
 
 async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let active = state.active.load();
-    if !authorized(&headers, &active.config.server.client_keys) {
+    // Bearer-only identity, same extraction as `authorized`.
+    let Some(client_key) = matched_key(
+        &headers,
+        &active.config.server.client_keys,
+        InboundFormat::OpenAiChat,
+    ) else {
         return unauthorized();
-    }
+    };
     let live = if catalog::has_devin(&active.config) {
         let kick = state.catalog.kick();
         if kick.inflight && state.catalog.loaded().is_none() {
@@ -235,8 +240,15 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         None
     };
     let ids = catalog::listed_ids(&active.config, live.as_deref());
+    let key_policy = active
+        .config
+        .server
+        .key_policies
+        .get(client_key.index)
+        .and_then(Option::as_ref);
     let data: Vec<_> = ids
         .into_iter()
+        .filter(|&id| key_policy.is_none_or(|p| policy::allows_model(p, id)))
         .map(|id| {
             // `free` only when the model has at least one non-fallback leg and
             // every non-fallback leg is marked free; a missing marker is billed.
@@ -314,10 +326,11 @@ async fn messages(State(state): State<Arc<AppState>>, request: Request) -> Respo
 
 async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) -> Response {
     let active = state.active.load();
-    let client_key = matched_key(request.headers(), &active.config.server.client_keys, format);
-    if client_key.is_none() {
+    let Some(client_key) =
+        matched_key(request.headers(), &active.config.server.client_keys, format)
+    else {
         return unauthorized();
-    }
+    };
     if catalog::has_devin(&active.config) {
         state.catalog.kick();
     }
@@ -345,7 +358,7 @@ async fn execute_authorized(
     active: &Active,
     request: Request,
     format: InboundFormat,
-    client_key: Option<Arc<str>>,
+    client_key: MatchedKey,
 ) -> Response {
     let context_overflow = match request.headers().get(CONTEXT_OVERFLOW_HEADER) {
         None => None,
@@ -412,7 +425,7 @@ async fn route_request(
     format: InboundFormat,
     context_overflow: Option<ContextOverflow>,
     end_user: Option<Arc<str>>,
-    client_key: Option<Arc<str>>,
+    client_key: MatchedKey,
 ) -> Response {
     let Ok(metadata) = RequestMetadata::parse(&body, format) else {
         return error(
@@ -447,6 +460,22 @@ async fn route_request(
         }
     };
     let model: Arc<str> = Arc::from(metadata.model.as_ref());
+    // A listed key may request only names its policy allows — checked on the
+    // requested id before any alias, canonical, or catch-all resolution.
+    if active
+        .config
+        .server
+        .key_policies
+        .get(client_key.index)
+        .and_then(Option::as_ref)
+        .is_some_and(|key_policy| !policy::allows_model(key_policy, &model))
+    {
+        return error(
+            StatusCode::FORBIDDEN,
+            "model_not_allowed",
+            "Gateway key is not allowed to use this model",
+        );
+    }
     if active
         .config
         .model_names
@@ -497,7 +526,7 @@ async fn route_request(
         anthropic_headers: anthropic_headers.clone(),
         request_id: request_id.clone(),
         end_user: end_user.clone(),
-        client_key: client_key.clone(),
+        client_key: Some(client_key.fingerprint.clone()),
     };
 
     let mut dropped = 0;
@@ -616,9 +645,20 @@ fn authorized_for_format(headers: &HeaderMap, keys: &[Arc<str>], format: Inbound
     matched_key(headers, keys, format).is_some()
 }
 
-/// Constant-time scan that also returns which key matched, so the request log
-/// can attribute the call by key fingerprint rather than the secret itself.
-fn matched_key(headers: &HeaderMap, keys: &[Arc<str>], format: InboundFormat) -> Option<Arc<str>> {
+/// Which configured client key a request presented: the index into
+/// `server.client_keys` (for per-key policy) and the `key_` fingerprint that
+/// attributes the request log without holding the secret.
+struct MatchedKey {
+    index: usize,
+    fingerprint: Arc<str>,
+}
+
+/// Constant-time scan that also returns which key matched.
+fn matched_key(
+    headers: &HeaderMap,
+    keys: &[Arc<str>],
+    format: InboundFormat,
+) -> Option<MatchedKey> {
     let presented: Vec<u8> = if format == InboundFormat::AnthropicMessages
         && !headers.contains_key(header::AUTHORIZATION)
     {
@@ -640,30 +680,35 @@ fn matched_key(headers: &HeaderMap, keys: &[Arc<str>], format: InboundFormat) ->
         value.1.trim_start_matches(' ').as_bytes().to_vec()
     };
     keys.iter()
-        .find(|key| bool::from(key.as_bytes().ct_eq(&presented)))
-        .map(|key| {
-            // Pepper the fingerprint with a hash of the configured key set so
-            // a log reader cannot confirm a guessed low-entropy key without
-            // knowing every configured key. Keys are hashed sorted so a
-            // reload that only reorders them keeps the same fingerprints.
-            let mut ordered: Vec<&Arc<str>> = keys.iter().collect();
-            ordered.sort();
-            let mut pepper = Sha256::new();
-            for configured in ordered {
-                pepper.update(configured.as_bytes());
-                pepper.update([0]);
-            }
-            let pepper = pepper.finalize();
-            let mut hasher = Sha256::new();
-            hasher.update(pepper);
-            hasher.update(key.as_bytes());
-            let digest = hasher.finalize();
-            let mut fingerprint = String::from("key_");
-            for byte in &digest[..8] {
-                fingerprint.push_str(&format!("{byte:02x}"));
-            }
-            Arc::from(fingerprint)
+        .position(|key| bool::from(key.as_bytes().ct_eq(&presented)))
+        .map(|index| MatchedKey {
+            index,
+            fingerprint: key_fingerprint(keys, &keys[index]),
         })
+}
+
+fn key_fingerprint(keys: &[Arc<str>], key: &Arc<str>) -> Arc<str> {
+    // Pepper the fingerprint with a hash of the configured key set so
+    // a log reader cannot confirm a guessed low-entropy key without
+    // knowing every configured key. Keys are hashed sorted so a
+    // reload that only reorders them keeps the same fingerprints.
+    let mut ordered: Vec<&Arc<str>> = keys.iter().collect();
+    ordered.sort();
+    let mut pepper = Sha256::new();
+    for configured in ordered {
+        pepper.update(configured.as_bytes());
+        pepper.update([0]);
+    }
+    let pepper = pepper.finalize();
+    let mut hasher = Sha256::new();
+    hasher.update(pepper);
+    hasher.update(key.as_bytes());
+    let digest = hasher.finalize();
+    let mut fingerprint = String::from("key_");
+    for byte in &digest[..8] {
+        fingerprint.push_str(&format!("{byte:02x}"));
+    }
+    Arc::from(fingerprint)
 }
 
 fn without_gateway_routing_fields(body: &[u8]) -> Option<Bytes> {
@@ -859,8 +904,10 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer sk-beta"),
         );
-        let before = matched_key(&headers, &keys, InboundFormat::OpenAiChat);
-        let after = matched_key(&headers, &reordered, InboundFormat::OpenAiChat);
+        let before = matched_key(&headers, &keys, InboundFormat::OpenAiChat)
+            .map(|matched| matched.fingerprint);
+        let after = matched_key(&headers, &reordered, InboundFormat::OpenAiChat)
+            .map(|matched| matched.fingerprint);
         assert_eq!(before, after);
     }
 }

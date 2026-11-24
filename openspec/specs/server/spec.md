@@ -2,10 +2,61 @@
 
 ## Purpose
 
-Inbound request policy that runs before any upstream call: end-user identity
-and image intake.
+Inbound request policy that runs before any upstream call: end-user identity,
+per-key model restrictions, and image intake.
 
 ## Requirements
+
+### Requirement: Per-key model policy
+
+`[server]` SHALL accept optional `[[server.key_policies]]` entries, each naming
+one `server.client_keys` secret reference as `key` plus glob lists `models` and
+`blocked`. A client key with no entry SHALL be unrestricted. For a listed key,
+the requested `model` field — before alias, canonical, or catch-all resolution —
+SHALL match at least one `models` glob (an absent or empty `models` allows every
+name) and no `blocked` glob, on every inbound format that resolves a model;
+otherwise the gateway SHALL return 403 `model_not_allowed` before any upstream
+call, in the same error shape as per-model `allowed_keys`. Globs SHALL match
+ASCII case-sensitively with `*` spanning any substring including `/` and `?`
+matching exactly one byte.
+
+Config SHALL reject a `key_policies` entry whose `key` does not resolve to a
+`server.client_keys` value, a repeated key, an empty pattern, and an entry with
+no `models` and no `blocked` (allow-all minus nothing is meaningless). The
+check SHALL use the same matched-key identity as authentication and
+`allowed_keys`, so it covers chat completions, `/v1/responses`, and Anthropic
+`/v1/messages` keys presented as bearer or `x-api-key` credentials.
+
+`GET /v1/models` SHALL list only names the requesting key's policy allows; an
+unrestricted key's list SHALL be unchanged and the `*` catch-all SHALL never
+appear for either.
+
+#### Scenario: Listed key denied a non-matching name
+
+WHEN a restricted key requests a model no `models` glob matches
+THEN the gateway returns 403 `model_not_allowed` without an upstream call.
+
+#### Scenario: Blocked wins over allowed
+
+WHEN a requested name matches both `models` and `blocked`
+THEN the request is rejected 403 even though an allow glob matched.
+
+#### Scenario: Unlisted key unchanged
+
+WHEN a key has no `key_policies` entry
+THEN any configured or catch-all-routed name works as before
+AND `GET /v1/models` returns the full configured list.
+
+#### Scenario: Listing filtered
+
+WHEN a restricted key calls `GET /v1/models`
+THEN only configured names and aliases matching its policy appear
+AND `*` is not listed for any key.
+
+#### Scenario: Policy bound to a non-client key
+
+WHEN `key_policies[].key` resolves to a secret absent from `client_keys`
+THEN config load fails with a `client_keys` validation error.
 
 ### Requirement: Hashed end-user identity
 
