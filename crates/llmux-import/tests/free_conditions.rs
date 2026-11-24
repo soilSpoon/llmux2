@@ -88,11 +88,16 @@ fn openrouter_free_variants_get_the_documented_caps_and_free_billing() {
     // Free-by-definition: the `:free` variant suffix is provider-documented
     // evidence, no --free-providers flag needed.
     assert_eq!(free.billing, Billing::Free);
-    assert_eq!(free.quota.rpm, Some(20));
-    assert_eq!(free.quota.rpd, Some(50));
+    // The documented caps are account-wide, so the leg binds the named
+    // `[[shared_quotas]]` family instead of a per-leg quota.
+    assert_eq!(free.shared_quota.as_deref(), Some("openrouter-free"));
+    assert_eq!(free.quota.rpm, None);
+    assert_eq!(config.shared_quotas["openrouter-free"].rpm, Some(20));
+    assert_eq!(config.shared_quotas["openrouter-free"].rpd, Some(50));
     // A non-:free OpenRouter model stays billed and uncapped.
     let paid = deps["openai/paid-model"];
     assert_eq!(paid.billing, Billing::Billed);
+    assert_eq!(paid.shared_quota, None);
     assert_eq!(paid.quota.rpm, None);
 }
 
@@ -103,8 +108,10 @@ fn kilo_anonymous_legs_get_the_documented_hourly_bound() {
     let anon = deps["minimax/minimax-m2.1"];
     assert_eq!(anon.billing, Billing::Free);
     // Documented 200 requests/hour/IP is approximated as rpm=3 until hourly
-    // windows exist; never exceeds the real cap.
-    assert_eq!(anon.quota.rpm, Some(3));
+    // windows exist; the allowance is per IP, so anonymous legs bind a shared
+    // family scoped by provider + base URL.
+    assert_eq!(anon.shared_quota.as_deref(), Some("kilo-anonymous"));
+    assert_eq!(config.shared_quotas["kilo-anonymous"].rpm, Some(3));
 }
 
 #[test]
@@ -115,6 +122,7 @@ fn key_gated_free_legs_get_caps_only_with_evidence() {
     let deps = by_model(&config);
     assert_eq!(deps["claude-fable-5"].billing, Billing::Billed);
     assert_eq!(deps["claude-fable-5"].quota.rpm, None);
+    assert_eq!(deps["claude-fable-5"].shared_quota, None);
 
     let config = import(&[
         (
@@ -135,19 +143,25 @@ fn key_gated_free_legs_get_caps_only_with_evidence() {
         ),
     ]);
     let deps = by_model(&config);
+    // Each provider's documented tier cap is per account, so the legs bind
+    // one named family per row instead of carrying per-leg quota fields.
     let fm = deps["claude-fable-5"];
     assert_eq!(fm.billing, Billing::Free);
-    assert_eq!(fm.quota.rpm, Some(60));
-    assert_eq!(fm.quota.tpm, Some(100_000));
+    assert_eq!(fm.shared_quota.as_deref(), Some("freemodel-free"));
+    assert_eq!(config.shared_quotas["freemodel-free"].rpm, Some(60));
+    assert_eq!(config.shared_quotas["freemodel-free"].tpm, Some(100_000));
     let cohere = deps["command-a"];
-    assert_eq!(cohere.quota.rpm, Some(20));
+    assert_eq!(cohere.shared_quota.as_deref(), Some("cohere-trial"));
+    assert_eq!(config.shared_quotas["cohere-trial"].rpm, Some(20));
     // [C1] covers the Command A family only — a `command-r` leg on the same
     // host keeps no free-tier cap.
+    assert_eq!(deps["command-r"].shared_quota, None);
     assert_eq!(deps["command-r"].quota.rpm, None);
     let samba = deps["gpt-oss-120b"];
-    assert_eq!(samba.quota.rpm, Some(20));
-    assert_eq!(samba.quota.rpd, Some(20));
-    assert_eq!(samba.quota.tpd, Some(200_000));
+    assert_eq!(samba.shared_quota.as_deref(), Some("sambanova-free"));
+    assert_eq!(config.shared_quotas["sambanova-free"].rpm, Some(20));
+    assert_eq!(config.shared_quotas["sambanova-free"].rpd, Some(20));
+    assert_eq!(config.shared_quotas["sambanova-free"].tpd, Some(200_000));
 }
 
 #[test]
@@ -217,6 +231,40 @@ fn any_custom_header_makes_a_credentialess_connection_authenticated() {
         assert_eq!(leg.billing, Billing::Billed, "{header}");
         assert_eq!(leg.quota.rpm, None, "{header}");
     }
+}
+
+#[test]
+fn free_legs_on_two_credentials_share_one_account_cap() {
+    // Two OpenRouter credentials each get :free legs; both bind the same
+    // family name but the scope is the credential, so each account keeps its
+    // own 50/day window — while same-credential legs now share it.
+    let mut dump = fixture();
+    dump["provider_connections"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(
+            {"id":"or2","provider":"openrouter","auth_type":"apikey","is_active":1,"api_key":"test-or2-secret","priority":0}
+        ));
+    dump["combos"][0]["data"]["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(
+            {"kind":"model","providerId":"openrouter","model":"meta/second-model:free","connectionId":"or2"}
+        ));
+    let config = import_fixture(&dump, &[]);
+    // One family row for every bound leg, never one per deployment —
+    // openrouter-free + kilo-anonymous (the fixture's anonymous leg).
+    assert_eq!(config.shared_quotas.len(), 2);
+    assert_eq!(config.shared_quotas["openrouter-free"].rpd, Some(50));
+    let deps = by_model(&config);
+    assert_eq!(
+        deps["google/test-model:free"].shared_quota.as_deref(),
+        Some("openrouter-free")
+    );
+    assert_eq!(
+        deps["meta/second-model:free"].shared_quota.as_deref(),
+        Some("openrouter-free")
+    );
 }
 
 #[test]

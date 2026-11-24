@@ -31,8 +31,15 @@ pub(super) struct Conditions {
     /// plans share a host never set this; their free state needs
     /// `--free-providers` evidence.
     pub asserts_free: bool,
-    /// Deployment `quota` fields to emit on a free leg.
+    /// Deployment `quota` fields to emit on a free leg. When `shared` names a
+    /// family they become the `[[shared_quotas]]` spec instead — the
+    /// documented limit is one account-wide allowance, not one per leg.
     pub quota: &'static [(&'static str, u32)],
+    /// `[[shared_quotas]]` family name matching legs bind, `Some` when the
+    /// row's cap is a per-account (or per-IP) allowance rather than per
+    /// model. The gateway scopes the family by credential — or provider +
+    /// base URL for anonymous legs — so two keys never share a window.
+    pub shared: Option<&'static str>,
     /// RFC3339 `expires_at` for time-boxed free offers, stamped on free legs.
     pub expires_at: Option<&'static str>,
 }
@@ -48,6 +55,7 @@ const TABLE: &[Conditions] = &[
         anonymous_only: false,
         asserts_free: true,
         quota: &[("rpm", 20), ("rpd", 50)],
+        shared: Some("openrouter-free"),
         expires_at: None,
     },
     // Kilo anonymous access: 200 requests/hour/IP [K2]. QuotaSpec has no
@@ -61,6 +69,7 @@ const TABLE: &[Conditions] = &[
         anonymous_only: true,
         asserts_free: true,
         quota: &[("rpm", 3)],
+        shared: Some("kilo-anonymous"),
         expires_at: None,
     },
     // freemodel.in Free plan: 60 RPM / 100K TPM [F2]. The 1M tokens/month
@@ -73,6 +82,7 @@ const TABLE: &[Conditions] = &[
         anonymous_only: false,
         asserts_free: false,
         quota: &[("rpm", 60), ("tpm", 100_000)],
+        shared: Some("freemodel-free"),
         expires_at: None,
     },
     // Cohere trial Command A family: 20 RPM [C1]. The 1,000 calls/month cap
@@ -85,6 +95,7 @@ const TABLE: &[Conditions] = &[
         anonymous_only: false,
         asserts_free: false,
         quota: &[("rpm", 20)],
+        shared: Some("cohere-trial"),
         expires_at: None,
     },
     // SambaNova free tier: 20 RPM / 20 RPD / 200K TPD [S1].
@@ -95,6 +106,7 @@ const TABLE: &[Conditions] = &[
         anonymous_only: false,
         asserts_free: false,
         quota: &[("rpm", 20), ("rpd", 20), ("tpd", 200_000)],
+        shared: Some("sambanova-free"),
         expires_at: None,
     },
     // packet.ai Token Factory: $0 until 2026-12-16, then paid [P1]. Rate
@@ -106,6 +118,7 @@ const TABLE: &[Conditions] = &[
         anonymous_only: false,
         asserts_free: false,
         quota: &[],
+        shared: None,
         expires_at: Some("2026-12-16T23:59:59Z"),
     },
 ];

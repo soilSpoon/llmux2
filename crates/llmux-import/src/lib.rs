@@ -32,7 +32,7 @@ use llmux_types::provider::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -569,6 +569,8 @@ struct Expander<'a> {
     connections: &'a [Connection],
     nodes: &'a [Value],
     warnings: &'a mut Vec<String>,
+    /// Families emitted as `[[shared_quotas]]`: name → the row's quota spec.
+    shared_quotas: &'a mut BTreeMap<&'static str, &'static [(&'static str, u32)]>,
     remaining_steps: usize,
     exhausted: bool,
     policy: &'a policy::Policy,
@@ -826,8 +828,19 @@ impl Expander<'_> {
                 if deployment["billing"] == "free" {
                     if let Some(cond) = free_conditions::lookup(&c.base_url, &model, c.anonymous())
                     {
-                        for &(field, value) in cond.quota {
-                            deployment["quota"][field] = value.into();
+                        match cond.shared {
+                            // Account-wide cap: legs bind the family and the
+                            // gateway scopes one window per credential or
+                            // provider+base URL — not per model leg.
+                            Some(family) => {
+                                deployment["shared_quota"] = family.into();
+                                self.shared_quotas.entry(family).or_insert(cond.quota);
+                            }
+                            None => {
+                                for &(field, value) in cond.quota {
+                                    deployment["quota"][field] = value.into();
+                                }
+                            }
                         }
                         if let Some(stamp) = cond.expires_at {
                             deployment["expires_at"] = stamp.into();
@@ -1449,6 +1462,7 @@ pub fn import_with_options(
                     connections: &connections,
                     nodes,
                     warnings: &mut Vec::new(),
+                    shared_quotas: &mut BTreeMap::new(),
                     remaining_steps: 1024,
                     exhausted: false,
                     policy: &policy,
@@ -1535,6 +1549,9 @@ pub fn import_with_options(
         }
     }
     let mut models = Vec::new();
+    // `[[shared_quotas]]` families collected while expanding: rows whose cap
+    // is one account-wide allowance bind the family instead of per-leg quota.
+    let mut shared_quotas: BTreeMap<&'static str, &'static [(&'static str, u32)]> = BTreeMap::new();
     context.reset_usage();
     let mut deployment_ids = HashSet::new();
     for name in order {
@@ -1566,6 +1583,7 @@ pub fn import_with_options(
             connections: &connections,
             nodes: array(&root, "providerNodes"),
             warnings: &mut warnings,
+            shared_quotas: &mut shared_quotas,
             remaining_steps: 1024,
             exhausted: false,
             policy: &policy,
@@ -1600,6 +1618,7 @@ pub fn import_with_options(
                 connections: &connections,
                 nodes,
                 warnings: &mut warnings,
+                shared_quotas: &mut shared_quotas,
                 remaining_steps: 1,
                 exhausted: false,
                 policy: &policy,
@@ -1626,6 +1645,7 @@ pub fn import_with_options(
                     connections: &connections,
                     nodes,
                     warnings: &mut warnings,
+                    shared_quotas: &mut shared_quotas,
                     remaining_steps: 1024,
                     exhausted: false,
                     policy: &policy,
@@ -1831,6 +1851,18 @@ pub fn import_with_options(
         }
     }
     let mut config = json!({"server":{"listen":options.listen.unwrap_or("127.0.0.1:8080"),"client_keys":client_keys},"credentials":credentials,"models":models});
+    if !shared_quotas.is_empty() {
+        config["shared_quotas"] = shared_quotas
+            .into_iter()
+            .map(|(name, quota)| {
+                let mut row = json!({"name": name});
+                for &(field, value) in quota {
+                    row[field] = value.into();
+                }
+                row
+            })
+            .collect();
+    }
     if !key_policies.is_empty() {
         config["server"]["key_policies"] = json!(key_policies);
     }
