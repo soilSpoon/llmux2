@@ -210,6 +210,9 @@ fn deployment_identity(
     String,
     String,
     String,
+    String,
+    String,
+    String,
 ) {
     (
         string(dep, "credential").to_owned(),
@@ -220,6 +223,9 @@ fn deployment_identity(
         identity_field(&dep["max_context"]),
         identity_field(&dep["quota"]),
         identity_field(&dep["timeout_ms"]),
+        string(dep, "billing").to_owned(),
+        identity_field(&dep["shared_quota"]),
+        identity_field(&dep["expires_at"]),
     )
 }
 
@@ -2004,6 +2010,29 @@ mod dedupe_tests {
             vec!["m-0", "m-1", "m-2", "m-3"]
         );
         assert_eq!(warnings, vec!["m: dropped 2 duplicate deployments"]);
+    }
+
+    #[test]
+    fn free_and_billed_variants_on_one_route_both_survive_dedupe() {
+        // A model-scoped --free-providers entry marks one leg free while a
+        // sibling on the same credential+host+model stays billed: billing,
+        // shared_quota, and expires_at are routing behavior, not decoration —
+        // identical rows here would silently drop the billed leg.
+        let mut models = vec![json!({
+            "name": "m",
+            "deployments": [
+                {"id":"m-0","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":0,"billing":"free","shared_quota":"sambanova-free"},
+                {"id":"m-1","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":1,"billing":"billed"},
+                {"id":"m-2","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":2,"billing":"free","shared_quota":"sambanova-free","expires_at":"2026-12-16T23:59:59Z"}
+            ]
+        })];
+        let warnings = run(&mut models);
+        let deps = models[0]["deployments"].as_array().unwrap();
+        assert_eq!(
+            deps.iter().map(|dep| string(dep, "id")).collect::<Vec<_>>(),
+            vec!["m-0", "m-1", "m-2"]
+        );
+        assert!(warnings.is_empty());
     }
 
     #[test]
