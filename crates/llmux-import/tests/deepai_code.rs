@@ -491,3 +491,27 @@ fn exported_ephemeral_deepai_bridge_url_is_imported() {
         "the export's ephemeral app bridge URL must survive upstream resolution"
     );
 }
+
+#[test]
+fn token_file_without_discovery_state_fails_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = write(dir.path(), "token", "synthetic-session");
+    let out = dir.path().join("out.toml");
+    let result = llmux_import::import_with_options(
+        &fixture().to_string(),
+        &out,
+        None,
+        &ImportOptions {
+            deepai_code_token_file: Some(&token),
+            ..Default::default()
+        },
+    );
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("token file without discovery state unexpectedly imported"),
+    };
+    assert_eq!(
+        error,
+        "--deepai-code-token-file requires --deepai-code-state"
+    );
+}
