@@ -464,6 +464,28 @@ billing = "free"
 quota = {{ tpm = 6 }}
 
 [[models]]
+name = "deployment-token-tight"
+[[models.deployments]]
+id = "deployment-token-tight"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-deployment-token-tight"
+billing = "free"
+quota = {{ tpm = 9 }}
+
+[[models]]
+name = "deployment-token-exact"
+[[models.deployments]]
+id = "deployment-token-exact"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-deployment-token-exact"
+billing = "free"
+quota = {{ tpm = 10 }}
+
+[[models]]
 name = "credential-token-starved"
 [[models.deployments]]
 id = "credential-token"
@@ -513,9 +535,45 @@ async fn token_starved_free_legs_stop_counting_for_the_free_catalog() {
         "deployment-token-starved",
         "credential-token-starved",
         "shared-token-starved",
+        "deployment-token-tight",
+        "deployment-token-exact",
     ] {
         assert!(listed(&gateway, "ci-key").await.contains(&model.to_owned()));
     }
+
+    // A lower boundary: after the first minimal chat the tight model has four
+    // units left. A cost-1 probe would still admit, but another minimal chat
+    // must not, so the model must leave the catalog.
+    let tight = "deployment-token-tight";
+    let before = seen.lock().unwrap().len();
+    let (status, _) = chat(&gateway, "ci-key", tight).await;
+    assert_eq!(status, StatusCode::OK, "{tight}: first minimal chat");
+    assert_eq!(seen.lock().unwrap().len(), before + 1);
+    let (status, _) = chat(&gateway, "ci-key", tight).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{tight}: four units cannot admit another minimal chat"
+    );
+    assert_eq!(seen.lock().unwrap().len(), before + 1);
+    assert!(!listed(&gateway, "ci-key").await.contains(&tight.to_owned()));
+
+    // A positive boundary: after the first minimal chat the exact model has
+    // five units left, exactly the minimum OpenAI chat admission cost, so it
+    // must remain advertised and admit the second minimal chat.
+    let exact = "deployment-token-exact";
+    let before = seen.lock().unwrap().len();
+    let (status, _) = chat(&gateway, "ci-key", exact).await;
+    assert_eq!(status, StatusCode::OK, "{exact}: first minimal chat");
+    assert_eq!(seen.lock().unwrap().len(), before + 1);
+    assert!(listed(&gateway, "ci-key").await.contains(&exact.to_owned()));
+    let (status, _) = chat(&gateway, "ci-key", exact).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{exact}: exact remaining minimum cost"
+    );
+    assert_eq!(seen.lock().unwrap().len(), before + 2);
 
     let mut wrongly_advertised = Vec::new();
     for model in [

@@ -120,6 +120,14 @@ be treated as full allowance. Daily caps, per-minute limits, and expiry dates
 on free deployments SHALL be tracked the same way, so a temporarily exhausted
 leg is never pruned for today's exhaustion alone.
 
+For an OpenAI chat request the token estimate charged to these windows is
+`ceil(counted prompt bytes / 4)` plus any explicit output-token cap, except
+that the input part has a floor of 5 estimated tokens. That floor is the
+shared minimum OpenAI chat admission cost: it covers message framing and
+tokenizer overhead the byte estimate cannot see, and every component that
+asks whether a minimal chat could be admitted SHALL use it rather than a
+hypothetical one-token request.
+
 An account-wide cap SHALL be declared once as a named `[[shared_quotas]]`
 family (rpm/rpd/tpm/tpd and fixed windows, positive values) and bound per
 deployment with `shared_quota = "<name>"`. Legs that name the same family draw on one set of
@@ -340,8 +348,8 @@ advertised a canonical model only while at least one usable free
 (non-billed) deployment exists for it, and SHALL never have a request routed
 to a billed leg — equivalent to `x-llmux-free-only: true` on every request.
 A usable free deployment is non-fallback, zero-cost, able to serve OpenAI
-chat, and able to admit at least a minimal request when the list is built:
-its credential is not disabled, it is not expired or parked as
+chat, and able to admit the shared minimum-cost OpenAI chat request when the
+list is built: its credential is not disabled, it is not expired or parked as
 not-provisioned, its upstream id is not absent from a loaded live catalog,
 and it is not held out by cooldown, quota, or concurrency state. A model
 whose every leg is billed, or whose free legs are all unusable by that rule,

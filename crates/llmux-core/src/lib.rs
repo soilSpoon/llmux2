@@ -469,12 +469,17 @@ impl Executor {
                 .is_some_and(|ids| !ids.contains(dep.upstream_model.as_ref()))
     }
 
-    /// Whether a deployment can admit at least a minimal request in `format`
-    /// right now. Catalog availability cannot know a future request's size or
-    /// conversion needs, so this intentionally uses a one-token request while
-    /// applying the same disabled, parked, expired, stale-upstream, cooldown,
-    /// quota, concurrency, and format gates routing applies before `Send`.
-    pub fn deployment_available(&self, idx: DeploymentIdx, format: InboundFormat) -> bool {
+    /// Whether a deployment can admit a request costing `needed` in `format`
+    /// right now, applying the same disabled, parked, expired,
+    /// stale-upstream, cooldown, quota, concurrency, and format gates routing
+    /// applies before `Send`. The probe is read-only: it charges no quota and
+    /// takes no concurrency permit.
+    pub fn deployment_available(
+        &self,
+        idx: DeploymentIdx,
+        format: InboundFormat,
+        needed: u64,
+    ) -> bool {
         let idx = index(idx);
         let dep = &self.cfg.deployments[idx];
         let binding = &self.bindings[idx];
@@ -487,7 +492,7 @@ impl Executor {
             return false;
         }
         let now = Instant::now();
-        binding.limits.available_at(now, 1) == now
+        binding.limits.available_at(now, needed) == now
     }
 
     /// Whether the credential is disabled in routing; `None` for unknown ids.

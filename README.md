@@ -197,7 +197,7 @@ The hash is lowercase hex SHA-256 of the UTF-8 salt bytes immediately followed b
 
 `remote_images` is `allow` (default) or `reject`. `reject` answers 400 `{"error":{"message":"remote image URLs are not accepted; send a data: URL",...}}` before any upstream call when a chat, Messages, or Responses body contains an `http`/`https` `image_url` (object or string) or an Anthropic image source URL. Optional `max_image_bytes` rejects a `data:` image, or a native Anthropic base64 image, whose decoded payload exceeds the limit with 413. A non-positive limit is a config error. Unset means no size cap. Both checks run in one place on the inbound body, not in each adapter.
 
-Before a response is committed, the gateway can fail over on upstream server, connection, and timeout errors within its attempt and time limits. Rate-limit and quota-exhaustion failover are controlled by `routing.fallback_on` and enabled by default. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local request and token quotas use per-deployment sliding windows (one minute for `rpm`/`tpm`, one day for `rpd`/`tpd`) only when configured. Token quotas count the same prompt-plus-output estimate used for context fitting, and a single request larger than a token quota is still admitted when that window is empty. A credential may also set `quota` (`rpm`, `rpd`, `tpm`, `tpd`) for providers that limit per key or project across models; those windows are shared by every deployment that uses the credential.
+Before a response is committed, the gateway can fail over on upstream server, connection, and timeout errors within its attempt and time limits. Rate-limit and quota-exhaustion failover are controlled by `routing.fallback_on` and enabled by default. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local request and token quotas use per-deployment sliding windows (one minute for `rpm`/`tpm`, one day for `rpd`/`tpd`) only when configured. Token quotas count the same prompt-plus-output estimate used for context fitting; for OpenAI chat the input part is floored at 5 estimated tokens, the shared minimal chat admission cost. A single request larger than a token quota is still admitted when that window is empty. A credential may also set `quota` (`rpm`, `rpd`, `tpm`, `tpd`) for providers that limit per key or project across models; those windows are shared by every deployment that uses the credential.
 
 ### Strict OpenAI-compatible upstreams
 
@@ -295,11 +295,15 @@ change routing or model access. Unclassified authenticated keys are logged as
 `free_only = true` makes a key free-only: every request behaves as if it sent
 `x-llmux-free-only: true` (billed legs are never eligible), and
 `GET /v1/models` advertises only models with at least one usable free leg — a
-non-fallback deployment marked `billing = "free"` whose credential is not
-disabled. "Free" means zero per-request cost, so subscription- or plan-covered
-legs count too; a model drops from the list when its last free leg is removed
-or its credential is disabled. A `free_only`-only entry needs no `models` or
-`blocked` lists.
+non-fallback deployment marked `billing = "free"` that could admit a minimal
+OpenAI chat request at that instant. Besides credential state, expiry,
+parking, stale live-catalog ids, and format support, this includes cooldown,
+local quota, and concurrency state. "Free" means zero per-request cost, so
+subscription- or plan-covered legs count too; a model drops from the list
+while its last free leg cannot currently admit, and returns when that state
+clears. The list is an admission snapshot, not a guarantee that a larger
+request or one needing unsupported conversion features will fit. A
+`free_only`-only entry needs no `models` or `blocked` lists.
 
 ## Credentials
 
