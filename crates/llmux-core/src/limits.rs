@@ -455,8 +455,15 @@ impl Window {
             }
             WindowKind::Fixed { anchor, used } => {
                 let mut used = used.lock().unwrap_or_else(|err| err.into_inner());
-                let index = Self::fixed_index(*anchor, self.span, used.wall_at(now));
-                if index != used.index {
+                // Fixed-window placement is decided after acquiring the mutex:
+                // a caller can capture `now` before a reset boundary but reach
+                // the lock only inside the next window. Using that stale time
+                // would roll the index backward and erase charges already made
+                // in the current window. Indices therefore only move forward,
+                // and late admissions charge the window current at acquisition.
+                let acquired = Instant::now();
+                let index = Self::fixed_index(*anchor, self.span, used.wall_at(acquired));
+                if index > used.index {
                     used.index = index;
                     used.total = 0;
                 }
@@ -466,8 +473,10 @@ impl Window {
     }
 
     /// When enough usage expires for the window to admit `target` more units.
-    /// For a fixed window that is always the next boundary: nothing ages out
-    /// earlier, and everything does then.
+    /// Sliding windows use `target` to find the earliest entry expiry that
+    /// frees enough room. Fixed windows intentionally ignore it: their budget
+    /// has no partial refresh, so the first time any more units can be admitted
+    /// is the next anchored boundary, when the whole allowance returns.
     fn free_at(&self, guard: &WindowGuard<'_>, target: u64, now: Instant) -> Instant {
         match (&self.kind, guard) {
             (WindowKind::Sliding(_), WindowGuard::Sliding(used)) => {
@@ -483,15 +492,16 @@ impl Window {
                 // full span out rather than "now".
                 used.entries
                     .back()
-                    .map_or_else(|| Instant::now() + self.span, |&(at, _)| at + self.span)
+                    .map_or_else(|| now + self.span, |&(at, _)| at + self.span)
             }
             (WindowKind::Fixed { anchor, .. }, WindowGuard::Fixed(used)) => {
                 let span_nanos = i128::try_from(self.span.as_nanos()).unwrap_or(i128::MAX);
-                let wall_now = used.wall_at(now);
+                let acquired = Instant::now();
+                let wall_now = used.wall_at(acquired);
                 let elapsed = nanos_between(*anchor, wall_now);
                 let next_boundary = (i128::from(used.index) + 1) * span_nanos;
                 let wait = u64::try_from((next_boundary - elapsed).max(0)).unwrap_or(u64::MAX);
-                now + Duration::from_nanos(wait)
+                acquired + Duration::from_nanos(wait)
             }
             _ => unreachable!("guard and window kinds match by construction"),
         }
@@ -854,16 +864,20 @@ mod tests {
         assert_eq!(limits.available_at(now, 0), now + CONCURRENCY_RETRY);
     }
 
-    fn fixed_requests(span_secs: u32, max: u32) -> QuotaSpec {
+    fn fixed_requests_at(span_secs: u32, max: u32, anchor: SystemTime) -> QuotaSpec {
         QuotaSpec {
             fixed: vec![llmux_types::FixedWindowSpec {
                 unit: llmux_types::FixedUnit::Requests,
                 max,
                 span_secs,
-                anchor: SystemTime::now(),
+                anchor,
             }],
             ..QuotaSpec::default()
         }
+    }
+
+    fn fixed_requests(span_secs: u32, max: u32) -> QuotaSpec {
+        fixed_requests_at(span_secs, max, SystemTime::now())
     }
 
     /// A fixed anchored window spends its whole budget, then parks every
@@ -891,6 +905,81 @@ mod tests {
         assert!(
             limits.admit(0).is_some(),
             "the whole budget returns at once — none of it waits for the first charge to age out"
+        );
+        assert!(limits.admit(0).is_none());
+    }
+
+    /// A caller that captured `now` before a reset boundary can acquire the
+    /// window lock only after another caller charged the new window. The stale
+    /// timestamp must neither move the index backward nor erase that charge;
+    /// the delayed admission belongs to the current window too.
+    #[tokio::test(start_paused = true)]
+    async fn stale_fixed_window_timestamps_cannot_erase_current_window_charges() {
+        let anchor = SystemTime::now() - Duration::from_secs(3_500);
+        let window = Window::for_credential(fixed_requests_at(3_600, 10, anchor))
+            .pop()
+            .unwrap();
+        let stale = Instant::now();
+        tokio::time::advance(Duration::from_secs(101)).await;
+        let current = Instant::now();
+        let current_index = {
+            let mut guard = window.lock(current);
+            guard.charge(current, 1);
+            assert_eq!(guard.total(), 1);
+            match &guard {
+                WindowGuard::Fixed(used) => used.index,
+                WindowGuard::Sliding(_) => panic!("fixed window expected"),
+            }
+        };
+
+        {
+            let guard = window.lock(stale);
+            assert_eq!(
+                guard.total(),
+                1,
+                "a stale lock must not erase the current window"
+            );
+            match &guard {
+                WindowGuard::Fixed(used) => assert_eq!(used.index, current_index),
+                WindowGuard::Sliding(_) => panic!("fixed window expected"),
+            }
+        }
+        let mut delayed = window.lock(stale);
+        delayed.charge(stale, 1);
+        assert_eq!(
+            delayed.total(),
+            2,
+            "the delayed admission is accounted in the current window"
+        );
+    }
+
+    /// Start partway through an anchored window and stagger the charges. At
+    /// the boundary both charges are still younger than the span, so a sliding
+    /// implementation would keep them; the fixed window must nevertheless
+    /// return the whole allowance exactly at that boundary.
+    #[tokio::test(start_paused = true)]
+    async fn fixed_reset_is_anchored_not_sliding_for_staggered_charges() {
+        let anchor = SystemTime::now() - Duration::from_secs(1_000);
+        let limits = Arc::new(DeploymentLimits::new(fixed_requests_at(3_600, 2, anchor)));
+        assert!(limits.admit(0).is_some());
+        tokio::time::advance(Duration::from_secs(100)).await;
+        assert!(limits.admit(0).is_some());
+        assert!(limits.admit(0).is_none(), "the window budget is spent");
+
+        let now = Instant::now();
+        let ready = limits.available_at(now, 0);
+        assert!(
+            ready > now + Duration::from_secs(2_490) && ready <= now + Duration::from_secs(2_501),
+            "retry is the next anchored boundary, not either charge's sliding expiry: {ready:?} vs {now:?}"
+        );
+        tokio::time::advance(Duration::from_secs(2_501)).await;
+        assert!(
+            limits.admit(0).is_some(),
+            "the boundary resets even though the first charge is only about 2,601s old"
+        );
+        assert!(
+            limits.admit(0).is_some(),
+            "the second slot returns too even though its charge is only about 2,501s old"
         );
         assert!(limits.admit(0).is_none());
     }

@@ -164,10 +164,14 @@ allowances, calendar-style monthly caps. Window boundaries are
 than the first use. Usage accumulates within the current window and resets
 wholesale at the boundary: the full budget is available immediately after a
 reset, unlike the sliding `rpm`/`rpd`/`tpm`/`tpd` windows, which ration it
-back as usage ages out. `max` and `span_secs` SHALL be positive. Where the
-provider's window shape or phase is unknown, the sliding windows remain the
-conservative choice — a sliding span never admits more in any interval of
-that length than its cap, whatever the provider's real boundaries.
+back as usage ages out. `max` and `span_secs` SHALL be positive. Concurrent
+admissions SHALL choose the fixed window after acquiring the window lock, and
+window indices SHALL be monotonic: a timestamp captured before a boundary but
+charged afterward counts in the current window and cannot erase charges already
+made there. Where the provider's window shape or phase is unknown, the sliding
+windows remain the conservative choice — a sliding span never admits more in
+any interval of that length than its cap, whatever the provider's real
+boundaries.
 
 #### Scenario: Weekly window front-loads after reset
 
