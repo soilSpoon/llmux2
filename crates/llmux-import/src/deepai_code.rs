@@ -117,6 +117,7 @@ pub(crate) fn step(
         .find(|c| c.kind == "openai_compat" && c.credential.is_some() && discovered(c))?;
     let mut step = connection.provider.step(model);
     step["connectionId"] = json!(connection.source_id);
+    step["deepaiCodeDiscovery"] = json!(true);
     Some(step)
 }
 

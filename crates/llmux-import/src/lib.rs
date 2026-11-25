@@ -722,7 +722,8 @@ impl Expander<'_> {
                 .policy
                 .openrouter_replacements
                 .then(|| bridge::source(&p, self.nodes))
-                .flatten();
+                .flatten()
+                .filter(|_| step.get("deepaiCodeDiscovery").and_then(Value::as_bool) != Some(true));
             let redirected = antigravity || bridge.is_some();
             let replacement = if antigravity {
                 if !pinned.is_empty() || !allowed.is_empty() {

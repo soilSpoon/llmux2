@@ -448,3 +448,46 @@ fn discovery_without_exported_connection_creates_free_leg_and_preserves_alias() 
         "discovery-backed availability must keep the mapped public alias"
     );
 }
+
+#[test]
+fn discovery_survives_openrouter_replacements_on_a_custom_deepai_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let root = custom_deepai_fixture(json!(["paid/a"]));
+    let mut options = options(&state, &token);
+    options.openrouter_replacements = true;
+    let (config, report) = run(&root, &options);
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [
+            (BRIDGE.to_string(), "claude-haiku-5-5".to_string()),
+            ("https://paid.example/v1".to_string(), "a".to_string()),
+        ],
+        "discovery must keep its pinned DeepAI leg instead of passing it through bridge replacement"
+    );
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|w| w.contains("no reviewed bridge replacement")),
+        "the generated discovery leg is not a bridge-replacement source: {:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn exported_ephemeral_deepai_bridge_url_is_imported() {
+    let mut root = custom_deepai_fixture(json!(["deepai/claude-haiku-5-5"]));
+    root["providerNodes"][1]["baseUrl"] = json!(BRIDGE);
+    let (config, _) = run(&root, &ImportOptions::default());
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [(BRIDGE.to_string(), "claude-haiku-5-5".to_string())],
+        "the export's ephemeral app bridge URL must survive upstream resolution"
+    );
+}
