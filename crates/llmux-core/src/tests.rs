@@ -2452,6 +2452,99 @@ async fn request_log_records_stream_usage_after_completion() {
 }
 
 #[tokio::test]
+async fn request_log_records_nested_responses_stream_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, adapter, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [Some(1024); 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+        [None; 3],
+    )
+    .await;
+    adapter.stream_events.lock().unwrap().extend([SseEvent {
+        event: Some("response.completed".into()),
+        data: r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":13,"output_tokens":5,"input_tokens_details":{"cached_tokens":7}}}}"#.into(),
+    }]);
+
+    let routed = executor
+        .execute(GatewayRequest {
+            stream: true,
+            ..request()
+        })
+        .await
+        .unwrap();
+    let GatewayResponse::Stream(events) = routed.response else {
+        panic!("expected stream")
+    };
+    let events: Vec<_> = events.collect().await;
+    assert!(events.iter().all(Result::is_ok));
+    drop(executor);
+
+    let line = std::fs::read_to_string(&path).unwrap();
+    let record: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(record["usage"]["input_tokens"], 13);
+    assert_eq!(record["usage"]["output_tokens"], 5);
+    assert_eq!(record["usage"]["cached_input_tokens"], 7);
+}
+
+#[tokio::test]
+async fn request_log_merges_split_anthropic_stream_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, adapter, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [Some(1024); 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+        [None; 3],
+    )
+    .await;
+    adapter.stream_events.lock().unwrap().extend([
+        SseEvent {
+            event: Some("message_start".into()),
+            data: r#"{"type":"message_start","message":{"usage":{"input_tokens":21,"cache_read_input_tokens":8,"cache_creation_input_tokens":4}}}"#.into(),
+        },
+        SseEvent {
+            event: Some("message_delta".into()),
+            data: r#"{"type":"message_delta","usage":{"output_tokens":9}}"#.into(),
+        },
+    ]);
+
+    let routed = executor
+        .execute(GatewayRequest {
+            stream: true,
+            ..request()
+        })
+        .await
+        .unwrap();
+    let GatewayResponse::Stream(events) = routed.response else {
+        panic!("expected stream")
+    };
+    let events: Vec<_> = events.collect().await;
+    assert!(events.iter().all(Result::is_ok));
+    drop(executor);
+
+    let line = std::fs::read_to_string(&path).unwrap();
+    let record: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(record["usage"]["input_tokens"], 21);
+    assert_eq!(record["usage"]["output_tokens"], 9);
+    assert_eq!(record["usage"]["cached_input_tokens"], 8);
+    assert_eq!(record["usage"]["cache_creation_input_tokens"], 4);
+}
+
+#[tokio::test]
 async fn request_log_writes_partial_stream_record_on_cancellation() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("requests.jsonl");

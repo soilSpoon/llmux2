@@ -74,12 +74,19 @@ fn parse_usage_object(usage: &serde_json::Value) -> Option<TokenUsage> {
     let parsed = TokenUsage {
         input_tokens: number(usage, &["input_tokens", "prompt_tokens"]),
         output_tokens: number(usage, &["output_tokens", "completion_tokens"]),
-        cached_input_tokens: number(usage, &["cache_read_input_tokens"]).or_else(|| {
-            usage
-                .get("prompt_tokens_details")
-                .and_then(|details| details.get("cached_tokens"))
-                .and_then(serde_json::Value::as_u64)
-        }),
+        cached_input_tokens: number(usage, &["cache_read_input_tokens"])
+            .or_else(|| {
+                usage
+                    .get("prompt_tokens_details")
+                    .and_then(|details| details.get("cached_tokens"))
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .or_else(|| {
+                usage
+                    .get("input_tokens_details")
+                    .and_then(|details| details.get("cached_tokens"))
+                    .and_then(serde_json::Value::as_u64)
+            }),
         cache_creation_input_tokens: number(usage, &["cache_creation_input_tokens"]),
     };
     (parsed.input_tokens.is_some()
@@ -90,15 +97,25 @@ fn parse_usage_object(usage: &serde_json::Value) -> Option<TokenUsage> {
 }
 
 /// Extracts token accounting without retaining prompts or response content.
-/// Handles the OpenAI-compatible usage object directly and Anthropic's nested
-/// `message.usage` form used by `message_start` stream events.
+/// Handles the OpenAI-compatible usage object directly, Anthropic's nested
+/// `message.usage` form used by `message_start` stream events, and the
+/// Responses API's nested `response.usage` completion form.
 pub fn usage_from_json(value: &serde_json::Value) -> Option<TokenUsage> {
-    value.get("usage").and_then(parse_usage_object).or_else(|| {
-        value
-            .get("message")
-            .and_then(|message| message.get("usage"))
-            .and_then(parse_usage_object)
-    })
+    value
+        .get("usage")
+        .and_then(parse_usage_object)
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(|message| message.get("usage"))
+                .and_then(parse_usage_object)
+        })
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| response.get("usage"))
+                .and_then(parse_usage_object)
+        })
 }
 
 pub fn usage_from_body(body: &[u8]) -> Option<TokenUsage> {
