@@ -27,6 +27,12 @@ pub(super) fn billed(connection: &Connection, model: &str, policy: &Policy) -> b
     if connection.policy == ModelPolicy::Workers {
         return true;
     }
+    if connection.policy == ModelPolicy::DeepAiCode {
+        return policy
+            .deepai_code
+            .as_ref()
+            .is_none_or(|state| !crate::deepai_code::free(state, model));
+    }
     if connection.policy == ModelPolicy::KiloFree || connection.base_url == xplabs::BASE_URL {
         return false;
     }
@@ -74,6 +80,7 @@ pub(super) enum ModelPolicy {
     Workers,
     KiloFree,
     DeepAiText,
+    DeepAiCode,
 }
 
 pub(super) struct External {
@@ -290,7 +297,7 @@ impl Policy {
 
     pub fn model(&self, policy: ModelPolicy, model: &str) -> Result<String, &'static str> {
         match policy {
-            ModelPolicy::Any => Ok(model.to_owned()),
+            ModelPolicy::Any | ModelPolicy::DeepAiCode => Ok(model.to_owned()),
             ModelPolicy::DeepAiText => DEEPAI_TEXT_MODELS
                 .contains(&model)
                 .then(|| model.to_owned())

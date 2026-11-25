@@ -563,19 +563,25 @@ and `openai_compat` for the sidecar.
 With `--deepai-code-state PATH`, the importer SHALL load a discovery JSON
 written by the review tooling: a loopback `base_url` for the app's model
 proxy, a `free` set of catalog ids whose `theosPerRequest` is zero, and an
-optional `scope` listing the models a per-harness token may serve. A
-non-loopback `base_url` SHALL fail the import. When
+optional `scope` listing the models a per-harness token may serve. `free`
+SHALL be an array, a present `scope` SHALL be an array, and malformed
+discovery JSON or a non-loopback `base_url` SHALL fail the import. When
 `--deepai-code-token-file PATH` is also given the importer SHALL emit a
 `file:` credential for that token; the flag without `--deepai-code-state`
 SHALL be an error. The discovered `base_url` SHALL replace the base URL of
-every `deepai-code` connection (or attach to a new lowest-priority connection
-when the export has none and a token was given). For each imported combo
-model that maps to a `free`, in-scope catalog id the importer SHALL append a
-free `openai_compat` leg against that connection, which sorts ahead of billed
-legs with the other verified-free legs. Metered catalog ids, ids outside the
-token scope, and catalog-free ids with no mapping SHALL emit no leg; unmapped
-free ids SHALL be counted as warnings. Without `--deepai-code-state` every
-deepai-code leg keeps its previous billed treatment.
+every reviewed DeepAI Code connection — the built-in `deepai-code` identity
+or an OpenAI-compatible custom node with prefix `deepai` — never an unrelated
+keyed loopback bridge such as Cloudflare-direct (or attach to a new
+lowest-priority connection when the export has none and a token was given).
+For each imported combo model that maps to a `free`, in-scope catalog id the
+importer SHALL append a free `openai_compat` leg against that connection,
+which sorts ahead of billed legs with the other verified-free legs. The same
+free classification and session-token scope SHALL apply to existing exported
+legs that use the reviewed DeepAI Code connection. Metered catalog ids, ids
+outside the token scope, and catalog-free ids with no mapping SHALL emit no
+leg; unmapped free ids SHALL be counted as warnings. Without
+`--deepai-code-state` every deepai-code leg keeps its previous billed
+treatment.
 
 #### Scenario: Discovered free leg leads the canonical model
 

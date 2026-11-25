@@ -1,4 +1,4 @@
-use crate::{array, string, Connection};
+use crate::{string, Connection};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::Path;
@@ -43,8 +43,14 @@ fn fs_err(path: &Path) -> Result<String, String> {
 }
 
 fn ids(root: &Value, field: &str) -> Result<HashSet<String>, String> {
+    let Some(value) = root.get(field) else {
+        return Err(format!("deepai-code state {field} must be an array"));
+    };
+    let Some(items) = value.as_array() else {
+        return Err(format!("deepai-code state {field} must be an array"));
+    };
     let mut out = HashSet::new();
-    for (i, item) in array(root, field).iter().enumerate() {
+    for (i, item) in items.iter().enumerate() {
         let Some(id) = item.as_str().map(str::trim) else {
             return Err(format!("deepai-code state {field}[{i}] must be a string"));
         };
@@ -106,11 +112,9 @@ pub(crate) fn step(
             return None;
         }
     }
-    let connection = connections.iter().find(|c| {
-        c.kind == "openai_compat"
-            && c.credential.is_some()
-            && (c.provider.is_builtin("deepai-code") || is_bridge_url(&c.base_url))
-    })?;
+    let connection = connections
+        .iter()
+        .find(|c| c.kind == "openai_compat" && c.credential.is_some() && discovered(c))?;
     let mut step = connection.provider.step(model);
     step["connectionId"] = json!(connection.source_id);
     Some(step)
@@ -132,8 +136,30 @@ pub(crate) fn unmapped(state: &State) -> impl Iterator<Item = &String> {
         .filter(|id| !MODEL_MAP.iter().any(|(_, model)| model == *id))
 }
 
-/// The `deepai-code` builtin or a custom node carrying the reviewed bridge
-/// URL — the identities the discovery stage may rewire.
+/// Whether the raw export connection is the reviewed DeepAI Code identity:
+/// the `deepai-code` builtin, or a custom node exposing the `deepai` prefix
+/// through an OpenAI-compatible protocol. URL shape alone is not identity —
+/// keyed Cloudflare-direct bridges may use the same loopback `/v1` shape.
+pub(crate) fn reviewed_source(connection: &Value, nodes: &[Value]) -> bool {
+    let provider = string(connection, "provider");
+    nodes
+        .iter()
+        .find(|node| string(node, "id") == provider)
+        .map_or(provider == "deepai-code", |node| {
+            string(node, "prefix") == "deepai" && string(node, "type") == "openai-compatible"
+        })
+}
+
+/// Whether `model` is outside the discovered session-token scope.
+pub(crate) fn outside_scope(state: &State, model: &str) -> bool {
+    state
+        .scope
+        .as_ref()
+        .is_some_and(|scope| !scope.contains(model))
+}
+
+/// Connections the discovery stage may rewire. Marked at import time from
+/// the reviewed provider identity, never inferred from a loopback URL alone.
 pub(crate) fn discovered(connection: &Connection) -> bool {
-    connection.provider.is_builtin("deepai-code") || is_bridge_url(&connection.base_url)
+    connection.policy == crate::policy::ModelPolicy::DeepAiCode
 }

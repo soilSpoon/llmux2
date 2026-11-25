@@ -753,6 +753,18 @@ impl Expander<'_> {
                         continue;
                     }
                 };
+                if c.policy == policy::ModelPolicy::DeepAiCode
+                    && self
+                        .policy
+                        .deepai_code
+                        .as_ref()
+                        .is_some_and(|state| deepai_code::outside_scope(state, &model))
+                {
+                    self.warnings.push(format!(
+                        "combo {name} step {index}: skipped DeepAI Code leg {model} — outside the session token's model scope"
+                    ));
+                    continue;
+                }
                 if c.base_url == xplabs::BASE_URL && !xplabs::free_model(&model) {
                     self.warnings.push(format!(
                         "combo {name} step {index}: dropped billed XPLabs route {model}"
@@ -1249,6 +1261,10 @@ pub fn import_with_options(
                 policy::ModelPolicy::KiloFree
             } else if kind == KIND_DEEPAI {
                 policy::ModelPolicy::DeepAiText
+            } else if kind == KIND_OPENAI_COMPAT
+                && deepai_code::reviewed_source(c, array(&root, "providerNodes"))
+            {
+                policy::ModelPolicy::DeepAiCode
             } else {
                 policy::ModelPolicy::Any
             },
@@ -1333,7 +1349,7 @@ pub fn import_with_options(
                     kind: "openai_compat".into(),
                     base_url: state.base_url.clone(),
                     priority: i64::MAX,
-                    policy: policy::ModelPolicy::Any,
+                    policy: policy::ModelPolicy::DeepAiCode,
                 }),
                 None => warnings.push(
                     "deepai-code state given without --deepai-code-token-file and no keyed deepai-code connection exists; no free legs emitted".into(),

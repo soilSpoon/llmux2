@@ -172,3 +172,117 @@ fn unmapped_free_catalog_id_is_reported() {
         .iter()
         .any(|w| w.contains("unmapped free DeepAI catalog id muse-ember")));
 }
+
+fn custom_deepai_fixture(models: Value) -> Value {
+    json!({
+        "providerConnections":[
+            {"id":"paid","provider":"paid-node","authType":"apikey","apiKey":"synthetic-paid"},
+            {"id":"dac","provider":"custom-deepai","authType":"apikey","apiKey":"synthetic-dac"}
+        ],
+        "providerNodes":[
+            {"id":"paid-node","prefix":"paid","type":"openai-compatible","baseUrl":"https://paid.example/v1"},
+            {"id":"custom-deepai","prefix":"deepai","type":"openai-compatible","baseUrl":"http://127.0.0.1:8790/deepai/v1"}
+        ],
+        "combos":[{"name":"claude-haiku-5.5","models":models}],
+        "apiKeys":[{"key":"synthetic-client"}]
+    })
+}
+
+#[test]
+fn discovery_does_not_rewire_a_keyed_cloudflare_loopback_bridge() {
+    let cfpd_url = "http://127.0.0.1:49555/v1";
+    let mut root = fixture();
+    root["providerNodes"].as_array_mut().unwrap().push(
+        json!({"id":"cfpd-node","prefix":"cloudflare-direct","type":"openai-compatible","baseUrl":cfpd_url}),
+    );
+    root["providerConnections"].as_array_mut().unwrap().push(
+        json!({"id":"cfpd","provider":"cfpd-node","authType":"apikey","apiKey":"synthetic-cfpd"}),
+    );
+    root["combos"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name":"cf","models":["cloudflare-direct/meta/llama-3.1-8b-instruct"]}));
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let (config, _) = run(&root, &options(&state, &token));
+    assert_eq!(
+        legs(&config, "cf"),
+        [(
+            cfpd_url.to_string(),
+            "meta/llama-3.1-8b-instruct".to_string()
+        )]
+    );
+}
+
+#[test]
+fn custom_deepai_discovery_leg_is_free_and_leads_paid_legs() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let root = custom_deepai_fixture(json!(["paid/a"]));
+    let (config, _) = run(&root, &options(&state, &token));
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [
+            (BRIDGE.to_string(), "claude-haiku-5-5".to_string()),
+            ("https://paid.example/v1".to_string(), "a".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn session_token_scope_applies_to_existing_exported_deepai_legs() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"],"scope":["deepseek-v4.1-flash"]})
+            .to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let root = custom_deepai_fixture(json!(["deepai/claude-haiku-5-5", "paid/a"]));
+    let (config, report) = run(&root, &options(&state, &token));
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [("https://paid.example/v1".to_string(), "a".to_string())]
+    );
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.contains("outside the session token's model scope")));
+}
+
+#[test]
+fn malformed_discovery_list_types_fail_import() {
+    for (field, value) in [
+        ("free", json!("claude-haiku-5-5")),
+        ("scope", json!({"bad":true})),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]});
+        state[field] = value;
+        let state = write(dir.path(), "state.json", &state.to_string());
+        let token = write(dir.path(), "token", "synthetic-session");
+        let outdir = tempfile::tempdir().unwrap();
+        let out = outdir.path().join("out.toml");
+        assert!(
+            llmux_import::import_with_options(
+                &fixture().to_string(),
+                &out,
+                None,
+                &options(&state, &token),
+            )
+            .is_err(),
+            "{field} accepted a non-array value"
+        );
+    }
+}
