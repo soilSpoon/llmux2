@@ -68,7 +68,11 @@ fn provider_registry(
     acp_agents: &std::collections::HashMap<Arc<str>, AcpAgentSpec>,
 ) -> ProviderRegistry {
     let mut registry = ProviderRegistry::default();
-    for kind in [provider::OPENAI, provider::OPENAI_COMPAT] {
+    for kind in [
+        provider::OPENAI,
+        provider::OPENAI_COMPAT,
+        provider::DEEPAI_CODE,
+    ] {
         registry.register(Arc::new(OpenAiCompat::new(kind)));
     }
     registry.register(Arc::new(Anthropic::new(provider::ANTHROPIC)));
@@ -93,6 +97,7 @@ fn static_sources(
             let source = match provider.0.as_ref() {
                 provider::ANTHROPIC => StaticKey::header(ANTHROPIC_KEY_HEADER, &key)?,
                 provider::DEEPAI => StaticKey::header(DEEPAI_KEY_HEADER, &key)?,
+                provider::DEEPAI_CODE => StaticKey::header(DEEPAI_KEY_HEADER, &key)?,
                 _ => StaticKey::bearer(&key)?,
             };
             Ok((id, Arc::new(source) as Arc<dyn CredentialSource>))

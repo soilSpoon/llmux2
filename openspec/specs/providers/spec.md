@@ -51,6 +51,18 @@ It SHALL reject unsupported options and send the key in
 `Api-Key`, not `Authorization`. DeepAI Code SHALL use the existing
 `openai_compat` adapter when its gateway speaks Chat Completions.
 
+#### Scenario: DeepAI Code lane
+
+WHEN a deployment uses the `deepai_code` provider kind
+THEN the gateway SHALL send the credential as `Api-Key`, never as
+Authorization, and SHALL forward the deployment's configured
+`x-deepai-code-theos` header unchanged, because the lane refuses a request
+without it.
+AND a `403` whose code or type is `theos_exhausted` or `theos_insufficient`
+SHALL be classified as a spent quota rather than an unusable credential, while
+`social_login_required` and `machine_required` SHALL remain credential
+refusals.
+
 #### Scenario: DeepAI text response
 
 WHEN a configured `deepai` deployment receives a text chat request
