@@ -412,7 +412,11 @@ async fn exhausted_free_leg_stops_counting_for_the_free_catalog() {
 
     let (status, _) = chat(&gateway, "ci-key", "quota-draining").await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(seen_models(&seen), ["up-free-quota"], "no second upstream call");
+    assert_eq!(
+        seen_models(&seen),
+        ["up-free-quota"],
+        "no second upstream call"
+    );
 
     let empty: Vec<String> = Vec::new();
     assert_eq!(listed(&gateway, "ci-key").await, empty);

@@ -264,15 +264,18 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         .key_policies
         .get(client_key.index)
         .and_then(Option::as_ref);
-    // A usable free leg is a non-fallback deployment marked free whose
-    // credential is not disabled — the same legs a free-only request could
-    // actually route to right now.
+    // A usable free leg is a non-fallback deployment marked free that could
+    // admit an OpenAI chat request right now. Quota, cooldown, parking, expiry,
+    // and stale-catalog state count because ci otherwise keeps buying models
+    // whose every free leg can only return all_candidates_exhausted.
     let has_usable_free_leg = |id: &str| match active.config.model_names.get(id) {
         Some(&index) => active.config.models[index].deployments.iter().any(|idx| {
             let dep = &active.config.deployments[idx.0 as usize];
             !dep.fallback
                 && dep.billing == Billing::Free
-                && active.executor.credential_disabled(&dep.credential) != Some(true)
+                && active
+                    .executor
+                    .deployment_available(*idx, InboundFormat::OpenAiChat)
         }),
         None => false,
     };

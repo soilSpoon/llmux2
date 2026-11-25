@@ -20,8 +20,8 @@ use limits::{DeploymentLimits, Permit, Window};
 use llmux_config::RuntimeConfig;
 use llmux_types::{
     provider, AuthMaterial, Billing, BuildError, ContextOverflow, CredentialSource, Deployment,
-    DeploymentIdx, ErrorKind, GatewayRequest, GatewayResponse, ProviderAdapter, ProviderRegistry,
-    QuotaSpec, SseCommitment, Support, UpstreamError,
+    DeploymentIdx, ErrorKind, GatewayRequest, GatewayResponse, InboundFormat, ProviderAdapter,
+    ProviderRegistry, QuotaSpec, SseCommitment, Support, UpstreamError,
 };
 use machine::{Built, Effect, Event, Outcome, Phase, State};
 pub use request_log::RequestLog;
@@ -467,6 +467,27 @@ impl Executor {
                 .devin_catalog
                 .get()
                 .is_some_and(|ids| !ids.contains(dep.upstream_model.as_ref()))
+    }
+
+    /// Whether a deployment can admit at least a minimal request in `format`
+    /// right now. Catalog availability cannot know a future request's size or
+    /// conversion needs, so this intentionally uses a one-token request while
+    /// applying the same disabled, parked, expired, stale-upstream, cooldown,
+    /// quota, concurrency, and format gates routing applies before `Send`.
+    pub fn deployment_available(&self, idx: DeploymentIdx, format: InboundFormat) -> bool {
+        let idx = index(idx);
+        let dep = &self.cfg.deployments[idx];
+        let binding = &self.bindings[idx];
+        if binding.disabled.load(Ordering::Relaxed)
+            || binding.limits.not_provisioned()
+            || binding.adapter.supports(format) == Support::No
+            || dep.expires_at.is_some_and(|end| SystemTime::now() >= end)
+            || self.devin_upstream_missing(dep)
+        {
+            return false;
+        }
+        let now = Instant::now();
+        binding.limits.available_at(now, 1) == now
     }
 
     /// Whether the credential is disabled in routing; `None` for unknown ids.
