@@ -18,7 +18,7 @@ const USAGE: &str = "usage: llmux [--url URL] [--key KEY] <command>
 Commands:
   status | deployments | credentials | models | reload
   enable <credential-id> | disable <credential-id>
-  export-upstream-quota --config PATH [--request-log PATH] [--runtime-deployments PATH] [--now RFC3339] [--no-request-log]
+  export-upstream-quota --config PATH [--request-log PATH] [--runtime-deployments PATH] [--traffic-classes PATH] [--now RFC3339] [--no-request-log]
 
 Target: --url/--key or LLMUX_ADMIN_URL/LLMUX_ADMIN_KEY (default http://127.0.0.1:8080).";
 
@@ -47,7 +47,11 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--no-request-log" => {
                 parsed.flags.insert("--no-request-log".into());
             }
-            flag @ ("--config" | "--request-log" | "--runtime-deployments" | "--now") => {
+            flag @ ("--config"
+            | "--request-log"
+            | "--runtime-deployments"
+            | "--traffic-classes"
+            | "--now") => {
                 let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
                 if parsed.options.insert(flag.to_string(), value).is_some() {
                     return Err(format!("duplicate flag {flag}"));
@@ -108,6 +112,7 @@ async fn run() -> Result<String, String> {
             config: PathBuf::from(config),
             request_log: options.remove("--request-log").map(PathBuf::from),
             runtime_deployments: options.remove("--runtime-deployments").map(PathBuf::from),
+            traffic_classes: options.remove("--traffic-classes").map(PathBuf::from),
             now: options.remove("--now"),
             no_request_log,
         });

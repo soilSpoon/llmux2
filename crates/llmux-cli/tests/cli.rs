@@ -224,6 +224,7 @@ async fn export_upstream_quota_joins_config_log_and_runtime_state() {
     let config = dir.path().join("llmux.toml");
     let log = dir.path().join("requests.jsonl");
     let runtime = dir.path().join("deployments.json");
+    let traffic = dir.path().join("traffic-classes.json");
     std::fs::write(
         &config,
         r#"[server]
@@ -277,10 +278,10 @@ priority = 0
     std::fs::write(
         &log,
         concat!(
-            "{\"ts_ms\":1795694360000,\"request_id\":\"r1\",\"model\":\"test-model\",\"deployment\":\"free-leg\",\"provider\":\"openai_compat\",\"attempts\":1,\"legs\":[{\"deployment\":\"free-leg\",\"provider\":\"openai_compat\",\"outcome\":\"routed\"}],\"latency_ms\":100,\"outcome\":\"routed\"}\n",
-            "{\"ts_ms\":1795694370000,\"request_id\":\"r2\",\"model\":\"test-alias\",\"deployment\":\"free-leg\",\"provider\":\"openai_compat\",\"attempts\":1,\"legs\":[{\"deployment\":\"free-leg\",\"provider\":\"openai_compat\",\"outcome\":\"rate_limited\"}],\"latency_ms\":20,\"outcome\":\"error\",\"error_kind\":\"rate_limited\"}\n",
-            "{\"ts_ms\":1795694380000,\"request_id\":\"r3\",\"model\":\"test-model\",\"attempts\":0,\"legs\":[],\"latency_ms\":0,\"outcome\":\"error\",\"error_kind\":\"all_candidates_exhausted\"}\n",
-            "{\"ts_ms\":1795611600000,\"request_id\":\"old\",\"model\":\"test-model\",\"deployment\":\"free-leg\",\"provider\":\"openai_compat\",\"attempts\":1,\"legs\":[{\"deployment\":\"free-leg\",\"provider\":\"openai_compat\",\"outcome\":\"routed\"}],\"latency_ms\":90,\"outcome\":\"routed\"}\n",
+            "{\"ts_ms\":1795694360000,\"request_id\":\"r1\",\"client_key\":\"key_5f6cfe5187aeea01\",\"model\":\"test-model\",\"deployment\":\"free-leg\",\"provider\":\"openai_compat\",\"attempts\":1,\"legs\":[{\"deployment\":\"free-leg\",\"provider\":\"openai_compat\",\"outcome\":\"routed\"}],\"latency_ms\":100,\"outcome\":\"routed\"}\n",
+            "{\"ts_ms\":1795694370000,\"request_id\":\"r2\",\"client_key\":\"key_1d0d1a8a5278c8ca\",\"model\":\"test-alias\",\"deployment\":\"free-leg\",\"provider\":\"openai_compat\",\"attempts\":1,\"legs\":[{\"deployment\":\"free-leg\",\"provider\":\"openai_compat\",\"outcome\":\"rate_limited\"}],\"latency_ms\":20,\"outcome\":\"error\",\"error_kind\":\"rate_limited\"}\n",
+            "{\"ts_ms\":1795694380000,\"request_id\":\"r3\",\"client_key\":\"key_1d0d1a8a5278c8ca\",\"model\":\"test-model\",\"attempts\":0,\"legs\":[],\"latency_ms\":0,\"outcome\":\"error\",\"error_kind\":\"all_candidates_exhausted\"}\n",
+            "{\"ts_ms\":1795611600000,\"request_id\":\"old\",\"client_key\":\"key_5f6cfe5187aeea01\",\"model\":\"test-model\",\"deployment\":\"free-leg\",\"provider\":\"openai_compat\",\"attempts\":1,\"legs\":[{\"deployment\":\"free-leg\",\"provider\":\"openai_compat\",\"outcome\":\"routed\"}],\"latency_ms\":90,\"outcome\":\"routed\"}\n",
             "{\"ts_ms\":1795603200000,\"request_id\":\"ancient-coverage\",\"model\":\"unrelated\",\"attempts\":0,\"legs\":[],\"latency_ms\":0,\"outcome\":\"error\",\"error_kind\":\"all_candidates_exhausted\"}\n"
         ),
     )
@@ -288,6 +289,11 @@ priority = 0
     std::fs::write(
         &runtime,
         r#"{"deployments":[{"model":"test-model","id":"free-leg","provider":"openai_compat","priority":0,"disabled":false,"not_provisioned":false,"expired":false,"cooldown_ms":null,"cooldown_scope":null,"rpm_limit":10,"concurrency_limit":null,"in_flight":null,"routed":0,"failed_attempts":0,"stream_errors":0,"handoffs":0,"failure_classes":{},"skip_reasons":{}}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &traffic,
+        r#"{"key_5f6cfe5187aeea01":{"trafficClass":"ci_buyer_shaped","source":"test-traffic-shape","confidence":"inferred"},"key_1d0d1a8a5278c8ca":{"trafficClass":"synthetic_probe","source":"test-periodic-probe","confidence":"inferred"}}"#,
     )
     .unwrap();
 
@@ -299,6 +305,8 @@ priority = 0
         log.to_str().unwrap(),
         "--runtime-deployments",
         runtime.to_str().unwrap(),
+        "--traffic-classes",
+        traffic.to_str().unwrap(),
         "--now",
         "2026-11-26T12:00:00Z",
     ]);
@@ -344,6 +352,28 @@ priority = 0
     assert_eq!(row["capacitySaturation"], 0.002);
     assert_eq!(row["lastErrorKind"], "all_candidates_exhausted");
     assert_eq!(row["medianFailureLatencyMs"], 10);
+    assert_eq!(row["trafficClass"], "mixed");
+    assert_eq!(row["clientKeyFingerprint"], Value::Null);
+    let traffic_rows = row["trafficBreakdown"].as_array().unwrap();
+    let buyer = traffic_rows
+        .iter()
+        .find(|entry| entry["trafficClass"] == "ci_buyer_shaped")
+        .unwrap();
+    assert_eq!(buyer["clientKeyFingerprint"], "key_5f6cfe5187aeea01");
+    assert_eq!(buyer["classificationConfidence"], "inferred");
+    assert_eq!(buyer["attemptedUnits1h"], 1);
+    assert_eq!(buyer["servedUnits1h"], 1);
+    assert_eq!(buyer["zeroCandidateUnits1h"], 0);
+    assert_eq!(buyer["attemptedUnits24h"], 2);
+    assert_eq!(buyer["servedUnits24h"], 2);
+    let probe = traffic_rows
+        .iter()
+        .find(|entry| entry["trafficClass"] == "synthetic_probe")
+        .unwrap();
+    assert_eq!(probe["clientKeyFingerprint"], "key_1d0d1a8a5278c8ca");
+    assert_eq!(probe["attemptedUnits1h"], 2);
+    assert_eq!(probe["servedUnits1h"], 0);
+    assert_eq!(probe["zeroCandidateUnits1h"], 1);
     let windows = row["quotaWindows"].as_array().unwrap();
     assert!(windows.iter().any(|window| {
         window["scope"] == "shared_quota"
@@ -361,7 +391,9 @@ priority = 0
         .find(|row| row["model"] == "parked-model")
         .unwrap();
     assert_eq!(parked["parked"], true);
-    assert_eq!(parked["freeOrMembership"], "billed");
+    assert_eq!(parked["freeOrMembership"], Value::Null);
+    assert_eq!(parked["legs"][0]["billingDeclared"], "billed");
+    assert_eq!(parked["legs"][0]["classificationConfidence"], "unknown");
     assert_eq!(parked["legs"][0]["parked"], true);
     assert_eq!(
         parked["legs"][0]["parkReasons"],

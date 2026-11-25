@@ -15,6 +15,7 @@ pub struct ExportOptions {
     pub config: PathBuf,
     pub request_log: Option<PathBuf>,
     pub runtime_deployments: Option<PathBuf>,
+    pub traffic_classes: Option<PathBuf>,
     pub now: Option<String>,
     pub no_request_log: bool,
 }
@@ -47,8 +48,13 @@ pub fn run(options: ExportOptions) -> Result<String, String> {
         "not_configured"
     };
     let request_log_input = log_path.as_ref().map(input_provenance);
+    let traffic_input = options.traffic_classes.as_ref().map(input_provenance);
+    let traffic_classes = match &options.traffic_classes {
+        Some(path) => read_traffic_classes(path)?,
+        None => HashMap::new(),
+    };
     let log = match log_path {
-        Some(path) => Some(read_request_log(&path, unix_ms(now))?),
+        Some(path) => Some(read_request_log(&path, unix_ms(now), &traffic_classes)?),
         None => None,
     };
     let runtime_input = options.runtime_deployments.as_ref().map(input_provenance);
@@ -61,6 +67,7 @@ pub fn run(options: ExportOptions) -> Result<String, String> {
         request_log: request_log_input,
         request_log_state,
         runtime_deployments: runtime_input,
+        traffic_classes: traffic_input,
     };
     let export = build_export(&inventory, log.as_ref(), runtime.as_ref(), now, inputs);
     serde_json::to_string_pretty(&export).map_err(|err| format!("serializing export failed: {err}"))
@@ -82,6 +89,7 @@ struct ExportInputs {
     request_log: Option<InputProvenance>,
     request_log_state: &'static str,
     runtime_deployments: Option<InputProvenance>,
+    traffic_classes: Option<InputProvenance>,
 }
 
 #[derive(Serialize)]
@@ -114,6 +122,9 @@ struct UpstreamRow {
     capacity_saturation: Option<f64>,
     last_error_kind: Option<String>,
     median_failure_latency_ms: Option<u64>,
+    traffic_class: Option<&'static str>,
+    client_key_fingerprint: Option<String>,
+    traffic_breakdown: Option<Vec<TrafficBreakdownOut>>,
     availability: BTreeMap<String, String>,
     field_sources: BTreeMap<String, String>,
     source: &'static str,
@@ -128,6 +139,11 @@ struct ExportLeg {
     upstream_model: String,
     priority: i32,
     billing: &'static str,
+    billing_declared: &'static str,
+    free_or_membership: Option<&'static str>,
+    classification_source: &'static str,
+    classification_confidence: &'static str,
+    host: Option<String>,
     shared_quota: Option<String>,
     parked: Option<bool>,
     park_reasons: Vec<&'static str>,
@@ -161,6 +177,28 @@ struct Recent429 {
     kind: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrafficBreakdownOut {
+    traffic_class: String,
+    client_key_fingerprint: Option<String>,
+    classification_source: Option<String>,
+    classification_confidence: Option<String>,
+    attempted_units1h: u64,
+    attempted_units24h: u64,
+    served_units1h: u64,
+    served_units24h: u64,
+    zero_candidate_units1h: u64,
+    zero_candidate_units24h: u64,
+}
+
+#[derive(Clone)]
+struct TrafficClassRule {
+    traffic_class: String,
+    source: Option<String>,
+    confidence: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct RuntimeDeployments {
     deployments: Vec<RuntimeDeployment>,
@@ -179,6 +217,7 @@ struct RuntimeDeployment {
 struct LogRecord {
     ts_ms: u64,
     model: String,
+    client_key: Option<String>,
     outcome: String,
     error_kind: Option<String>,
     latency_ms: u64,
@@ -202,6 +241,7 @@ struct LogData {
 
 #[derive(Default)]
 struct ModelLog {
+    traffic: BTreeMap<TrafficKey, TrafficBucket>,
     attempted1h: u64,
     attempted24h: u64,
     served1h: u64,
@@ -211,6 +251,39 @@ struct ModelLog {
     failure_latencies24h: Vec<u64>,
     last_error24h: Option<(u64, String)>,
     recent429: BTreeMap<String, (u64, u64)>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TrafficKey {
+    traffic_class: String,
+    fingerprint: Option<String>,
+}
+
+#[derive(Default)]
+struct TrafficBucket {
+    source: Option<String>,
+    confidence: Option<String>,
+    attempted1h: u64,
+    attempted24h: u64,
+    served1h: u64,
+    served24h: u64,
+    zero1h: u64,
+    zero24h: u64,
+}
+
+impl TrafficBucket {
+    fn ingest(&mut self, record: &LogRecord, in_hour: bool) {
+        self.attempted24h += 1;
+        self.attempted1h += u64::from(in_hour);
+        if record.outcome == "routed" {
+            self.served24h += 1;
+            self.served1h += u64::from(in_hour);
+        }
+        if record.attempts == 0 {
+            self.zero24h += 1;
+            self.zero1h += u64::from(in_hour);
+        }
+    }
 }
 
 fn input_provenance(path: &PathBuf) -> InputProvenance {
@@ -224,7 +297,48 @@ fn input_provenance(path: &PathBuf) -> InputProvenance {
     }
 }
 
-fn read_request_log(path: &PathBuf, now_ms: u64) -> Result<LogData, String> {
+fn read_traffic_classes(path: &PathBuf) -> Result<HashMap<String, TrafficClassRule>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| format!("reading traffic classes {} failed: {err}", path.display()))?;
+    let raw: HashMap<String, serde_json::Value> = serde_json::from_str(&text)
+        .map_err(|err| format!("traffic classes {} is invalid JSON: {err}", path.display()))?;
+    let mut rules = HashMap::new();
+    for (fingerprint, value) in raw {
+        let rule = match value {
+            serde_json::Value::String(class) => TrafficClassRule {
+                traffic_class: class,
+                source: None,
+                confidence: None,
+            },
+            serde_json::Value::Object(object) => {
+                let get = |keys: &[&str]| {
+                    keys.iter()
+                        .find_map(|key| object.get(*key)?.as_str().map(str::to_string))
+                };
+                TrafficClassRule {
+                    traffic_class: get(&["trafficClass", "traffic_class", "class"]).ok_or_else(
+                        || format!("traffic class for {fingerprint} is missing trafficClass"),
+                    )?,
+                    source: get(&["source", "classificationSource"]),
+                    confidence: get(&["confidence", "classificationConfidence"]),
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "traffic class for {fingerprint} must be a string or object"
+                ))
+            }
+        };
+        rules.insert(fingerprint, rule);
+    }
+    Ok(rules)
+}
+
+fn read_request_log(
+    path: &PathBuf,
+    now_ms: u64,
+    traffic_classes: &HashMap<String, TrafficClassRule>,
+) -> Result<LogData, String> {
     let file = File::open(path)
         .map_err(|err| format!("reading request log {} failed: {err}", path.display()))?;
     let mut data = LogData::default();
@@ -251,7 +365,7 @@ fn read_request_log(path: &PathBuf, now_ms: u64) -> Result<LogData, String> {
                 .map_or(record.ts_ms, |first| first.min(record.ts_ms)),
         );
         let model = data.models.entry(record.model.clone()).or_default();
-        model.ingest(&record, now_ms);
+        model.ingest(&record, now_ms, traffic_classes);
         for leg in record.legs {
             data.deployment_requests
                 .entry(leg.deployment)
@@ -266,13 +380,35 @@ fn read_request_log(path: &PathBuf, now_ms: u64) -> Result<LogData, String> {
 }
 
 impl ModelLog {
-    fn ingest(&mut self, record: &LogRecord, now_ms: u64) {
+    fn ingest(
+        &mut self,
+        record: &LogRecord,
+        now_ms: u64,
+        traffic_classes: &HashMap<String, TrafficClassRule>,
+    ) {
         let day_start = now_ms.saturating_sub(86_400_000);
         let hour_start = now_ms.saturating_sub(3_600_000);
         if record.ts_ms < day_start {
             return;
         }
         let in_hour = record.ts_ms >= hour_start;
+        let fingerprint = record.client_key.clone();
+        let rule = fingerprint
+            .as_ref()
+            .and_then(|fingerprint| traffic_classes.get(fingerprint));
+        let traffic_class = rule
+            .map(|rule| rule.traffic_class.clone())
+            .unwrap_or_else(|| "unknown".into());
+        let bucket = self
+            .traffic
+            .entry(TrafficKey {
+                traffic_class,
+                fingerprint,
+            })
+            .or_default();
+        bucket.source = rule.and_then(|rule| rule.source.clone());
+        bucket.confidence = rule.and_then(|rule| rule.confidence.clone());
+        bucket.ingest(record, in_hour);
         self.attempted24h += 1;
         self.attempted1h += u64::from(in_hour);
         if record.outcome == "routed" {
@@ -434,15 +570,15 @@ fn build_row(
         .iter()
         .filter_map(|window| window.reset_at.clone())
         .min();
-    let free_count = legs.iter().filter(|leg| leg.billing == "free").count();
-    let free_or_membership = if legs.is_empty() {
+    let classes: Vec<_> = legs.iter().map(|leg| leg.free_or_membership).collect();
+    let free_or_membership = if classes.is_empty() || classes.iter().any(Option::is_none) {
         None
-    } else if free_count == legs.len() {
+    } else if classes.iter().all(|class| *class == Some("free")) {
         Some("free")
-    } else if free_count != 0 {
-        Some("mixed")
+    } else if classes.iter().all(|class| *class == Some("membership")) {
+        Some("membership")
     } else {
-        Some("billed")
+        Some("mixed")
     };
     let marginal_cost = None;
     let parked = if !legs.is_empty() && legs.iter().all(|leg| leg.parked == Some(true)) {
@@ -524,6 +660,29 @@ fn build_row(
         Some((units, saturation)) => (Some(units), saturation),
         None => (None, None),
     };
+    let traffic_breakdown = log.map(|_| combined.traffic_breakdown());
+    let traffic_class = traffic_breakdown.as_ref().and_then(|rows| {
+        if rows.is_empty() {
+            None
+        } else if rows
+            .iter()
+            .all(|row| row.traffic_class == rows[0].traffic_class)
+        {
+            match rows[0].traffic_class.as_str() {
+                "ci_buyer_shaped" => Some("ci_buyer_shaped"),
+                "synthetic_probe" => Some("synthetic_probe"),
+                "internal" => Some("internal"),
+                _ => Some("unknown"),
+            }
+        } else {
+            Some("mixed")
+        }
+    });
+    let client_key_fingerprint = traffic_breakdown.as_ref().and_then(|rows| {
+        (rows.len() == 1)
+            .then(|| rows[0].client_key_fingerprint.clone())
+            .flatten()
+    });
     let recent429 = log.map(|_| combined.recent429());
     UpstreamRow {
         model: model.name.to_string(),
@@ -546,6 +705,9 @@ fn build_row(
         capacity_saturation,
         last_error_kind: combined.last_error.clone(),
         median_failure_latency_ms: combined.median_failure_latency(),
+        traffic_class,
+        client_key_fingerprint,
+        traffic_breakdown,
         availability,
         field_sources,
         source: "llmux2",
@@ -638,6 +800,14 @@ fn build_leg(
                 Billing::Free => "free",
                 Billing::Billed => "billed",
             },
+            billing_declared: match deployment.billing {
+                Billing::Free => "free",
+                Billing::Billed => "billed",
+            },
+            free_or_membership: plan_classification(deployment).0,
+            classification_source: plan_classification(deployment).1,
+            classification_confidence: plan_classification(deployment).2,
+            host: deployment.base_url.as_deref().and_then(host_from_url),
             shared_quota: deployment.shared_quota.as_ref().map(ToString::to_string),
             parked,
             park_reasons: reasons,
@@ -646,6 +816,38 @@ fn build_leg(
         },
         windows,
     }
+}
+
+fn plan_classification(
+    deployment: &DeploymentInventory,
+) -> (Option<&'static str>, &'static str, &'static str) {
+    let antigravity_subscription = deployment.provider.0.as_ref() == "antigravity"
+        || deployment
+            .base_url
+            .as_deref()
+            .is_some_and(|url| url.contains("daily-cloudcode-pa.googleapis.com"));
+    if antigravity_subscription {
+        (
+            Some("membership"),
+            "wo104-revenue-analyst-correction",
+            "inferred",
+        )
+    } else if deployment.billing == Billing::Free {
+        (
+            Some("free"),
+            "config_billing_declared_unverified",
+            "inferred",
+        )
+    } else {
+        (None, "config_billing_declared_unverified", "unknown")
+    }
+}
+
+fn host_from_url(url: &str) -> Option<String> {
+    url.split_once("://")
+        .map(|(_, rest)| rest.split('/').next().unwrap_or(rest).to_string())
+        .or_else(|| url.split('/').next().map(str::to_string))
+        .filter(|host| !host.is_empty())
 }
 
 #[derive(Clone)]
@@ -864,6 +1066,7 @@ fn deployment_ids_for_scope(
 
 #[derive(Default)]
 struct CombinedLog {
+    traffic: BTreeMap<TrafficKey, TrafficBucket>,
     attempted1h: u64,
     attempted24h: u64,
     served1h: u64,
@@ -878,6 +1081,17 @@ struct CombinedLog {
 
 impl CombinedLog {
     fn add(&mut self, model: &ModelLog) {
+        for (key, bucket) in &model.traffic {
+            let out = self.traffic.entry(key.clone()).or_default();
+            out.source = bucket.source.clone();
+            out.confidence = bucket.confidence.clone();
+            out.attempted1h += bucket.attempted1h;
+            out.attempted24h += bucket.attempted24h;
+            out.served1h += bucket.served1h;
+            out.served24h += bucket.served24h;
+            out.zero1h += bucket.zero1h;
+            out.zero24h += bucket.zero24h;
+        }
         self.attempted1h += model.attempted1h;
         self.attempted24h += model.attempted24h;
         self.served1h += model.served1h;
@@ -897,6 +1111,24 @@ impl CombinedLog {
             entry.0 += count;
             entry.1 = entry.1.max(*at);
         }
+    }
+
+    fn traffic_breakdown(&self) -> Vec<TrafficBreakdownOut> {
+        self.traffic
+            .iter()
+            .map(|(key, bucket)| TrafficBreakdownOut {
+                traffic_class: key.traffic_class.clone(),
+                client_key_fingerprint: key.fingerprint.clone(),
+                classification_source: bucket.source.clone(),
+                classification_confidence: bucket.confidence.clone(),
+                attempted_units1h: bucket.attempted1h,
+                attempted_units24h: bucket.attempted24h,
+                served_units1h: bucket.served1h,
+                served_units24h: bucket.served24h,
+                zero_candidate_units1h: bucket.zero1h,
+                zero_candidate_units24h: bucket.zero24h,
+            })
+            .collect()
     }
 
     fn median_failure_latency(&self) -> Option<u64> {

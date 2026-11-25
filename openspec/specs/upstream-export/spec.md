@@ -102,3 +102,21 @@ upstream 429/402 observation.
 WHEN one leg returns `rate_limited` and another leg serves the request
 THEN the row is counted as served and the leg limit still appears in
 `recent429`.
+
+### Requirement: Traffic classes stay separated
+
+When request-log input is available, demand counts SHALL be emitted both as all-key totals and per `(trafficClass, clientKeyFingerprint)` buckets. Fingerprints SHALL use the gateway's non-secret `key_<16 hex>` form. Classification SHALL come from an explicit `--traffic-classes` mapping; unmapped or missing keys SHALL be `unknown`, not inferred by the exporter. Buyer-shaped, synthetic-probe, internal, and unknown traffic SHALL NOT be collapsed into one buyer-demand count.
+
+#### Scenario: Probe traffic separated
+
+WHEN one fingerprint is classified as `synthetic_probe` and another as `ci_buyer_shaped`
+THEN `trafficBreakdown` exposes separate attempted, served, and zero-candidate counts for both, and the row-level aggregate remains visibly all-traffic rather than buyer-only.
+
+### Requirement: Billing declaration is not plan truth
+
+`billing` in config SHALL be emitted only as `billingDeclared`. Leg-level `freeOrMembership` SHALL carry `classificationSource` and `classificationConfidence`. Antigravity OAuth legs on `daily-cloudcode-pa.googleapis.com` SHALL be marked membership only as inferred provenance unless independently verified; unverified billed declarations SHALL remain unknown rather than being treated as proven paid supply.
+
+#### Scenario: Antigravity subscription asset
+
+WHEN an antigravity OAuth leg is declared `billed` in config but uses the subscription/free-quota host
+THEN the export reports `billingDeclared=billed`, `freeOrMembership=membership`, and inferred provenance rather than trusting the config label.
