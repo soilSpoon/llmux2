@@ -764,7 +764,7 @@ impl Executor {
                                 binding.limits.admit(needed)
                             };
                             if support != Support::Convert && permit.is_none() {
-                                skip_reason = Some(SkipReason::AdmissionLimited);
+                                skip_reason = Some(deny_reason(&binding.limits));
                             }
                             event = Event::Admit {
                                 permit: support == Support::Convert || permit.is_some(),
@@ -792,18 +792,20 @@ impl Executor {
                             break;
                         }
                         Effect::Admit => {
-                            permit = permit.take().or_else(|| {
-                                if binding.limits.cooldown_until(Instant::now()).is_some() {
-                                    skip_reason = Some(SkipReason::Cooldown);
-                                    None
-                                } else {
-                                    let permit = binding.limits.admit(needed);
-                                    if permit.is_none() {
-                                        skip_reason = Some(SkipReason::AdmissionLimited);
-                                    }
-                                    permit
+                            if binding.limits.cooldown_until(Instant::now()).is_some() {
+                                // A cooldown that landed during the build
+                                // recalls even a permit granted before it, so
+                                // a cooling deployment is never sent traffic.
+                                permit = None;
+                                skip_reason = Some(SkipReason::Cooldown);
+                            } else if permit.is_none() {
+                                // Convert deployments admit here, after a
+                                // successful conversion build.
+                                permit = binding.limits.admit(needed);
+                                if permit.is_none() {
+                                    skip_reason = Some(deny_reason(&binding.limits));
                                 }
-                            });
+                            }
                             event = Event::Gate {
                                 permit: permit.is_some(),
                             };
@@ -1221,6 +1223,17 @@ impl Executor {
             })),
         };
         response
+    }
+}
+
+/// A refused admission is a cooldown when the deployment is cooling — even
+/// one that landed after the caller's own check — and a quota or concurrency
+/// limit otherwise.
+fn deny_reason(limits: &DeploymentLimits) -> SkipReason {
+    if limits.cooldown_until(Instant::now()).is_some() {
+        SkipReason::Cooldown
+    } else {
+        SkipReason::AdmissionLimited
     }
 }
 
