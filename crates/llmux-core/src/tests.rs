@@ -461,6 +461,53 @@ async fn expired_deployments_are_skipped() {
 }
 
 #[tokio::test]
+async fn same_level_spread_keeps_a_prompt_prefix_on_one_deployment() {
+    let future = SystemTime::now() + Duration::from_secs(60);
+    let (executor, _, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("model", &[0, 1, 2])],
+        Default::default(),
+        Default::default(),
+        false,
+        None,
+        [None; 3],
+        [Some((0, future)); 3],
+    )
+    .await;
+    let repeated = || GatewayRequest {
+        body: Bytes::from_static(b"shared-cache-prefix"),
+        ..request()
+    };
+
+    let first = executor.execute(repeated()).await.unwrap().deployment;
+    for _ in 0..4 {
+        assert_eq!(
+            executor.execute(repeated()).await.unwrap().deployment,
+            first
+        );
+    }
+
+    let mut spread = HashSet::new();
+    for i in 0..24 {
+        let routed = executor
+            .execute(GatewayRequest {
+                body: Bytes::from(format!("shared-cache-prefix-{i}")),
+                ..request()
+            })
+            .await
+            .unwrap()
+            .deployment;
+        spread.insert(routed);
+    }
+    assert!(
+        spread.len() > 1,
+        "distinct cache keys should spread across same-level deployments"
+    );
+}
+
+#[tokio::test]
 async fn priority_boost_promotes_until_deadline_then_reverts() {
     let future = SystemTime::now() + Duration::from_secs(3600);
     let past = SystemTime::now() - Duration::from_secs(60);

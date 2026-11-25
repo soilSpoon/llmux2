@@ -693,7 +693,7 @@ impl Executor {
             (&model.deployments[..], &order.groups[..])
         };
         let sequence = if groups.iter().any(|group| group.len() > 1) {
-            order.next.fetch_add(1, Ordering::Relaxed)
+            cache_seed(&req).unwrap_or_else(|| order.next.fetch_add(1, Ordering::Relaxed))
         } else {
             0
         };
@@ -1276,6 +1276,40 @@ fn hold_permit(response: GatewayResponse, permit: Permit) -> GatewayResponse {
 
 fn index(idx: DeploymentIdx) -> usize {
     idx.0 as usize
+}
+
+/// Only the stable leading prompt bytes feed cache affinity. Chat turns usually
+/// append after the shared system/early-message prefix, while the tail is where
+/// prompts diverge; 8 KiB is enough for meaningful provider prompt caching
+/// without copying whole bodies into the selection path.
+const CACHE_PREFIX_BYTES: usize = 8 * 1024;
+
+fn cache_seed(req: &GatewayRequest) -> Option<usize> {
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut present = false;
+    for part in [req.end_user.as_deref(), req.client_key.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        hash = fnv_part(hash, part.as_bytes());
+        present = true;
+    }
+    let prefix = &req.body[..req.body.len().min(CACHE_PREFIX_BYTES)];
+    if !prefix.is_empty() {
+        hash = fnv_part(hash, prefix);
+        present = true;
+    }
+    present.then_some(hash as usize)
+}
+
+fn fnv_part(mut hash: u64, part: &[u8]) -> u64 {
+    for byte in (part.len() as u64).to_le_bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
+    for &byte in part {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 /// Priority a deployment competes with right now: `priority_boost` while its
