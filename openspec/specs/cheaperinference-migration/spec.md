@@ -607,9 +607,12 @@ keyed loopback bridge such as Cloudflare-direct (or attach to a new
 lowest-priority connection when the export has none and a token was given).
 For each imported combo model that maps to a `free`, in-scope catalog id the
 importer SHALL append a free `openai_compat` leg against that connection,
-which sorts ahead of billed legs with the other verified-free legs. The same
-free classification and session-token scope SHALL apply to existing exported
-legs that use the reviewed DeepAI Code connection. Discovery-backed legs SHALL
+which sorts ahead of billed legs with the other verified-free legs. When the
+export already contains an equivalent deployment on that endpoint and model,
+the importer SHALL reuse that deployment instead of emitting a duplicate that
+would add selection weight or a duplicate-deployment warning. The same free
+classification and session-token scope SHALL apply to existing exported legs
+that use the reviewed DeepAI Code connection. Discovery-backed legs SHALL
 also count when deciding whether a canonical combo is available for mapped
 public aliases under `--openrouter-replacements`. Metered catalog ids, ids
 outside the token scope, and catalog-free ids with no mapping SHALL emit no

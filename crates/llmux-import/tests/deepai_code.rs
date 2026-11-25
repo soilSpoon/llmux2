@@ -156,6 +156,39 @@ fn state_without_token_keeps_the_exported_credential() {
             ("https://paid.example/v1".to_string(), "a".to_string()),
         ]
     );
+    let index = config.models[*config.model_names.get("claude-haiku-5.5").unwrap()].deployments[0];
+    let deployment = &config.deployments[index.0 as usize];
+    assert_eq!(deployment.credential.as_ref(), "upstream-dac");
+    assert_eq!(
+        config.api_keys.get("upstream-dac").unwrap().key.as_ref(),
+        "synthetic-dac",
+        "state alone must keep the exported connection's credential"
+    );
+}
+
+#[test]
+fn session_token_replaces_the_exported_deepai_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let (config, _) = run(&fixture(), &options(&state, &token));
+    let index = config.models[*config.model_names.get("claude-haiku-5.5").unwrap()].deployments[0];
+    let deployment = &config.deployments[index.0 as usize];
+    assert_eq!(deployment.credential.as_ref(), "deepai-code-discovered");
+    assert_eq!(
+        config
+            .api_keys
+            .get("deepai-code-discovered")
+            .unwrap()
+            .key
+            .as_ref(),
+        "synthetic-session",
+        "the emitted deployment must resolve to the supplied session-token file"
+    );
 }
 
 #[test]
@@ -263,6 +296,35 @@ fn session_token_scope_applies_to_existing_exported_deepai_legs() {
 }
 
 #[test]
+fn discovery_reuses_an_existing_exported_deepai_leg() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let root = custom_deepai_fixture(json!(["deepai/claude-haiku-5-5", "paid/a"]));
+    let (config, report) = run(&root, &options(&state, &token));
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [
+            (BRIDGE.to_string(), "claude-haiku-5-5".to_string()),
+            ("https://paid.example/v1".to_string(), "a".to_string()),
+        ],
+        "the discovered leg must not double the exported leg's selection weight"
+    );
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|w| w.contains("duplicate deployment")),
+        "the import must reuse the exported leg instead of emitting then dropping a duplicate: {:?}",
+        report.warnings
+    );
+}
+
+#[test]
 fn malformed_discovery_list_types_fail_import() {
     for (field, value) in [
         ("free", json!("claude-haiku-5-5")),
@@ -307,6 +369,44 @@ fn custom_deepai_free_provider_evidence_survives_without_discovery_state() {
     );
     let index = config.models[*config.model_names.get("claude-haiku-5.5").unwrap()].deployments[0];
     assert_eq!(config.deployments[index.0 as usize].billing, Billing::Free);
+}
+
+#[test]
+fn discovery_reuses_a_declared_deepai_leg_instead_of_appending_a_sibling() {
+    let mut root = custom_deepai_fixture(json!([
+        {"kind":"model","model":"deepai/claude-haiku-5-5","connectionId":"dac2"},
+        "paid/a"
+    ]));
+    root["providerConnections"].as_array_mut().unwrap().push(
+        json!({"id":"dac2","provider":"custom-deepai","authType":"apikey","apiKey":"synthetic-dac2"}),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let (config, _) = run(
+        &root,
+        &ImportOptions {
+            deepai_code_state: Some(&state),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [
+            (BRIDGE.to_string(), "claude-haiku-5-5".to_string()),
+            ("https://paid.example/v1".to_string(), "a".to_string()),
+        ],
+        "the declared DeepAI leg must be reused rather than duplicated"
+    );
+    let index = config.models[*config.model_names.get("claude-haiku-5.5").unwrap()].deployments[0];
+    assert_eq!(
+        config.deployments[index.0 as usize].credential.as_ref(),
+        "upstream-dac2",
+        "the declared connection pin decides which existing credential serves the leg"
+    );
 }
 
 #[test]

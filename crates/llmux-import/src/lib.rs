@@ -1699,7 +1699,7 @@ pub fn import_with_options(
             if combos.contains_key(&name) {
                 if let Some(step) = deepai_code::step(&name, state, &connections, &mut warnings) {
                     let combo = HashMap::from([(name.clone(), json!({"models":[step]}))]);
-                    let before = deployments.len();
+                    let mut discovered = Vec::new();
                     Expander {
                         context: &mut context,
                         combos: &combo,
@@ -1712,8 +1712,19 @@ pub fn import_with_options(
                         policy: &policy,
                         dead: &dead,
                     }
-                    .expand(&name, &mut Vec::new(), &mut deployments);
-                    if deployments.len() != before {
+                    .expand(&name, &mut Vec::new(), &mut discovered);
+                    let mut added = false;
+                    for deployment in discovered {
+                        if deployments.iter().any(|existing| {
+                            existing["base_url"] == deployment["base_url"]
+                                && existing["upstream_model"] == deployment["upstream_model"]
+                        }) {
+                            continue;
+                        }
+                        deployments.push(deployment);
+                        added = true;
+                    }
+                    if added {
                         warnings.push(format!("combo {name}: added reviewed free DeepAI Code leg"));
                     }
                 }
