@@ -53,10 +53,6 @@ fn reviewed_free_xplabs_model_is_prepended_ahead_of_paid_legs() {
         ("gpt-6-luna", "gpt-6-luna"),
         ("deepseek-v4.1-flash", "deepseek-v4.1-flash"),
         ("deepseek-v4.1-flash-fast", "deepseek-v4.1-flash"),
-        (
-            "deepseek-v4.1-flash-1017-uncensored",
-            "deepseek-v4.1-flash-uncensored-fast:free",
-        ),
     ] {
         let (actual, warnings) = routes(&fixture(name, json!(["paid/a", "paid/b"])));
         assert_eq!(
@@ -272,6 +268,56 @@ fn credentials(root: &Value) -> Vec<(String, String)> {
             (dep.upstream_model.to_string(), dep.credential.to_string())
         })
         .collect()
+}
+
+/// The `uncensored-fast:free` promotion ended audience-gated: on 2026-11-25 the
+/// production key got `model_not_granted` ("selected audience") while the billed
+/// id stayed up. The combo keeps its other legs; no XPLabs route is generated.
+#[test]
+fn dead_uncensored_promo_generates_no_xplabs_leg() {
+    for legs in [
+        json!([
+            "paid/a",
+            "experlabs/deepseek-v4.1-flash-uncensored-fast:free"
+        ]),
+        json!(["paid/a"]),
+    ] {
+        let (actual, _) = routes(&fixture("deepseek-v4.1-flash-1017-uncensored", legs));
+        assert_eq!(actual, [pair("https://paid.example/v1", "a")]);
+    }
+}
+
+/// Drift check against a committed snapshot of the keyless
+/// `GET https://api.experientiallabs.ai/api/plan-discounts` (re-fetch to update).
+/// Every slug the importer may emit as a free XPLabs leg must still reach a 100%
+/// discount on some paid plan — the OCI key bills at that tier (bare ids return
+/// usage.cost 0 where the free plan shows 0%). The snapshot cannot see Free Core
+/// `:free` routing or audience-gated promotions, so a slug going free here still
+/// needs a `llmux-import --scan-free experlabs` probe before it joins the table.
+#[test]
+fn plan_discounts_fixture_covers_every_verified_free_slug() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/xplabs-plan-discounts.json")).unwrap();
+    let models = fixture["models"].as_array().unwrap();
+    let hits_100 = |slug: &str| {
+        models
+            .iter()
+            .find(|m| m["slug"] == slug)
+            .unwrap_or_else(|| panic!("{slug} missing from plan-discounts snapshot"))
+    };
+    for id in llmux_import::xplabs_free_ids() {
+        let row = hits_100(id);
+        assert!(
+            ["free", "pro", "max", "ultra"]
+                .iter()
+                .any(|p| row[p].as_f64() == Some(100.0)),
+            "{id} no longer reaches 100% on any plan — re-verify before regen"
+        );
+    }
+    let row = hits_100("deepseek-v4.1-flash-uncensored");
+    assert!(["free", "pro", "max", "ultra"]
+        .iter()
+        .all(|p| row[p].as_f64() != Some(100.0)));
 }
 
 #[test]
