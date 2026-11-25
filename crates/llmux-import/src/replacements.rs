@@ -259,12 +259,6 @@ const ROUTES: &[Route] = &[
     ("google/gemini-4-carbon", "gemini", "gemini-4-carbon"),
     // https://ai-gateway.kilo.ai/api/v1/models
     (
-        "dots-studio/dots-3-note-preview:free",
-        "kilo",
-        "dots-studio/dots-3-note-preview:free",
-    ),
-    // https://ai-gateway.kilo.ai/api/v1/models
-    (
         "recursive/flint-v1.0:free",
         "kilo",
         "recursive/flint-v1.0:free",
