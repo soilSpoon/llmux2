@@ -81,7 +81,8 @@ above. Current catalog, from observed traffic:
 | Antigravity | 429 RESOURCE_EXHAUSTED | QuotaExhausted (family) | weekly window end |
 | Credit relays | `insufficient_credits` / 402 credits | QuotaExhausted (account) | unknown; park to quota_max |
 | IteraCompute | "capacity temporarily exhausted" | RateLimited | backoff |
-| Generic | `Retry-After`, `x-ratelimit-remaining: 0` + reset | RateLimited / QuotaExhausted | header |
+| Generic | `Retry-After`, `x-ratelimit-remaining{,-requests}: 0` + reset | RateLimited / QuotaExhausted | header |
+| IETF window | `x-ratelimit-{limit,remaining,reset}` (AI Horde) | RateLimited / parked on `remaining: 0` | epoch or delta-seconds header |
 
 New signatures SHALL be added here with the code change that parses them.
 

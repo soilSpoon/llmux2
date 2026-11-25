@@ -552,6 +552,10 @@ pub(crate) const LIMIT_REMAINING_REQUESTS: &str = "x-ratelimit-remaining-request
 pub(crate) const LIMIT_REMAINING_TOKENS: &str = "x-ratelimit-remaining-tokens";
 pub(crate) const LIMIT_RESET_REQUESTS: &str = "x-ratelimit-reset-requests";
 pub(crate) const LIMIT_RESET_TOKENS: &str = "x-ratelimit-reset-tokens";
+/// IETF-style single-window names (AI Horde). `reset` arrives as unix-epoch
+/// seconds; `x-ratelimit-limit` names the window size and is not consumed today.
+const GENERIC_REMAINING: &str = "x-ratelimit-remaining";
+const GENERIC_RESET: &str = "x-ratelimit-reset";
 
 #[async_trait]
 impl ProviderAdapter for OpenAiCompat {
@@ -684,9 +688,15 @@ impl ProviderAdapter for OpenAiCompat {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u32>().ok())
         };
-        let remaining_requests = count(LIMIT_REMAINING_REQUESTS);
+        let remaining_requests =
+            count(LIMIT_REMAINING_REQUESTS).or_else(|| count(GENERIC_REMAINING));
         let remaining_tokens = count(LIMIT_REMAINING_TOKENS);
-        let reset_requests = header_text(headers, LIMIT_RESET_REQUESTS).and_then(parse_duration);
+        let reset_requests = header_text(headers, LIMIT_RESET_REQUESTS)
+            .and_then(parse_duration)
+            .or_else(|| {
+                header_text(headers, GENERIC_RESET)
+                    .and_then(|value| parse_reset_value(value, SystemTime::now()))
+            });
         let reset_tokens = header_text(headers, LIMIT_RESET_TOKENS).and_then(parse_duration);
         if remaining_requests.is_none()
             && remaining_tokens.is_none()
@@ -764,6 +774,25 @@ fn parse_duration(mut value: &str) -> Option<Duration> {
     Some(Duration::from_secs_f64(
         seconds.min(MAX_RESET_HINT.as_secs_f64()),
     ))
+}
+
+/// Generic `x-ratelimit-reset` value: a plain integer at or above the epoch
+/// bound is a unix timestamp (AI Horde); below it the integer is
+/// delta-seconds, and non-integer values use the duration grammar.
+fn parse_reset_value(value: &str, now: SystemTime) -> Option<Duration> {
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        let secs: u64 = value.parse().ok()?;
+        let wait = if secs >= 1_000_000_000 {
+            SystemTime::UNIX_EPOCH
+                .checked_add(Duration::from_secs(secs))?
+                .duration_since(now)
+                .unwrap_or_default()
+        } else {
+            Duration::from_secs(secs)
+        };
+        return Some(wait.min(MAX_RESET_HINT));
+    }
+    parse_duration(value)
 }
 
 fn error_details(body: &[u8]) -> serde_json::Value {
@@ -869,7 +898,9 @@ fn classify_error_details(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_ascii_lowercase();
-    let scope = if header_text(headers, LIMIT_REMAINING_REQUESTS) == Some("0") {
+    let scope = if header_text(headers, LIMIT_REMAINING_REQUESTS) == Some("0")
+        || header_text(headers, GENERIC_REMAINING) == Some("0")
+    {
         Scope::Requests
     } else if header_text(headers, LIMIT_REMAINING_TOKENS) == Some("0")
         || message.contains("tokens per")
@@ -903,6 +934,9 @@ fn classify_error_details(
             Scope::Requests => header_text(headers, LIMIT_RESET_REQUESTS).and_then(parse_duration),
             Scope::Tokens => header_text(headers, LIMIT_RESET_TOKENS).and_then(parse_duration),
             Scope::Unknown => None,
+        })
+        .or_else(|| {
+            header_text(headers, GENERIC_RESET).and_then(|value| parse_reset_value(value, now))
         });
     let wait = wait_raw.map(|wait| wait.min(MAX_RETRY));
     let quota = [code, kind].iter().any(|marker| {
@@ -1652,6 +1686,79 @@ mod tests {
         assert_eq!(
             adapter.observe_limits(&headers).unwrap().reset_requests,
             Some(Duration::from_secs(30 * 86_400))
+        );
+    }
+
+    #[test]
+    fn generic_rate_limit_headers_feed_observation_and_429_wait() {
+        // IETF-style family (`x-ratelimit-{limit,remaining,reset}`) as sent by
+        // AI Horde: `reset` is a unix-epoch second, `remaining` counts the
+        // shared request window.
+        let adapter = OpenAiCompat::new("test");
+        let now = SystemTime::now();
+        let epoch_secs = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-limit", HeaderValue::from_static("90"));
+        headers.insert(GENERIC_REMAINING, HeaderValue::from_static("0"));
+        headers.insert(
+            GENERIC_RESET,
+            HeaderValue::from_str(&epoch_secs.to_string()).unwrap(),
+        );
+        let observed = adapter.observe_limits(&headers).unwrap();
+        assert_eq!(observed.remaining_requests, Some(0));
+        let wait = observed.reset_requests.unwrap();
+        assert!(
+            wait > Duration::from_secs(50) && wait <= Duration::from_secs(61),
+            "{wait:?}"
+        );
+        assert_eq!(observed.remaining_tokens, None);
+
+        // A plain integer below the epoch bound is delta-seconds.
+        headers.insert(GENERIC_RESET, HeaderValue::from_static("90"));
+        assert_eq!(
+            adapter.observe_limits(&headers).unwrap().reset_requests,
+            Some(Duration::from_secs(90))
+        );
+
+        // An exhausted generic window picks the request scope and resets the
+        // 429 wait from the epoch hint.
+        let err = classify_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &headers,
+            Bytes::from_static(br#"{"error":{"message":"rate limited"}}"#),
+            now,
+        );
+        assert!(
+            matches!(err, UpstreamError::RateLimited { retry_after: Some(wait), .. } if wait == Duration::from_secs(90)),
+            "{err:?}"
+        );
+
+        // OpenAI-family headers keep precedence over the generic ones.
+        headers.insert(LIMIT_REMAINING_REQUESTS, HeaderValue::from_static("5"));
+        headers.insert(LIMIT_RESET_REQUESTS, HeaderValue::from_static("6m0s"));
+        let observed = adapter.observe_limits(&headers).unwrap();
+        assert_eq!(observed.remaining_requests, Some(5));
+        assert_eq!(observed.reset_requests, Some(Duration::from_secs(360)));
+
+        // A generic reset applies even without a scope marker.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            GENERIC_RESET,
+            HeaderValue::from_str(&epoch_secs.to_string()).unwrap(),
+        );
+        let err = classify_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &headers,
+            Bytes::from_static(br#"{"error":{"message":"rate limited"}}"#),
+            now,
+        );
+        assert!(
+            matches!(err, UpstreamError::RateLimited { retry_after: Some(wait), .. } if wait > Duration::from_secs(50) && wait <= Duration::from_secs(61)),
+            "{err:?}"
         );
     }
 
