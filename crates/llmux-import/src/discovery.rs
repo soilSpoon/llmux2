@@ -48,6 +48,60 @@ pub enum ProbeVerdict {
     Unknown(String),
 }
 
+/// Detailed probe outcome for lifecycle verification. `Quota` stays separate
+/// here even though the scan-facing `ProbeVerdict` folds it into `Unknown`:
+/// quota exhaustion parks a leg, while billing and termination verdicts are
+/// removal candidates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    Free,
+    Billed,
+    Quota,
+    Unavailable,
+    Unknown,
+}
+
+/// Machine-readable probe evidence. `detail` preserves the scan-facing human
+/// reason; callers emitting durable reports should use the normalized fields
+/// instead because provider messages are uncontrolled text.
+#[derive(Debug)]
+pub struct ProbeReport {
+    pub outcome: ProbeOutcome,
+    pub cost: Option<f64>,
+    pub error_class: Option<String>,
+    pub http_status: Option<u16>,
+    detail: String,
+}
+
+impl ProbeReport {
+    fn new(
+        outcome: ProbeOutcome,
+        cost: Option<f64>,
+        error_class: Option<&str>,
+        http_status: Option<u16>,
+        detail: String,
+    ) -> Self {
+        Self {
+            outcome,
+            cost,
+            error_class: error_class.map(str::to_string),
+            http_status,
+            detail,
+        }
+    }
+
+    fn scan_verdict(&self) -> ProbeVerdict {
+        match self.outcome {
+            ProbeOutcome::Free => ProbeVerdict::Free,
+            ProbeOutcome::Billed => ProbeVerdict::Billed,
+            ProbeOutcome::Unavailable => ProbeVerdict::Unavailable(self.detail.clone()),
+            ProbeOutcome::Quota | ProbeOutcome::Unknown => {
+                ProbeVerdict::Unknown(self.detail.clone())
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for ProbeVerdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -101,6 +155,30 @@ pub async fn probe_model_with_deadline(
     model: &str,
     timeout: Duration,
 ) -> ProbeVerdict {
+    probe_model_detailed_with_deadline(client, base_url, Some(key), model, timeout)
+        .await
+        .scan_verdict()
+}
+
+/// Detailed one-token probe used by lifecycle verification. `key = None`
+/// probes an explicitly anonymous deployment without an Authorization header.
+pub async fn probe_model_detailed(
+    client: &HttpClient,
+    base_url: &str,
+    key: Option<&str>,
+    model: &str,
+) -> ProbeReport {
+    probe_model_detailed_with_deadline(client, base_url, key, model, PROBE_TIMEOUT).await
+}
+
+/// `probe_model_detailed` with an explicit deadline.
+pub async fn probe_model_detailed_with_deadline(
+    client: &HttpClient,
+    base_url: &str,
+    key: Option<&str>,
+    model: &str,
+    timeout: Duration,
+) -> ProbeReport {
     // The key rides the Authorization header: plaintext HTTP to a
     // non-loopback host would leak it — the same https-or-loopback policy
     // as upstream_uri.
@@ -108,9 +186,13 @@ pub async fn probe_model_with_deadline(
     match url.parse::<Uri>() {
         Ok(uri) if is_https_or_loopback_http(&uri) => {}
         _ => {
-            return ProbeVerdict::Unknown(format!(
-                "probe base must be https or loopback http: {base_url}"
-            ));
+            return ProbeReport::new(
+                ProbeOutcome::Unknown,
+                None,
+                Some("invalid_probe_base"),
+                None,
+                format!("probe base must be https or loopback http: {base_url}"),
+            );
         }
     }
     let payload = json!({
@@ -119,13 +201,21 @@ pub async fn probe_model_with_deadline(
         "max_tokens": 1,
         "stream": false,
     });
-    let request = match Request::post(&url)
-        .header("authorization", format!("Bearer {key}"))
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(payload.to_string())))
-    {
+    let mut builder = Request::post(&url).header("content-type", "application/json");
+    if let Some(key) = key {
+        builder = builder.header("authorization", format!("Bearer {key}"));
+    }
+    let request = match builder.body(Full::new(Bytes::from(payload.to_string()))) {
         Ok(request) => request,
-        Err(e) => return ProbeVerdict::Unknown(e.to_string()),
+        Err(e) => {
+            return ProbeReport::new(
+                ProbeOutcome::Unknown,
+                None,
+                Some("invalid_probe_request"),
+                None,
+                e.to_string(),
+            );
+        }
     };
     let exchange = async {
         let response = client.request(request).await.map_err(|e| e.to_string())?;
@@ -139,8 +229,20 @@ pub async fn probe_model_with_deadline(
     };
     match tokio::time::timeout(timeout, exchange).await {
         Ok(Ok((status, bytes))) => classify(status, &bytes),
-        Ok(Err(e)) => ProbeVerdict::Unknown(e),
-        Err(_) => ProbeVerdict::Unknown(format!("probe timed out after {timeout:?}")),
+        Ok(Err(e)) => ProbeReport::new(
+            ProbeOutcome::Unknown,
+            None,
+            Some("transport_error"),
+            None,
+            e,
+        ),
+        Err(_) => ProbeReport::new(
+            ProbeOutcome::Unknown,
+            None,
+            Some("timeout"),
+            None,
+            format!("probe timed out after {timeout:?}"),
+        ),
     }
 }
 
@@ -165,7 +267,45 @@ fn error_text(body: &Value) -> String {
     parts.join(" ").to_ascii_lowercase()
 }
 
-fn classify(status: StatusCode, bytes: &[u8]) -> ProbeVerdict {
+fn quota_error_class(status: StatusCode, code: &str) -> &'static str {
+    if status == StatusCode::TOO_MANY_REQUESTS
+        || code.contains("rate_limit")
+        || code.contains("rate-limit")
+        || code.contains("ratelimit")
+    {
+        "rate_limited"
+    } else if code.contains("cooldown") {
+        "cooldown"
+    } else {
+        "quota_exhausted"
+    }
+}
+
+fn billing_error_class(status: StatusCode, code: &str) -> &'static str {
+    if status == StatusCode::PAYMENT_REQUIRED {
+        "payment_required"
+    } else if code.contains("insufficient_credits") {
+        "insufficient_credits"
+    } else if code.contains("insufficient") {
+        "insufficient_balance"
+    } else {
+        "billing_error"
+    }
+}
+
+fn unavailable_error_class(status: StatusCode, code: &str) -> &'static str {
+    if code.contains("model_not_allowed") {
+        "model_not_allowed"
+    } else if code.contains("model_not_granted") {
+        "model_not_granted"
+    } else if status == StatusCode::NOT_FOUND {
+        "not_found"
+    } else {
+        "model_unavailable"
+    }
+}
+
+fn classify(status: StatusCode, bytes: &[u8]) -> ProbeReport {
     let body = serde_json::from_slice::<Value>(bytes).ok();
     if status.is_success() {
         return match body
@@ -173,12 +313,31 @@ fn classify(status: StatusCode, bytes: &[u8]) -> ProbeVerdict {
             .and_then(|v| v.pointer("/usage/cost"))
             .and_then(Value::as_f64)
         {
-            Some(cost) if cost <= 0.0 => ProbeVerdict::Free,
-            Some(_) => ProbeVerdict::Billed,
-            None => ProbeVerdict::Unknown(format!("{status}: no usage.cost")),
+            Some(cost) if cost <= 0.0 => ProbeReport::new(
+                ProbeOutcome::Free,
+                Some(cost),
+                None,
+                Some(status.as_u16()),
+                format!("{status}: usage.cost={cost}"),
+            ),
+            Some(cost) => ProbeReport::new(
+                ProbeOutcome::Billed,
+                Some(cost),
+                Some("cost_positive"),
+                Some(status.as_u16()),
+                format!("{status}: usage.cost={cost}"),
+            ),
+            None => ProbeReport::new(
+                ProbeOutcome::Unknown,
+                None,
+                Some("missing_usage_cost"),
+                Some(status.as_u16()),
+                format!("{status}: no usage.cost"),
+            ),
         };
     }
     let code = body.as_ref().map(error_text).unwrap_or_default();
+    let detail = format!("{status}: {code}");
     // Quota/rate-limit class first: a shared free tier's daily cap can
     // surface as 429 or a code like `insufficient_quota` — a parked leg,
     // never a billing verdict. Checking it before the billed heuristics
@@ -188,23 +347,49 @@ fn classify(status: StatusCode, bytes: &[u8]) -> ProbeVerdict {
         || code.contains("rate_limit")
         || code.contains("rate-limit")
         || code.contains("ratelimit")
+        || code.contains("cooldown")
     {
-        ProbeVerdict::Unknown(format!("{status}: {code}"))
+        ProbeReport::new(
+            ProbeOutcome::Quota,
+            None,
+            Some(quota_error_class(status, &code)),
+            Some(status.as_u16()),
+            detail,
+        )
     } else if status == StatusCode::PAYMENT_REQUIRED
         || code.contains("insufficient")
         || code.contains("credit")
         || code.contains("billing")
         || code.contains("payment")
     {
-        ProbeVerdict::Billed
+        ProbeReport::new(
+            ProbeOutcome::Billed,
+            None,
+            Some(billing_error_class(status, &code)),
+            Some(status.as_u16()),
+            detail,
+        )
     } else if status == StatusCode::NOT_FOUND
         || code.contains("model_not_allowed")
+        || code.contains("model_not_granted")
         || code.contains("not_found")
         || code.contains("does not exist")
     {
-        ProbeVerdict::Unavailable(format!("{status}: {code}"))
+        ProbeReport::new(
+            ProbeOutcome::Unavailable,
+            None,
+            Some(unavailable_error_class(status, &code)),
+            Some(status.as_u16()),
+            detail,
+        )
     } else {
-        ProbeVerdict::Unknown(format!("{status}: {code}"))
+        ProbeReport::new(
+            ProbeOutcome::Unknown,
+            None,
+            Some("http_error"),
+            Some(status.as_u16()),
+            detail,
+        )
     }
 }
 
