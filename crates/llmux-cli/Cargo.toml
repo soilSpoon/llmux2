@@ -9,6 +9,10 @@ name = "llmux"
 path = "src/main.rs"
 
 [dependencies]
+time.workspace = true
+serde.workspace = true
+llmux-types.workspace = true
+llmux-config.workspace = true
 bytes.workspace = true
 http.workspace = true
 http-body-util.workspace = true
@@ -19,5 +23,6 @@ tokio.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 axum.workspace = true
 llmux-testkit.workspace = true

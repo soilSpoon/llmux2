@@ -5,13 +5,20 @@ use http::{header, Method, Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use std::process::ExitCode;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    process::ExitCode,
+};
+
+mod upstream_export;
 
 const USAGE: &str = "usage: llmux [--url URL] [--key KEY] <command>
 
 Commands:
   status | deployments | credentials | models | reload
   enable <credential-id> | disable <credential-id>
+  export-upstream-quota --config PATH [--request-log PATH] [--runtime-deployments PATH] [--now RFC3339] [--no-request-log]
 
 Target: --url/--key or LLMUX_ADMIN_URL/LLMUX_ADMIN_KEY (default http://127.0.0.1:8080).";
 
@@ -20,6 +27,8 @@ struct Args {
     key: Option<String>,
     command: String,
     arg: Option<String>,
+    options: BTreeMap<String, String>,
+    flags: BTreeSet<String>,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -28,11 +37,22 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         key: std::env::var("LLMUX_ADMIN_KEY").ok(),
         command: String::new(),
         arg: None,
+        options: BTreeMap::new(),
+        flags: BTreeSet::new(),
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--url" => parsed.url = args.next().ok_or("--url needs a value")?,
             "--key" => parsed.key = Some(args.next().ok_or("--key needs a value")?),
+            "--no-request-log" => {
+                parsed.flags.insert("--no-request-log".into());
+            }
+            flag @ ("--config" | "--request-log" | "--runtime-deployments" | "--now") => {
+                let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
+                if parsed.options.insert(flag.to_string(), value).is_some() {
+                    return Err(format!("duplicate flag {flag}"));
+                }
+            }
             flag if flag.starts_with("--") => {
                 // Report the flag name only: `--key=SECRET` must not echo the key.
                 return Err(format!(
@@ -70,6 +90,33 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<String, String> {
     let args = parse(std::env::args().skip(1)).map_err(|err| format!("{err}\n{USAGE}"))?;
+    if args.command == "export-upstream-quota" {
+        if args.arg.is_some() {
+            return Err(format!(
+                "export-upstream-quota takes no positional argument\n{USAGE}"
+            ));
+        }
+        let mut options = args.options;
+        let config = options
+            .remove("--config")
+            .ok_or_else(|| format!("export-upstream-quota needs --config PATH\n{USAGE}"))?;
+        let no_request_log = args.flags.contains("--no-request-log");
+        if no_request_log && options.contains_key("--request-log") {
+            return Err("--no-request-log conflicts with --request-log".into());
+        }
+        return upstream_export::run(upstream_export::ExportOptions {
+            config: PathBuf::from(config),
+            request_log: options.remove("--request-log").map(PathBuf::from),
+            runtime_deployments: options.remove("--runtime-deployments").map(PathBuf::from),
+            now: options.remove("--now"),
+            no_request_log,
+        });
+    }
+    if !args.options.is_empty() || !args.flags.is_empty() {
+        return Err(format!(
+            "file-export flags require export-upstream-quota\n{USAGE}"
+        ));
+    }
     let (method, path) = match (args.command.as_str(), args.arg.as_deref()) {
         ("status", None) => (Method::GET, "/admin/status".into()),
         ("deployments", None) => (Method::GET, "/admin/deployments".into()),
