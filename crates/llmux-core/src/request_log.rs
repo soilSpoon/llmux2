@@ -1,17 +1,20 @@
 //! Durable per-request records: one JSON object per line, for nightly analysis.
 
 use crate::GatewayError;
-use llmux_types::ErrorKind;
+use futures_util::Stream;
+use llmux_types::{BoxStream, ErrorKind, SseEvent, UpstreamError};
 use serde::Serialize;
 use std::{
     fs::OpenOptions,
     io::{self, Write},
     path::Path,
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, SyncSender},
         Arc, Barrier,
     },
+    task::{Context, Poll},
     thread::{self, JoinHandle},
     time::SystemTime,
 };
@@ -20,12 +23,186 @@ use std::{
 /// than blocks the runtime.
 const QUEUE_CAPACITY: usize = 4096;
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct QuotaRemaining {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpm: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrent: Option<u32>,
+}
+
+/// Provider-reported token accounting. Every field is optional: providers do
+/// not all report the same counters, and a missing counter is not a zero.
+#[derive(Clone, Default, Serialize)]
+pub struct TokenUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+}
+
+impl TokenUsage {
+    fn merge(&mut self, newer: TokenUsage) {
+        for (current, newer) in [
+            (&mut self.input_tokens, newer.input_tokens),
+            (&mut self.output_tokens, newer.output_tokens),
+            (&mut self.cached_input_tokens, newer.cached_input_tokens),
+            (
+                &mut self.cache_creation_input_tokens,
+                newer.cache_creation_input_tokens,
+            ),
+        ] {
+            if newer.is_some() {
+                *current = newer;
+            }
+        }
+    }
+}
+
+fn number(value: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| value.get(*key)?.as_u64())
+}
+
+fn parse_usage_object(usage: &serde_json::Value) -> Option<TokenUsage> {
+    if !usage.is_object() {
+        return None;
+    }
+    let parsed = TokenUsage {
+        input_tokens: number(usage, &["input_tokens", "prompt_tokens"]),
+        output_tokens: number(usage, &["output_tokens", "completion_tokens"]),
+        cached_input_tokens: number(usage, &["cache_read_input_tokens"]).or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(serde_json::Value::as_u64)
+        }),
+        cache_creation_input_tokens: number(usage, &["cache_creation_input_tokens"]),
+    };
+    (parsed.input_tokens.is_some()
+        || parsed.output_tokens.is_some()
+        || parsed.cached_input_tokens.is_some()
+        || parsed.cache_creation_input_tokens.is_some())
+    .then_some(parsed)
+}
+
+/// Extracts token accounting without retaining prompts or response content.
+/// Handles the OpenAI-compatible usage object directly and Anthropic's nested
+/// `message.usage` form used by `message_start` stream events.
+pub fn usage_from_json(value: &serde_json::Value) -> Option<TokenUsage> {
+    value.get("usage").and_then(parse_usage_object).or_else(|| {
+        value
+            .get("message")
+            .and_then(|message| message.get("usage"))
+            .and_then(parse_usage_object)
+    })
+}
+
+pub fn usage_from_body(body: &[u8]) -> Option<TokenUsage> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .as_ref()
+        .and_then(usage_from_json)
+}
+
+/// Owned metadata needed to write a stream's request record after the stream
+/// finishes. It intentionally contains only routing metadata and numeric usage.
+pub struct PendingStreamRecord {
+    pub log: Arc<RequestLog>,
+    pub ts_ms: u64,
+    pub request_id: Box<str>,
+    pub model: Box<str>,
+    pub deployment: Option<Box<str>>,
+    pub provider: Option<Box<str>>,
+    pub client_key: Option<Box<str>>,
+    pub image_count: u32,
+    pub upstream_request_id: Option<Box<str>>,
+    pub attempts: usize,
+    pub legs: Vec<AttemptLeg>,
+    pub latency_ms: u64,
+    pub quota_remaining: Option<QuotaRemaining>,
+}
+
+impl PendingStreamRecord {
+    fn finish(self, usage: Option<&TokenUsage>) {
+        self.log.record(&RequestRecord {
+            ts_ms: self.ts_ms,
+            request_id: &self.request_id,
+            model: &self.model,
+            deployment: self.deployment.as_deref(),
+            provider: self.provider.as_deref(),
+            client_key: self.client_key.as_deref(),
+            image_count: self.image_count,
+            upstream_request_id: self.upstream_request_id.as_deref(),
+            attempts: self.attempts,
+            legs: self.legs,
+            latency_ms: self.latency_ms,
+            outcome: "routed",
+            error_kind: None,
+            quota_remaining: self.quota_remaining,
+            usage,
+        });
+    }
+}
+
+/// Pass-through stream that captures numeric usage fields and writes the
+/// request record on end-of-stream, the first upstream stream error, or drop.
+pub struct UsageCaptureStream {
+    inner: BoxStream<'static, Result<SseEvent, UpstreamError>>,
+    pending: Option<PendingStreamRecord>,
+    usage: Option<TokenUsage>,
+}
+
+impl UsageCaptureStream {
+    pub fn new(
+        inner: BoxStream<'static, Result<SseEvent, UpstreamError>>,
+        pending: PendingStreamRecord,
+    ) -> Self {
+        Self {
+            inner,
+            pending: Some(pending),
+            usage: None,
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            pending.finish(self.usage.as_ref());
+        }
+    }
+}
+
+impl Stream for UsageCaptureStream {
+    type Item = Result<SseEvent, UpstreamError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let poll = self.inner.as_mut().poll_next(cx);
+        match &poll {
+            Poll::Ready(Some(Ok(event))) => {
+                if event.data.contains("\"usage\"") {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&event.data) {
+                        if let Some(usage) = usage_from_json(&value) {
+                            self.usage
+                                .get_or_insert_with(TokenUsage::default)
+                                .merge(usage);
+                        }
+                    }
+                }
+            }
+            Poll::Ready(Some(Err(_))) | Poll::Ready(None) => self.finish(),
+            Poll::Pending => {}
+        }
+        poll
+    }
+}
+
+impl Drop for UsageCaptureStream {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 /// One upstream send: the deployment and provider it hit, and `routed` when it
@@ -63,6 +240,8 @@ pub struct RequestRecord<'a> {
     pub error_kind: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_remaining: Option<QuotaRemaining>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<&'a TokenUsage>,
 }
 
 pub struct RequestLog {
@@ -211,6 +390,7 @@ mod tests {
                 latency_ms: 42,
                 outcome: "routed",
                 error_kind: None,
+                usage: None,
                 quota_remaining: Some(QuotaRemaining {
                     rpm: Some(9),
                     concurrent: None,
@@ -258,6 +438,7 @@ mod tests {
             latency_ms: 1000,
             outcome: "error",
             error_kind: Some("rate_limited"),
+            usage: None,
             quota_remaining: None,
         });
         drop(log);
@@ -293,6 +474,7 @@ mod tests {
             latency_ms: 1,
             outcome: "routed",
             error_kind: None,
+            usage: None,
             quota_remaining: None,
         };
         // The writer is parked on the barrier, so these fill the bounded queue.
