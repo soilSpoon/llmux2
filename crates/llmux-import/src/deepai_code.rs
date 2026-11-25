@@ -1,6 +1,7 @@
 use crate::{string, Connection};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::path::Path;
 
 /// Non-secret DeepAI Code discovery output (`--deepai-code-state`): where a
@@ -67,13 +68,25 @@ fn ids(root: &Value, field: &str) -> Result<HashSet<String>, String> {
 /// the same session as `…/deepai/v1`. Both path shapes are the reviewed
 /// DeepAI Code upstream — nothing else on loopback qualifies.
 pub(crate) fn is_bridge_url(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("http://127.0.0.1:") else {
+    let Ok(uri) = url.parse::<http::Uri>() else {
         return false;
     };
-    let (port, path) = rest.split_once('/').unwrap_or((rest, ""));
-    port.bytes().all(|b| b.is_ascii_digit())
-        && port.parse::<u16>().is_ok_and(|port| port != 0)
-        && matches!(path, "v1" | "deepai/v1")
+    if uri.scheme_str() != Some("http") {
+        return false;
+    }
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let ip_host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || ip_host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    loopback
+        && uri.port_u16().is_some_and(|port| port != 0)
+        && matches!(uri.path(), "/v1" | "/deepai/v1")
+        && uri.query().is_none()
 }
 
 // Canonical combo name -> DeepAI Code catalog id, reviewed against the app's
@@ -163,4 +176,36 @@ pub(crate) fn outside_scope(state: &State, model: &str) -> bool {
 /// the reviewed provider identity, never inferred from a loopback URL alone.
 pub(crate) fn discovered(connection: &Connection) -> bool {
     connection.policy == crate::policy::ModelPolicy::DeepAiCode
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_bridge_url;
+
+    #[test]
+    fn bridge_urls_accept_every_loopback_host_form() {
+        for url in [
+            "http://127.0.0.1:49759/v1",
+            "http://127.10.20.30:49759/deepai/v1",
+            "http://localhost:49759/v1",
+            "http://[::1]:49759/deepai/v1",
+        ] {
+            assert!(is_bridge_url(url), "loopback bridge URL rejected: {url}");
+        }
+    }
+
+    #[test]
+    fn bridge_urls_reject_non_loopback_or_wrong_shape() {
+        for url in [
+            "http://192.168.1.10:49759/v1",
+            "http://example.com:49759/v1",
+            "https://localhost:49759/v1",
+            "http://localhost:0/v1",
+            "http://localhost/v1",
+            "http://localhost:49759/other",
+            "http://localhost:49759/v1?probe=1",
+        ] {
+            assert!(!is_bridge_url(url), "unsafe bridge URL accepted: {url}");
+        }
+    }
 }

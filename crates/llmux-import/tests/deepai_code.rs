@@ -493,6 +493,21 @@ fn exported_ephemeral_deepai_bridge_url_is_imported() {
 }
 
 #[test]
+fn exported_localhost_deepai_bridge_url_is_imported() {
+    let mut root = custom_deepai_fixture(json!(["deepai/claude-haiku-5-5"]));
+    root["providerNodes"][1]["baseUrl"] = json!("http://localhost:49759/v1");
+    let (config, _) = run(&root, &ImportOptions::default());
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [(
+            "http://localhost:49759/v1".to_string(),
+            "claude-haiku-5-5".to_string()
+        )],
+        "exported connection validation uses the same loopback bridge matching"
+    );
+}
+
+#[test]
 fn token_file_without_discovery_state_fails_import() {
     let dir = tempfile::tempdir().unwrap();
     let token = write(dir.path(), "token", "synthetic-session");
