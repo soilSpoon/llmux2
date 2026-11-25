@@ -1,16 +1,31 @@
 //! Lifecycle verification for legs the config currently marks free.
 //!
-//! The verifier is deliberately conservative: a probe runs only where the
-//! provider is known to fail closed on billing (or is a loopback test
-//! fixture), and quota exhaustion is a parking signal rather than removal
-//! evidence. Reports carry normalized evidence, never credential material.
+//! Verification is cost-aware. Buyer-traffic evidence is the preferred
+//! signal, free metadata is the fallback, and a chat-completion probe is an
+//! explicit operator choice because even one token can spend a scarce free
+//! quota. Reports carry normalized evidence, never credential material.
 
 use crate::discovery::{self, ProbeOutcome};
+use bytes::Bytes;
+use http::{Request, Uri};
+use http_body_util::{BodyExt, Full, Limited};
 use llmux_config::RuntimeConfig;
-use llmux_types::{provider, Billing, Deployment, DeploymentIdx, HttpClient};
+use llmux_types::{
+    is_https_or_loopback_http, provider, Billing, Deployment, DeploymentIdx, HttpClient,
+};
 use serde::Serialize;
-use std::{collections::HashMap, net::IpAddr, path::Path, sync::Arc, time::SystemTime};
+use serde_json::Value;
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    path::Path,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+
+const METADATA_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_METADATA_BODY: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -20,6 +35,15 @@ pub enum Classification {
     QuotaDrained,
     Unknown,
     PromoExtended,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceSource {
+    PassiveBuyer,
+    FreeMetadata,
+    ActiveProbe,
+    None,
 }
 
 #[derive(Debug, Serialize)]
@@ -32,6 +56,7 @@ pub struct VerifyRow {
     pub credential_id: Option<String>,
     pub classification: Classification,
     pub removal_candidate: bool,
+    pub evidence_source: EvidenceSource,
     pub probed: bool,
     pub cost: Option<f64>,
     pub error_class: Option<String>,
@@ -47,11 +72,24 @@ pub struct VerifyReport {
     pub legs: Vec<VerifyRow>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VerifyOptions {
+    /// Spend a one-token chat probe after cheaper evidence is inconclusive.
+    /// The operator must use this only for legs whose buyer traffic is sparse
+    /// and whose continued availability matters; request-capped free tiers
+    /// count even tiny probes against the same quota as buyer traffic.
+    pub active_probe: bool,
+}
+
 /// Verify every `billing = "free"` deployment in a parsed config. Free is the
 /// explicit marker only: the gateway's own sweep and free-only routing treat a
 /// missing marker as billed, so quota or expiry metadata alone never admits a
 /// leg into verification.
-pub async fn verify_runtime_config(config: &RuntimeConfig, client: &HttpClient) -> VerifyReport {
+pub async fn verify_runtime_config(
+    config: &RuntimeConfig,
+    client: &HttpClient,
+    options: VerifyOptions,
+) -> VerifyReport {
     let canonical = canonical_names(config);
     let mut legs = Vec::new();
     for deployment in config
@@ -60,7 +98,7 @@ pub async fn verify_runtime_config(config: &RuntimeConfig, client: &HttpClient) 
         .filter(|deployment| deployment.billing == Billing::Free)
     {
         let canonical = canonical.get(&deployment.idx).cloned().unwrap_or_default();
-        legs.push(verify_leg(config, client, deployment, canonical).await);
+        legs.push(verify_leg(config, client, deployment, canonical, options).await);
     }
     VerifyReport {
         generated_at: rfc3339(SystemTime::now()),
@@ -70,11 +108,11 @@ pub async fn verify_runtime_config(config: &RuntimeConfig, client: &HttpClient) 
 
 /// Load and verify a config file. Secret references resolve only inside the
 /// verifier process; report rows never carry the resolved values.
-pub async fn verify_config(path: &Path) -> Result<VerifyReport, String> {
+pub async fn verify_config(path: &Path, options: VerifyOptions) -> Result<VerifyReport, String> {
     let config = RuntimeConfig::load(path)
         .map_err(|error| format!("could not load config for --verify-free: {error}"))?;
     let client = discovery::client()?;
-    Ok(verify_runtime_config(&config, &client).await)
+    Ok(verify_runtime_config(&config, &client, options).await)
 }
 
 fn canonical_names(config: &RuntimeConfig) -> HashMap<DeploymentIdx, Arc<str>> {
@@ -139,17 +177,148 @@ fn probe_policy(host: &str) -> Result<(), String> {
     }
 }
 
+/// Whether catalog absence is meaningful for this host. Loopback is the test
+/// double. Experiential is explicitly excluded because its `/v1/models` omits
+/// `:free` ids even while they remain servable. Other providers need a
+/// reviewed adapter before absence can become removal evidence.
+fn metadata_policy(host: &str) -> Result<(), String> {
+    if host_is_loopback(host) {
+        Ok(())
+    } else if host.eq_ignore_ascii_case("api.experientiallabs.ai") {
+        Err("metadata catalog does not list Experiential free ids".to_string())
+    } else {
+        Err(format!(
+            "metadata catalog policy unknown for upstream host {host}"
+        ))
+    }
+}
+
+struct MetadataEvidence {
+    listed: Option<bool>,
+    error_class: Option<&'static str>,
+    http_status: Option<u16>,
+    reason: String,
+}
+
+async fn metadata_evidence(
+    client: &HttpClient,
+    base_url: &str,
+    key: Option<&str>,
+    model: &str,
+    host: &str,
+) -> MetadataEvidence {
+    if let Err(reason) = metadata_policy(host) {
+        return MetadataEvidence {
+            listed: None,
+            error_class: Some("metadata_policy_unavailable"),
+            http_status: None,
+            reason,
+        };
+    }
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    match url.parse::<Uri>() {
+        Ok(uri) if is_https_or_loopback_http(&uri) => {}
+        _ => {
+            return MetadataEvidence {
+                listed: None,
+                error_class: Some("invalid_metadata_base"),
+                http_status: None,
+                reason: "metadata base must be https or loopback http".to_string(),
+            };
+        }
+    }
+    let mut builder = Request::get(&url);
+    if let Some(key) = key {
+        builder = builder.header("authorization", format!("Bearer {key}"));
+    }
+    let request = match builder.body(Full::new(Bytes::new())) {
+        Ok(request) => request,
+        Err(_) => {
+            return MetadataEvidence {
+                listed: None,
+                error_class: Some("invalid_metadata_request"),
+                http_status: None,
+                reason: "could not build metadata request".to_string(),
+            };
+        }
+    };
+    let exchange = async {
+        let response = client.request(request).await.map_err(|e| e.to_string())?;
+        let status = response.status();
+        let bytes = Limited::new(response.into_body(), MAX_METADATA_BODY)
+            .collect()
+            .await
+            .map(|c| c.to_bytes())
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>((status, bytes))
+    };
+    let (status, bytes) = match tokio::time::timeout(METADATA_TIMEOUT, exchange).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => {
+            return MetadataEvidence {
+                listed: None,
+                error_class: Some("metadata_transport_error"),
+                http_status: None,
+                reason: "metadata request failed".to_string(),
+            };
+        }
+        Err(_) => {
+            return MetadataEvidence {
+                listed: None,
+                error_class: Some("metadata_timeout"),
+                http_status: None,
+                reason: "metadata request timed out".to_string(),
+            };
+        }
+    };
+    if !status.is_success() {
+        return MetadataEvidence {
+            listed: None,
+            error_class: Some("metadata_http_error"),
+            http_status: Some(status.as_u16()),
+            reason: "metadata catalog returned an error".to_string(),
+        };
+    }
+    let body: Value = match serde_json::from_slice(&bytes) {
+        Ok(body) => body,
+        Err(_) => {
+            return MetadataEvidence {
+                listed: None,
+                error_class: Some("metadata_malformed"),
+                http_status: Some(status.as_u16()),
+                reason: "metadata catalog was not an OpenAI model list".to_string(),
+            };
+        }
+    };
+    let Some(ids) = body["data"].as_array() else {
+        return MetadataEvidence {
+            listed: None,
+            error_class: Some("metadata_malformed"),
+            http_status: Some(status.as_u16()),
+            reason: "metadata catalog was not an OpenAI model list".to_string(),
+        };
+    };
+    let listed = ids.iter().any(|row| row["id"].as_str() == Some(model));
+    MetadataEvidence {
+        listed: Some(listed),
+        error_class: (!listed).then_some("model_absent_from_catalog"),
+        http_status: Some(status.as_u16()),
+        reason: if listed {
+            "metadata lists the model, but a catalog listing does not prove servability".to_string()
+        } else {
+            "metadata catalog no longer lists the model".to_string()
+        },
+    }
+}
+
 async fn verify_leg(
     config: &RuntimeConfig,
     client: &HttpClient,
     deployment: &Deployment,
     canonical_model: Arc<str>,
+    options: VerifyOptions,
 ) -> VerifyRow {
     let mut row = base_row(deployment, canonical_model);
-    if let Err(reason) = probe_policy(&row.upstream_host) {
-        row.reason = Some(reason);
-        return row;
-    }
     let auth = match probe_auth(config, deployment) {
         Ok(auth) => auth,
         Err(reason) => {
@@ -161,8 +330,37 @@ async fn verify_leg(
         ProbeAuth::Anonymous => None,
         ProbeAuth::Bearer(key) => Some(key),
     };
-    let probed_at = SystemTime::now();
     let base_url = deployment.base_url.to_string();
+    let metadata = metadata_evidence(
+        client,
+        &base_url,
+        key,
+        deployment.upstream_model.as_ref(),
+        &row.upstream_host,
+    )
+    .await;
+    row.evidence_source = EvidenceSource::FreeMetadata;
+    row.error_class = metadata.error_class.map(str::to_string);
+    row.http_status = metadata.http_status;
+    if metadata.listed == Some(false) {
+        row.classification = Classification::PromoEnded;
+        row.removal_candidate = true;
+        row.reason = Some(metadata.reason);
+        return row;
+    }
+    if !options.active_probe {
+        row.reason = Some(format!(
+            "passive buyer evidence is not available to this verifier; {}; active probe not authorized",
+            metadata.reason
+        ));
+        return row;
+    }
+    if let Err(reason) = probe_policy(&row.upstream_host) {
+        row.evidence_source = EvidenceSource::None;
+        row.reason = Some(reason);
+        return row;
+    }
+    let probed_at = SystemTime::now();
     let evidence =
         discovery::probe_model_detailed(client, &base_url, key, deployment.upstream_model.as_ref())
             .await;
@@ -189,6 +387,7 @@ async fn verify_leg(
     }
     row.classification = classification;
     row.removal_candidate = classification == Classification::PromoEnded;
+    row.evidence_source = EvidenceSource::ActiveProbe;
     row.probed = true;
     row.cost = evidence.cost;
     row.error_class = evidence.error_class;
@@ -208,6 +407,7 @@ fn base_row(deployment: &Deployment, canonical_model: Arc<str>) -> VerifyRow {
             .then(|| deployment.credential.to_string()),
         classification: Classification::Unknown,
         removal_candidate: false,
+        evidence_source: EvidenceSource::None,
         probed: false,
         cost: None,
         error_class: None,

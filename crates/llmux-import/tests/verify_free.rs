@@ -1,4 +1,9 @@
-use axum::{http::StatusCode, response::Json, routing::post, Router};
+use axum::{
+    http::StatusCode,
+    response::Json,
+    routing::{get, post},
+    Router,
+};
 use llmux_testkit::TestServer;
 use serde_json::{json, Value};
 use std::{fs, path::Path, process::Command};
@@ -39,6 +44,15 @@ fn verify(config: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_llmux-import"))
         .arg("--verify-free")
         .arg(config)
+        .output()
+        .unwrap()
+}
+
+fn verify_with_active_probe(config: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_llmux-import"))
+        .arg("--verify-free")
+        .arg(config)
+        .arg("--verify-free-active-probe")
         .output()
         .unwrap()
 }
@@ -120,7 +134,7 @@ billing = "free"
     let dir = tempfile::tempdir().unwrap();
     let config = write_config(dir.path(), &deployments);
 
-    let out = verify(&config);
+    let out = verify_with_active_probe(&config);
     assert!(
         out.status.success(),
         "{}",
@@ -159,6 +173,79 @@ billing = "free"
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_free_uses_free_metadata_before_spending_a_probe() {
+    let chat_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = chat_calls.clone();
+    let router = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(move |body: Json<Value>| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock()
+                        .unwrap()
+                        .push(body["model"].as_str().unwrap().to_string());
+                    Json(json!({"usage": {"cost": 0.0}}))
+                }
+            }),
+        )
+        .route(
+            "/v1/models",
+            get(|| async { Json(json!({"data": [{"id": "listed"}]})) }),
+        );
+    let server = TestServer::start(router).await.unwrap();
+    let base = format!("{}/v1", server.url());
+    let deployments = format!(
+        r#"[[models.deployments]]
+id = "missing-from-catalog"
+credential = "upstream"
+base_url = "{base}"
+upstream_model = "missing"
+billing = "free"
+
+[[models.deployments]]
+id = "listed-in-catalog"
+credential = "upstream"
+base_url = "{base}"
+upstream_model = "listed"
+billing = "free"
+"#
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path(), &deployments);
+
+    let out = verify(&config);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let missing = row(&report, "missing-from-catalog");
+    assert_eq!(missing["classification"], "promo_ended");
+    assert_eq!(missing["removal_candidate"], true);
+    assert_eq!(missing["probed"], false);
+    assert_eq!(missing["evidence_source"], "free_metadata");
+    assert_eq!(missing["error_class"], "model_absent_from_catalog");
+    let listed = row(&report, "listed-in-catalog");
+    assert_eq!(listed["classification"], "unknown");
+    assert_eq!(listed["removal_candidate"], false);
+    assert_eq!(listed["probed"], false);
+    assert_eq!(listed["evidence_source"], "free_metadata");
+    assert!(
+        listed["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("does not prove servability")),
+        "listed metadata must stay honest about servability: {listed}"
+    );
+    assert!(
+        chat_calls.lock().unwrap().is_empty(),
+        "metadata evidence must not spend a chat probe: {:?}",
+        chat_calls.lock().unwrap()
+    );
+}
+
 #[test]
 fn verify_free_never_probes_a_provider_with_unknown_billing_policy() {
     let deployments = r#"[[models.deployments]]
@@ -171,7 +258,7 @@ billing = "free"
     let dir = tempfile::tempdir().unwrap();
     let config = write_config(dir.path(), deployments);
 
-    let out = verify(&config);
+    let out = verify_with_active_probe(&config);
     assert!(
         out.status.success(),
         "{}",
