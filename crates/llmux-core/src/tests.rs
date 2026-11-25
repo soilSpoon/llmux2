@@ -508,6 +508,60 @@ async fn same_level_spread_keeps_a_prompt_prefix_on_one_deployment() {
 }
 
 #[tokio::test]
+async fn cache_affinity_uses_stable_system_prompt_not_conversation_tail() {
+    let future = SystemTime::now() + Duration::from_secs(60);
+    let (executor, _, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("model", &[0, 1, 2])],
+        Default::default(),
+        Default::default(),
+        false,
+        None,
+        [None; 3],
+        [Some((0, future)); 3],
+    )
+    .await;
+    let system = "shared-system-prefix-".repeat(300);
+    let body = |user: &str| {
+        Bytes::from(
+            serde_json::json!({
+                "model": "model",
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            })
+            .to_string(),
+        )
+    };
+
+    let first = executor
+        .execute(GatewayRequest {
+            body: body("First question"),
+            ..request()
+        })
+        .await
+        .unwrap()
+        .deployment;
+    for user in ["Second question", "Third question"] {
+        assert_eq!(
+            executor
+                .execute(GatewayRequest {
+                    body: body(user),
+                    ..request()
+                })
+                .await
+                .unwrap()
+                .deployment,
+            first,
+            "same stable system prefix should keep cache affinity despite a changing tail"
+        );
+    }
+}
+
+#[tokio::test]
 async fn priority_boost_promotes_until_deadline_then_reverts() {
     let future = SystemTime::now() + Duration::from_secs(3600);
     let past = SystemTime::now() - Duration::from_secs(60);

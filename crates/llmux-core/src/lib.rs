@@ -20,8 +20,8 @@ use limits::{DeploymentLimits, Permit, Window};
 use llmux_config::RuntimeConfig;
 use llmux_types::{
     provider, AuthMaterial, Billing, BuildError, ContextOverflow, CredentialSource, Deployment,
-    DeploymentIdx, ErrorKind, GatewayRequest, GatewayResponse, ProviderAdapter, ProviderRegistry,
-    QuotaSpec, SseCommitment, Support, UpstreamError,
+    DeploymentIdx, ErrorKind, GatewayRequest, GatewayResponse, InboundFormat, ProviderAdapter,
+    ProviderRegistry, QuotaSpec, SseCommitment, Support, UpstreamError,
 };
 use machine::{Built, Effect, Event, Outcome, Phase, State};
 pub use request_log::RequestLog;
@@ -1278,10 +1278,10 @@ fn index(idx: DeploymentIdx) -> usize {
     idx.0 as usize
 }
 
-/// Only the stable leading prompt bytes feed cache affinity. Chat turns usually
-/// append after the shared system/early-message prefix, while the tail is where
-/// prompts diverge; 8 KiB is enough for meaningful provider prompt caching
-/// without copying whole bodies into the selection path.
+/// Only stable prompt/session material feeds cache affinity. Raw JSON cannot
+/// be used directly: ordinary chat bodies are often shorter than the byte cap,
+/// so their changing conversation tail would poison the key even when the
+/// cacheable system prefix is identical. 8 KiB bounds the selection-path copy.
 const CACHE_PREFIX_BYTES: usize = 8 * 1024;
 
 fn cache_seed(req: &GatewayRequest) -> Option<usize> {
@@ -1294,12 +1294,111 @@ fn cache_seed(req: &GatewayRequest) -> Option<usize> {
         hash = fnv_part(hash, part.as_bytes());
         present = true;
     }
-    let prefix = &req.body[..req.body.len().min(CACHE_PREFIX_BYTES)];
-    if !prefix.is_empty() {
-        hash = fnv_part(hash, prefix);
+    let prompt_parts = stable_prompt_parts(req);
+    if prompt_parts.is_empty() {
+        let prefix = &req.body[..req.body.len().min(CACHE_PREFIX_BYTES)];
+        if !prefix.is_empty() {
+            hash = fnv_part(hash, prefix);
+            present = true;
+        }
+    } else {
+        for part in prompt_parts {
+            hash = fnv_part(hash, &part);
+        }
         present = true;
     }
     present.then_some(hash as usize)
+}
+
+fn stable_prompt_parts(req: &GatewayRequest) -> Vec<Vec<u8>> {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
+        return Vec::new();
+    };
+    let mut parts = Vec::new();
+    let mut remaining = CACHE_PREFIX_BYTES;
+    match req.format {
+        InboundFormat::OpenAiChat => {
+            if let Some(messages) = value.get("messages").and_then(|v| v.as_array()) {
+                push_leading_system_parts(messages, &mut parts, &mut remaining);
+            }
+        }
+        InboundFormat::AnthropicMessages => {
+            if let Some(system) = value.get("system") {
+                push_prompt_content(&mut parts, "system", system, &mut remaining);
+            }
+        }
+        InboundFormat::OpenAiResponses => {
+            if let Some(instructions) = value.get("instructions") {
+                push_prompt_content(&mut parts, "system", instructions, &mut remaining);
+            }
+            if let Some(input) = value.get("input").and_then(|v| v.as_array()) {
+                push_leading_system_parts(input, &mut parts, &mut remaining);
+            }
+        }
+    }
+    parts
+}
+
+fn push_leading_system_parts(
+    items: &[serde_json::Value],
+    parts: &mut Vec<Vec<u8>>,
+    remaining: &mut usize,
+) {
+    for item in items {
+        if *remaining == 0 {
+            break;
+        }
+        let Some(role) = item.get("role").and_then(|v| v.as_str()) else {
+            break;
+        };
+        if !matches!(role, "system" | "developer") {
+            break;
+        }
+        if let Some(content) = item.get("content") {
+            push_prompt_content(parts, role, content, remaining);
+        }
+    }
+}
+
+fn push_prompt_content(
+    parts: &mut Vec<Vec<u8>>,
+    role: &str,
+    content: &serde_json::Value,
+    remaining: &mut usize,
+) {
+    if *remaining == 0 {
+        return;
+    }
+    let serialized = match content.as_str() {
+        Some(_) => None,
+        None => serde_json::to_vec(content).ok(),
+    };
+    let content_len = match (content.as_str(), &serialized) {
+        (Some(text), _) => text.len(),
+        (None, Some(bytes)) => bytes.len(),
+        (None, None) => 0,
+    };
+    if content_len == 0 {
+        return;
+    }
+    let role_len = role.len().min(*remaining);
+    if role_len > 0 {
+        parts.push(role.as_bytes()[..role_len].to_vec());
+        *remaining -= role_len;
+    }
+    if *remaining == 0 {
+        return;
+    }
+    let bytes = match (content.as_str(), serialized) {
+        (Some(text), _) => text.as_bytes()[..text.len().min(*remaining)].to_vec(),
+        (None, Some(mut serialized)) => {
+            serialized.truncate(*remaining);
+            serialized
+        }
+        (None, None) => Vec::new(),
+    };
+    *remaining -= bytes.len();
+    parts.push(bytes);
 }
 
 fn fnv_part(mut hash: u64, part: &[u8]) -> u64 {

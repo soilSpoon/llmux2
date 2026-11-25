@@ -229,10 +229,11 @@ keys across the eligible deployments instead of concentrating all traffic on
 one leg. The same cache key SHALL start at the same deployment while it remains
 eligible, so repeated or prefix-sharing requests keep warm provider caches;
 different cache keys spread across the same-level deployments. A cache key is
-built from the hashed end user or client-key fingerprint when present plus the
-stable leading prompt bytes. When no cache key exists, same-level deployments
-SHALL rotate so traffic still spreads. Eligibility, quota, cooldown, quality,
-and free-before-paid ordering still outrank affinity: a saturated or degraded
+built from the hashed end user or client-key fingerprint when present plus
+stable prompt/session material such as system instructions, never the changing
+conversation tail alone; unparsable formats fall back to stable leading body
+bytes. When no cache key exists, same-level deployments SHALL rotate so traffic
+still spreads. Eligibility, quota, cooldown, quality, and free-before-paid ordering still outrank affinity: a saturated or degraded
 deployment spills to the next eligible same-level deployment before any lower
 level is considered.
 
