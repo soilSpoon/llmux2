@@ -118,7 +118,7 @@ leg. These are not counts of legs that can be restored unchanged.
 | --- | --- | --- |
 | `cloudflare-direct`, `cloudflare-playground` (43-leg bridge group) | Workers AI account API token, `/client/v4/accounts/ACCOUNT_ID/ai/v1` [CF1–2] | 10,000 neurons/day; `openai_compat`. Use a free-eligible model, not the playground catalog. In particular GLM-5.2 is explicitly paid-method-gated. |
 | `deepai` (same group) | DeepAI's `https://api.deepai.org/api/<model>` with an `Api-Key` header [D1] | The `deepai` adapter converts text Chat Completions for `text-generator` and `summarization`. Neither authenticated generation nor free API use is verified. |
-| `deepai-code` (same group) | Keyed DeepAI Code sidecar with Chat Completions | Use `openai_compat`, not `deepai`. The importer accepts the reviewed keyed sidecar at `http://127.0.0.1:8790/deepai/v1` for the exported node with the `deepai` prefix or built-in `deepai-code` connection. The listener must be reachable from llmux2. The live sidecar and pricing remain unverified. |
+| `deepai-code` (same group) | DeepAI Code's `https://api.deepai.org/deepai_code` Chat Completions lane, `api-key` authenticated [DC1] | Native as `provider = "deepai_code"`; no sidecar needed. The key must belong to an account signed in with Google or Apple, and every request carries `x-deepai-code-theos = "7"`. A sidecar at `http://127.0.0.1:8790/deepai/v1` also works through `openai_compat`. See the DeepAI Code block under Ready-to-paste configuration. |
 | `duckduckgo-web` / `ddgw` (same group) | No supported third-party Duck.ai inference API verified [D2] | Direct import remains unavailable. The existing opt-in importer replacement uses only reviewed same-model matches. |
 | `antigravity` (34-leg OAuth group) | Google AI Studio/Gemini API key [G1–3] | Official free eligible models, project quotas, data-use caveats. `openai_compat`; do not migrate consumer OAuth. Five existing keys are not five independent project quotas. |
 | `xai-oauth` / grok-cli (same group) | xAI API key at `https://api.x.ai/v1` [X1–2] | Official keyed access, but no current free credit grant verified. Do not count as a free replacement. Current quickstart demonstrates Responses; llmux2 has no native upstream `responses` kind. Chat compatibility/model eligibility must be checked separately. |
@@ -301,6 +301,15 @@ page only exposes account-specific limits, no number is invented.
   “Pass your key in the api-key header and the model's inputs as form fields. The endpoint URL is https://api.deepai.org/api/<model>”.
   Keyless probes returned HTTP 401 for `text-generator` and `summarization`.
   That verifies endpoint recognition, not successful generation or free API use.
+- **DC1** [DeepAI Code docs](https://deepai.org/docs) (retrieved 2026-11-25):
+  “DeepAI Code is for accounts signed in with Google or Apple, or on DeepAI Pro
+  with a verified email.” `POST https://api.deepai.org/deepai_code/chat/completions`
+  takes an OpenAI-compatible body and an `Api-Key` header; `Authorization: Bearer`
+  is refused with 401 `auth_required`. `GET /deepai_code/theos` returns the
+  account's daily metered balance, and a request without `x-deepai-code-theos: 7`
+  is refused with 426. Probe on 2026-11-25: 28 catalog models, 12 with
+  `theosPerRequest: "0"`, `claude-haiku-5-5` answered and left the balance
+  unchanged. No `x-ratelimit-*` or `retry-after` headers are returned.
 - **D2** [Duck.ai terms](https://duckduckgo.com/duckai/privacy-terms):
   Prohibit automated querying and circumventing safeguards. Status requests to
   both Duck.ai hosts returned a browser challenge, not a plain anonymous token.
@@ -367,14 +376,28 @@ page only exposes account-specific limits, no number is invented.
   text input and does not expose Chat Completions options. The adapter rejects
   unsupported options instead of ignoring them.
 - **Credential headers:** A `deepai` API-key credential sets `Api-Key`. An
-  `openai_compat` API-key credential sets Bearer authorization.
+  `openai_compat` API-key credential sets Bearer authorization. A
+  `deepai_code` API-key credential also sets `Api-Key`, because the Code lane
+  refuses Bearer with 401 `auth_required`.
+- **DeepAI Code lane:** `provider = "deepai_code"` reuses the OpenAI-compatible
+  adapter against `https://api.deepai.org/deepai_code`; the lane version header
+  `x-deepai-code-theos = "7"` is a deployment header, not a credential, and a
+  request without it is refused with 426. Models whose
+  `theosPerRequest` is `"0"` cost nothing; the rest draw on the account's
+  daily metered balance, and a `403 theos_exhausted`/`theos_insufficient` is
+  classified as a spent quota, not a dead credential. That lane reports no
+  `x-ratelimit-*` or `retry-after` headers, so keep `rpm`/`rpd` quotas
+  conservative instead of relying on upstream hints. `machine_required` and
+  `social_login_required` are credential refusals: the leg parks until the
+  account signs in with Google or Apple and registers a machine.
 - **Per-deployment upstream headers are configurable:** `headers` on
   `[[models.deployments]]` sets extra headers, e.g. OpenRouter's optional
   `HTTP-Referer` and `X-Title` attribution, and accepts `env:`/`file:`
   references for the value. Hop-by-hop names and a keyed deployment's own
   `Authorization`/`x-api-key` are rejected, as are duplicate, invalid, or
   control-character entries, so do not set the credential header again there.
-- **Kinds:** the server registry includes `deepai` for the official text API.
+- **Kinds:** the server registry includes `deepai` for the official text API and
+  `deepai_code` for DeepAI Code's keyed Chat Completions lane.
   `/v1/responses` is an **inbound** route converted for existing adapters, not a
   native upstream `provider = "responses"` implementation. A config string parsing
   does not mean a provider kind exists in the server registry.
@@ -425,6 +448,43 @@ credential = "cloudflare-key"
 base_url = "https://api.cloudflare.com/client/v4/accounts/ACCOUNT_ID/ai/v1"
 upstream_model = "@cf/meta/llama-3.1-8b-instruct"
 ```
+
+### DeepAI Code (Google- or Apple-signed-in account)
+
+The key comes from the DeepAI account's API keys page; the account itself must
+have signed in with Google or Apple, or be on DeepAI Pro with a verified email,
+otherwise every request fails with `403 social_login_required`. Every model
+below costs 0 theos, which keeps the leg free on the account's daily balance.
+A brand-new account or day can answer `403 machine_required` until the account
+registers a machine; that is an account step, not a route through llmux2.
+
+```toml
+[server]
+client_keys = ["env:LLMUX_CLIENT_KEY"]
+
+[[credentials]]
+id = "deepai-code-key"
+kind = "api_key"
+provider = "deepai_code"
+key = "env:DEEPAI_CODE_KEY"
+
+[[models]]
+name = "claude-haiku-5-5"
+[[models.deployments]]
+id = "claude-haiku-5-5-deepai-code"
+credential = "deepai-code-key"
+base_url = "https://api.deepai.org/deepai_code"
+upstream_model = "claude-haiku-5-5"
+headers = { x-deepai-code-theos = "7" }
+quota = { rpm = 30, concurrent = 4 }
+```
+
+Repeat the `[[models]]` block for `deepseek-v4.1-flash`, `glm-5.3-flash`,
+`mimo-2.6-flash`, `qwen-3.8-flash`, `minimax-m3.1-flash`, `muse-ember`,
+`solar-mini-4`, `gpt-6-luna`, `mimo-2.6-pro`, `glyph-cluster` and
+`deepai-cyber`. Do not add the metered models (`minimax-m3` = 2 theos,
+`glm-5.3` = 3, `claude-sonnet-5-5` = 10, `gpt-6.1-sol` = 10 per request)
+without a spending decision; the daily balance is small.
 
 ### Kilo Gateway (official API key)
 
