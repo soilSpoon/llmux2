@@ -953,6 +953,13 @@ fn classify_error_details(
                 | "credits_exhausted"
         )
     });
+    // A free allowance that will not convert to paid answers 429
+    // `free_allowance_used` (Revenue Analyst WO-70). The allowance is spent,
+    // so the leg is exhausted, not briefly limited, and must not stay a retry
+    // candidate. Codes arrive in snake, kebab, or prose spelling.
+    let free_allowance = [code, kind, message.as_str()]
+        .iter()
+        .any(|marker| normalized_code(marker).contains("free_allowance_used"));
     // Cloudflare Workers AI reports errors in a top-level `errors[]` array —
     // codes 4006/3036 or the "daily free allocation" phrasing mean the
     // account's daily neuron allocation is spent until 00:00 UTC.
@@ -971,9 +978,11 @@ fn classify_error_details(
         402 => UpstreamError::QuotaExhausted {
             reset_at: quota_reset(now, cf_daily, monthly, wait_raw),
         },
-        429 if quota || daily || cf_daily || monthly => UpstreamError::QuotaExhausted {
-            reset_at: quota_reset(now, cf_daily, monthly, wait_raw),
-        },
+        429 if quota || free_allowance || daily || cf_daily || monthly => {
+            UpstreamError::QuotaExhausted {
+                reset_at: quota_reset(now, cf_daily, monthly, wait_raw),
+            }
+        }
         429 => UpstreamError::RateLimited { retry_after: wait },
         401 => UpstreamError::Auth { refreshable: true },
         403 if body.trim_ascii_start().starts_with(b"<") => UpstreamError::Server { status },
@@ -999,6 +1008,21 @@ fn classify_error_details(
         400..=499 => UpstreamError::BadRequest { status, body },
         _ => bad_gateway(),
     }
+}
+
+/// Error codes and types arrive as snake_case, kebab-case, or prose; fold them
+/// into one lowercase snake form so a single signature covers every spelling.
+fn normalized_code(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// The first entry of a Cloudflare-style `{"errors":[{"code":N,"message":M}]}`
@@ -1923,6 +1947,76 @@ mod tests {
         assert!(matches!(
             classify(403, r#"{"error":{"message":"forbidden"}}"#),
             UpstreamError::Auth { refreshable: false }
+        ));
+    }
+
+    #[test]
+    fn a_spent_free_allowance_429_is_quota_exhaustion_not_a_rate_limit() {
+        // Revenue Analyst WO-70: runcrate answers an exhausted free allowance
+        // with 429 `free_allowance_used` and does not convert that leg to
+        // paid. Rate-limited would keep the dead leg in rotation and fold
+        // quota exhaustion into the 429 rate-limit stats.
+        for code in [
+            "free_allowance_used",
+            "FREE_ALLOWANCE_USED",
+            "free-allowance-used",
+            "free allowance used",
+        ] {
+            let body =
+                format!(r#"{{"error":{{"code":"{code}","message":"upstream refused the call"}}}}"#);
+            assert!(
+                matches!(
+                    classify(429, &body),
+                    UpstreamError::QuotaExhausted { reset_at: None }
+                ),
+                "{code} must classify as QuotaExhausted, got {:?}",
+                classify(429, &body)
+            );
+        }
+        // Some relays keep the marker only in the message.
+        assert!(matches!(
+            classify(
+                429,
+                r#"{"error":{"message":"Free Allowance Used for this model"}}"#
+            ),
+            UpstreamError::QuotaExhausted { reset_at: None }
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_429_rate_limit_wording_stays_rate_limited() {
+        for body in [
+            r#"{"error":{"code":"rate_limit_exceeded","message":"Rate limit reached for requests"}}"#,
+            r#"{"error":{"message":"Too many requests, slow down"}}"#,
+        ] {
+            assert!(
+                matches!(
+                    classify(429, body),
+                    UpstreamError::RateLimited { retry_after: None }
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_spent_free_allowance_429_waits_for_the_reported_reset() {
+        let now = SystemTime::UNIX_EPOCH;
+        let body = Bytes::from_static(
+            br#"{"error":{"code":"free_allowance_used","message":"free allowance spent"}}"#,
+        );
+        // A reported reset is the wait basis and is not squeezed by the
+        // generic retry cap; the cooldown policy's quota_max bounds it.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("2592000"));
+        assert!(matches!(
+            classify_error(StatusCode::TOO_MANY_REQUESTS, &headers, body.clone(), now),
+            UpstreamError::QuotaExhausted { reset_at: Some(reset) } if reset == now + Duration::from_secs(2_592_000)
+        ));
+        // With no hint it keeps the existing policy: no derived reset.
+        assert!(matches!(
+            classify_error(StatusCode::TOO_MANY_REQUESTS, &HeaderMap::new(), body, now),
+            UpstreamError::QuotaExhausted { reset_at: None }
         ));
     }
 
