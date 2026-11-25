@@ -919,6 +919,40 @@ fn keyed_kilo_requires_two_zero_prices_while_anonymous_is_unchanged() {
 }
 
 #[test]
+fn expired_kilo_openrouter_replacement_is_not_emitted() {
+    let mut root = fixture();
+    root["providerConnections"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"kiloanon","provider":"kilo","authType":"none"}));
+    root["combos"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name":"kilo-control","models":["kilo/vendor/free"]}));
+    let dir = tempfile::tempdir().unwrap();
+    success(&run(
+        &root,
+        dir.path(),
+        &[("--openrouter-replacements", dir.path())],
+    ));
+    let config = RuntimeConfig::load(dir.path().join("out.toml")).unwrap();
+    let control = &config.models[config.model_names["kilo-control"]];
+    assert_eq!(control.deployments.len(), 1);
+    assert_eq!(
+        config.deployments[control.deployments[0].0 as usize]
+            .upstream_model
+            .as_ref(),
+        "vendor/free"
+    );
+    assert!(!config
+        .model_names
+        .contains_key("openrouter/dots-studio/dots-3-note-preview:free"));
+    assert!(config.deployments.iter().all(|deployment| {
+        deployment.upstream_model.as_ref() != "dots-studio/dots-3-note-preview:free"
+    }));
+}
+
+#[test]
 fn external_kilo_key_and_verified_openrouter_replacements_use_real_loader() {
     let mut root = fixture();
     root["providerConnections"].as_array_mut().unwrap().extend([
