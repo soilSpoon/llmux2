@@ -355,6 +355,70 @@ async fn free_only_key_sees_no_billed_only_models() {
     assert_eq!(seen_models(&seen), ["up-mixed-free"]);
 }
 
+fn free_only_quota_config(url: &str, dir: &std::path::Path) -> String {
+    for (file, value) in [("owner", "owner-key"), ("ci", "ci-key")] {
+        std::fs::write(dir.join(file), value).unwrap();
+    }
+    let dir = dir.display();
+    format!(
+        r#"
+[server]
+client_keys = ["file:{dir}/owner", "file:{dir}/ci"]
+
+[[server.key_policies]]
+key = "file:{dir}/ci"
+free_only = true
+
+[[models]]
+name = "quota-draining"
+[[models.deployments]]
+id = "free-quota"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-free-quota"
+billing = "free"
+quota = {{ rpm = 1 }}
+"#
+    )
+}
+
+#[tokio::test]
+async fn exhausted_free_leg_stops_counting_for_the_free_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let remote = TestServer::start(
+        Router::new()
+            .route("/v1/chat/completions", post(upstream))
+            .with_state(seen.clone()),
+    )
+    .await
+    .unwrap();
+    let gateway = TestServer::start(
+        llmux_server::app(
+            RuntimeConfig::parse(&free_only_quota_config(&remote.url(), dir.path())).unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let gateway = gateway.url();
+
+    assert_eq!(listed(&gateway, "ci-key").await, ["quota-draining"]);
+    let (status, _) = chat(&gateway, "ci-key", "quota-draining").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(seen_models(&seen), ["up-free-quota"]);
+
+    let (status, _) = chat(&gateway, "ci-key", "quota-draining").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(seen_models(&seen), ["up-free-quota"], "no second upstream call");
+
+    let empty: Vec<String> = Vec::new();
+    assert_eq!(listed(&gateway, "ci-key").await, empty);
+    assert_eq!(listed(&gateway, "owner-key").await, ["quota-draining"]);
+}
+
 fn free_only_cred_config(url: &str, dir: &std::path::Path) -> String {
     for (file, value) in [
         ("owner", "owner-key"),
