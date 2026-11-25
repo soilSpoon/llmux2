@@ -84,6 +84,11 @@ above. Current catalog, from observed traffic:
 | Generic | `Retry-After`, `x-ratelimit-remaining{,-requests}: 0` + reset | RateLimited / QuotaExhausted | header |
 | IETF window | `x-ratelimit-{limit,remaining,reset}` (AI Horde) | RateLimited / parked on `remaining: 0` | epoch or delta-seconds header |
 
+When OpenAI-scoped and generic window headers are mixed, the generic
+`x-ratelimit-remaining` SHALL be only the fallback request counter: an
+explicit healthy `x-ratelimit-remaining-requests` must not be overridden, so
+an exhausted scoped token window still selects `x-ratelimit-reset-tokens`.
+
 New signatures SHALL be added here with the code change that parses them.
 
 ### Requirement: Multi-account providers stay independent

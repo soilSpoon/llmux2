@@ -898,8 +898,9 @@ fn classify_error_details(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_ascii_lowercase();
-    let scope = if header_text(headers, LIMIT_REMAINING_REQUESTS) == Some("0")
-        || header_text(headers, GENERIC_REMAINING) == Some("0")
+    let scoped_requests = header_text(headers, LIMIT_REMAINING_REQUESTS);
+    let scope = if scoped_requests == Some("0")
+        || (scoped_requests.is_none() && header_text(headers, GENERIC_REMAINING) == Some("0"))
     {
         Scope::Requests
     } else if header_text(headers, LIMIT_REMAINING_TOKENS) == Some("0")
@@ -1691,6 +1692,10 @@ mod tests {
 
     #[test]
     fn generic_rate_limit_headers_feed_observation_and_429_wait() {
+        // Test-local names keep this regression compilable on the parent
+        // implementation, where the production generic constants do not exist.
+        const TEST_GENERIC_REMAINING: &str = "x-ratelimit-remaining";
+        const TEST_GENERIC_RESET: &str = "x-ratelimit-reset";
         // IETF-style family (`x-ratelimit-{limit,remaining,reset}`) as sent by
         // AI Horde: `reset` is a unix-epoch second, `remaining` counts the
         // shared request window.
@@ -1703,13 +1708,18 @@ mod tests {
             + 60;
         let mut headers = HeaderMap::new();
         headers.insert("x-ratelimit-limit", HeaderValue::from_static("90"));
-        headers.insert(GENERIC_REMAINING, HeaderValue::from_static("0"));
+        headers.insert(TEST_GENERIC_REMAINING, HeaderValue::from_static("0"));
         headers.insert(
-            GENERIC_RESET,
+            TEST_GENERIC_RESET,
             HeaderValue::from_str(&epoch_secs.to_string()).unwrap(),
         );
+        assert_eq!(
+            adapter
+                .observe_limits(&headers)
+                .map(|observed| observed.remaining_requests),
+            Some(Some(0))
+        );
         let observed = adapter.observe_limits(&headers).unwrap();
-        assert_eq!(observed.remaining_requests, Some(0));
         let wait = observed.reset_requests.unwrap();
         assert!(
             wait > Duration::from_secs(50) && wait <= Duration::from_secs(61),
@@ -1718,7 +1728,7 @@ mod tests {
         assert_eq!(observed.remaining_tokens, None);
 
         // A plain integer below the epoch bound is delta-seconds.
-        headers.insert(GENERIC_RESET, HeaderValue::from_static("90"));
+        headers.insert(TEST_GENERIC_RESET, HeaderValue::from_static("90"));
         assert_eq!(
             adapter.observe_limits(&headers).unwrap().reset_requests,
             Some(Duration::from_secs(90))
@@ -1744,10 +1754,26 @@ mod tests {
         assert_eq!(observed.remaining_requests, Some(5));
         assert_eq!(observed.reset_requests, Some(Duration::from_secs(360)));
 
+        // Mixed families keep scoped classification precedence: an exhausted
+        // token window wins over a healthy explicit request counter, and the
+        // generic remaining count cannot force request scope as a fallback.
+        headers.insert(LIMIT_REMAINING_TOKENS, HeaderValue::from_static("0"));
+        headers.insert(LIMIT_RESET_TOKENS, HeaderValue::from_static("20ms"));
+        let err = classify_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &headers,
+            Bytes::from_static(br#"{"error":{"message":"rate limited"}}"#),
+            now,
+        );
+        assert!(
+            matches!(err, UpstreamError::RateLimited { retry_after: Some(wait), .. } if wait == Duration::from_millis(20)),
+            "{err:?}"
+        );
+
         // A generic reset applies even without a scope marker.
         let mut headers = HeaderMap::new();
         headers.insert(
-            GENERIC_RESET,
+            TEST_GENERIC_RESET,
             HeaderValue::from_str(&epoch_secs.to_string()).unwrap(),
         );
         let err = classify_error(
