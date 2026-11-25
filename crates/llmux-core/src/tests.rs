@@ -507,6 +507,60 @@ async fn same_level_spread_keeps_a_prompt_prefix_on_one_deployment() {
     );
 }
 
+#[test]
+fn stable_prompt_extraction_stops_before_large_conversation_tail() {
+    let tail = "x".repeat(1_800_000);
+    let body = Bytes::from(format!(
+        r#"{{"messages":[{{"role":"system","content":"shared system prompt with spaces"}},{{"role":"user","content":"{tail}"#
+    ));
+    let parts = stable_prompt_parts(&GatewayRequest { body, ..request() });
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0], b"system");
+    assert_eq!(parts[1], b"shared system prompt with spaces");
+}
+
+#[test]
+fn stable_prompt_extraction_reads_multiple_leading_system_messages() {
+    let parts = stable_prompt_parts(&GatewayRequest {
+        body: Bytes::from_static(
+            br#"{"messages":[{"role":"system","content":"first prefix"},{"role":"developer","content":"second prefix"},{"role":"user","content":"tail"}]}"#,
+        ),
+        ..request()
+    });
+    assert_eq!(parts.len(), 4);
+    assert_eq!(parts[0], b"system");
+    assert_eq!(parts[1], b"first prefix");
+    assert_eq!(parts[2], b"developer");
+    assert_eq!(parts[3], b"second prefix");
+}
+
+#[test]
+fn stable_prompt_extraction_covers_anthropic_and_responses_formats() {
+    let anthropic = stable_prompt_parts(&GatewayRequest {
+        format: InboundFormat::AnthropicMessages,
+        body: Bytes::from_static(
+            br#"{"system":"anthropic system prompt","messages":[{"role":"user","content":"tail"}]}"#,
+        ),
+        ..request()
+    });
+    assert_eq!(anthropic.len(), 2);
+    assert_eq!(anthropic[0], b"system");
+    assert_eq!(anthropic[1], b"anthropic system prompt");
+
+    let responses = stable_prompt_parts(&GatewayRequest {
+        format: InboundFormat::OpenAiResponses,
+        body: Bytes::from_static(
+            br#"{"instructions":"responses instructions","input":[{"role":"developer","content":"developer prefix"},{"role":"user","content":"tail"}]}"#,
+        ),
+        ..request()
+    });
+    assert_eq!(responses.len(), 4);
+    assert_eq!(responses[0], b"system");
+    assert_eq!(responses[1], b"responses instructions");
+    assert_eq!(responses[2], b"developer");
+    assert_eq!(responses[3], b"developer prefix");
+}
+
 #[tokio::test]
 async fn cache_affinity_uses_stable_system_prompt_not_conversation_tail() {
     let future = SystemTime::now() + Duration::from_secs(60);

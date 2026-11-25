@@ -1310,95 +1310,394 @@ fn cache_seed(req: &GatewayRequest) -> Option<usize> {
     present.then_some(hash as usize)
 }
 
+/// The extractor is deliberately lexical rather than a full JSON parse. It
+/// scans only a small bounded prefix: enough for the 8 KiB affinity material
+/// plus object/array punctuation. Large conversation tails and inline images
+/// after the leading non-system message are never walked on the routing hot
+/// path. Malformed or unusually ordered input simply falls back to the raw
+/// bounded body prefix below.
+const CACHE_SCAN_BYTES: usize = CACHE_PREFIX_BYTES + 1024;
+
+struct JsonScan<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    limit: usize,
+}
+
+struct ScannedString<'a> {
+    inner: &'a [u8],
+    complete: bool,
+}
+
+struct ScannedValue<'a> {
+    raw: &'a [u8],
+    complete: bool,
+    string: bool,
+}
+
+impl<'a> JsonScan<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            pos: 0,
+            limit: bytes.len().min(CACHE_SCAN_BYTES),
+        }
+    }
+
+    fn skip_ws(&mut self) {
+        while self.pos < self.limit && self.bytes[self.pos].is_ascii_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn consume(&mut self, byte: u8) -> bool {
+        self.skip_ws();
+        if self.pos < self.limit && self.bytes[self.pos] == byte {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek(&mut self) -> Option<u8> {
+        self.skip_ws();
+        (self.pos < self.limit).then(|| self.bytes[self.pos])
+    }
+
+    fn scan_string_prefix(&mut self, max_inner_bytes: usize) -> Option<ScannedString<'a>> {
+        self.skip_ws();
+        if self.pos >= self.limit || self.bytes[self.pos] != b'"' {
+            return None;
+        }
+        self.pos += 1;
+        let start = self.pos;
+        let scan_end = self
+            .limit
+            .min(start.saturating_add(max_inner_bytes.saturating_add(1)));
+        let mut escaped = false;
+        while self.pos < scan_end {
+            let byte = self.bytes[self.pos];
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                let inner = &self.bytes[start..self.pos];
+                self.pos += 1;
+                return Some(ScannedString {
+                    inner,
+                    complete: true,
+                });
+            }
+            self.pos += 1;
+        }
+        let end = start.saturating_add(max_inner_bytes).min(self.limit);
+        (end > start).then(|| ScannedString {
+            inner: &self.bytes[start..end],
+            complete: false,
+        })
+    }
+
+    fn scan_key(&mut self) -> Option<&'a [u8]> {
+        let key = self.scan_string_prefix(128)?;
+        key.complete.then_some(key.inner)
+    }
+
+    fn scan_composite_prefix(&mut self, max_bytes: usize) -> Option<ScannedValue<'a>> {
+        self.skip_ws();
+        let start = self.pos;
+        let scan_end = self
+            .limit
+            .min(start.saturating_add(max_bytes.saturating_add(1)));
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        while self.pos < scan_end {
+            let byte = self.bytes[self.pos];
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+            } else if byte == b'"' {
+                in_string = true;
+            } else if byte == b'{' || byte == b'[' {
+                depth += 1;
+            } else if byte == b'}' || byte == b']' {
+                depth = depth.checked_sub(1)?;
+                self.pos += 1;
+                if depth == 0 {
+                    return Some(ScannedValue {
+                        raw: &self.bytes[start..self.pos],
+                        complete: true,
+                        string: false,
+                    });
+                }
+                continue;
+            }
+            self.pos += 1;
+        }
+        let end = start.saturating_add(max_bytes).min(self.limit);
+        (end > start).then(|| ScannedValue {
+            raw: &self.bytes[start..end],
+            complete: false,
+            string: false,
+        })
+    }
+
+    fn scan_primitive_prefix(&mut self, max_bytes: usize) -> Option<ScannedValue<'a>> {
+        self.skip_ws();
+        let start = self.pos;
+        while self.pos < self.limit {
+            if matches!(self.bytes[self.pos], b',' | b'}' | b']')
+                || self.bytes[self.pos].is_ascii_whitespace()
+            {
+                break;
+            }
+            self.pos += 1;
+            if self.pos - start >= max_bytes {
+                break;
+            }
+        }
+        (self.pos > start).then(|| ScannedValue {
+            raw: &self.bytes[start..self.pos],
+            complete: true,
+            string: false,
+        })
+    }
+
+    fn scan_value_prefix(&mut self, max_bytes: usize) -> Option<ScannedValue<'a>> {
+        match self.peek()? {
+            b'"' => {
+                let string = self.scan_string_prefix(max_bytes)?;
+                Some(ScannedValue {
+                    raw: string.inner,
+                    complete: string.complete,
+                    string: true,
+                })
+            }
+            b'{' | b'[' => self.scan_composite_prefix(max_bytes),
+            _ => self.scan_primitive_prefix(max_bytes),
+        }
+    }
+
+    fn skip_value(&mut self) -> bool {
+        self.scan_value_prefix(CACHE_SCAN_BYTES)
+            .is_some_and(|value| value.complete)
+    }
+}
+
 fn stable_prompt_parts(req: &GatewayRequest) -> Vec<Vec<u8>> {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&req.body) else {
-        return Vec::new();
-    };
+    let mut scan = JsonScan::new(&req.body);
     let mut parts = Vec::new();
     let mut remaining = CACHE_PREFIX_BYTES;
-    match req.format {
-        InboundFormat::OpenAiChat => {
-            if let Some(messages) = value.get("messages").and_then(|v| v.as_array()) {
-                push_leading_system_parts(messages, &mut parts, &mut remaining);
-            }
+    if !scan.consume(b'{') {
+        return parts;
+    }
+    loop {
+        scan.skip_ws();
+        if scan.consume(b'}') || scan.pos >= scan.limit {
+            break;
         }
-        InboundFormat::AnthropicMessages => {
-            if let Some(system) = value.get("system") {
-                push_prompt_content(&mut parts, "system", system, &mut remaining);
-            }
+        let Some(key) = scan.scan_key() else {
+            break;
+        };
+        if !scan.consume(b':') {
+            break;
         }
-        InboundFormat::OpenAiResponses => {
-            if let Some(instructions) = value.get("instructions") {
-                push_prompt_content(&mut parts, "system", instructions, &mut remaining);
+        let handled = match (req.format, key) {
+            (InboundFormat::OpenAiChat, b"messages") => {
+                scan_leading_system_parts(&mut scan, &mut parts, &mut remaining);
+                true
             }
-            if let Some(input) = value.get("input").and_then(|v| v.as_array()) {
-                push_leading_system_parts(input, &mut parts, &mut remaining);
+            (InboundFormat::AnthropicMessages, b"system") => {
+                scan_prompt_content(&mut scan, &mut parts, "system", &mut remaining);
+                true
             }
+            (InboundFormat::OpenAiResponses, b"instructions") => {
+                scan_prompt_content(&mut scan, &mut parts, "system", &mut remaining);
+                true
+            }
+            (InboundFormat::OpenAiResponses, b"input") => {
+                scan_leading_system_parts(&mut scan, &mut parts, &mut remaining);
+                true
+            }
+            _ => false,
+        };
+        if remaining == 0 {
+            break;
         }
+        if !handled && !scan.skip_value() {
+            break;
+        }
+        scan.skip_ws();
+        if scan.consume(b',') {
+            continue;
+        }
+        break;
     }
     parts
 }
 
-fn push_leading_system_parts(
-    items: &[serde_json::Value],
+fn scan_leading_system_parts(
+    scan: &mut JsonScan<'_>,
     parts: &mut Vec<Vec<u8>>,
     remaining: &mut usize,
 ) {
-    for item in items {
-        if *remaining == 0 {
+    if !scan.consume(b'[') {
+        return;
+    }
+    loop {
+        scan.skip_ws();
+        if scan.consume(b']') || scan.pos >= scan.limit || *remaining == 0 {
+            return;
+        }
+        if !scan.consume(b'{') {
+            return;
+        }
+        let mut role = None;
+        let mut content = None;
+        let mut stop_after_item = false;
+        loop {
+            scan.skip_ws();
+            if scan.consume(b'}') || scan.pos >= scan.limit {
+                break;
+            }
+            let Some(key) = scan.scan_key() else {
+                return;
+            };
+            if !scan.consume(b':') {
+                return;
+            }
+            match key {
+                b"role" => {
+                    let Some(value) = scan.scan_string_prefix(32) else {
+                        return;
+                    };
+                    if !value.complete {
+                        return;
+                    }
+                    role = Some(value.inner);
+                    if !matches!(role, Some(b"system" | b"developer")) {
+                        // The first non-system item begins the changing tail. In
+                        // the common role-before-content order this avoids its
+                        // large content entirely.
+                        stop_after_item = true;
+                        break;
+                    }
+                }
+                b"content" => {
+                    let budget = remaining.saturating_add(1);
+                    let Some(value) = scan.scan_value_prefix(budget) else {
+                        return;
+                    };
+                    content = Some(if value.string {
+                        value.raw[..value.raw.len().min(*remaining)].to_vec()
+                    } else {
+                        bounded_json_bytes(value.raw, *remaining)
+                    });
+                    if !value.complete || *remaining == 0 {
+                        stop_after_item = true;
+                        break;
+                    }
+                }
+                _ => {
+                    if !scan.skip_value() {
+                        return;
+                    }
+                }
+            }
+            scan.skip_ws();
+            if scan.consume(b',') {
+                continue;
+            }
+            scan.consume(b'}');
             break;
         }
-        let Some(role) = item.get("role").and_then(|v| v.as_str()) else {
-            break;
-        };
-        if !matches!(role, "system" | "developer") {
-            break;
+        let is_system = matches!(role, Some(b"system" | b"developer"));
+        if is_system {
+            if let Some(content) = content {
+                push_prompt_bytes(parts, role.unwrap(), &content, remaining);
+            }
         }
-        if let Some(content) = item.get("content") {
-            push_prompt_content(parts, role, content, remaining);
+        if stop_after_item || !is_system || *remaining == 0 {
+            return;
         }
+        scan.skip_ws();
+        if scan.consume(b',') {
+            continue;
+        }
+        return;
     }
 }
 
-fn push_prompt_content(
+fn scan_prompt_content(
+    scan: &mut JsonScan<'_>,
     parts: &mut Vec<Vec<u8>>,
     role: &str,
-    content: &serde_json::Value,
     remaining: &mut usize,
 ) {
-    if *remaining == 0 {
+    let budget = remaining.saturating_add(1);
+    let Some(value) = scan.scan_value_prefix(budget) else {
         return;
-    }
-    let serialized = match content.as_str() {
-        Some(_) => None,
-        None => serde_json::to_vec(content).ok(),
     };
-    let content_len = match (content.as_str(), &serialized) {
-        (Some(text), _) => text.len(),
-        (None, Some(bytes)) => bytes.len(),
-        (None, None) => 0,
+    let content = if value.string {
+        value.raw[..value.raw.len().min(*remaining)].to_vec()
+    } else {
+        bounded_json_bytes(value.raw, *remaining)
     };
-    if content_len == 0 {
+    push_prompt_bytes(parts, role.as_bytes(), &content, remaining);
+}
+
+fn push_prompt_bytes(parts: &mut Vec<Vec<u8>>, role: &[u8], content: &[u8], remaining: &mut usize) {
+    if *remaining == 0 || content.is_empty() {
         return;
     }
     let role_len = role.len().min(*remaining);
     if role_len > 0 {
-        parts.push(role.as_bytes()[..role_len].to_vec());
+        parts.push(role[..role_len].to_vec());
         *remaining -= role_len;
     }
     if *remaining == 0 {
         return;
     }
-    let bytes = match (content.as_str(), serialized) {
-        (Some(text), _) => text.as_bytes()[..text.len().min(*remaining)].to_vec(),
-        (None, Some(mut serialized)) => {
-            serialized.truncate(*remaining);
-            serialized
+    let len = content.len().min(*remaining);
+    parts.push(content[..len].to_vec());
+    *remaining -= len;
+}
+
+/// Copies at most `cap` bytes of a borrowed JSON value. Whitespace outside
+/// strings is insignificant in JSON, so dropping it keeps affinity stable
+/// across equivalent client serialization without materializing the tail.
+fn bounded_json_bytes(raw: &[u8], cap: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len().min(cap));
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in raw {
+        if out.len() == cap {
+            break;
         }
-        (None, None) => Vec::new(),
-    };
-    *remaining -= bytes.len();
-    parts.push(bytes);
+        if in_string {
+            out.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+            out.push(byte);
+        } else if !byte.is_ascii_whitespace() {
+            out.push(byte);
+        }
+    }
+    out
 }
 
 fn fnv_part(mut hash: u64, part: &[u8]) -> u64 {
