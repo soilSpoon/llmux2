@@ -1512,7 +1512,9 @@ fn stable_prompt_parts(req: &GatewayRequest) -> Vec<Vec<u8>> {
         }
         let handled = match (req.format, key) {
             (InboundFormat::OpenAiChat, b"messages") => {
-                scan_leading_system_parts(&mut scan, &mut parts, &mut remaining);
+                if !scan_leading_system_parts(&mut scan, &mut parts, &mut remaining) {
+                    break;
+                }
                 true
             }
             (InboundFormat::AnthropicMessages, b"system") => {
@@ -1555,67 +1557,71 @@ fn scan_leading_system_parts(
     scan: &mut JsonScan<'_>,
     parts: &mut Vec<Vec<u8>>,
     remaining: &mut usize,
-) {
+) -> bool {
     if !scan.consume(b'[') {
-        return;
+        return false;
     }
     loop {
         scan.skip_ws();
-        if scan.consume(b']') || scan.pos >= scan.limit || *remaining == 0 {
-            return;
+        if scan.consume(b']') {
+            return true;
+        }
+        if scan.pos >= scan.limit || *remaining == 0 {
+            return false;
         }
         if !scan.consume(b'{') {
-            return;
+            return false;
         }
         let mut role = None;
         let mut content = None;
-        let mut stop_after_item = false;
         loop {
             scan.skip_ws();
-            if scan.consume(b'}') || scan.pos >= scan.limit {
+            if scan.consume(b'}') {
                 break;
             }
+            if scan.pos >= scan.limit {
+                return false;
+            }
             let Some(key) = scan.scan_key() else {
-                return;
+                return false;
             };
             if !scan.consume(b':') {
-                return;
+                return false;
             }
             match key {
                 b"role" => {
                     let Some(value) = scan.scan_string_prefix(32) else {
-                        return;
+                        return false;
                     };
                     if !value.complete {
-                        return;
+                        return false;
                     }
                     role = Some(value.inner);
                     if !matches!(role, Some(b"system" | b"developer")) {
-                        // The first non-system item begins the changing tail. In
-                        // the common role-before-content order this avoids its
-                        // large content entirely.
-                        stop_after_item = true;
-                        break;
+                        return false;
                     }
                 }
                 b"content" => {
                     let budget = remaining.saturating_add(1);
                     let Some(value) = scan.scan_value_prefix(budget) else {
-                        return;
+                        return false;
                     };
-                    content = Some(if value.string {
+                    let scanned = if value.string {
                         value.raw[..value.raw.len().min(*remaining)].to_vec()
                     } else {
                         bounded_json_bytes(value.raw, *remaining)
-                    });
-                    if !value.complete || *remaining == 0 {
-                        stop_after_item = true;
-                        break;
+                    };
+                    if !value.complete {
+                        if matches!(role, Some(b"system" | b"developer")) {
+                            push_prompt_bytes(parts, role.unwrap(), &scanned, remaining);
+                        }
+                        return false;
                     }
+                    content = Some(scanned);
                 }
                 _ => {
                     if !scan.skip_value() {
-                        return;
+                        return false;
                     }
                 }
             }
@@ -1623,8 +1629,10 @@ fn scan_leading_system_parts(
             if scan.consume(b',') {
                 continue;
             }
-            scan.consume(b'}');
-            break;
+            if scan.consume(b'}') {
+                break;
+            }
+            return false;
         }
         let is_system = matches!(role, Some(b"system" | b"developer"));
         if is_system {
@@ -1632,14 +1640,17 @@ fn scan_leading_system_parts(
                 push_prompt_bytes(parts, role.unwrap(), &content, remaining);
             }
         }
-        if stop_after_item || !is_system || *remaining == 0 {
-            return;
+        if !is_system || *remaining == 0 {
+            return false;
         }
         scan.skip_ws();
         if scan.consume(b',') {
             continue;
         }
-        return;
+        if scan.consume(b']') {
+            return true;
+        }
+        return false;
     }
 }
 

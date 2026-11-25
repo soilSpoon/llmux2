@@ -535,6 +535,19 @@ fn stable_prompt_extraction_reads_multiple_leading_system_messages() {
 }
 
 #[test]
+fn stable_prompt_extraction_does_not_treat_nested_message_keys_as_top_level() {
+    let parts = stable_prompt_parts(&GatewayRequest {
+        body: Bytes::from_static(
+            br#"{"messages":[{"role":"system","content":"shared prefix"},{"role":"user","content":"tail","messages":[{"role":"system","content":"nested poison"}]}]}"#,
+        ),
+        ..request()
+    });
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0], b"system");
+    assert_eq!(parts[1], b"shared prefix");
+}
+
+#[test]
 fn stable_prompt_extraction_reads_responses_instructions_after_input() {
     for body in [
         br#"{"input":"First question","instructions":"shared system prompt"}"#.as_slice(),
