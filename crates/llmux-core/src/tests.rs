@@ -2545,6 +2545,73 @@ async fn request_log_merges_split_anthropic_stream_usage() {
 }
 
 #[tokio::test]
+async fn request_log_writes_stream_record_on_first_upstream_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let log = Arc::new(RequestLog::open(&path).unwrap());
+    let mut step = 0usize;
+    let inner: llmux_types::BoxStream<'static, Result<SseEvent, UpstreamError>> = Box::pin(
+        futures_util::stream::poll_fn(move |_cx| {
+            step += 1;
+            match step {
+                1 => std::task::Poll::Ready(Some(Ok(SseEvent {
+                    event: None,
+                    data: r#"{"choices":[],"usage":{"prompt_tokens":31,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":6}}}"#.into(),
+                }))),
+                2 => std::task::Poll::Ready(Some(Err(UpstreamError::StreamBroken {
+                    bytes_sent: 17,
+                }))),
+                _ => std::task::Poll::Pending,
+            }
+        }),
+    );
+    let pending = crate::request_log::PendingStreamRecord {
+        log: log.clone(),
+        ts_ms: 0,
+        request_id: "test".into(),
+        model: "model".into(),
+        deployment: Some("dep0".into()),
+        provider: Some("test".into()),
+        client_key: None,
+        image_count: 0,
+        upstream_request_id: None,
+        attempts: 1,
+        legs: vec![],
+        latency_ms: 0,
+        quota_remaining: None,
+    };
+    let mut events = crate::request_log::UsageCaptureStream::new(inner, pending);
+
+    assert!(events.next().await.unwrap().is_ok());
+    assert!(matches!(
+        events.next().await,
+        Some(Err(UpstreamError::StreamBroken { bytes_sent: 17 }))
+    ));
+
+    let mut written = String::new();
+    for _ in 0..200 {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if !contents.trim().is_empty() {
+                written = contents;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !written.is_empty(),
+        "first upstream stream error did not durably write the request record"
+    );
+    let record: serde_json::Value = serde_json::from_str(written.trim()).unwrap();
+    assert_eq!(record["outcome"], "routed");
+    assert_eq!(record["usage"]["input_tokens"], 31);
+    assert_eq!(record["usage"]["output_tokens"], 8);
+    assert_eq!(record["usage"]["cached_input_tokens"], 6);
+    drop(events);
+    drop(log);
+}
+
+#[tokio::test]
 async fn request_log_writes_partial_stream_record_on_cancellation() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("requests.jsonl");
