@@ -423,6 +423,136 @@ async fn exhausted_free_leg_stops_counting_for_the_free_catalog() {
     assert_eq!(listed(&gateway, "owner-key").await, ["quota-draining"]);
 }
 
+fn free_only_token_window_config(url: &str, dir: &std::path::Path) -> String {
+    for (file, value) in [
+        ("owner", "owner-key"),
+        ("ci", "ci-key"),
+        ("token-cred", "synthetic-token-cred"),
+    ] {
+        std::fs::write(dir.join(file), value).unwrap();
+    }
+    let dir = dir.display();
+    format!(
+        r#"
+[server]
+client_keys = ["file:{dir}/owner", "file:{dir}/ci"]
+
+[[server.key_policies]]
+key = "file:{dir}/ci"
+free_only = true
+
+[[shared_quotas]]
+name = "token-family"
+tpm = 6
+
+[[credentials]]
+id = "token-cred"
+kind = "api_key"
+provider = "openai_compat"
+key = "file:{dir}/token-cred"
+quota = {{ tpd = 6 }}
+
+[[models]]
+name = "deployment-token-starved"
+[[models.deployments]]
+id = "deployment-token"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-deployment-token"
+billing = "free"
+quota = {{ tpm = 6 }}
+
+[[models]]
+name = "credential-token-starved"
+[[models.deployments]]
+id = "credential-token"
+credential = "token-cred"
+base_url = "{url}/v1"
+upstream_model = "up-credential-token"
+billing = "free"
+
+[[models]]
+name = "shared-token-starved"
+[[models.deployments]]
+id = "shared-token"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-shared-token"
+billing = "free"
+shared_quota = "token-family"
+"#
+    )
+}
+
+#[tokio::test]
+async fn token_starved_free_legs_stop_counting_for_the_free_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let remote = TestServer::start(
+        Router::new()
+            .route("/v1/chat/completions", post(upstream))
+            .with_state(seen.clone()),
+    )
+    .await
+    .unwrap();
+    let gateway = TestServer::start(
+        llmux_server::app(
+            RuntimeConfig::parse(&free_only_token_window_config(&remote.url(), dir.path()))
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let gateway = gateway.url();
+
+    for model in [
+        "deployment-token-starved",
+        "credential-token-starved",
+        "shared-token-starved",
+    ] {
+        assert!(listed(&gateway, "ci-key").await.contains(&model.to_owned()));
+    }
+
+    let mut wrongly_advertised = Vec::new();
+    for model in [
+        "deployment-token-starved",
+        "credential-token-starved",
+        "shared-token-starved",
+    ] {
+        let before = seen.lock().unwrap().len();
+        let (status, _) = chat(&gateway, "ci-key", model).await;
+        assert_eq!(status, StatusCode::OK, "{model}: first minimal chat");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            before + 1,
+            "{model}: first chat reached upstream"
+        );
+
+        let (status, _) = chat(&gateway, "ci-key", model).await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{model}: second minimal chat has only one token unit left"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            before + 1,
+            "{model}: token-starved second chat made an upstream call"
+        );
+        if listed(&gateway, "ci-key").await.contains(&model.to_owned()) {
+            wrongly_advertised.push(model);
+        }
+    }
+    assert!(
+        wrongly_advertised.is_empty(),
+        "token-starved models still advertised: {wrongly_advertised:?}"
+    );
+}
+
 fn free_only_cred_config(url: &str, dir: &std::path::Path) -> String {
     for (file, value) in [
         ("owner", "owner-key"),
