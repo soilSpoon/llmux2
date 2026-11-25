@@ -32,7 +32,7 @@ use llmux_types::provider::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -210,6 +210,9 @@ fn deployment_identity(
     String,
     String,
     String,
+    String,
+    String,
+    String,
 ) {
     (
         string(dep, "credential").to_owned(),
@@ -220,6 +223,9 @@ fn deployment_identity(
         identity_field(&dep["max_context"]),
         identity_field(&dep["quota"]),
         identity_field(&dep["timeout_ms"]),
+        string(dep, "billing").to_owned(),
+        identity_field(&dep["shared_quota"]),
+        identity_field(&dep["expires_at"]),
     )
 }
 
@@ -569,6 +575,8 @@ struct Expander<'a> {
     connections: &'a [Connection],
     nodes: &'a [Value],
     warnings: &'a mut Vec<String>,
+    /// Families emitted as `[[shared_quotas]]`: name → the row's quota spec.
+    shared_quotas: &'a mut BTreeMap<&'static str, &'static [(&'static str, u32)]>,
     remaining_steps: usize,
     exhausted: bool,
     policy: &'a policy::Policy,
@@ -826,8 +834,19 @@ impl Expander<'_> {
                 if deployment["billing"] == "free" {
                     if let Some(cond) = free_conditions::lookup(&c.base_url, &model, c.anonymous())
                     {
-                        for &(field, value) in cond.quota {
-                            deployment["quota"][field] = value.into();
+                        match cond.shared {
+                            // Account-wide cap: legs bind the family and the
+                            // gateway scopes one window per credential or
+                            // provider+base URL — not per model leg.
+                            Some(family) => {
+                                deployment["shared_quota"] = family.into();
+                                self.shared_quotas.entry(family).or_insert(cond.quota);
+                            }
+                            None => {
+                                for &(field, value) in cond.quota {
+                                    deployment["quota"][field] = value.into();
+                                }
+                            }
                         }
                         if let Some(stamp) = cond.expires_at {
                             deployment["expires_at"] = stamp.into();
@@ -1449,6 +1468,7 @@ pub fn import_with_options(
                     connections: &connections,
                     nodes,
                     warnings: &mut Vec::new(),
+                    shared_quotas: &mut BTreeMap::new(),
                     remaining_steps: 1024,
                     exhausted: false,
                     policy: &policy,
@@ -1535,6 +1555,9 @@ pub fn import_with_options(
         }
     }
     let mut models = Vec::new();
+    // `[[shared_quotas]]` families collected while expanding: rows whose cap
+    // is one account-wide allowance bind the family instead of per-leg quota.
+    let mut shared_quotas: BTreeMap<&'static str, &'static [(&'static str, u32)]> = BTreeMap::new();
     context.reset_usage();
     let mut deployment_ids = HashSet::new();
     for name in order {
@@ -1566,6 +1589,7 @@ pub fn import_with_options(
             connections: &connections,
             nodes: array(&root, "providerNodes"),
             warnings: &mut warnings,
+            shared_quotas: &mut shared_quotas,
             remaining_steps: 1024,
             exhausted: false,
             policy: &policy,
@@ -1600,6 +1624,7 @@ pub fn import_with_options(
                 connections: &connections,
                 nodes,
                 warnings: &mut warnings,
+                shared_quotas: &mut shared_quotas,
                 remaining_steps: 1,
                 exhausted: false,
                 policy: &policy,
@@ -1626,6 +1651,7 @@ pub fn import_with_options(
                     connections: &connections,
                     nodes,
                     warnings: &mut warnings,
+                    shared_quotas: &mut shared_quotas,
                     remaining_steps: 1024,
                     exhausted: false,
                     policy: &policy,
@@ -1831,6 +1857,18 @@ pub fn import_with_options(
         }
     }
     let mut config = json!({"server":{"listen":options.listen.unwrap_or("127.0.0.1:8080"),"client_keys":client_keys},"credentials":credentials,"models":models});
+    if !shared_quotas.is_empty() {
+        config["shared_quotas"] = shared_quotas
+            .into_iter()
+            .map(|(name, quota)| {
+                let mut row = json!({"name": name});
+                for &(field, value) in quota {
+                    row[field] = value.into();
+                }
+                row
+            })
+            .collect();
+    }
     if !key_policies.is_empty() {
         config["server"]["key_policies"] = json!(key_policies);
     }
@@ -1972,6 +2010,29 @@ mod dedupe_tests {
             vec!["m-0", "m-1", "m-2", "m-3"]
         );
         assert_eq!(warnings, vec!["m: dropped 2 duplicate deployments"]);
+    }
+
+    #[test]
+    fn free_and_billed_variants_on_one_route_both_survive_dedupe() {
+        // A model-scoped --free-providers entry marks one leg free while a
+        // sibling on the same credential+host+model stays billed: billing,
+        // shared_quota, and expires_at are routing behavior, not decoration —
+        // identical rows here would silently drop the billed leg.
+        let mut models = vec![json!({
+            "name": "m",
+            "deployments": [
+                {"id":"m-0","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":0,"billing":"free","shared_quota":"sambanova-free"},
+                {"id":"m-1","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":1,"billing":"billed"},
+                {"id":"m-2","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":2,"billing":"free","shared_quota":"sambanova-free","expires_at":"2026-12-16T23:59:59Z"}
+            ]
+        })];
+        let warnings = run(&mut models);
+        let deps = models[0]["deployments"].as_array().unwrap();
+        assert_eq!(
+            deps.iter().map(|dep| string(dep, "id")).collect::<Vec<_>>(),
+            vec!["m-0", "m-1", "m-2"]
+        );
+        assert!(warnings.is_empty());
     }
 
     #[test]
