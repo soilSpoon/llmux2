@@ -2629,3 +2629,22 @@ async fn convert_deployment_cooled_during_build_is_skipped_at_the_gate() {
     assert_eq!(result.deployment.as_ref(), "dep2");
     assert_eq!(adapter.calls.lock().unwrap().len(), 2);
 }
+
+/// Unlike a convert deployment, a passthrough deployment already holds its
+/// permit when the build starts — the gate must recall even a granted permit
+/// when a cooldown lands during the build, or the cooling deployment is sent
+/// traffic the spec forbids.
+#[tokio::test]
+async fn passthrough_deployment_cooled_during_build_is_recalled_at_the_gate() {
+    let (executor, adapter, _, _server) = fixture_with_models(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("model", &[0, 2])],
+        Default::default(),
+    )
+    .await;
+    *adapter.cool_on_build.lock().unwrap() = Some(executor.bindings[0].limits.clone());
+    let result = executor.execute(request()).await.unwrap();
+    assert_eq!(result.deployment.as_ref(), "dep2");
+}
