@@ -120,7 +120,8 @@ THEN import skips that row with a missing-refresh-token warning and continues.
 
 #### Scenario: DeepAI Code loopback
 
-WHEN a DeepAI Code node has a valid API key and `http://127.0.0.1:8790/deepai/v1`
+WHEN a DeepAI Code node has a valid API key and a loopback `*/deepai/v1` base
+URL
 THEN its deployment uses `openai_compat` at that URL and the same model id.
 
 #### Scenario: Antigravity connection without a stored client pair
@@ -572,9 +573,11 @@ deployments through names or free-status hints alone.
 
 The importer SHALL accept an API key for the built-in DeepAI connection and
 route only `text-generator` and `summarization` to the official text API.
-The importer SHALL retain the explicitly configured
-`http://127.0.0.1:8790/deepai/v1` sidecar as `openai_compat` for a keyed
-`deepai-code` connection or OpenAI-compatible node with prefix `deepai`.
+The importer SHALL retain a loopback `*/deepai/v1` sidecar as
+`openai_compat` for a keyed `deepai-code` connection or OpenAI-compatible
+node with prefix `deepai`. The DeepAI Code app serves its model proxy on a
+random per-launch loopback port, so the allowlist covers any loopback host
+with that path rather than one pinned port.
 The regular loopback restrictions apply to other URLs. An explicit
 same-model replacement option still takes precedence for bridge nodes.
 The two native DeepAI text IDs take precedence over the Code node's
@@ -586,6 +589,57 @@ WHEN an export contains keyed connections for the official DeepAI API and
 the reviewed local DeepAI Code sidecar
 THEN the importer selects `deepai` for supported text IDs
 and `openai_compat` for the sidecar.
+
+### Requirement: DeepAI Code discovery
+
+With `--deepai-code-state PATH`, the importer SHALL load a discovery JSON
+written by the review tooling: a loopback `base_url` for the app's model
+proxy, a `free` set of catalog ids whose `theosPerRequest` is zero, and an
+optional `scope` listing the models a per-harness token may serve. `free`
+SHALL be an array, a present `scope` SHALL be an array, and malformed
+discovery JSON or a non-loopback `base_url` SHALL fail the import. When
+`--deepai-code-token-file PATH` is also given the importer SHALL emit a
+`file:` credential for that token; the flag without `--deepai-code-state`
+SHALL be an error. The discovered `base_url` SHALL replace the base URL of
+every reviewed DeepAI Code connection — the built-in `deepai-code` identity
+or an OpenAI-compatible custom node with prefix `deepai` — never an unrelated
+keyed loopback bridge such as Cloudflare-direct (or attach to a new
+lowest-priority connection when the export has none and a token was given).
+For each imported combo model that maps to a `free`, in-scope catalog id the
+importer SHALL append a free `openai_compat` leg against that connection,
+which sorts ahead of billed legs with the other verified-free legs. When the
+export already contains an equivalent deployment on that endpoint and model,
+the importer SHALL reuse that deployment instead of emitting a duplicate that
+would add selection weight or a duplicate-deployment warning. The same free
+classification and session-token scope SHALL apply to existing exported legs
+that use the reviewed DeepAI Code connection. Discovery-backed legs SHALL
+also count when deciding whether a canonical combo is available for mapped
+public aliases under `--openrouter-replacements`. Metered catalog ids, ids
+outside the token scope, and catalog-free ids with no mapping SHALL emit no
+leg; unmapped free ids SHALL be counted as warnings. Without
+`--deepai-code-state` every deepai-code leg keeps its previous billed
+treatment, including explicit `--free-providers` evidence for a custom
+DeepAI node.
+
+#### Scenario: Discovered free leg leads the canonical model
+
+WHEN `--deepai-code-state` lists a loopback base URL and marks
+`claude-haiku-5-5` free and the export's `deepai-code` connection is keyed
+THEN the `claude-haiku-5-5` combo gains a free `openai_compat` leg at the
+discovered base URL ahead of its billed legs.
+
+#### Scenario: Session token attaches as a file credential
+
+WHEN `--deepai-code-state` and `--deepai-code-token-file` are both given
+THEN the deepai-code connection's credential is a `file:` reference to the
+token path and the token value never appears in the config or warnings.
+
+#### Scenario: Discovery without a keyed connection
+
+WHEN `--deepai-code-state` and `--deepai-code-token-file` are given but the
+export has no `deepai-code` connection
+THEN a lowest-priority `deepai-code` connection is created at the discovered
+base URL with the token credential.
 
 ### Requirement: Reviewed same-model bridge replacements
 

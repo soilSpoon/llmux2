@@ -19,6 +19,8 @@ fn run() -> Result<(), String> {
     let mut listen = None;
     let mut overlay = None;
     let mut free_providers = None;
+    let mut deepai_code_state = None;
+    let mut deepai_code_token = None;
     let mut canonical_map = None;
     let mut workers_rpm: Option<u32> = None;
     let mut scan_free = None;
@@ -66,13 +68,15 @@ fn run() -> Result<(), String> {
             Some("--listen") => &mut listen,
             Some("--overlay") => &mut overlay,
             Some("--free-providers") => &mut free_providers,
+            Some("--deepai-code-state") => &mut deepai_code_state,
+            Some("--deepai-code-token-file") => &mut deepai_code_token,
             Some("--canonical-map") => &mut canonical_map,
             Some("--scan-free") => &mut scan_free,
             Some("--scan-page-url") => &mut scan_page_url,
             Some("--scan-probe-base") => &mut scan_probe_base,
             Some("--scan-key-file") => &mut scan_key_file,
             _ => return Err(
-                "usage: llmux-import --input export.json --output llmux.toml [--secrets-dir DIR] [--cloudflare-account-id-file PATH --cloudflare-token-file PATH] [--workers-ai-models PATH] [--kilo-free-models PATH] [--kilo-key-file PATH] [--devin-models PATH] [--nous-state PATH --nous-models PATH] [--openrouter-replacements] [--workers-ai-rpm RPM] [--omniroute-fallback BASE_URL --omniroute-key SECRET_REF] [--exclude-models PATH] [--listen HOST:PORT] [--overlay PATH] [--free-providers PATH] [--canonical-map PATH] | llmux-import --scan-free PROVIDER [--scan-page-url URL] [--scan-probe-base URL] [--scan-key-file PATH]"
+                "usage: llmux-import --input export.json --output llmux.toml [--secrets-dir DIR] [--cloudflare-account-id-file PATH --cloudflare-token-file PATH] [--workers-ai-models PATH] [--kilo-free-models PATH] [--kilo-key-file PATH] [--devin-models PATH] [--nous-state PATH --nous-models PATH] [--openrouter-replacements] [--workers-ai-rpm RPM] [--omniroute-fallback BASE_URL --omniroute-key SECRET_REF] [--exclude-models PATH] [--listen HOST:PORT] [--overlay PATH] [--free-providers PATH] [--deepai-code-state PATH --deepai-code-token-file PATH] [--canonical-map PATH] | llmux-import --scan-free PROVIDER [--scan-page-url URL] [--scan-probe-base URL] [--scan-key-file PATH]"
                     .into(),
             ),
         };
@@ -113,6 +117,8 @@ fn run() -> Result<(), String> {
         exclude_models: excluded.as_deref(),
         overlay: overlay.as_deref(),
         free_providers: free_providers.as_deref(),
+        deepai_code_state: deepai_code_state.as_deref(),
+        deepai_code_token_file: deepai_code_token.as_deref(),
         canonical_map: canonical_map.as_deref(),
     };
     let report =

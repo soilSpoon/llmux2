@@ -29,6 +29,14 @@ pub(super) fn billed(connection: &Connection, model: &str, policy: &Policy) -> b
     if connection.policy == ModelPolicy::Workers {
         return true;
     }
+    if connection.policy == ModelPolicy::DeepAiCode {
+        if let Some(state) = &policy.deepai_code {
+            return !crate::deepai_code::free(state, model);
+        }
+        // Without discovery state the connection keeps its pre-discovery
+        // policy below; in particular, explicit `--free-providers` evidence
+        // for a custom DeepAI node still marks it free.
+    }
     if connection.policy == ModelPolicy::KiloFree || connection.base_url == xplabs::BASE_URL {
         return false;
     }
@@ -46,6 +54,10 @@ pub(super) fn billed(connection: &Connection, model: &str, policy: &Policy) -> b
                     .filter_map(|e| e.and_then(|m| m.as_ref()))
                     .any(|models| models.contains(model))
         }),
+        ProviderIdentity::Builtin(id) if id == "deepai-code" => policy
+            .deepai_code
+            .as_ref()
+            .is_none_or(|state| !crate::deepai_code::free(state, model)),
         ProviderIdentity::Builtin(id) if id == "devin-cli-agentic" => !policy
             .devin_free
             .as_ref()
@@ -77,6 +89,7 @@ pub(super) enum ModelPolicy {
     Workers,
     KiloFree,
     DeepAiText,
+    DeepAiCode,
 }
 
 pub(super) struct External {
@@ -109,6 +122,12 @@ pub(super) struct Policy {
     /// `--free-providers`. A `None` model set marks the whole provider free;
     /// a `Some` set marks only the listed upstream model ids free.
     pub free_custom: Option<HashMap<String, Option<HashSet<String>>>>,
+    /// DeepAI Code discovery state (`--deepai-code-state`): its `free` set
+    /// marks catalog ids free on the deepai-code connection.
+    pub deepai_code: Option<crate::deepai_code::State>,
+    /// `file:` reference to the DeepAI Code session token
+    /// (`--deepai-code-token-file`), rotated per harness session.
+    pub deepai_code_token: Option<String>,
 }
 
 fn reference(path: &Path) -> Result<String, String> {
@@ -262,6 +281,9 @@ impl Policy {
                     .into(),
             );
         }
+        if options.deepai_code_token_file.is_some() && options.deepai_code_state.is_none() {
+            return Err("--deepai-code-token-file requires --deepai-code-state".into());
+        }
         Ok(Self {
             workers,
             workers_rpm: options.workers_ai_rpm.unwrap_or(WORKERS_DEFAULT_RPM),
@@ -274,12 +296,17 @@ impl Policy {
                 .map(crate::devin::free_models)
                 .transpose()?,
             free_custom,
+            deepai_code: options
+                .deepai_code_state
+                .map(crate::deepai_code::State::load)
+                .transpose()?,
+            deepai_code_token: options.deepai_code_token_file.map(reference).transpose()?,
         })
     }
 
     pub fn model(&self, policy: ModelPolicy, model: &str) -> Result<String, &'static str> {
         match policy {
-            ModelPolicy::Any => Ok(model.to_owned()),
+            ModelPolicy::Any | ModelPolicy::DeepAiCode => Ok(model.to_owned()),
             ModelPolicy::DeepAiText => DEEPAI_TEXT_MODELS
                 .contains(&model)
                 .then(|| model.to_owned())
@@ -415,6 +442,8 @@ mod tests {
             openrouter_replacements: false,
             devin_free,
             free_custom,
+            deepai_code: None,
+            deepai_code_token: None,
         }
     }
 

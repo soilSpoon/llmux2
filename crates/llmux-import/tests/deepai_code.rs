@@ -1,0 +1,647 @@
+use llmux_config::RuntimeConfig;
+use llmux_import::ImportOptions;
+use llmux_types::Billing;
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+
+const BRIDGE: &str = "http://127.0.0.1:49759/v1";
+
+fn fixture() -> Value {
+    json!({
+        "providerConnections":[
+            {"id":"paid","provider":"paid-node","authType":"apikey","apiKey":"synthetic-paid"},
+            {"id":"dac","provider":"deepai-code","authType":"apikey","apiKey":"synthetic-dac",
+             "providerSpecificData":{"baseUrl":"http://127.0.0.1:8790/deepai/v1"}}
+        ],
+        "providerNodes":[
+            {"id":"paid-node","prefix":"paid","type":"openai-compatible","baseUrl":"https://paid.example/v1"}
+        ],
+        "combos":[{"name":"claude-haiku-5.5","models":["paid/a"]}],
+        "apiKeys":[{"key":"synthetic-client"}]
+    })
+}
+
+fn write(dir: &Path, name: &str, content: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, content).unwrap();
+    path
+}
+
+fn run(root: &Value, options: &ImportOptions) -> (RuntimeConfig, llmux_import::ImportReport) {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.toml");
+    let report = llmux_import::import_with_options(&root.to_string(), &out, None, options).unwrap();
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(!text.contains("synthetic-"));
+    assert!(report.warnings.iter().all(|w| !w.contains("synthetic-")));
+    (RuntimeConfig::load(&out).unwrap(), report)
+}
+
+fn legs(config: &RuntimeConfig, name: &str) -> Vec<(String, String)> {
+    config.models[*config.model_names.get(name).unwrap()]
+        .deployments
+        .iter()
+        .map(|index| {
+            let dep = &config.deployments[index.0 as usize];
+            (dep.base_url.to_string(), dep.upstream_model.to_string())
+        })
+        .collect()
+}
+
+fn options<'a>(state: &'a Path, token: &'a Path) -> ImportOptions<'a> {
+    ImportOptions {
+        deepai_code_state: Some(state),
+        deepai_code_token_file: Some(token),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn discovered_free_leg_leads_the_mapped_canonical_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5","deepseek-v4.1-flash"],
+            "scope":["claude-haiku-5-5"]})
+        .to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let (config, report) = run(&fixture(), &options(&state, &token));
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [
+            (BRIDGE.to_string(), "claude-haiku-5-5".to_string()),
+            ("https://paid.example/v1".to_string(), "a".to_string()),
+        ]
+    );
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.contains("free DeepAI Code leg")));
+}
+
+#[test]
+fn metered_or_out_of_scope_models_emit_no_leg() {
+    let dir = tempfile::tempdir().unwrap();
+    // claude-haiku-5-5 absent from scope -> no leg even though it is free.
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"],"scope":["deepseek-v4.1-flash"]})
+            .to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let (config, report) = run(&fixture(), &options(&state, &token));
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [("https://paid.example/v1".to_string(), "a".to_string())]
+    );
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.contains("outside the session token's model scope")));
+
+    // Metered (theosPerRequest > 0) models never leave the free list.
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":[],"scope":["claude-haiku-5-5"]}).to_string(),
+    );
+    let (config, _) = run(&fixture(), &options(&state, &token));
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [("https://paid.example/v1".to_string(), "a".to_string())]
+    );
+}
+
+#[test]
+fn non_loopback_state_url_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":"https://upstream.example/v1","free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let out = tempfile::tempdir().unwrap().path().join("out.toml");
+    assert!(llmux_import::import_with_options(
+        &fixture().to_string(),
+        &out,
+        None,
+        &options(&state, &token),
+    )
+    .is_err());
+}
+
+#[test]
+fn state_without_token_keeps_the_exported_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let (config, _) = run(
+        &fixture(),
+        &ImportOptions {
+            deepai_code_state: Some(&state),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [
+            (BRIDGE.to_string(), "claude-haiku-5-5".to_string()),
+            ("https://paid.example/v1".to_string(), "a".to_string()),
+        ]
+    );
+    let index = config.models[*config.model_names.get("claude-haiku-5.5").unwrap()].deployments[0];
+    let deployment = &config.deployments[index.0 as usize];
+    assert_eq!(deployment.credential.as_ref(), "upstream-dac");
+    assert_eq!(
+        config.api_keys.get("upstream-dac").unwrap().key.as_ref(),
+        "synthetic-dac",
+        "state alone must keep the exported connection's credential"
+    );
+}
+
+#[test]
+fn session_token_replaces_the_exported_deepai_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let (config, _) = run(&fixture(), &options(&state, &token));
+    let index = config.models[*config.model_names.get("claude-haiku-5.5").unwrap()].deployments[0];
+    let deployment = &config.deployments[index.0 as usize];
+    assert_eq!(deployment.credential.as_ref(), "deepai-code-discovered");
+    assert_eq!(
+        config
+            .api_keys
+            .get("deepai-code-discovered")
+            .unwrap()
+            .key
+            .as_ref(),
+        "synthetic-session",
+        "the emitted deployment must resolve to the supplied session-token file"
+    );
+}
+
+#[test]
+fn unmapped_free_catalog_id_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5","muse-ember"]}).to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let (_, report) = run(&fixture(), &options(&state, &token));
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.contains("unmapped free DeepAI catalog id muse-ember")));
+}
+
+fn custom_deepai_fixture(models: Value) -> Value {
+    json!({
+        "providerConnections":[
+            {"id":"paid","provider":"paid-node","authType":"apikey","apiKey":"synthetic-paid"},
+            {"id":"dac","provider":"custom-deepai","authType":"apikey","apiKey":"synthetic-dac"}
+        ],
+        "providerNodes":[
+            {"id":"paid-node","prefix":"paid","type":"openai-compatible","baseUrl":"https://paid.example/v1"},
+            {"id":"custom-deepai","prefix":"deepai","type":"openai-compatible","baseUrl":"http://127.0.0.1:8790/deepai/v1"}
+        ],
+        "combos":[{"name":"claude-haiku-5.5","models":models}],
+        "apiKeys":[{"key":"synthetic-client"}]
+    })
+}
+
+#[test]
+fn discovery_does_not_rewire_a_keyed_cloudflare_loopback_bridge() {
+    let cfpd_url = "http://127.0.0.1:49555/v1";
+    let mut root = fixture();
+    root["providerNodes"].as_array_mut().unwrap().push(
+        json!({"id":"cfpd-node","prefix":"cloudflare-direct","type":"openai-compatible","baseUrl":cfpd_url}),
+    );
+    root["providerConnections"].as_array_mut().unwrap().push(
+        json!({"id":"cfpd","provider":"cfpd-node","authType":"apikey","apiKey":"synthetic-cfpd"}),
+    );
+    root["combos"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name":"cf","models":["cloudflare-direct/meta/llama-3.1-8b-instruct"]}));
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let (config, _) = run(&root, &options(&state, &token));
+    assert_eq!(
+        legs(&config, "cf"),
+        [(
+            cfpd_url.to_string(),
+            "meta/llama-3.1-8b-instruct".to_string()
+        )]
+    );
+}
+
+#[test]
+fn custom_deepai_discovery_leg_is_free_and_leads_paid_legs() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let root = custom_deepai_fixture(json!(["paid/a"]));
+    let (config, _) = run(&root, &options(&state, &token));
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [
+            (BRIDGE.to_string(), "claude-haiku-5-5".to_string()),
+            ("https://paid.example/v1".to_string(), "a".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn session_token_scope_applies_to_existing_exported_deepai_legs() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"],"scope":["deepseek-v4.1-flash"]})
+            .to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let root = custom_deepai_fixture(json!(["deepai/claude-haiku-5-5", "paid/a"]));
+    let (config, report) = run(&root, &options(&state, &token));
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [("https://paid.example/v1".to_string(), "a".to_string())]
+    );
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.contains("outside the session token's model scope")));
+}
+
+#[test]
+fn discovery_reuses_an_existing_exported_deepai_leg() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let root = custom_deepai_fixture(json!(["deepai/claude-haiku-5-5", "paid/a"]));
+    let (config, report) = run(&root, &options(&state, &token));
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [
+            (BRIDGE.to_string(), "claude-haiku-5-5".to_string()),
+            ("https://paid.example/v1".to_string(), "a".to_string()),
+        ],
+        "the discovered leg must not double the exported leg's selection weight"
+    );
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|w| w.contains("duplicate deployment")),
+        "the import must reuse the exported leg instead of emitting then dropping a duplicate: {:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn malformed_discovery_list_types_fail_import() {
+    for (field, value) in [
+        ("free", json!("claude-haiku-5-5")),
+        ("scope", json!({"bad":true})),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]});
+        state[field] = value;
+        let state = write(dir.path(), "state.json", &state.to_string());
+        let token = write(dir.path(), "token", "synthetic-session");
+        let outdir = tempfile::tempdir().unwrap();
+        let out = outdir.path().join("out.toml");
+        assert!(
+            llmux_import::import_with_options(
+                &fixture().to_string(),
+                &out,
+                None,
+                &options(&state, &token),
+            )
+            .is_err(),
+            "{field} accepted a non-array value"
+        );
+    }
+}
+
+#[test]
+fn custom_deepai_free_provider_evidence_survives_without_discovery_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = write(
+        dir.path(),
+        "free.json",
+        &json!([{"provider":"custom-deepai","evidence":"operator-confirmed free sidecar review"}])
+            .to_string(),
+    );
+    let root = custom_deepai_fixture(json!(["deepai/claude-haiku-5-5"]));
+    let (config, _) = run(
+        &root,
+        &ImportOptions {
+            free_providers: Some(&free),
+            ..Default::default()
+        },
+    );
+    let index = config.models[*config.model_names.get("claude-haiku-5.5").unwrap()].deployments[0];
+    assert_eq!(config.deployments[index.0 as usize].billing, Billing::Free);
+}
+
+#[test]
+fn discovery_reuses_a_declared_deepai_leg_instead_of_appending_a_sibling() {
+    let mut root = custom_deepai_fixture(json!([
+        {"kind":"model","model":"deepai/claude-haiku-5-5","connectionId":"dac2"},
+        "paid/a"
+    ]));
+    root["providerConnections"].as_array_mut().unwrap().push(
+        json!({"id":"dac2","provider":"custom-deepai","authType":"apikey","apiKey":"synthetic-dac2"}),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let (config, _) = run(
+        &root,
+        &ImportOptions {
+            deepai_code_state: Some(&state),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [
+            (BRIDGE.to_string(), "claude-haiku-5-5".to_string()),
+            ("https://paid.example/v1".to_string(), "a".to_string()),
+        ],
+        "the declared DeepAI leg must be reused rather than duplicated"
+    );
+    let index = config.models[*config.model_names.get("claude-haiku-5.5").unwrap()].deployments[0];
+    assert_eq!(
+        config.deployments[index.0 as usize].credential.as_ref(),
+        "upstream-dac2",
+        "the declared connection pin decides which existing credential serves the leg"
+    );
+}
+
+#[test]
+fn discovery_without_exported_connection_creates_free_leg_and_preserves_alias() {
+    let root = json!({
+        "providerConnections":[],
+        "providerNodes":[],
+        "combos":[{"id":"haiku-id","name":"claude-haiku-5.5","models":[]}],
+        "modelComboMappings":[{"pattern":"public-haiku","comboId":"haiku-id","enabled":true}],
+        "apiKeys":[{"key":"synthetic-client"}]
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let (config, _) = run(
+        &root,
+        &ImportOptions {
+            deepai_code_state: Some(&state),
+            deepai_code_token_file: Some(&token),
+            openrouter_replacements: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [(BRIDGE.to_string(), "claude-haiku-5-5".to_string())]
+    );
+    let index = config.models[*config.model_names.get("claude-haiku-5.5").unwrap()].deployments[0];
+    assert_eq!(
+        config.deployments[index.0 as usize].credential.as_ref(),
+        "deepai-code-discovered"
+    );
+    assert!(
+        config.model_names.contains_key("public-haiku"),
+        "discovery-backed availability must keep the mapped public alias"
+    );
+}
+
+#[test]
+fn discovery_survives_openrouter_replacements_on_a_custom_deepai_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let root = custom_deepai_fixture(json!(["paid/a"]));
+    let mut options = options(&state, &token);
+    options.openrouter_replacements = true;
+    let (config, report) = run(&root, &options);
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [
+            (BRIDGE.to_string(), "claude-haiku-5-5".to_string()),
+            ("https://paid.example/v1".to_string(), "a".to_string()),
+        ],
+        "discovery must keep its pinned DeepAI leg instead of passing it through bridge replacement"
+    );
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|w| w.contains("no reviewed bridge replacement")),
+        "the generated discovery leg is not a bridge-replacement source: {:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn exported_ephemeral_deepai_bridge_url_is_imported() {
+    let mut root = custom_deepai_fixture(json!(["deepai/claude-haiku-5-5"]));
+    root["providerNodes"][1]["baseUrl"] = json!(BRIDGE);
+    let (config, _) = run(&root, &ImportOptions::default());
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [(BRIDGE.to_string(), "claude-haiku-5-5".to_string())],
+        "the export's ephemeral app bridge URL must survive upstream resolution"
+    );
+}
+
+#[test]
+fn exported_localhost_deepai_bridge_url_is_imported() {
+    let mut root = custom_deepai_fixture(json!(["deepai/claude-haiku-5-5"]));
+    root["providerNodes"][1]["baseUrl"] = json!("http://localhost:49759/v1");
+    let (config, _) = run(&root, &ImportOptions::default());
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [(
+            "http://localhost:49759/v1".to_string(),
+            "claude-haiku-5-5".to_string()
+        )],
+        "exported connection validation uses the same loopback bridge matching"
+    );
+}
+
+#[test]
+fn token_file_without_discovery_state_fails_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = write(dir.path(), "token", "synthetic-session");
+    let out = dir.path().join("out.toml");
+    let result = llmux_import::import_with_options(
+        &fixture().to_string(),
+        &out,
+        None,
+        &ImportOptions {
+            deepai_code_token_file: Some(&token),
+            ..Default::default()
+        },
+    );
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("token file without discovery state unexpectedly imported"),
+    };
+    assert_eq!(
+        error,
+        "--deepai-code-token-file requires --deepai-code-state"
+    );
+}
+
+#[test]
+fn state_url_with_embedded_credential_is_rejected_without_leaking_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":"http://127.0.0.1:49759/v1?token=supersecret","free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let out = dir.path().join("out.toml");
+    let result = llmux_import::import_with_options(
+        &fixture().to_string(),
+        &out,
+        None,
+        &options(&state, &token),
+    );
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("state URL carrying a query credential unexpectedly imported"),
+    };
+    assert!(
+        !error.contains("supersecret"),
+        "validation error must not echo the credential query: {error}"
+    );
+}
+
+#[test]
+fn discovery_supplies_the_endpoint_for_a_keyed_builtin_export() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let mut root = fixture();
+    // A reviewed builtin export can carry the key while the recorded bridge
+    // endpoint is empty/missing: discovery is then the only source of the URL,
+    // and upstream resolution must not reject the connection before rewiring.
+    root["providerConnections"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("providerSpecificData");
+    root["combos"] = json!([{"name":"claude-haiku-5.5","models":["deepai-code/claude-haiku-5-5"]}]);
+    let (config, report) = run(
+        &root,
+        &ImportOptions {
+            deepai_code_state: Some(&state),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [(BRIDGE.to_string(), "claude-haiku-5-5".to_string())],
+        "the validated discovery URL must resolve the exported connection: {:?}",
+        report.warnings
+    );
+    let index = config.models[*config.model_names.get("claude-haiku-5.5").unwrap()].deployments[0];
+    let deployment = &config.deployments[index.0 as usize];
+    assert_eq!(deployment.credential.as_ref(), "upstream-dac");
+    assert_eq!(
+        config.api_keys.get("upstream-dac").unwrap().key.as_ref(),
+        "synthetic-dac",
+        "without a token file the exported keyed credential must be retained"
+    );
+}
+
+#[test]
+fn cli_flags_wire_discovery_state_and_session_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let input = write(dir.path(), "export.json", &fixture().to_string());
+    let out = dir.path().join("out.toml");
+    let secrets = dir.path().join("secrets");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_llmux-import"))
+        .args([
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+            "--secrets-dir",
+            secrets.to_str().unwrap(),
+            "--deepai-code-state",
+            state.to_str().unwrap(),
+            "--deepai-code-token-file",
+            token.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "cli import failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = RuntimeConfig::load(&out).unwrap();
+    let index = config.models[*config.model_names.get("claude-haiku-5.5").unwrap()].deployments[0];
+    let deployment = &config.deployments[index.0 as usize];
+    assert_eq!(deployment.base_url.to_string(), BRIDGE);
+    assert_eq!(deployment.credential.as_ref(), "deepai-code-discovered");
+    assert_eq!(
+        config
+            .api_keys
+            .get("deepai-code-discovered")
+            .unwrap()
+            .key
+            .as_ref(),
+        "synthetic-session",
+        "the cli must forward the token file into the discovered credential"
+    );
+}

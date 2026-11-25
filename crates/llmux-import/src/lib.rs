@@ -5,6 +5,7 @@ mod bridge;
 mod connection;
 mod context;
 mod db_dump;
+mod deepai_code;
 mod devin;
 mod direct;
 pub mod discovery;
@@ -85,6 +86,17 @@ pub struct ImportOptions<'a> {
     /// operator confirmed the provider is free (a plan or pricing page, or
     /// the account usage API). Custom legs bill unless listed.
     pub free_providers: Option<&'a Path>,
+    /// DeepAI Code discovery output (non-secret): a reachable model bridge
+    /// `base_url` and the catalog ids that are free (`theosPerRequest == 0`)
+    /// plus, optionally, the session token's model `scope`. Discovered free
+    /// legs join reviewed canonical models ahead of billed ones. Without it,
+    /// `deepai-code` connections import exactly as before.
+    pub deepai_code_state: Option<&'a Path>,
+    /// File holding the DeepAI Code session bearer token; emitted as a
+    /// `file:` credential on the discovered connection. Rotates per harness
+    /// session. Requires `deepai_code_state`; without it the export's own
+    /// credential is kept.
+    pub deepai_code_token_file: Option<&'a Path>,
     /// Optional path for `canonical-map.json`, the review artifact listing
     /// every spelling that resolves to each emitted model name. Suffixed
     /// ids (effort/`-fast`/`-no-think`) are distinct entries — they never
@@ -710,7 +722,8 @@ impl Expander<'_> {
                 .policy
                 .openrouter_replacements
                 .then(|| bridge::source(&p, self.nodes))
-                .flatten();
+                .flatten()
+                .filter(|_| step.get("deepaiCodeDiscovery").and_then(Value::as_bool) != Some(true));
             let redirected = antigravity || bridge.is_some();
             let replacement = if antigravity {
                 if !pinned.is_empty() || !allowed.is_empty() {
@@ -804,6 +817,18 @@ impl Expander<'_> {
                         continue;
                     }
                 };
+                if c.policy == policy::ModelPolicy::DeepAiCode
+                    && self
+                        .policy
+                        .deepai_code
+                        .as_ref()
+                        .is_some_and(|state| deepai_code::outside_scope(state, &model))
+                {
+                    self.warnings.push(format!(
+                        "combo {name} step {index}: skipped DeepAI Code leg {model} — outside the session token's model scope"
+                    ));
+                    continue;
+                }
                 if c.base_url == xplabs::BASE_URL && !xplabs::free_model(&model) {
                     self.warnings.push(format!(
                         "combo {name} step {index}: dropped billed XPLabs route {model}"
@@ -1193,9 +1218,18 @@ pub fn import_with_options(
         } else if let connection::SelectedAuth::Oauth(oauth) = &auth {
             Ok((oauth.kind.to_owned(), oauth.base_url.to_owned()))
         } else {
+            let nodes = array(&root, "providerNodes");
+            let discovered_endpoint = policy
+                .deepai_code
+                .as_ref()
+                .filter(|_| {
+                    deepai_code::reviewed_source(c, nodes)
+                        && upstream::declares_no_endpoint(c, nodes)
+                })
+                .map(|state| deepai_code::with_endpoint(c, &state.base_url));
             upstream::resolve(
-                c,
-                array(&root, "providerNodes"),
+                discovered_endpoint.as_ref().unwrap_or(c),
+                nodes,
                 matches!(auth, connection::SelectedAuth::Key(_)),
                 &mut warnings,
                 listen_port,
@@ -1322,6 +1356,10 @@ pub fn import_with_options(
                 policy::ModelPolicy::KiloFree
             } else if kind == KIND_DEEPAI {
                 policy::ModelPolicy::DeepAiText
+            } else if kind == KIND_OPENAI_COMPAT
+                && deepai_code::reviewed_source(c, array(&root, "providerNodes"))
+            {
+                policy::ModelPolicy::DeepAiCode
             } else {
                 policy::ModelPolicy::Any
             },
@@ -1370,6 +1408,47 @@ pub fn import_with_options(
                     priority: i64::MAX,
                     policy: policy::ModelPolicy::KiloFree,
                 });
+            }
+        }
+    }
+    if let Some(state) = &policy.deepai_code {
+        for id in deepai_code::unmapped(state) {
+            warnings.push(format!("unmapped free DeepAI catalog id {id}"));
+        }
+        let discovered = match &policy.deepai_code_token {
+            Some(token) => {
+                let id = unique("deepai-code-discovered", &mut ids);
+                credentials
+                    .push(json!({"id":id,"kind":"api_key","provider":"openai_compat","key":token}));
+                Some(id)
+            }
+            None => None,
+        };
+        let mut attached = false;
+        for c in &mut connections {
+            if deepai_code::discovered(c) {
+                c.base_url = state.base_url.clone();
+                if let Some(id) = &discovered {
+                    c.credential = Some(id.clone());
+                }
+                attached = true;
+            }
+        }
+        if !attached {
+            match discovered {
+                Some(credential) => connections.push(Connection {
+                    headers: json!({}),
+                    source_id: unique("deepai-code-discovered", &mut source_ids),
+                    provider: upstream::ProviderIdentity::Builtin("deepai-code".into()),
+                    credential: Some(credential),
+                    kind: "openai_compat".into(),
+                    base_url: state.base_url.clone(),
+                    priority: i64::MAX,
+                    policy: policy::ModelPolicy::DeepAiCode,
+                }),
+                None => warnings.push(
+                    "deepai-code state given without --deepai-code-token-file and no keyed deepai-code connection exists; no free legs emitted".into(),
+                ),
             }
         }
     }
@@ -1475,6 +1554,34 @@ pub fn import_with_options(
                     dead: &dead,
                 }
                 .expand(target, &mut Vec::new(), &mut deployments);
+                if deployments.is_empty() {
+                    if let Some(state) = &policy.deepai_code {
+                        let mut scan_warnings = Vec::new();
+                        if let Some(step) =
+                            deepai_code::step(target, state, &connections, &mut scan_warnings)
+                        {
+                            let discovered =
+                                HashMap::from([((*target).clone(), json!({"models":[step]}))]);
+                            Expander {
+                                context: &mut context,
+                                combos: &discovered,
+                                connections: &connections,
+                                nodes,
+                                warnings: &mut scan_warnings,
+                                shared_quotas: &mut BTreeMap::new(),
+                                remaining_steps: 1,
+                                exhausted: false,
+                                policy: &policy,
+                                dead: &dead,
+                            }
+                            .expand(
+                                target,
+                                &mut Vec::new(),
+                                &mut deployments,
+                            );
+                        }
+                    }
+                }
                 if deployments.is_empty() {
                     unavailable_combos.insert((*target).clone());
                 }
@@ -1596,6 +1703,43 @@ pub fn import_with_options(
             dead: &dead,
         }
         .expand(&name, &mut Vec::new(), &mut deployments);
+        // Discovered DeepAI Code legs are catalog-free and expand before the
+        // free-first sort, so they join the free group ahead of billed legs.
+        if let Some(state) = &policy.deepai_code {
+            if combos.contains_key(&name) {
+                if let Some(step) = deepai_code::step(&name, state, &connections, &mut warnings) {
+                    let combo = HashMap::from([(name.clone(), json!({"models":[step]}))]);
+                    let mut discovered = Vec::new();
+                    Expander {
+                        context: &mut context,
+                        combos: &combo,
+                        connections: &connections,
+                        nodes,
+                        warnings: &mut warnings,
+                        shared_quotas: &mut shared_quotas,
+                        remaining_steps: 1,
+                        exhausted: false,
+                        policy: &policy,
+                        dead: &dead,
+                    }
+                    .expand(&name, &mut Vec::new(), &mut discovered);
+                    let mut added = false;
+                    for deployment in discovered {
+                        if deployments.iter().any(|existing| {
+                            existing["base_url"] == deployment["base_url"]
+                                && existing["upstream_model"] == deployment["upstream_model"]
+                        }) {
+                            continue;
+                        }
+                        deployments.push(deployment);
+                        added = true;
+                    }
+                    if added {
+                        warnings.push(format!("combo {name}: added reviewed free DeepAI Code leg"));
+                    }
+                }
+            }
+        }
         // Verified-free legs go ahead of billed ones; stable sort keeps each
         // group's existing relative order. Deliberate placement passes below
         // (Morph logprobs order, XPLabs placement, secondary expansion) still
