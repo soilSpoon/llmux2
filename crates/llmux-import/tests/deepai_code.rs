@@ -1,5 +1,6 @@
 use llmux_config::RuntimeConfig;
 use llmux_import::ImportOptions;
+use llmux_types::Billing;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -285,4 +286,65 @@ fn malformed_discovery_list_types_fail_import() {
             "{field} accepted a non-array value"
         );
     }
+}
+
+#[test]
+fn custom_deepai_free_provider_evidence_survives_without_discovery_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = write(
+        dir.path(),
+        "free.json",
+        &json!([{"provider":"custom-deepai","evidence":"operator-confirmed free sidecar review"}])
+            .to_string(),
+    );
+    let root = custom_deepai_fixture(json!(["deepai/claude-haiku-5-5"]));
+    let (config, _) = run(
+        &root,
+        &ImportOptions {
+            free_providers: Some(&free),
+            ..Default::default()
+        },
+    );
+    let index = config.models[*config.model_names.get("claude-haiku-5.5").unwrap()].deployments[0];
+    assert_eq!(config.deployments[index.0 as usize].billing, Billing::Free);
+}
+
+#[test]
+fn discovery_without_exported_connection_creates_free_leg_and_preserves_alias() {
+    let root = json!({
+        "providerConnections":[],
+        "providerNodes":[],
+        "combos":[{"id":"haiku-id","name":"claude-haiku-5.5","models":[]}],
+        "modelComboMappings":[{"pattern":"public-haiku","comboId":"haiku-id","enabled":true}],
+        "apiKeys":[{"key":"synthetic-client"}]
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let (config, _) = run(
+        &root,
+        &ImportOptions {
+            deepai_code_state: Some(&state),
+            deepai_code_token_file: Some(&token),
+            openrouter_replacements: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [(BRIDGE.to_string(), "claude-haiku-5-5".to_string())]
+    );
+    let index = config.models[*config.model_names.get("claude-haiku-5.5").unwrap()].deployments[0];
+    assert_eq!(
+        config.deployments[index.0 as usize].credential.as_ref(),
+        "deepai-code-discovered"
+    );
+    assert!(
+        config.model_names.contains_key("public-haiku"),
+        "discovery-backed availability must keep the mapped public alias"
+    );
 }

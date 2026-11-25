@@ -1545,6 +1545,34 @@ pub fn import_with_options(
                 }
                 .expand(target, &mut Vec::new(), &mut deployments);
                 if deployments.is_empty() {
+                    if let Some(state) = &policy.deepai_code {
+                        let mut scan_warnings = Vec::new();
+                        if let Some(step) =
+                            deepai_code::step(target, state, &connections, &mut scan_warnings)
+                        {
+                            let discovered =
+                                HashMap::from([((*target).clone(), json!({"models":[step]}))]);
+                            Expander {
+                                context: &mut context,
+                                combos: &discovered,
+                                connections: &connections,
+                                nodes,
+                                warnings: &mut scan_warnings,
+                                shared_quotas: &mut BTreeMap::new(),
+                                remaining_steps: 1,
+                                exhausted: false,
+                                policy: &policy,
+                                dead: &dead,
+                            }
+                            .expand(
+                                target,
+                                &mut Vec::new(),
+                                &mut deployments,
+                            );
+                        }
+                    }
+                }
+                if deployments.is_empty() {
                     unavailable_combos.insert((*target).clone());
                 }
             }
@@ -1678,6 +1706,7 @@ pub fn import_with_options(
                         connections: &connections,
                         nodes,
                         warnings: &mut warnings,
+                        shared_quotas: &mut shared_quotas,
                         remaining_steps: 1,
                         exhausted: false,
                         policy: &policy,

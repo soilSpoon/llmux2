@@ -30,10 +30,12 @@ pub(super) fn billed(connection: &Connection, model: &str, policy: &Policy) -> b
         return true;
     }
     if connection.policy == ModelPolicy::DeepAiCode {
-        return policy
-            .deepai_code
-            .as_ref()
-            .is_none_or(|state| !crate::deepai_code::free(state, model));
+        if let Some(state) = &policy.deepai_code {
+            return !crate::deepai_code::free(state, model);
+        }
+        // Without discovery state the connection keeps its pre-discovery
+        // policy below; in particular, explicit `--free-providers` evidence
+        // for a custom DeepAI node still marks it free.
     }
     if connection.policy == ModelPolicy::KiloFree || connection.base_url == xplabs::BASE_URL {
         return false;

@@ -609,11 +609,14 @@ For each imported combo model that maps to a `free`, in-scope catalog id the
 importer SHALL append a free `openai_compat` leg against that connection,
 which sorts ahead of billed legs with the other verified-free legs. The same
 free classification and session-token scope SHALL apply to existing exported
-legs that use the reviewed DeepAI Code connection. Metered catalog ids, ids
+legs that use the reviewed DeepAI Code connection. Discovery-backed legs SHALL
+also count when deciding whether a canonical combo is available for mapped
+public aliases under `--openrouter-replacements`. Metered catalog ids, ids
 outside the token scope, and catalog-free ids with no mapping SHALL emit no
 leg; unmapped free ids SHALL be counted as warnings. Without
 `--deepai-code-state` every deepai-code leg keeps its previous billed
-treatment.
+treatment, including explicit `--free-providers` evidence for a custom
+DeepAI node.
 
 #### Scenario: Discovered free leg leads the canonical model
 
