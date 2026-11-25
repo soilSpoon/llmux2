@@ -535,6 +535,23 @@ fn stable_prompt_extraction_reads_multiple_leading_system_messages() {
 }
 
 #[test]
+fn stable_prompt_extraction_reads_responses_instructions_after_input() {
+    for body in [
+        br#"{"input":"First question","instructions":"shared system prompt"}"#.as_slice(),
+        br#"{"input":[{"role":"user","content":"First question"}],"instructions":"shared system prompt"}"#.as_slice(),
+    ] {
+        let parts = stable_prompt_parts(&GatewayRequest {
+            format: InboundFormat::OpenAiResponses,
+            body: Bytes::copy_from_slice(body),
+            ..request()
+        });
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], b"system");
+        assert_eq!(parts[1], b"shared system prompt");
+    }
+}
+
+#[test]
 fn stable_prompt_extraction_covers_anthropic_and_responses_formats() {
     let anthropic = stable_prompt_parts(&GatewayRequest {
         format: InboundFormat::AnthropicMessages,

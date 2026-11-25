@@ -1318,6 +1318,7 @@ fn cache_seed(req: &GatewayRequest) -> Option<usize> {
 /// bounded body prefix below.
 const CACHE_SCAN_BYTES: usize = CACHE_PREFIX_BYTES + 1024;
 
+#[derive(Clone)]
 struct JsonScan<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -1523,7 +1524,14 @@ fn stable_prompt_parts(req: &GatewayRequest) -> Vec<Vec<u8>> {
                 true
             }
             (InboundFormat::OpenAiResponses, b"input") => {
-                scan_leading_system_parts(&mut scan, &mut parts, &mut remaining);
+                // Extract any leading system-like input without depending on
+                // where that extraction stops, then skip the complete input
+                // value so a later top-level `instructions` key is still seen.
+                // The skip remains bounded by CACHE_SCAN_BYTES; oversized input
+                // simply ends extraction rather than walking the request tail.
+                let mut lookahead = scan.clone();
+                scan_leading_system_parts(&mut lookahead, &mut parts, &mut remaining);
+                scan.skip_value();
                 true
             }
             _ => false,
