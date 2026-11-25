@@ -530,3 +530,29 @@ fn token_file_without_discovery_state_fails_import() {
         "--deepai-code-token-file requires --deepai-code-state"
     );
 }
+
+#[test]
+fn state_url_with_embedded_credential_is_rejected_without_leaking_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":"http://127.0.0.1:49759/v1?token=supersecret","free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let out = dir.path().join("out.toml");
+    let result = llmux_import::import_with_options(
+        &fixture().to_string(),
+        &out,
+        None,
+        &options(&state, &token),
+    );
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("state URL carrying a query credential unexpectedly imported"),
+    };
+    assert!(
+        !error.contains("supersecret"),
+        "validation error must not echo the credential query: {error}"
+    );
+}

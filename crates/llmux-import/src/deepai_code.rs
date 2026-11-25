@@ -23,9 +23,9 @@ impl State {
             serde_json::from_str(&content).map_err(|_| "invalid deepai-code state JSON")?;
         let base_url = string(&root, "base_url").to_owned();
         if !is_bridge_url(&base_url) {
-            return Err(format!(
-                "deepai-code state base_url must be a loopback bridge URL, got {base_url:?}"
-            ));
+            // Never echo the URL: a malformed discovery file can carry a query
+            // or userinfo credential, and this error reaches the CLI's stderr.
+            return Err("deepai-code state base_url must be a loopback bridge URL".into());
         }
         let scope = match root.get("scope") {
             Some(_) => Some(ids(&root, "scope")?),
