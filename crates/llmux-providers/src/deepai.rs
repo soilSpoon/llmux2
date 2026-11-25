@@ -434,6 +434,7 @@ mod tests {
             base_url: base_url.parse().unwrap(),
             upstream_model: "text-generator".into(),
             strip_request_fields: Box::default(),
+            shared_quota: None,
             priority: 0,
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(10),

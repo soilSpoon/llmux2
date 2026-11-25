@@ -10,6 +10,7 @@ mod devin;
 mod direct;
 pub mod discovery;
 mod fallback;
+mod free_conditions;
 mod morph;
 mod nous;
 mod policy;
@@ -32,7 +33,7 @@ use llmux_types::provider::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -120,6 +121,23 @@ struct Connection {
     policy: policy::ModelPolicy,
 }
 
+impl Connection {
+    /// True only when the leg reaches upstream with no authentication — the
+    /// sole case a per-IP anonymous offer can apply. A custom node may carry
+    /// headers that authenticate upstream (`Authorization`, cookies, tokens)
+    /// with `auth_type = "none"` and no credential; rather than enumerate
+    /// every auth-bearing header name, any custom header marks the leg
+    /// authenticated — a false positive only forgoes a free tag, never admits
+    /// a keyed leg into a per-IP allowance.
+    fn anonymous(&self) -> bool {
+        self.credential.is_none()
+            && !self
+                .headers
+                .as_object()
+                .is_some_and(|headers| !headers.is_empty())
+    }
+}
+
 // OmniRoute registry/<id>/index.ts; Gemini uses Google's documented OpenAI compatibility API.
 pub const PROVIDERS: &[(&str, &str, &str)] = &[
     ("openai", KIND_OPENAI, "https://api.openai.com/v1"),
@@ -204,6 +222,9 @@ fn deployment_identity(
     String,
     String,
     String,
+    String,
+    String,
+    String,
 ) {
     (
         string(dep, "credential").to_owned(),
@@ -214,6 +235,9 @@ fn deployment_identity(
         identity_field(&dep["max_context"]),
         identity_field(&dep["quota"]),
         identity_field(&dep["timeout_ms"]),
+        string(dep, "billing").to_owned(),
+        identity_field(&dep["shared_quota"]),
+        identity_field(&dep["expires_at"]),
     )
 }
 
@@ -453,23 +477,49 @@ fn glob_list(value: Option<&Value>) -> Option<Vec<String>> {
         .collect()
 }
 
+/// Restricted fields OmniRoute enforces outside model access that have no
+/// llmux2 equivalent and do not change which models a key may call: API
+/// scopes (llmux2 keys are chat-only), combo/connection allowlists
+/// (OmniRoute object ids — the objects they name cease to exist
+/// post-migration, and the emitted `models`/`blocked` lists are the access
+/// gate), the catalog-scope flag (the `models` list already gates /models),
+/// and the machine binding (embedded in the key value itself).
+const OMNIROUTE_INTERNAL_FIELDS: &[&str] = &[
+    "scopes",
+    "allowedcombos",
+    "allowedconnections",
+    "catalogscope",
+    "machineid",
+];
+
 /// A restricted key is portable only when its whole restriction is
 /// `model_access_mode = restricted` plus `allowed_models`/`blocked_models`
 /// glob lists, which `server.key_policies` expresses exactly (blocked
-/// matches always win). Any other restricted field — ip allowlists, scopes,
-/// quotas, rate limits, combos, schedules — has no llmux2 equivalent, so
-/// the key keeps the fail-closed skip rather than silently widening access.
-fn portable_key_policy(key: &Value) -> Option<(Vec<String>, Vec<String>)> {
+/// matches always win), and OmniRoute-internal fields — the model lists are
+/// ported, the internals are dropped and named in a warning. Any other
+/// restricted field — ip allowlists, quotas, rate limits, schedules —
+/// has no llmux2 equivalent, so the key keeps the fail-closed skip rather
+/// than silently widening access.
+fn portable_key_policy(key: &Value) -> Option<(Vec<String>, Vec<String>, Vec<String>)> {
     if key_field(key, "modelaccessmode").and_then(Value::as_str) != Some("restricted") {
         return None;
     }
+    let mut dropped = Vec::new();
     let mut stripped = key.clone();
-    stripped.as_object_mut()?.retain(|field, _| {
+    stripped.as_object_mut()?.retain(|field, value| {
+        let name = field.replace('_', "").to_ascii_lowercase();
+        if OMNIROUTE_INTERNAL_FIELDS.contains(&name.as_str()) {
+            if !value_is_unset(Some(value)) {
+                dropped.push(field.clone());
+            }
+            return false;
+        }
         !matches!(
-            field.replace('_', "").to_ascii_lowercase().as_str(),
+            name.as_str(),
             "allowedmodels" | "blockedmodels" | "modelaccessmode"
         )
     });
+    dropped.sort_unstable();
     if !unrestricted_client_key(&stripped) {
         return None;
     }
@@ -483,7 +533,18 @@ fn portable_key_policy(key: &Value) -> Option<(Vec<String>, Vec<String>)> {
         None | Some(Value::Null) => Vec::new(),
         value => glob_list(value)?,
     };
-    Some((allowed, blocked))
+    Some((allowed, blocked, dropped))
+}
+
+fn value_is_unset(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => true,
+        Some(Value::Array(items)) => items.is_empty(),
+        Some(Value::String(text)) => text.is_empty(),
+        Some(Value::Bool(flag)) => !*flag,
+        Some(Value::Number(number)) => number.as_f64() == Some(0.0),
+        _ => false,
+    }
 }
 
 fn write_secret(dir: &Path, id: &str, secret: &str) -> Result<String, String> {
@@ -526,6 +587,8 @@ struct Expander<'a> {
     connections: &'a [Connection],
     nodes: &'a [Value],
     warnings: &'a mut Vec<String>,
+    /// Families emitted as `[[shared_quotas]]`: name → the row's quota spec.
+    shared_quotas: &'a mut BTreeMap<&'static str, &'static [(&'static str, u32)]>,
     remaining_steps: usize,
     exhausted: bool,
     policy: &'a policy::Policy,
@@ -791,6 +854,28 @@ impl Expander<'_> {
                 }
                 if c.policy == policy::ModelPolicy::Workers {
                     deployment["quota"] = json!({"rpm":self.policy.workers_rpm});
+                }
+                if deployment["billing"] == "free" {
+                    if let Some(cond) = free_conditions::lookup(&c.base_url, &model, c.anonymous())
+                    {
+                        match cond.shared {
+                            // Account-wide cap: legs bind the family and the
+                            // gateway scopes one window per credential or
+                            // provider+base URL — not per model leg.
+                            Some(family) => {
+                                deployment["shared_quota"] = family.into();
+                                self.shared_quotas.entry(family).or_insert(cond.quota);
+                            }
+                            None => {
+                                for &(field, value) in cond.quota {
+                                    deployment["quota"][field] = value.into();
+                                }
+                            }
+                        }
+                        if let Some(stamp) = cond.expires_at {
+                            deployment["expires_at"] = stamp.into();
+                        }
+                    }
                 }
                 if let Some(credential) = &c.credential {
                     deployment["credential"] = credential.clone().into();
@@ -1452,6 +1537,7 @@ pub fn import_with_options(
                     connections: &connections,
                     nodes,
                     warnings: &mut Vec::new(),
+                    shared_quotas: &mut BTreeMap::new(),
                     remaining_steps: 1024,
                     exhausted: false,
                     policy: &policy,
@@ -1538,6 +1624,9 @@ pub fn import_with_options(
         }
     }
     let mut models = Vec::new();
+    // `[[shared_quotas]]` families collected while expanding: rows whose cap
+    // is one account-wide allowance bind the family instead of per-leg quota.
+    let mut shared_quotas: BTreeMap<&'static str, &'static [(&'static str, u32)]> = BTreeMap::new();
     context.reset_usage();
     let mut deployment_ids = HashSet::new();
     for name in order {
@@ -1569,6 +1658,7 @@ pub fn import_with_options(
             connections: &connections,
             nodes: array(&root, "providerNodes"),
             warnings: &mut warnings,
+            shared_quotas: &mut shared_quotas,
             remaining_steps: 1024,
             exhausted: false,
             policy: &policy,
@@ -1628,6 +1718,7 @@ pub fn import_with_options(
                 connections: &connections,
                 nodes,
                 warnings: &mut warnings,
+                shared_quotas: &mut shared_quotas,
                 remaining_steps: 1,
                 exhausted: false,
                 policy: &policy,
@@ -1654,6 +1745,7 @@ pub fn import_with_options(
                     connections: &connections,
                     nodes,
                     warnings: &mut warnings,
+                    shared_quotas: &mut shared_quotas,
                     remaining_steps: 1024,
                     exhausted: false,
                     policy: &policy,
@@ -1819,11 +1911,17 @@ pub fn import_with_options(
         };
         let id = unique(&format!("client-{i}"), &mut ids);
         let key_ref = write_secret(&dir, &id, key["key"].as_str().unwrap())?;
-        if let Some((models, blocked)) = policy {
+        if let Some((models, blocked, dropped)) = policy {
             key_policies.push(json!({"key": key_ref, "models": models, "blocked": blocked}));
-            warnings.push(format!(
-                "client key {i}: restricted model lists ported to server.key_policies"
-            ));
+            let mut warning =
+                format!("client key {i}: restricted model lists ported to server.key_policies");
+            if !dropped.is_empty() {
+                warning.push_str(&format!(
+                    "; dropped OmniRoute-internal fields {}",
+                    dropped.join(", ")
+                ));
+            }
+            warnings.push(warning);
         }
         client_keys.push(key_ref);
     }
@@ -1853,6 +1951,18 @@ pub fn import_with_options(
         }
     }
     let mut config = json!({"server":{"listen":options.listen.unwrap_or("127.0.0.1:8080"),"client_keys":client_keys},"credentials":credentials,"models":models});
+    if !shared_quotas.is_empty() {
+        config["shared_quotas"] = shared_quotas
+            .into_iter()
+            .map(|(name, quota)| {
+                let mut row = json!({"name": name});
+                for &(field, value) in quota {
+                    row[field] = value.into();
+                }
+                row
+            })
+            .collect();
+    }
     if !key_policies.is_empty() {
         config["server"]["key_policies"] = json!(key_policies);
     }
@@ -1994,6 +2104,29 @@ mod dedupe_tests {
             vec!["m-0", "m-1", "m-2", "m-3"]
         );
         assert_eq!(warnings, vec!["m: dropped 2 duplicate deployments"]);
+    }
+
+    #[test]
+    fn free_and_billed_variants_on_one_route_both_survive_dedupe() {
+        // A model-scoped --free-providers entry marks one leg free while a
+        // sibling on the same credential+host+model stays billed: billing,
+        // shared_quota, and expires_at are routing behavior, not decoration —
+        // identical rows here would silently drop the billed leg.
+        let mut models = vec![json!({
+            "name": "m",
+            "deployments": [
+                {"id":"m-0","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":0,"billing":"free","shared_quota":"sambanova-free"},
+                {"id":"m-1","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":1,"billing":"billed"},
+                {"id":"m-2","credential":"c","upstream_model":"u","base_url":"https://example.com/v1","priority":2,"billing":"free","shared_quota":"sambanova-free","expires_at":"2026-12-16T23:59:59Z"}
+            ]
+        })];
+        let warnings = run(&mut models);
+        let deps = models[0]["deployments"].as_array().unwrap();
+        assert_eq!(
+            deps.iter().map(|dep| string(dep, "id")).collect::<Vec<_>>(),
+            vec!["m-0", "m-1", "m-2"]
+        );
+        assert!(warnings.is_empty());
     }
 
     #[test]

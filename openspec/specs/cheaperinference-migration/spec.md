@@ -275,11 +275,10 @@ logprobs, reorder unrelated combos, or replace the optional final fallback.
 - **THEN** no reviewed logprobs-order policy is applied
 
 ### Requirement: Reviewed free XPLabs routes first
-For the reviewed source combos `gpt-6-luna`, `deepseek-v4.1-flash`,
-`deepseek-v4.1-flash-fast` and `deepseek-v4.1-flash-1017-uncensored`, the
+For the reviewed source combos `gpt-6-luna`, `deepseek-v4.1-flash` and
+`deepseek-v4.1-flash-fast`, the
 importer SHALL place one deployment of the matching Experiential Labs (XPLabs)
-model (`gpt-6-luna`, `deepseek-v4.1-flash` or
-`deepseek-v4.1-flash-uncensored-fast:free`) first, pinned to an active, usable
+model (`gpt-6-luna` or `deepseek-v4.1-flash`) first, pinned to an active, usable
 API-key connection of the custom `experlabs` node at
 `https://api.experientiallabs.ai/v1`. In the fast
 combo it SHALL follow the verified Morph route. A declared leg for the same model
@@ -287,14 +286,18 @@ and endpoint SHALL be moved instead of duplicated, keeping its pinned
 connection, other legs SHALL keep their
 relative order, and a warning SHALL be emitted when the order changes. This
 follows OCI verification that these models cost 0 on the existing key and that
-XPLabs DeepSeek returns logprobs; for the uncensored combo the `:free` suffix
-is what marks the verified promo leg — the plain `deepseek-v4.1-flash-uncensored`
-and `deepseek-v4.1-flash-uncensored-fast` ids stay billed. Every XPLabs
+XPLabs DeepSeek returns logprobs. The earlier
+`deepseek-v4.1-flash-uncensored-fast:free` promo leg was removed after it went
+audience-gated (`model_not_granted` on the key, 2026-11-25); a promo slug that
+reappears SHALL be re-verified before rejoining the set. Every XPLabs
 deployment whose model is not in
 the verified-free set SHALL be dropped with a warning, in every combo and
 strategy: the account is overdrawn, so billed models OCI observed
 (`claude-haiku-5.5`, `qwen3.8-27b`, `deepseek-v4.1-flash-1017`) must never be
-generated, and a combo left with no deployments is skipped.
+generated, and a combo left with no deployments is skipped. The verified-free
+set SHALL be checked against a committed snapshot of the keyless
+`GET /api/plan-discounts` endpoint: every emitted slug must still reach a 100%
+discount on some paid plan.
 
 #### Scenario: Reviewed combo with an eligible XPLabs connection
 - **WHEN** a reviewed combo has paid legs and an eligible XPLabs connection exists
@@ -441,8 +444,37 @@ THEN the emitted config authenticates the key and binds it to a
 #### Scenario: Untranslatable restriction stays closed
 
 WHEN an export key combines model lists with a restriction llmux2 cannot
-express, such as `ip_allowlist` or `scopes`
+express, such as `ip_allowlist` or `rate_limits`
 THEN the key is skipped with a warning and no secret file is written for it.
+
+### Requirement: SQLite dump key fields normalize before the port
+
+API key rows from a SQLite table dump SHALL have their JSON-encoded text
+columns (`allowed_models`, `blocked_models`, `allowed_combos`,
+`allowed_connections`, `allowed_quotas`, `allowed_endpoints`,
+`ip_allowlist`, `rate_limits`, `scopes`, `preferred_connections`) parsed
+into arrays during normalization so dump-form and export-form rows behave
+identically downstream.
+
+A restricted key that also carries OmniRoute-internal fields — `scopes`,
+`allowedCombos`, `allowedConnections`, `catalogScope`, `machineId` — SHALL
+still port its model lists; the importer drops those fields and emits a
+warning naming each dropped field. A restricted field outside that list
+(ip allowlists, quotas, rate limits, schedules, forced models) keeps the
+fail-closed skip.
+
+#### Scenario: Dump row with internal fields still ports
+
+WHEN a dump `api_keys` row is `restricted` with string-encoded
+`allowed_models`/`blocked_models` and non-empty `scopes`,
+`allowed_combos`, `allowed_connections`, `catalog_scope`, `machine_id`
+THEN the key imports, `server.key_policies` carries the parsed model
+lists, and a warning names the dropped fields.
+
+#### Scenario: Real restriction outside the internal list stays closed
+
+WHEN a dump `api_keys` row is `restricted` with a `rate_limits` entry
+THEN the key is skipped with a warning and no secret file is written.
 
 ### Requirement: Revenue-oriented allocation
 

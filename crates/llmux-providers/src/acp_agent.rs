@@ -441,6 +441,7 @@ mod tests {
                 base_url: provider::ACP_AGENT_BASE_URL.parse().unwrap(),
                 upstream_model: upstream_model.into(),
                 strip_request_fields: Box::default(),
+                shared_quota: None,
                 priority: 0,
                 quota: QuotaSpec::default(),
                 timeout: Duration::from_secs(30),

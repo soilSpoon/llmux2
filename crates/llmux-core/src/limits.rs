@@ -16,6 +16,9 @@ const CONCURRENCY_RETRY: Duration = Duration::from_secs(1);
 pub(super) struct DeploymentLimits {
     baseline: Instant,
     cooldown_until_ns: AtomicU64,
+    /// Serializes admission with cooldown registration: a request either
+    /// charges before the cooldown lands or is refused by it, never after it.
+    admission: Mutex<()>,
     /// Whether the current cooldown is a credential-shared quota reset.
     credential_cooldown: AtomicBool,
     /// The provider does not provision this deployment at all: it stays
@@ -61,6 +64,7 @@ impl DeploymentLimits {
         Self {
             baseline: Instant::now(),
             cooldown_until_ns: AtomicU64::new(0),
+            admission: Mutex::new(()),
             credential_cooldown: AtomicBool::new(false),
             not_provisioned: AtomicBool::new(false),
             concurrent: spec.concurrent,
@@ -147,6 +151,7 @@ impl DeploymentLimits {
     }
 
     fn cool_down_with_scope(&self, wait: Duration, credential: bool) -> Instant {
+        let _admission = self.admission.lock().unwrap_or_else(|err| err.into_inner());
         let offset = self.baseline.elapsed() + wait;
         let offset_ns = offset.as_nanos().min(u64::MAX as u128) as u64;
         let previous = self
@@ -200,6 +205,10 @@ impl DeploymentLimits {
     }
 
     pub fn admit(self: &Arc<Self>, tokens: u64) -> Option<Permit> {
+        let _admission = self.admission.lock().unwrap_or_else(|err| err.into_inner());
+        if self.cooldown_until(Instant::now()).is_some() {
+            return None;
+        }
         let mut probe = Permit(None, None);
         if self.limit_strikes.load(Ordering::Relaxed) > 0 {
             if self
@@ -239,6 +248,7 @@ impl DeploymentLimits {
     }
 
     pub fn admit_repair(&self, tokens: u64) -> bool {
+        let _admission = self.admission.lock().unwrap_or_else(|err| err.into_inner());
         let now = Instant::now();
         self.cooldown_until(now).is_none() && self.charge_windows(tokens, now)
     }
@@ -616,6 +626,25 @@ mod tests {
             assert!(limits.admit(0).is_some());
         }
         assert!(limits.windows[0].lock(Instant::now()).entries.is_empty());
+    }
+
+    /// The cooldown invariant lives in admission itself: a caller that never
+    /// checks `cooldown_until` — or checked it before a concurrent 429 landed —
+    /// is still refused, so a cooling deployment is never charged.
+    #[tokio::test(start_paused = true)]
+    async fn admission_is_refused_for_the_whole_cooldown() {
+        let limits = Arc::new(DeploymentLimits::new(QuotaSpec::default()));
+        assert!(limits.admit(0).is_some(), "an idle deployment admits");
+        limits.cool_down(Duration::from_secs(60));
+        assert!(
+            limits.admit(0).is_none(),
+            "no admission while the cooldown runs"
+        );
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(
+            limits.admit(0).is_some(),
+            "admission resumes once the cooldown expires"
+        );
     }
 
     #[test]

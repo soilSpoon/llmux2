@@ -21,7 +21,7 @@ use llmux_config::RuntimeConfig;
 use llmux_types::{
     provider, AuthMaterial, Billing, BuildError, ContextOverflow, CredentialSource, Deployment,
     DeploymentIdx, ErrorKind, GatewayRequest, GatewayResponse, ProviderAdapter, ProviderRegistry,
-    SseCommitment, Support, UpstreamError,
+    QuotaSpec, SseCommitment, Support, UpstreamError,
 };
 use machine::{Built, Effect, Event, Outcome, Phase, State};
 pub use request_log::RequestLog;
@@ -204,6 +204,9 @@ impl Executor {
 
     fn shared_limits<'a>(
         shared: &mut Vec<(&'a Deployment, Arc<DeploymentLimits>)>,
+        shared_caps: &mut Vec<(&'a Deployment, Vec<Arc<Window>>)>,
+        local_windows: &mut Vec<(&'a Deployment, Vec<Arc<Window>>)>,
+        group_specs: &HashMap<Arc<str>, QuotaSpec>,
         key_windows: &HashMap<Arc<str>, Vec<Arc<Window>>>,
         dep: &'a Deployment,
     ) -> Arc<DeploymentLimits> {
@@ -213,6 +216,7 @@ impl Executor {
                 && other.base_url == dep.base_url
                 && other.upstream_model == dep.upstream_model
                 && other.quota == dep.quota
+                && other.shared_quota == dep.shared_quota
         };
         if let Some((_, limits)) = shared.iter().find(|(other, _)| same_route(other)) {
             return limits.clone();
@@ -220,7 +224,89 @@ impl Executor {
         let key = key_windows
             .get(&dep.credential)
             .map_or(&[][..], Vec::as_slice);
-        let limits = Arc::new(DeploymentLimits::with_shared(dep.quota, key));
+        // Route-local quota budgets the route, not each binding variant:
+        // siblings differing only in `shared_quota` draw on one local window
+        // set — separate windows would double the route's allowance. The
+        // family windows below stay per-binding by contrast.
+        let same_local_route = |other: &&Deployment| {
+            other.provider == dep.provider
+                && other.credential == dep.credential
+                && other.base_url == dep.base_url
+                && other.upstream_model == dep.upstream_model
+                && other.quota == dep.quota
+        };
+        let local = match local_windows
+            .iter()
+            .find(|(other, _)| same_local_route(other))
+        {
+            Some((_, windows)) => windows.clone(),
+            None => {
+                let windows = Window::for_quota(dep.quota);
+                local_windows.push((dep, windows.clone()));
+                windows
+            }
+        };
+        // A named shared quota is one account-wide window set: legs that bind
+        // to the same group draw on it even when they serve different upstream
+        // models (a provider's documented free allowance is per account, not
+        // per model). Scope is the credential — or, for anonymous legs, the
+        // provider plus base URL, approximating a per-IP allowance. Only the
+        // windows are shared: cooldowns, strikes and inflight stay
+        // per-deployment.
+        let shared_group = dep.shared_quota.as_ref().map(|group| {
+            let same_scope = |other: &&Deployment| {
+                other.shared_quota.as_ref() == Some(group)
+                    && if dep.credential.is_empty() {
+                        other.credential.is_empty()
+                            && other.provider == dep.provider
+                            && other.base_url == dep.base_url
+                    } else {
+                        other.credential == dep.credential
+                    }
+            };
+            match shared_caps.iter().find(|(other, _)| same_scope(other)) {
+                Some((_, windows)) => windows.clone(),
+                None => {
+                    // Parse rejects dangling `shared_quota` names; a hand-built
+                    // RuntimeConfig must still fail closed, never unlimited.
+                    // Family caps are account-wide ceilings, so they use the
+                    // hard credential variant — soft windows would admit one
+                    // oversized request to an idle scope and blow the cap.
+                    let windows = match group_specs.get(group) {
+                        Some(spec) => Window::for_credential(*spec),
+                        None => {
+                            debug_assert!(
+                                false,
+                                "shared_quota group `{group}` missing from shared_quotas"
+                            );
+                            Window::for_credential(llmux_types::QuotaSpec {
+                                rpm: Some(0),
+                                rpd: Some(0),
+                                tpm: Some(0),
+                                tpd: Some(0),
+                                concurrent: None,
+                            })
+                        }
+                    };
+                    shared_caps.push((dep, windows.clone()));
+                    windows
+                }
+            }
+        });
+        let mut windows = local;
+        windows.extend(key.iter().cloned());
+        if let Some(family) = shared_group {
+            windows.extend(family);
+        }
+        // `with_shared` would rebuild private local windows from `dep.quota`;
+        // pass only `concurrent` so the deduped route-local set is used.
+        let limits = Arc::new(DeploymentLimits::with_shared(
+            QuotaSpec {
+                concurrent: dep.quota.concurrent,
+                ..Default::default()
+            },
+            &windows,
+        ));
         shared.push((dep, limits.clone()));
         limits
     }
@@ -238,6 +324,10 @@ impl Executor {
         let mut disabled = HashMap::<Arc<str>, Arc<AtomicBool>>::new();
         // Deployments that reach the same upstream route draw on one provider limit.
         let mut shared_limits = Vec::<(&Deployment, Arc<DeploymentLimits>)>::new();
+        // Legs bound to one named shared quota draw on one set of windows.
+        let mut shared_caps = Vec::<(&Deployment, Vec<Arc<Window>>)>::new();
+        // Route-local quota windows are shared across bindings on one route.
+        let mut local_windows = Vec::<(&Deployment, Vec<Arc<Window>>)>::new();
         // A credential's quota is one set of windows shared by all of its deployments.
         let key_windows: HashMap<Arc<str>, Vec<Arc<Window>>> = cfg
             .credential_quotas
@@ -276,7 +366,14 @@ impl Executor {
                     adapter,
                     auth,
                     disabled,
-                    limits: Self::shared_limits(&mut shared_limits, &key_windows, dep),
+                    limits: Self::shared_limits(
+                        &mut shared_limits,
+                        &mut shared_caps,
+                        &mut local_windows,
+                        &cfg.shared_quotas,
+                        &key_windows,
+                        dep,
+                    ),
                     key_peers: Arc::default(),
                     stats: cfg.server.dashboard_key.is_some().then(Arc::default),
                 })
@@ -667,7 +764,7 @@ impl Executor {
                                 binding.limits.admit(needed)
                             };
                             if support != Support::Convert && permit.is_none() {
-                                skip_reason = Some(SkipReason::AdmissionLimited);
+                                skip_reason = Some(deny_reason(&binding.limits));
                             }
                             event = Event::Admit {
                                 permit: support == Support::Convert || permit.is_some(),
@@ -695,18 +792,20 @@ impl Executor {
                             break;
                         }
                         Effect::Admit => {
-                            permit = permit.take().or_else(|| {
-                                if binding.limits.cooldown_until(Instant::now()).is_some() {
-                                    skip_reason = Some(SkipReason::Cooldown);
-                                    None
-                                } else {
-                                    let permit = binding.limits.admit(needed);
-                                    if permit.is_none() {
-                                        skip_reason = Some(SkipReason::AdmissionLimited);
-                                    }
-                                    permit
+                            if binding.limits.cooldown_until(Instant::now()).is_some() {
+                                // A cooldown that landed during the build
+                                // recalls even a permit granted before it, so
+                                // a cooling deployment is never sent traffic.
+                                permit = None;
+                                skip_reason = Some(SkipReason::Cooldown);
+                            } else if permit.is_none() {
+                                // Convert deployments admit here, after a
+                                // successful conversion build.
+                                permit = binding.limits.admit(needed);
+                                if permit.is_none() {
+                                    skip_reason = Some(deny_reason(&binding.limits));
                                 }
-                            });
+                            }
                             event = Event::Gate {
                                 permit: permit.is_some(),
                             };
@@ -1124,6 +1223,17 @@ impl Executor {
             })),
         };
         response
+    }
+}
+
+/// A refused admission is a cooldown when the deployment is cooling — even
+/// one that landed after the caller's own check — and a quota or concurrency
+/// limit otherwise.
+fn deny_reason(limits: &DeploymentLimits) -> SkipReason {
+    if limits.cooldown_until(Instant::now()).is_some() {
+        SkipReason::Cooldown
+    } else {
+        SkipReason::AdmissionLimited
     }
 }
 
