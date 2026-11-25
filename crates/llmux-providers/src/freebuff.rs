@@ -91,6 +91,7 @@ mod tests {
             base_url: format!("{base}/api/v1/").parse().unwrap(),
             upstream_model: MODEL.into(),
             strip_request_fields: Box::default(),
+            shared_quota: None,
             priority: 0,
             quota: QuotaSpec::default(),
             timeout: Duration::from_secs(30),

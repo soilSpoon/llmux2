@@ -120,6 +120,28 @@ be treated as full allowance. Daily caps, per-minute limits, and expiry dates
 on free deployments SHALL be tracked the same way, so a temporarily exhausted
 leg is never pruned for today's exhaustion alone.
 
+An account-wide cap SHALL be declared once as a named `[[shared_quotas]]`
+family (rpm/rpd/tpm/tpd only, positive values) and bound per deployment with
+`shared_quota = "<name>"`. Legs that name the same family draw on one set of
+windows within the family's scope — the leg's credential, or provider plus
+base URL for anonymous legs, approximating a per-IP allowance — even when the
+legs serve different upstream models, so two OpenRouter `:free` legs on one
+key admit 50 requests a day in total, not 50 each. Legs that do not bind the
+family are never throttled by it, so a paid leg sharing the credential is
+unaffected. Cooldowns, inflight counts, and limit strikes stay per-deployment;
+only the quota windows are shared.
+
+#### Scenario: Shared free-tier cap across models
+
+WHEN two deployments on one credential serve different upstream models but
+bind the same `shared_quota` family
+THEN a request through one counts against the other's remaining allowance.
+
+#### Scenario: Sibling leg outside the family
+
+WHEN a third deployment on the same credential does not set `shared_quota`
+THEN the family's drained window never throttles it.
+
 #### Scenario: Parked leg revives at reset
 
 WHEN a deployment's daily-quota window resets at UTC midnight
