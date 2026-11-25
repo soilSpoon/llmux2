@@ -556,3 +556,92 @@ fn state_url_with_embedded_credential_is_rejected_without_leaking_it() {
         "validation error must not echo the credential query: {error}"
     );
 }
+
+#[test]
+fn discovery_supplies_the_endpoint_for_a_keyed_builtin_export() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let mut root = fixture();
+    // A reviewed builtin export can carry the key while the recorded bridge
+    // endpoint is empty/missing: discovery is then the only source of the URL,
+    // and upstream resolution must not reject the connection before rewiring.
+    root["providerConnections"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("providerSpecificData");
+    root["combos"] = json!([{"name":"claude-haiku-5.5","models":["deepai-code/claude-haiku-5-5"]}]);
+    let (config, report) = run(
+        &root,
+        &ImportOptions {
+            deepai_code_state: Some(&state),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        legs(&config, "claude-haiku-5.5"),
+        [(BRIDGE.to_string(), "claude-haiku-5-5".to_string())],
+        "the validated discovery URL must resolve the exported connection: {:?}",
+        report.warnings
+    );
+    let index = config.models[*config.model_names.get("claude-haiku-5.5").unwrap()].deployments[0];
+    let deployment = &config.deployments[index.0 as usize];
+    assert_eq!(deployment.credential.as_ref(), "upstream-dac");
+    assert_eq!(
+        config.api_keys.get("upstream-dac").unwrap().key.as_ref(),
+        "synthetic-dac",
+        "without a token file the exported keyed credential must be retained"
+    );
+}
+
+#[test]
+fn cli_flags_wire_discovery_state_and_session_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = write(
+        dir.path(),
+        "state.json",
+        &json!({"base_url":BRIDGE,"free":["claude-haiku-5-5"]}).to_string(),
+    );
+    let token = write(dir.path(), "token", "synthetic-session");
+    let input = write(dir.path(), "export.json", &fixture().to_string());
+    let out = dir.path().join("out.toml");
+    let secrets = dir.path().join("secrets");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_llmux-import"))
+        .args([
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+            "--secrets-dir",
+            secrets.to_str().unwrap(),
+            "--deepai-code-state",
+            state.to_str().unwrap(),
+            "--deepai-code-token-file",
+            token.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "cli import failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = RuntimeConfig::load(&out).unwrap();
+    let index = config.models[*config.model_names.get("claude-haiku-5.5").unwrap()].deployments[0];
+    let deployment = &config.deployments[index.0 as usize];
+    assert_eq!(deployment.base_url.to_string(), BRIDGE);
+    assert_eq!(deployment.credential.as_ref(), "deepai-code-discovered");
+    assert_eq!(
+        config
+            .api_keys
+            .get("deepai-code-discovered")
+            .unwrap()
+            .key
+            .as_ref(),
+        "synthetic-session",
+        "the cli must forward the token file into the discovered credential"
+    );
+}

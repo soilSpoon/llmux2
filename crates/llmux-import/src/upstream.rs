@@ -259,23 +259,22 @@ fn horde_base_url(url: &str) -> Result<&'static str, &'static str> {
     }
 }
 
-pub(super) fn resolve(
+/// The endpoint the export declares for a connection, before any validation:
+/// the provider-specific `baseUrl` override, else the pinned provider entry or
+/// the custom node's own `baseUrl`.
+fn declared_endpoint(
     connection: &Value,
     nodes: &[Value],
-    keyed: bool,
-    warnings: &mut Vec<String>,
-    listen_port: u16,
-) -> Result<(String, String), &'static str> {
+) -> Result<(&'static str, String), &'static str> {
     let id = string(connection, "provider");
-    let node = nodes.iter().find(|node| string(node, "id") == id);
-    if crate::devin::bridge(id) {
-        return Ok((DEVIN_ACP_KIND.into(), DEVIN_ACP_BASE_URL.into()));
-    }
     let (kind, fallback) = if let Some((_, kind, url)) = PROVIDERS.iter().find(|(p, _, _)| *p == id)
     {
         (*kind, *url)
     } else {
-        let node = node.ok_or("unknown/non-compatible provider or custom protocol settings")?;
+        let node = nodes
+            .iter()
+            .find(|node| string(node, "id") == id)
+            .ok_or("unknown/non-compatible provider or custom protocol settings")?;
         let kind = match string(node, "type") {
             "openai-compatible"
                 if matches!(string(node, "apiType"), "" | "chat" | "chat-completions") =>
@@ -292,11 +291,37 @@ pub(super) fn resolve(
     };
     let metadata = metadata(connection)?;
     let override_url = string(&metadata, "baseUrl");
-    let url = if override_url.is_empty() {
-        fallback
-    } else {
-        override_url
-    };
+    Ok((
+        kind,
+        if override_url.is_empty() {
+            fallback.to_owned()
+        } else {
+            override_url.to_owned()
+        },
+    ))
+}
+
+/// Whether the export declares no endpoint at all. The reviewed builtin
+/// `deepai-code` entry has an intentionally empty fallback: its reachable
+/// Bridge URL is only known from discovery, so such a connection must not be
+/// rejected before the validated discovery URL is applied.
+pub(super) fn declares_no_endpoint(connection: &Value, nodes: &[Value]) -> bool {
+    declared_endpoint(connection, nodes).is_ok_and(|(_, url)| url.trim_matches('/').is_empty())
+}
+
+pub(super) fn resolve(
+    connection: &Value,
+    nodes: &[Value],
+    keyed: bool,
+    warnings: &mut Vec<String>,
+    listen_port: u16,
+) -> Result<(String, String), &'static str> {
+    let id = string(connection, "provider");
+    let node = nodes.iter().find(|node| string(node, "id") == id);
+    if crate::devin::bridge(id) {
+        return Ok((DEVIN_ACP_KIND.into(), DEVIN_ACP_BASE_URL.into()));
+    }
+    let (kind, url) = declared_endpoint(connection, nodes)?;
     let url = url.trim_end_matches('/');
     if url.is_empty() {
         return Err("missing upstream base URL");

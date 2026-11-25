@@ -1218,9 +1218,18 @@ pub fn import_with_options(
         } else if let connection::SelectedAuth::Oauth(oauth) = &auth {
             Ok((oauth.kind.to_owned(), oauth.base_url.to_owned()))
         } else {
+            let nodes = array(&root, "providerNodes");
+            let discovered_endpoint = policy
+                .deepai_code
+                .as_ref()
+                .filter(|_| {
+                    deepai_code::reviewed_source(c, nodes)
+                        && upstream::declares_no_endpoint(c, nodes)
+                })
+                .map(|state| deepai_code::with_endpoint(c, &state.base_url));
             upstream::resolve(
-                c,
-                array(&root, "providerNodes"),
+                discovered_endpoint.as_ref().unwrap_or(c),
+                nodes,
                 matches!(auth, connection::SelectedAuth::Key(_)),
                 &mut warnings,
                 listen_port,

@@ -172,6 +172,24 @@ pub(crate) fn outside_scope(state: &State, model: &str) -> bool {
         .is_some_and(|scope| !scope.contains(model))
 }
 
+/// The export connection with the validated discovery URL installed as its
+/// provider base URL. Only used when the export declares no endpoint; the
+/// connection still runs through the full upstream/auth validation.
+pub(crate) fn with_endpoint(connection: &Value, base_url: &str) -> Value {
+    let mut connection = connection.clone();
+    let mut metadata = match connection.get("providerSpecificData") {
+        Some(Value::Object(map)) => map.clone(),
+        Some(Value::String(text)) => serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|parsed| parsed.as_object().cloned())
+            .unwrap_or_default(),
+        _ => serde_json::Map::new(),
+    };
+    metadata.insert("baseUrl".into(), json!(base_url));
+    connection["providerSpecificData"] = Value::Object(metadata);
+    connection
+}
+
 /// Connections the discovery stage may rewire. Marked at import time from
 /// the reviewed provider identity, never inferred from a loopback URL alone.
 pub(crate) fn discovered(connection: &Connection) -> bool {
