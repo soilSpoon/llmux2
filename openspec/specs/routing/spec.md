@@ -121,8 +121,8 @@ on free deployments SHALL be tracked the same way, so a temporarily exhausted
 leg is never pruned for today's exhaustion alone.
 
 An account-wide cap SHALL be declared once as a named `[[shared_quotas]]`
-family (rpm/rpd/tpm/tpd only, positive values) and bound per deployment with
-`shared_quota = "<name>"`. Legs that name the same family draw on one set of
+family (rpm/rpd/tpm/tpd and fixed windows, positive values) and bound per
+deployment with `shared_quota = "<name>"`. Legs that name the same family draw on one set of
 windows within the family's scope — the leg's credential, or provider plus
 base URL for anonymous legs, approximating a per-IP allowance — even when the
 legs serve different upstream models, so two OpenRouter `:free` legs on one
@@ -152,6 +152,35 @@ THEN it is skipped until the reset and becomes eligible again afterwards.
 WHEN a credential's weekly window has reset but recorded no usage yet
 THEN the gateway ranks it as holding its full allowance rather than assuming
 it is spent.
+
+### Requirement: Fixed anchored quota windows
+
+A quota specification MAY carry fixed anchored windows — `fixed` entries with
+`unit` (`requests` or `tokens`), `max`, `span_secs`, and an RFC 3339 `anchor`
+written as a quoted string — for provider allowances that reset at a
+wall-clock boundary: antigravity-style weekly windows, UTC-midnight daily
+allowances, calendar-style monthly caps. Window boundaries are
+`anchor + k × span_secs` for integer k, so the anchor pins the phase rather
+than the first use. Usage accumulates within the current window and resets
+wholesale at the boundary: the full budget is available immediately after a
+reset, unlike the sliding `rpm`/`rpd`/`tpm`/`tpd` windows, which ration it
+back as usage ages out. `max` and `span_secs` SHALL be positive. Where the
+provider's window shape or phase is unknown, the sliding windows remain the
+conservative choice — a sliding span never admits more in any interval of
+that length than its cap, whatever the provider's real boundaries.
+
+#### Scenario: Weekly window front-loads after reset
+
+WHEN a credential carries a fixed weekly window anchored at the provider's
+reset and the window boundary passes
+THEN its legs may spend the whole weekly budget at once rather than waiting
+for last week's usage to age out of a sliding window.
+
+#### Scenario: Mid-window budget enforcement
+
+WHEN usage within the current fixed window reaches `max`
+THEN further requests skip the window's deployments until the next boundary,
+and the reported retry time is that boundary.
 
 ### Requirement: Quota-expiry-first priority
 

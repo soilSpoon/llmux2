@@ -493,9 +493,10 @@ impl RawConfig {
                     group.quota.tpd,
                 ]
                 .contains(&Some(0))
+                || invalid_fixed_windows(&group.quota)
             {
                 return Err(invalid(
-                    "shared quota supports positive rpm, rpd, tpm and tpd only",
+                    "shared quota supports positive rpm, rpd, tpm, tpd and fixed windows only",
                 ));
             }
             let name: Arc<str> = group.name.as_str().into();
@@ -534,13 +535,14 @@ impl RawConfig {
                     quota,
                     disabled,
                     ..
-                } => (id, provider, *quota, *disabled),
+                } => (id, provider, quota.clone(), *disabled),
             };
             if quota.concurrent.is_some()
                 || [quota.rpm, quota.rpd, quota.tpm, quota.tpd].contains(&Some(0))
+                || invalid_fixed_windows(&quota)
             {
                 return Err(invalid(
-                    "credential quota supports positive rpm, rpd, tpm and tpd only",
+                    "credential quota supports positive rpm, rpd, tpm, tpd and fixed windows only",
                 ));
             }
             if id.is_empty() || provider.is_empty() || provider_kinds.contains_key(id.as_str()) {
@@ -910,8 +912,9 @@ impl RawConfig {
                 if dep.max_context == Some(0) {
                     return Err(invalid("max_context must be positive"));
                 }
-                let quota = dep.quota;
+                let quota = &dep.quota;
                 if [quota.rpm, quota.rpd, quota.tpm, quota.tpd, quota.concurrent].contains(&Some(0))
+                    || invalid_fixed_windows(quota)
                 {
                     return Err(invalid("configured limits must be positive"));
                 }
@@ -1142,6 +1145,16 @@ fn expiry(deployment: &str, stamp: toml::value::Datetime) -> Result<SystemTime, 
 
 fn boost_until(deployment: &str, stamp: toml::value::Datetime) -> Result<SystemTime, ConfigError> {
     rfc3339(deployment, "priority_boost_until", stamp)
+}
+
+/// Fixed quota windows must meter a positive amount over a positive span; a
+/// zero span would divide by zero in the engine and a zero cap only ever
+/// parks the leg, both operator errors rather than real limits.
+fn invalid_fixed_windows(quota: &QuotaSpec) -> bool {
+    quota
+        .fixed
+        .iter()
+        .any(|window| window.max == 0 || window.span_secs == 0)
 }
 
 fn rfc3339(
@@ -1598,6 +1611,50 @@ mod tests {
                 "shared_quota = \"fam\"\nupstream_model =",
             );
             assert!(RuntimeConfig::parse(&input).is_err(), "{quota}");
+        }
+    }
+
+    #[test]
+    fn fixed_quota_windows_parse_and_validate() {
+        let base = config(REQUIRED);
+        let input = base.replace(
+            "upstream_model =",
+            "quota = { fixed = [ { unit = \"requests\", max = 200, span_secs = 604800, anchor = \"2026-11-17T00:00:00Z\" } ] }\nupstream_model =",
+        );
+        let parsed = RuntimeConfig::parse(&input).expect("a fixed quota window parses");
+        let window = &parsed.deployments[0].quota.fixed[0];
+        assert_eq!(window.unit, llmux_types::FixedUnit::Requests);
+        assert_eq!(window.max, 200);
+        assert_eq!(window.span_secs, 604800);
+        let anchor_secs = window
+            .anchor
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(anchor_secs, 1_794_873_600, "2026-11-17T00:00:00Z");
+
+        // A shared quota family carries fixed windows too — the account-wide
+        // allowance is the primary use case.
+        let family = format!(
+            "[[shared_quotas]]\nname = \"fam\"\nfixed = [ {{ unit = \"tokens\", max = 1000000, span_secs = 2592000, anchor = \"2026-11-01T00:00:00Z\" }} ]\n{base}"
+        )
+        .replace(
+            "upstream_model =",
+            "shared_quota = \"fam\"\nupstream_model =",
+        );
+        let parsed = RuntimeConfig::parse(&family).expect("shared family fixed window");
+        assert_eq!(parsed.shared_quotas["fam"].fixed[0].max, 1_000_000);
+
+        for bad in [
+            "unit = \"requests\", max = 0, span_secs = 3600, anchor = \"2026-11-17T00:00:00Z\"",
+            "unit = \"requests\", max = 200, span_secs = 0, anchor = \"2026-11-17T00:00:00Z\"",
+            "unit = \"requests\", max = 200, span_secs = 3600, anchor = \"not-a-date\"",
+        ] {
+            let input = base.replace(
+                "upstream_model =",
+                &format!("quota = {{ fixed = [ {{ {bad} }} ] }}\nupstream_model ="),
+            );
+            assert!(RuntimeConfig::parse(&input).is_err(), "{bad}");
         }
     }
 

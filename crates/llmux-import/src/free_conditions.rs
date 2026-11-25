@@ -7,10 +7,11 @@
 //! `expires_at` on time-boxed free offers so parked legs do not keep taking
 //! requests after the promo ends.
 //!
-//! Only limits `QuotaSpec` can express are emitted: rpm/rpd/tpm/tpd. Hourly,
-//! monthly, and wall-clock-anchored windows are out of scope until the spec
-//! grows those shapes — each row's comment records the real limit and the
-//! emitted bound is the closest safe one.
+//! Only limits `QuotaSpec` can express are emitted: rpm/rpd/tpm/tpd plus
+//! fixed anchored windows. Calendar-monthly caps and rows whose real window
+//! shape or phase is unverified stay on the closest safe sliding bound —
+//! each row's comment records the real limit; upgrading them to fixed
+//! windows needs per-provider evidence of the reset phase.
 
 /// One provider's documented free-tier conditions, keyed on the connection's
 /// base URL host.

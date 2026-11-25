@@ -1,11 +1,11 @@
-use llmux_types::{LimitObservation, QuotaSpec};
+use llmux_types::{FixedUnit, LimitObservation, QuotaSpec};
 use std::{
     collections::VecDeque,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::time::Instant;
 
@@ -43,7 +43,7 @@ impl DeploymentLimits {
             .windows
             .iter()
             .filter(|window| window.span == MINUTE && matches!(window.unit, Unit::Requests))
-            .map(|window| window.max.saturating_sub(window.lock(now).total))
+            .map(|window| window.max.saturating_sub(window.lock(now).total()))
             .min();
         let concurrent = self
             .concurrent
@@ -184,8 +184,8 @@ impl DeploymentLimits {
         for window in self.windows.iter() {
             let used = window.lock(now);
             let cost = window.unit.cost(tokens);
-            if used.total + cost > window.max && (window.hard || used.total > 0) {
-                ready = ready.max(used.free_at(window.max.saturating_sub(cost), window.span));
+            if used.total() + cost > window.max && (window.hard || used.total() > 0) {
+                ready = ready.max(window.free_at(&used, window.max.saturating_sub(cost), now));
             }
         }
         if self
@@ -251,15 +251,14 @@ impl DeploymentLimits {
             .collect();
         for (window, used) in &windows {
             let cost = window.unit.cost(tokens);
-            if used.total + cost > window.max && (window.hard || used.total > 0) {
+            if used.total() + cost > window.max && (window.hard || used.total() > 0) {
                 return false;
             }
         }
         for (window, used) in &mut windows {
             let cost = window.unit.cost(tokens);
             if cost > 0 {
-                used.entries.push_back((now, cost));
-                used.total += cost;
+                used.charge(now, cost);
             }
         }
         true
@@ -281,7 +280,7 @@ impl Unit {
     }
 }
 
-/// Sliding window of admitted requests or estimated tokens.
+/// Sliding or fixed-anchored window of admitted requests or estimated tokens.
 pub(super) struct Window {
     max: u64,
     span: Duration,
@@ -291,13 +290,88 @@ pub(super) struct Window {
     /// Deployment windows admit one oversized request to an idle deployment
     /// so an undersized quota cannot deadlock it.
     hard: bool,
-    used: Mutex<Usage>,
+    kind: WindowKind,
+}
+
+enum WindowKind {
+    Sliding(Mutex<Usage>),
+    /// A wall-clock-anchored fixed window: usage accumulates into the current
+    /// window and resets wholesale at the boundary, so the budget — unlike a
+    /// sliding window's — can be front-loaded right after a provider reset.
+    Fixed {
+        anchor: SystemTime,
+        used: Mutex<FixedUsage>,
+    },
 }
 
 #[derive(Default)]
 struct Usage {
     entries: VecDeque<(Instant, u64)>,
     total: u64,
+}
+
+struct FixedUsage {
+    /// The window `total` belongs to, in spans since the anchor; when the
+    /// clock crosses into another window the count resets wholesale.
+    index: i64,
+    total: u64,
+    /// Monotonic/wall clock bases captured together at construction. The
+    /// engine runs on tokio's monotonic clock — pausable in tests — while
+    /// fixed windows align to wall-clock anchors; pairing the two clocks
+    /// once keeps both frames consistent without re-reading a wall clock
+    /// that could jump.
+    mono_base: Instant,
+    wall_base: SystemTime,
+}
+
+impl FixedUsage {
+    fn new() -> Self {
+        Self {
+            index: i64::MIN,
+            total: 0,
+            mono_base: Instant::now(),
+            wall_base: SystemTime::now(),
+        }
+    }
+
+    fn wall_at(&self, mono: Instant) -> SystemTime {
+        self.wall_base
+            + mono
+                .checked_duration_since(self.mono_base)
+                .unwrap_or_default()
+    }
+}
+
+/// Signed nanoseconds from `earlier` to `later`.
+fn nanos_between(earlier: SystemTime, later: SystemTime) -> i128 {
+    match later.duration_since(earlier) {
+        Ok(d) => d.as_nanos() as i128,
+        Err(err) => -(err.duration().as_nanos() as i128),
+    }
+}
+
+enum WindowGuard<'a> {
+    Sliding(MutexGuard<'a, Usage>),
+    Fixed(MutexGuard<'a, FixedUsage>),
+}
+
+impl WindowGuard<'_> {
+    fn total(&self) -> u64 {
+        match self {
+            Self::Sliding(used) => used.total,
+            Self::Fixed(used) => used.total,
+        }
+    }
+
+    fn charge(&mut self, now: Instant, cost: u64) {
+        match self {
+            Self::Sliding(used) => {
+                used.entries.push_back((now, cost));
+                used.total += cost;
+            }
+            Self::Fixed(used) => used.total += cost,
+        }
+    }
 }
 
 impl Window {
@@ -318,7 +392,7 @@ impl Window {
     }
 
     fn windows(spec: QuotaSpec, hard: bool) -> Vec<Arc<Self>> {
-        [
+        let sliding = [
             (spec.rpm, MINUTE, Unit::Requests),
             (spec.rpd, DAY, Unit::Requests),
             (spec.tpm, MINUTE, Unit::Tokens),
@@ -332,42 +406,95 @@ impl Window {
                     span,
                     unit,
                     hard,
-                    used: Mutex::default(),
+                    kind: WindowKind::Sliding(Mutex::default()),
                 })
             })
+        });
+        let fixed = spec.fixed.iter().map(|window| {
+            Arc::new(Self {
+                max: u64::from(window.max),
+                span: Duration::from_secs(u64::from(window.span_secs)),
+                unit: match window.unit {
+                    FixedUnit::Requests => Unit::Requests,
+                    FixedUnit::Tokens => Unit::Tokens,
+                },
+                hard,
+                kind: WindowKind::Fixed {
+                    anchor: window.anchor,
+                    used: Mutex::new(FixedUsage::new()),
+                },
+            })
+        });
+        sliding.chain(fixed).collect()
+    }
+
+    /// The fixed window index covering `wall`: spans since the anchor,
+    /// floored so times before the anchor count negative windows.
+    fn fixed_index(anchor: SystemTime, span: Duration, wall: SystemTime) -> i64 {
+        let span_nanos = i128::try_from(span.as_nanos()).unwrap_or(i128::MAX);
+        let offset = nanos_between(anchor, wall);
+        i64::try_from(offset.div_euclid(span_nanos)).unwrap_or(if offset < 0 {
+            i64::MIN
+        } else {
+            i64::MAX
         })
-        .collect()
     }
 
-    fn lock(&self, now: Instant) -> std::sync::MutexGuard<'_, Usage> {
-        let mut used = self.used.lock().unwrap_or_else(|err| err.into_inner());
-        while let Some(&(at, cost)) = used.entries.front() {
-            if now.duration_since(at) < self.span {
-                break;
+    fn lock(&self, now: Instant) -> WindowGuard<'_> {
+        match &self.kind {
+            WindowKind::Sliding(mutex) => {
+                let mut used = mutex.lock().unwrap_or_else(|err| err.into_inner());
+                while let Some(&(at, cost)) = used.entries.front() {
+                    if now.duration_since(at) < self.span {
+                        break;
+                    }
+                    used.entries.pop_front();
+                    used.total -= cost;
+                }
+                WindowGuard::Sliding(used)
             }
-            used.entries.pop_front();
-            used.total -= cost;
+            WindowKind::Fixed { anchor, used } => {
+                let mut used = used.lock().unwrap_or_else(|err| err.into_inner());
+                let index = Self::fixed_index(*anchor, self.span, used.wall_at(now));
+                if index != used.index {
+                    used.index = index;
+                    used.total = 0;
+                }
+                WindowGuard::Fixed(used)
+            }
         }
-        used
     }
-}
 
-impl Usage {
-    /// When enough entries expire for the total to fall to `target`.
-    fn free_at(&self, target: u64, span: Duration) -> Instant {
-        let mut total = self.total;
-        for &(at, cost) in &self.entries {
-            total -= cost;
-            if total <= target {
-                return at + span;
+    /// When enough usage expires for the window to admit `target` more units.
+    /// For a fixed window that is always the next boundary: nothing ages out
+    /// earlier, and everything does then.
+    fn free_at(&self, guard: &WindowGuard<'_>, target: u64, now: Instant) -> Instant {
+        match (&self.kind, guard) {
+            (WindowKind::Sliding(_), WindowGuard::Sliding(used)) => {
+                let mut total = used.total;
+                for &(at, cost) in &used.entries {
+                    total -= cost;
+                    if total <= target {
+                        return at + self.span;
+                    }
+                }
+                // No entries to wait on: reached only when the request can never
+                // fit the window (cost > max on a hard window), so the reset is a
+                // full span out rather than "now".
+                used.entries
+                    .back()
+                    .map_or_else(|| Instant::now() + self.span, |&(at, _)| at + self.span)
             }
+            (WindowKind::Fixed { anchor, .. }, WindowGuard::Fixed(used)) => {
+                let span_nanos = i128::try_from(self.span.as_nanos()).unwrap_or(i128::MAX);
+                let wall_now = used.wall_at(now);
+                let elapsed = nanos_between(*anchor, wall_now);
+                let next_boundary = (i128::from(used.index) + 1) * span_nanos;
+                let wait = u64::try_from((next_boundary - elapsed).max(0)).unwrap_or(u64::MAX);
+                now + Duration::from_nanos(wait)
+            }
+            _ => unreachable!("guard and window kinds match by construction"),
         }
-        // No entries to wait on: reached only when the request can never fit
-        // the window (cost > max on a hard window), so the reset is a full
-        // span out rather than "now".
-        self.entries
-            .back()
-            .map_or_else(|| Instant::now() + span, |&(at, _)| at + span)
     }
 }
 
@@ -576,7 +703,7 @@ mod tests {
                 ..QuotaSpec::default()
             },
         ] {
-            let limits = Arc::new(DeploymentLimits::new(spec));
+            let limits = Arc::new(DeploymentLimits::new(spec.clone()));
             let now = Instant::now();
             assert!(limits.admit(10).is_some());
             assert!(limits.admit(1).is_none(), "{spec:?} is a daily quota");
@@ -615,7 +742,10 @@ mod tests {
         for _ in 0..3 {
             assert!(limits.admit(0).is_some());
         }
-        assert!(limits.windows[0].lock(Instant::now()).entries.is_empty());
+        assert!(
+            matches!(limits.windows[0].lock(Instant::now()), WindowGuard::Sliding(ref used) if used.entries.is_empty()),
+            "zero-token requests leave no sliding entries"
+        );
     }
 
     #[test]
@@ -722,5 +852,82 @@ mod tests {
             "a header cooldown must not hide the limit"
         );
         assert_eq!(limits.available_at(now, 0), now + CONCURRENCY_RETRY);
+    }
+
+    fn fixed_requests(span_secs: u32, max: u32) -> QuotaSpec {
+        QuotaSpec {
+            fixed: vec![llmux_types::FixedWindowSpec {
+                unit: llmux_types::FixedUnit::Requests,
+                max,
+                span_secs,
+                anchor: SystemTime::now(),
+            }],
+            ..QuotaSpec::default()
+        }
+    }
+
+    /// A fixed anchored window spends its whole budget, then parks every
+    /// request until the boundary — and at the boundary the WHOLE budget
+    /// returns at once. That wholesale refresh is the difference from a
+    /// sliding window, which would ration the budget back one entry at a
+    /// time and could never front-load a fresh window.
+    #[tokio::test(start_paused = true)]
+    async fn a_fixed_window_refreshes_the_whole_budget_at_the_boundary() {
+        let limits = Arc::new(DeploymentLimits::new(fixed_requests(3_600, 2)));
+        assert!(limits.admit(0).is_some());
+        assert!(limits.admit(0).is_some());
+        assert!(limits.admit(0).is_none(), "the window budget is spent");
+        let now = Instant::now();
+        let ready = limits.available_at(now, 0);
+        assert!(
+            ready > now + Duration::from_secs(3_500) && ready <= now + Duration::from_secs(3_601),
+            "the retry is the window boundary, not a gradual expiry: {ready:?} vs {now:?}"
+        );
+        tokio::time::advance(Duration::from_secs(3_601)).await;
+        assert!(
+            limits.admit(0).is_some(),
+            "crossing the boundary restores the budget"
+        );
+        assert!(
+            limits.admit(0).is_some(),
+            "the whole budget returns at once — none of it waits for the first charge to age out"
+        );
+        assert!(limits.admit(0).is_none());
+    }
+
+    /// Token-unit fixed windows charge estimated tokens, and a credential's
+    /// fixed window is a hard ceiling even on an empty window — an oversized
+    /// request can never slip through a free allowance by being first.
+    #[tokio::test(start_paused = true)]
+    async fn a_fixed_credential_window_counts_tokens_as_a_hard_ceiling() {
+        let spec = QuotaSpec {
+            fixed: vec![llmux_types::FixedWindowSpec {
+                unit: llmux_types::FixedUnit::Tokens,
+                max: 100,
+                span_secs: 3_600,
+                anchor: SystemTime::now(),
+            }],
+            ..QuotaSpec::default()
+        };
+        let shared = Window::for_credential(spec.clone());
+        let keyed = Arc::new(DeploymentLimits::with_shared(QuotaSpec::default(), &shared));
+        assert!(
+            keyed.admit(150).is_none(),
+            "an oversized request is rejected even when the window is empty"
+        );
+        assert!(keyed.admit(60).is_some());
+        assert!(keyed.admit(60).is_none(), "60 + 60 exceeds the window");
+        assert!(keyed.admit(40).is_some());
+        tokio::time::advance(Duration::from_secs(3_601)).await;
+        assert!(
+            keyed.admit(100).is_some(),
+            "the full token budget returns at the boundary"
+        );
+
+        let own = Arc::new(DeploymentLimits::new(spec));
+        assert!(
+            own.admit(150).is_some(),
+            "a deployment-level fixed window still admits an oversized request when idle"
+        );
     }
 }
