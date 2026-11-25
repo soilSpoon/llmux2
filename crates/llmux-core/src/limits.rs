@@ -247,7 +247,7 @@ impl DeploymentLimits {
         let mut windows: Vec<_> = self
             .windows
             .iter()
-            .map(|window| (window, window.lock(now)))
+            .map(|window| (window, window.lock_for_admission(now)))
             .collect();
         for (window, used) in &windows {
             let cost = window.unit.cost(tokens);
@@ -440,7 +440,22 @@ impl Window {
         })
     }
 
+    /// Read-path lock. Availability and remaining-budget queries are evaluated
+    /// at the caller's scan instant; fixed-window indices still only move
+    /// forward so a stale scan cannot erase current-window charges.
     fn lock(&self, now: Instant) -> WindowGuard<'_> {
+        self.lock_with_clock_source(now, false)
+    }
+
+    /// Admission-path lock. A caller can capture `now` before a reset boundary
+    /// but reach the mutex only inside the next window, so fixed-window
+    /// placement is decided after acquisition. Late admissions then charge the
+    /// window current at acquisition instead of rolling state backward.
+    fn lock_for_admission(&self, now: Instant) -> WindowGuard<'_> {
+        self.lock_with_clock_source(now, true)
+    }
+
+    fn lock_with_clock_source(&self, now: Instant, admission: bool) -> WindowGuard<'_> {
         match &self.kind {
             WindowKind::Sliding(mutex) => {
                 let mut used = mutex.lock().unwrap_or_else(|err| err.into_inner());
@@ -455,14 +470,8 @@ impl Window {
             }
             WindowKind::Fixed { anchor, used } => {
                 let mut used = used.lock().unwrap_or_else(|err| err.into_inner());
-                // Fixed-window placement is decided after acquiring the mutex:
-                // a caller can capture `now` before a reset boundary but reach
-                // the lock only inside the next window. Using that stale time
-                // would roll the index backward and erase charges already made
-                // in the current window. Indices therefore only move forward,
-                // and late admissions charge the window current at acquisition.
-                let acquired = Instant::now();
-                let index = Self::fixed_index(*anchor, self.span, used.wall_at(acquired));
+                let placement = if admission { Instant::now() } else { now };
+                let index = Self::fixed_index(*anchor, self.span, used.wall_at(placement));
                 if index > used.index {
                     used.index = index;
                     used.total = 0;
@@ -496,12 +505,11 @@ impl Window {
             }
             (WindowKind::Fixed { anchor, .. }, WindowGuard::Fixed(used)) => {
                 let span_nanos = i128::try_from(self.span.as_nanos()).unwrap_or(i128::MAX);
-                let acquired = Instant::now();
-                let wall_now = used.wall_at(acquired);
+                let wall_now = used.wall_at(now);
                 let elapsed = nanos_between(*anchor, wall_now);
                 let next_boundary = (i128::from(used.index) + 1) * span_nanos;
                 let wait = u64::try_from((next_boundary - elapsed).max(0)).unwrap_or(u64::MAX);
-                acquired + Duration::from_nanos(wait)
+                now + Duration::from_nanos(wait)
             }
             _ => unreachable!("guard and window kinds match by construction"),
         }
@@ -909,6 +917,26 @@ mod tests {
         assert!(limits.admit(0).is_none());
     }
 
+    /// Availability is an estimate at the caller's scan instant, not a hidden
+    /// read of whatever time it is when the mutex happens to be acquired. This
+    /// scan was captured while the window was still exhausted; even after the
+    /// real clock crosses the boundary, evaluating that scan must report the
+    /// boundary the caller saw.
+    #[tokio::test(start_paused = true)]
+    async fn fixed_window_availability_is_evaluated_at_the_scan_instant() {
+        let anchor = SystemTime::now() - Duration::from_secs(3_500);
+        let limits = Arc::new(DeploymentLimits::new(fixed_requests_at(3_600, 1, anchor)));
+        assert!(limits.admit(0).is_some());
+        let scan = Instant::now();
+        tokio::time::advance(Duration::from_secs(101)).await;
+
+        let ready = limits.available_at(scan, 0);
+        assert!(
+            ready > scan + Duration::from_secs(90) && ready <= scan + Duration::from_secs(101),
+            "the scan-time estimate is the anchored boundary, not the later lock-acquisition time: {ready:?} vs {scan:?}"
+        );
+    }
+
     /// A caller that captured `now` before a reset boundary can acquire the
     /// window lock only after another caller charged the new window. The stale
     /// timestamp must neither move the index backward nor erase that charge;
@@ -923,7 +951,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(101)).await;
         let current = Instant::now();
         let current_index = {
-            let mut guard = window.lock(current);
+            let mut guard = window.lock_for_admission(current);
             guard.charge(current, 1);
             assert_eq!(guard.total(), 1);
             match &guard {
@@ -944,7 +972,7 @@ mod tests {
                 WindowGuard::Sliding(_) => panic!("fixed window expected"),
             }
         }
-        let mut delayed = window.lock(stale);
+        let mut delayed = window.lock_for_admission(stale);
         delayed.charge(stale, 1);
         assert_eq!(
             delayed.total(),
