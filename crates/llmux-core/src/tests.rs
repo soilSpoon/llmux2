@@ -234,7 +234,7 @@ async fn fixture_full(
             strip_request_fields: Box::default(),
             priority: i as i32,
             quota: if i < 2 {
-                shared_quota
+                shared_quota.clone()
             } else {
                 Default::default()
             },
@@ -972,7 +972,7 @@ async fn fixture_shared_group(
                 upstream_model: upstreams[i as usize].into(),
                 strip_request_fields: Box::default(),
                 priority: i as i32,
-                quota: quotas[i as usize],
+                quota: quotas[i as usize].clone(),
                 shared_quota: fams[i as usize].map(Into::into),
                 timeout: Duration::from_secs(1),
                 max_context: None,
@@ -1015,7 +1015,7 @@ async fn fixture_shared_group(
         api_keys: HashMap::new(),
         shared_quotas: groups
             .iter()
-            .map(|(name, spec)| (Arc::from(*name), *spec))
+            .map(|(name, spec)| (Arc::from(*name), spec.clone()))
             .collect(),
         credential_quotas: HashMap::new(),
         credential_meta: HashMap::new(),
@@ -1080,7 +1080,7 @@ async fn shared_quota_binds_legs_on_one_scope_to_one_window() {
         [Some("fam"), Some("fam"), None],
         ["first", "first", "second"],
         ["upstream", "upstream-1", "upstream"],
-        [Default::default(); 3],
+        std::array::from_fn(|_| Default::default()),
         None,
     )
     .await;
@@ -1128,7 +1128,7 @@ async fn shared_quota_scopes_anonymous_legs_by_provider_and_base_url() {
         [Some("fam"), Some("fam"), Some("fam")],
         ["", "", ""],
         ["upstream", "upstream-1", "upstream"],
-        [Default::default(); 3],
+        std::array::from_fn(|_| Default::default()),
         Some(&other_url),
     )
     .await;
@@ -1330,7 +1330,7 @@ async fn shared_quota_family_cap_rejects_oversized_request_on_empty_window() {
         [Some("fam"), None, Some("fam")],
         ["first", "first", "second"],
         ["upstream", "upstream-1", "upstream"],
-        [Default::default(); 3],
+        std::array::from_fn(|_| Default::default()),
         None,
     )
     .await;
@@ -1364,7 +1364,7 @@ async fn unbound_legs_on_the_same_credential_keep_independent_windows() {
         [Some("fam"), None, None],
         ["first", "first", "second"],
         ["upstream", "upstream-1", "upstream"],
-        [Default::default(); 3],
+        std::array::from_fn(|_| Default::default()),
         None,
     )
     .await;
@@ -1403,7 +1403,7 @@ async fn bound_then_unbound_siblings_on_one_route_do_not_share_family_windows() 
         [Some("fam"), None, None],
         ["first", "first", "second"],
         ["upstream", "upstream", "upstream"],
-        [Default::default(); 3],
+        std::array::from_fn(|_| Default::default()),
         None,
     )
     .await;
@@ -1443,7 +1443,7 @@ async fn unbound_then_bound_siblings_on_one_route_keep_the_family_cap() {
         [None, Some("fam"), Some("fam")],
         ["first", "first", "first"],
         ["upstream", "upstream", "upstream-2"],
-        [Default::default(); 3],
+        std::array::from_fn(|_| Default::default()),
         None,
     )
     .await;
@@ -1479,11 +1479,11 @@ async fn legs_bound_to_different_families_on_one_route_do_not_conflate() {
     };
     let (executor, adapter, _, _server) = fixture_shared_group(
         &[("a", &[0, 1, 2])],
-        &[("fam-a", spec), ("fam-b", spec)],
+        &[("fam-a", spec.clone()), ("fam-b", spec)],
         [Some("fam-a"), Some("fam-b"), None],
         ["first", "first", "second"],
         ["upstream", "upstream", "upstream"],
-        [Default::default(); 3],
+        std::array::from_fn(|_| Default::default()),
         None,
     )
     .await;
@@ -1523,7 +1523,7 @@ async fn credentialed_leg_does_not_claim_the_anonymous_scope_window() {
         [Some("fam"), Some("fam"), Some("fam")],
         ["first", "", ""],
         ["upstream", "upstream", "upstream"],
-        [Default::default(); 3],
+        std::array::from_fn(|_| Default::default()),
         None,
     )
     .await;
@@ -1562,7 +1562,7 @@ async fn anonymous_leg_does_not_claim_the_credential_scope_window() {
         [Some("fam"), Some("fam"), Some("fam")],
         ["", "first", "first"],
         ["upstream", "upstream", "upstream"],
-        [Default::default(); 3],
+        std::array::from_fn(|_| Default::default()),
         None,
     )
     .await;

@@ -241,7 +241,7 @@ impl Executor {
         {
             Some((_, windows)) => windows.clone(),
             None => {
-                let windows = Window::for_quota(dep.quota);
+                let windows = Window::for_quota(dep.quota.clone());
                 local_windows.push((dep, windows.clone()));
                 windows
             }
@@ -273,7 +273,7 @@ impl Executor {
                     // hard credential variant — soft windows would admit one
                     // oversized request to an idle scope and blow the cap.
                     let windows = match group_specs.get(group) {
-                        Some(spec) => Window::for_credential(*spec),
+                        Some(spec) => Window::for_credential(spec.clone()),
                         None => {
                             debug_assert!(
                                 false,
@@ -285,6 +285,7 @@ impl Executor {
                                 tpm: Some(0),
                                 tpd: Some(0),
                                 concurrent: None,
+                                fixed: vec![],
                             })
                         }
                     };
@@ -332,7 +333,7 @@ impl Executor {
         let key_windows: HashMap<Arc<str>, Vec<Arc<Window>>> = cfg
             .credential_quotas
             .iter()
-            .map(|(id, quota)| (id.clone(), Window::for_credential(*quota)))
+            .map(|(id, quota)| (id.clone(), Window::for_credential(quota.clone())))
             .collect();
         let mut bindings = cfg
             .deployments

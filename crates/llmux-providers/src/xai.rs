@@ -106,7 +106,7 @@ impl ProviderAdapter for Xai {
             strip_request_fields: dep.strip_request_fields.clone(),
             shared_quota: None,
             priority: dep.priority,
-            quota: dep.quota,
+            quota: dep.quota.clone(),
             timeout: dep.timeout,
             max_context: dep.max_context,
             expires_at: dep.expires_at,
