@@ -42,7 +42,6 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, convert::Infallible, error::Error, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 
-const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const DEPLOYMENT_HEADER: HeaderName = HeaderName::from_static("x-llmux-deployment");
 const ATTEMPTS_HEADER: HeaderName = HeaderName::from_static("x-llmux-attempts");
 const CONTEXT_OVERFLOW_HEADER: HeaderName = HeaderName::from_static("x-llmux-context-overflow");
@@ -331,12 +330,13 @@ async fn responses(State(state): State<Arc<AppState>>, request: Request) -> Resp
 }
 
 async fn messages(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    let max_request_bytes = state.active.load().config.server.max_request_bytes;
     let response = execute(state, request, InboundFormat::AnthropicMessages).await;
     if response.status().is_success() {
         return response;
     }
     let (mut parts, body) = response.into_parts();
-    let mut payload: Value = body::to_bytes(body, MAX_REQUEST_BYTES)
+    let mut payload: Value = body::to_bytes(body, max_request_bytes)
         .await
         .ok()
         .and_then(|body| serde_json::from_slice(&body).ok())
@@ -412,7 +412,7 @@ async fn execute_authorized(
         },
     };
     let (parts, body) = request.into_parts();
-    let body = match body::to_bytes(body, MAX_REQUEST_BYTES).await {
+    let body = match body::to_bytes(body, active.config.server.max_request_bytes).await {
         Ok(body) => body,
         Err(err)
             if err

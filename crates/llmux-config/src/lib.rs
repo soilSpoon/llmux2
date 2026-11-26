@@ -19,6 +19,7 @@ use thiserror::Error;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 86_400_000;
+const DEFAULT_MAX_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -38,6 +39,8 @@ pub struct ServerConfig {
     /// Glob patterns matching requested model names no key may use.
     pub deny: Box<[String]>,
     pub request_timeout: Duration,
+    /// Maximum accepted inbound request body size in bytes.
+    pub max_request_bytes: usize,
     pub shutdown_timeout: Duration,
     pub drain_grace: Duration,
     pub expose_routing_headers: bool,
@@ -192,6 +195,7 @@ struct RawServer {
     listen: SocketAddr,
     client_keys: Vec<String>,
     request_timeout_ms: u64,
+    max_request_bytes: u64,
     shutdown_timeout_ms: u64,
     drain_grace_ms: u64,
     expose_routing_headers: bool,
@@ -212,6 +216,7 @@ impl Default for RawServer {
             listen: SocketAddr::from(([127, 0, 0, 1], 8080)),
             client_keys: Vec::new(),
             request_timeout_ms: DEFAULT_TIMEOUT_MS,
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             shutdown_timeout_ms: 60_000,
             drain_grace_ms: 2_000,
             expose_routing_headers: true,
@@ -422,6 +427,11 @@ impl RawConfig {
             models,
         } = self;
         let request_timeout = timeout(server.request_timeout_ms)?;
+        if server.max_request_bytes == 0 {
+            return Err(invalid("max_request_bytes must be positive"));
+        }
+        let max_request_bytes = usize::try_from(server.max_request_bytes)
+            .map_err(|_| invalid("max_request_bytes exceeds this platform"))?;
         if server.drain_grace_ms > 10_000 {
             return Err(invalid("server.drain_grace_ms must be between 0 and 10000"));
         }
@@ -991,6 +1001,7 @@ impl RawConfig {
                 key_policies,
                 deny: deny.into_boxed_slice(),
                 request_timeout,
+                max_request_bytes,
                 shutdown_timeout: timeout(server.shutdown_timeout_ms)?,
                 drain_grace: Duration::from_millis(server.drain_grace_ms),
                 expose_routing_headers: server.expose_routing_headers,
@@ -2016,6 +2027,31 @@ strip_request_fields = {fields}
         assert!(RuntimeConfig::parse(&base("anthropic", r#"["temperature", "seed"]"#)).is_err());
         assert!(RuntimeConfig::parse(&base("xai", r#"["temperature"]"#)).is_err());
         assert!(RuntimeConfig::parse(&base("openai", r#"["seed", "temperature"]"#)).is_ok());
+    }
+
+    #[test]
+    fn max_request_bytes_config_is_optional_and_must_be_positive() {
+        let base = config(REQUIRED);
+        let with = |extra: &str| {
+            base.replace(
+                "client_keys = [\"env:LLMUX_CONFIG_OAUTH_TEST_SECRET\"]\n",
+                &format!("client_keys = [\"env:LLMUX_CONFIG_OAUTH_TEST_SECRET\"]\n{extra}\n"),
+            )
+        };
+
+        let default = RuntimeConfig::parse(&base).unwrap();
+        assert_eq!(default.server.max_request_bytes, 32 * 1024 * 1024);
+        let custom = RuntimeConfig::parse(&with("max_request_bytes = 192")).unwrap();
+        assert_eq!(custom.server.max_request_bytes, 192);
+        let err = RuntimeConfig::parse(&with("max_request_bytes = 0"))
+            .err()
+            .expect("zero max_request_bytes config");
+        assert!(
+            err.to_string()
+                .contains("max_request_bytes must be positive"),
+            "{err}"
+        );
+        assert!(RuntimeConfig::parse(&with("max_request_bytes = -1")).is_err());
     }
 
     #[test]

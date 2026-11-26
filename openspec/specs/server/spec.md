@@ -3,9 +3,43 @@
 ## Purpose
 
 Inbound request policy that runs before any upstream call: end-user identity,
-per-key model restrictions, and image intake.
+per-key model restrictions, request size, and image intake.
 
 ## Requirements
+
+### Requirement: Inbound request body limit
+
+`[server]` SHALL accept optional integer `max_request_bytes` in bytes,
+defaulting to 33554432 (32 MiB). The value SHALL be positive; zero or a
+negative value SHALL make config load fail. Every
+inbound chat completions, Messages, or Responses request body larger than the
+configured limit SHALL be rejected 413 with OpenAI-style code
+`invalid_request_error` and message `Request body too large` before any
+upstream call. A body exactly at the limit SHALL be accepted for normal
+validation and routing. The same byte budget SHALL bound the gateway's
+internal error-payload read when translating failures into Anthropic Messages
+form.
+
+#### Scenario: Configured limit enforced before upstream
+
+WHEN `max_request_bytes = 192` and a chat request body is 193 bytes
+THEN the gateway returns 413 `invalid_request_error` and no upstream call is
+made.
+
+#### Scenario: Boundary inclusive
+
+WHEN a request body is exactly the configured limit
+THEN the gateway accepts it for normal validation and routing.
+
+#### Scenario: Multi-MiB default
+
+WHEN the setting is absent and a valid chat request body is 3 MiB
+THEN the gateway routes it.
+
+#### Scenario: Nonpositive value rejected
+
+WHEN `max_request_bytes` is zero or negative
+THEN config load fails.
 
 ### Requirement: Per-key model policy
 
