@@ -22,9 +22,6 @@ const PREFIX: &str = ".llmux-body-";
 const TEMP_SUFFIX: &str = ".tmp";
 const FINAL_SUFFIX: &str = "spool";
 
-#[cfg(test)]
-static PAUSE_BEFORE_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum SpoolError {
     #[error("request body spool storage capacity exhausted")]
@@ -132,12 +129,29 @@ pub struct SpoolStore {
 
 impl SpoolStore {
     /// Opens or creates the spool directory and sweeps orphans left by a
-    /// crash. Only unlocked files with llmux's spool prefix are removed, so a
-    /// live overlapping zero-downtime process keeps its files on Unix.
+    /// crash. On Linux and macOS, only unlocked files with llmux's spool prefix
+    /// are removed, so a live overlapping zero-downtime process keeps its files.
+    /// Other platforms do not provide that overlap-safety guarantee.
     pub fn open(dir: impl Into<PathBuf>, budget_bytes: u64) -> io::Result<Self> {
-        let dir = dir.into();
+        Self::open_inner(dir.into(), budget_bytes, None::<fn()>)
+    }
+
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    fn open_with_sweep_hook(
+        dir: impl Into<PathBuf>,
+        budget_bytes: u64,
+        before_sweep_lock: impl FnOnce(),
+    ) -> io::Result<Self> {
+        Self::open_inner(dir.into(), budget_bytes, Some(before_sweep_lock))
+    }
+
+    fn open_inner(
+        dir: PathBuf,
+        budget_bytes: u64,
+        before_sweep_lock: Option<impl FnOnce()>,
+    ) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
-        sweep(&dir)?;
+        sweep_with_hook(&dir, before_sweep_lock)?;
         Ok(Self {
             dir,
             budget: Arc::new(SpoolBudget::new(budget_bytes)),
@@ -157,6 +171,13 @@ impl SpoolStore {
     }
 
     pub fn begin(&self) -> Result<SpoolFile, SpoolError> {
+        self.begin_with_create_hook(None::<fn(&Path)>)
+    }
+
+    fn begin_with_create_hook(
+        &self,
+        before_lock: Option<impl FnOnce(&Path)>,
+    ) -> Result<SpoolFile, SpoolError> {
         let sweep_lock = open_sweep_lock(&self.dir).map_err(|_| SpoolError::Io)?;
         lock_shared(&sweep_lock).map_err(|_| SpoolError::Io)?;
         let file = tempfile::Builder::new()
@@ -164,9 +185,8 @@ impl SpoolStore {
             .suffix(TEMP_SUFFIX)
             .tempfile_in(&self.dir)
             .map_err(|_| SpoolError::Io)?;
-        #[cfg(test)]
-        if PAUSE_BEFORE_LOCK.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(200));
+        if let Some(before_lock) = before_lock {
+            before_lock(file.path());
         }
         lock_exclusive(file.as_file()).map_err(|_| SpoolError::Io)?;
         drop(sweep_lock);
@@ -184,8 +204,11 @@ impl SpoolStore {
     }
 }
 
-fn sweep(dir: &Path) -> io::Result<()> {
+fn sweep_with_hook(dir: &Path, before_sweep_lock: Option<impl FnOnce()>) -> io::Result<()> {
     let sweep_lock = open_sweep_lock(dir)?;
+    if let Some(before_sweep_lock) = before_sweep_lock {
+        before_sweep_lock();
+    }
     lock_exclusive_blocking(&sweep_lock)?;
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -239,6 +262,8 @@ fn lock_exclusive_blocking(file: &File) -> io::Result<()> {
     flock(file, libc::LOCK_EX)
 }
 
+// Linux/macOS flock is the supported overlap-safety mechanism. These no-ops
+// keep spool storage usable elsewhere without claiming that protection.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn lock_shared(_: &File) -> io::Result<()> {
     Ok(())
@@ -285,9 +310,16 @@ fn try_lock_exclusive(_: &File) -> io::Result<bool> {
     Ok(true)
 }
 
-/// Removes a spool only when no live process holds its flock. Crash orphans
-/// are unlocked and disappear at the next startup; files owned by an
-/// overlapping zero-downtime process are left alone.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn sweep_lock_is_free(dir: &Path) -> io::Result<bool> {
+    let file = open_sweep_lock(dir)?;
+    try_lock_exclusive(&file)
+}
+
+/// Removes a spool that passes the platform lock check. On Linux and macOS,
+/// crash orphans are unlocked and disappear at the next startup, while files
+/// owned by an overlapping zero-downtime process are left alone. Outside Linux
+/// and macOS the lock check is a no-op, so overlap preservation is not guaranteed.
 fn remove_if_unlocked(path: &Path) {
     let Ok(file) = OpenOptions::new().read(true).open(path) else {
         return;
@@ -509,29 +541,73 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn startup_sweep_cannot_delete_a_live_temp_during_create_before_lock() {
+        use std::sync::mpsc;
+
         let dir = tempfile::tempdir().unwrap();
         let store = SpoolStore::open(dir.path(), 64).unwrap();
-        PAUSE_BEFORE_LOCK.store(true, Ordering::Relaxed);
+        let (created_tx, created_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
         let writer = std::thread::spawn({
             let store = store.clone();
             move || {
-                let mut file = store.begin().unwrap();
+                let mut file = store
+                    .begin_with_create_hook(Some(move |path: &Path| {
+                        created_tx.send(path.to_path_buf()).unwrap();
+                        resume_rx.recv().unwrap();
+                    }))
+                    .unwrap();
                 file.write(b"live").unwrap();
                 file.finish()
             }
         });
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        SpoolStore::open(dir.path(), 64).unwrap();
-        PAUSE_BEFORE_LOCK.store(false, Ordering::Relaxed);
-        let spooled = writer
-            .join()
-            .unwrap()
-            .expect("a live overlapping temp spool must survive startup sweep");
-        assert_eq!(spooled.read_bytes().unwrap(), Bytes::from_static(b"live"));
+        let temp_path = created_rx
+            .recv()
+            .expect("writer must reach the create-before-lock point");
+        assert!(temp_path.exists());
+
+        let (sweep_tx, sweep_rx) = mpsc::channel();
+        let sweeper = std::thread::spawn({
+            let spool_dir = dir.path().to_path_buf();
+            move || {
+                SpoolStore::open_with_sweep_hook(spool_dir, 64, move || {
+                    sweep_tx.send(()).unwrap();
+                })
+                .map(|_| ())
+            }
+        });
+        sweep_rx
+            .recv()
+            .expect("sweeper must reach the sweep-lock point");
+
+        if sweep_lock_is_free(dir.path()).unwrap() {
+            // Without creation serialization this sweep cannot block. It must
+            // finish while the writer is still parked and remove the unlocked
+            // temp, otherwise the test did not exercise the race.
+            sweeper.join().unwrap().unwrap();
+            assert!(
+                !temp_path.exists(),
+                "unserialized sweep did not exercise the create-before-lock race"
+            );
+            resume_tx.send(()).unwrap();
+            writer
+                .join()
+                .unwrap()
+                .expect("a live overlapping temp spool must survive startup sweep");
+        } else {
+            resume_tx.send(()).unwrap();
+            let spooled = writer
+                .join()
+                .unwrap()
+                .expect("a live overlapping temp spool must survive startup sweep");
+            sweeper.join().unwrap().unwrap();
+            assert_eq!(spooled.read_bytes().unwrap(), Bytes::from_static(b"live"));
+        }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn startup_sweep_preserves_locked_overlap_files() {
         let dir = tempfile::tempdir().unwrap();

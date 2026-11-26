@@ -203,9 +203,10 @@ the next candidate and drops that copy when the candidate is done.
 `server.request_body_spool_budget_bytes` (default 536870912, 512 MiB) is the
 total in-flight disk reservation. Reservations are made before writes, so a
 full budget returns a generic 503 before any upstream call and leaves no
-partial spool. Files are removed on success, error, cancellation, and process
-start sweeps llmux orphans without unlinking locked files owned by an
-overlapping zero-downtime process.
+partial spool. Files are removed on success, error, and cancellation. On Linux
+and macOS, startup sweeps llmux orphans without unlinking locked files
+owned by an overlapping zero-downtime process. Other platforms do not provide
+that overlap-safety guarantee.
 
 The disk budget must fit comfortably within free space on the host; on small
 OCI shapes keep it on a disk-backed filesystem, not tmpfs, with the directory

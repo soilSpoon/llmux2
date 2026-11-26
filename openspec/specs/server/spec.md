@@ -83,10 +83,11 @@ not copy request content, and SHALL remove every partial file for that request.
 Disk writes SHALL use bounded disk operations that do not retain an async
 runtime blocking worker while the gateway waits for client network input.
 A successfully admitted spool SHALL be deleted when the request completes,
-fails, or is cancelled, and its budget bytes SHALL be released. Startup SHALL
-sweep llmux-named spool orphans without deleting files locked by a live
-overlapping process, and sweep SHALL serialize with spool creation so no
-visible temp file remains unlocked before creation completes.
+fails, or is cancelled, and its budget bytes SHALL be released. On Linux and
+macOS, startup SHALL sweep llmux-named spool orphans without deleting files
+locked by a live overlapping process, and sweep SHALL serialize with spool
+creation so no visible temp file remains unlocked before creation completes.
+The overlap-preservation guarantee SHALL apply only on Linux and macOS.
 
 When a spooled request fails over, the next upstream candidate SHALL be built
 from a fresh read of the immutable spool rather than requiring the ingress body
@@ -121,10 +122,11 @@ WHEN a spooled request is cancelled or routing ends in an error
 THEN its temporary or final spool file is removed and its disk budget is
 released.
 
-#### Scenario: Startup sweep preserves overlap
+#### Scenario: Startup sweep preserves overlap on Linux/macOS
 
-WHEN the gateway starts in a spool directory containing an unlocked orphan
-from a crashed process and a locked file owned by a live overlapping process
+WHEN the gateway starts on Linux or macOS in a spool directory containing an
+unlocked orphan from a crashed process and a locked file owned by a live
+overlapping process
 THEN it removes the orphan and leaves the live file intact.
 
 ### Requirement: Per-key model policy
