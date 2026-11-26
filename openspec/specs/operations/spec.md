@@ -472,6 +472,115 @@ WHEN `--scan-free` runs without `--scan-key-file`
 THEN candidates are reported with `verdict=unverified` and no upstream
 request is made.
 
+### Requirement: Free-leg lifecycle verification
+
+`llmux-import --verify-free CONFIG` SHALL re-verify every deployment the
+config explicitly marks `billing = "free"` and SHALL print one JSON report.
+Free is the explicit marker only: quota or expiry metadata without that marker
+SHALL NOT admit a leg into verification, matching free-only routing. Each row
+SHALL identify the deployment (`leg_id`, `canonical_model`, provider kind,
+upstream host, upstream model, and credential id when present) and SHALL report
+`classification`, `removal_candidate`, `evidence_source`, `probed`, normalized
+evidence (`cost`, `error_class`, `http_status`, `probed_at`), `expires_at` when
+present, and a machine-operable `reason` for an inconclusive or skipped check.
+Credential or secret values SHALL never appear in the report.
+
+Verification SHALL prefer cheaper evidence in this order: passive buyer-traffic
+observations first, free provider metadata second, and an active chat probe
+last. Passive evidence has zero marginal upstream cost; when it is available
+for a leg, the verifier SHALL NOT spend metadata or chat-probe requests for
+that leg. The standalone config verifier does not yet consume a buyer-traffic
+observation feed, so it SHALL say that passive evidence is unavailable rather
+than treating buyer traffic as absent. Provider metadata such as a model
+catalog or quota endpoint is the next source. A catalog listing SHALL NOT by
+itself classify a leg `still_free`, because listing does not prove servability.
+Catalog absence MAY classify `promo_ended` only for a reviewed metadata adapter
+whose catalog is known to be complete for the free ids. Experiential's catalog
+is not such evidence for free ids because it omits `:free` ids. Providers
+without a reviewed metadata adapter SHALL remain inconclusive rather than
+using absence as removal evidence.
+
+An active one-token chat probe SHALL run only when the operator passes
+`--verify-free-active-probe`; the default SHALL make no chat-completion
+request. That flag is for legs the operator has selected as important and
+sparse in buyer traffic, because request-capped free tiers count even tiny
+probes against the same quota as buyer traffic. The verifier SHALL NOT
+blind-probe even with that flag. A leg probes only when its provider is in
+the reviewed fail-closed probe-policy table — currently Experiential's API
+host, for which billing failures are explicit and successful responses expose
+`usage.cost`, or a loopback test fixture — and the deployment can use the
+OpenAI chat-completions probe shape with either a static API-key credential or
+explicit anonymous access. Every other leg SHALL be `unknown` with
+`probed = false` and a reason; no chat request SHALL be made for it.
+
+A probe that returns `usage.cost == 0` (or less) SHALL classify the leg
+`still_free`. Positive cost, a billing class answer (`insufficient_credits`,
+402, or payment/credit failure), or provider termination (`model_not_allowed`,
+`model_not_granted`, or 404/not-found) SHALL classify it `promo_ended` and set
+`removal_candidate = true`. A 429, cooldown, quota, or rate-limit class answer
+SHALL classify it `quota_drained` and SHALL never set `removal_candidate`, so a
+temporary quota drain parks the leg instead of removing it. Any other result
+SHALL be `unknown` with normalized evidence. When the config row's
+`expires_at` has already passed but the probe is still free, the classification
+SHALL be `promo_extended`, signalling either an extended promotion or stale
+expiry metadata rather than removal.
+
+Lifecycle probes SHALL use the same minimal one-token chat request and safety
+bounds as discovery probes: https or loopback-http base URLs only, a 20-second
+deadline, and a 64 KiB response-body cap. Metadata reads SHALL use the same
+transport policy and deadline, with a 1 MiB catalog cap.
+
+#### Scenario: Default verification does not spend a probe
+
+WHEN a configured free leg has no passive buyer observation input and its
+metadata is missing or inconclusive, and `--verify-free-active-probe` is not
+passed
+THEN its row reports `classification = "unknown"`, `probed = false`, and the
+reason, and the verifier makes no chat-completion request.
+
+#### Scenario: Metadata absence ends a promo without a probe
+
+WHEN a reviewed metadata catalog no longer lists a configured free model
+THEN its row reports `classification = "promo_ended"`,
+`evidence_source = "free_metadata"`, `removal_candidate = true`, and
+`probed = false`.
+
+#### Scenario: Metadata presence is not free evidence
+
+WHEN a reviewed metadata catalog still lists a configured free model but no
+passive or probe evidence is available
+THEN its row reports `classification = "unknown"` rather than `still_free`,
+because a catalog listing does not prove servability.
+
+#### Scenario: Cost-positive free leg becomes a removal candidate
+
+WHEN active probing is explicitly authorized and a configured free leg probes
+successfully with `usage.cost > 0`
+THEN its row reports `classification = "promo_ended"`,
+`removal_candidate = true`, the observed cost, and the probe time.
+
+#### Scenario: Quota exhaustion parks, never removes
+
+WHEN active probing is explicitly authorized and a configured free leg probe
+returns 429 or a quota/cooldown error class
+THEN its row reports `classification = "quota_drained"` and
+`removal_candidate = false`, even when the error text also contains billing
+words.
+
+#### Scenario: Unknown probe policy makes no upstream call
+
+WHEN active probing is explicitly authorized for a configured free leg whose
+provider billing behavior is not in the reviewed fail-closed table
+THEN the row reports `classification = "unknown"`, `probed = false`, and the
+reason, and the verifier makes no upstream request for that leg.
+
+#### Scenario: Expired promo still free signals extension
+
+WHEN active probing is explicitly authorized for a configured free leg with an
+`expires_at` in the past and its probe returns `usage.cost = 0`
+THEN its row reports `classification = "promo_extended"` rather than
+`still_free`, so stale expiry metadata or a real extension can be reviewed.
+
 ### Requirement: Reviewed free-tier conditions
 
 The importer SHALL keep a reviewed table of provider-documented free-tier

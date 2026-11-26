@@ -27,6 +27,8 @@ fn run() -> Result<(), String> {
     let mut scan_page_url = None;
     let mut scan_probe_base = None;
     let mut scan_key_file = None;
+    let mut verify_free = None;
+    let mut verify_free_active_probe = false;
     let mut args = env::args_os().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--openrouter-replacements" {
@@ -34,6 +36,13 @@ fn run() -> Result<(), String> {
                 return Err("duplicate argument".into());
             }
             replacements = true;
+            continue;
+        }
+        if arg == "--verify-free-active-probe" {
+            if verify_free_active_probe {
+                return Err("duplicate argument".into());
+            }
+            verify_free_active_probe = true;
             continue;
         }
         if arg == "--workers-ai-rpm" {
@@ -75,8 +84,9 @@ fn run() -> Result<(), String> {
             Some("--scan-page-url") => &mut scan_page_url,
             Some("--scan-probe-base") => &mut scan_probe_base,
             Some("--scan-key-file") => &mut scan_key_file,
+            Some("--verify-free") => &mut verify_free,
             _ => return Err(
-                "usage: llmux-import --input export.json --output llmux.toml [--secrets-dir DIR] [--cloudflare-account-id-file PATH --cloudflare-token-file PATH] [--workers-ai-models PATH] [--kilo-free-models PATH] [--kilo-key-file PATH] [--devin-models PATH] [--nous-state PATH --nous-models PATH] [--openrouter-replacements] [--workers-ai-rpm RPM] [--omniroute-fallback BASE_URL --omniroute-key SECRET_REF] [--exclude-models PATH] [--listen HOST:PORT] [--overlay PATH] [--free-providers PATH] [--deepai-code-state PATH --deepai-code-token-file PATH] [--canonical-map PATH] | llmux-import --scan-free PROVIDER [--scan-page-url URL] [--scan-probe-base URL] [--scan-key-file PATH]"
+                "usage: llmux-import --input export.json --output llmux.toml [--secrets-dir DIR] [--cloudflare-account-id-file PATH --cloudflare-token-file PATH] [--workers-ai-models PATH] [--kilo-free-models PATH] [--kilo-key-file PATH] [--devin-models PATH] [--nous-state PATH --nous-models PATH] [--openrouter-replacements] [--workers-ai-rpm RPM] [--omniroute-fallback BASE_URL --omniroute-key SECRET_REF] [--exclude-models PATH] [--listen HOST:PORT] [--overlay PATH] [--free-providers PATH] [--deepai-code-state PATH --deepai-code-token-file PATH] [--canonical-map PATH] | llmux-import --scan-free PROVIDER [--scan-page-url URL] [--scan-probe-base URL] [--scan-key-file PATH] | llmux-import --verify-free CONFIG [--verify-free-active-probe]"
                     .into(),
             ),
         };
@@ -87,6 +97,9 @@ fn run() -> Result<(), String> {
     }
     if let Some(provider) = scan_free {
         return scan_free_candidates(&provider, scan_page_url, scan_probe_base, scan_key_file);
+    }
+    if let Some(config) = verify_free {
+        return verify_free_legs(&config, verify_free_active_probe);
     }
     let input = input.ok_or("--input is required")?;
     let output = output.ok_or("--output is required")?;
@@ -186,6 +199,20 @@ fn scan_free_candidates(
             row.id, row.listed, verdict, row.evidence
         );
     }
+    Ok(())
+}
+
+fn verify_free_legs(config: &std::path::Path, active_probe: bool) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let report = runtime.block_on(llmux_import::verify_free::verify_config(
+        config,
+        llmux_import::verify_free::VerifyOptions { active_probe },
+    ))?;
+    let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+    println!("{json}");
     Ok(())
 }
 

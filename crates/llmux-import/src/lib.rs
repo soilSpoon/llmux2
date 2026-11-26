@@ -18,6 +18,7 @@ mod replacements;
 mod secondary;
 mod upstream;
 mod validation;
+pub mod verify_free;
 mod xplabs;
 
 /// Upstream ids in the reviewed XPLabs free map — the "already listed"
