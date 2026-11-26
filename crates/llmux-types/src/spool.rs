@@ -22,6 +22,12 @@ const PREFIX: &str = ".llmux-body-";
 const TEMP_SUFFIX: &str = ".tmp";
 const FINAL_SUFFIX: &str = "spool";
 
+#[derive(Clone, Copy, Debug)]
+enum SweepHookPoint {
+    BeforeLock,
+    BeforeScan,
+}
+
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum SpoolError {
     #[error("request body spool storage capacity exhausted")]
@@ -133,25 +139,25 @@ impl SpoolStore {
     /// are removed, so a live overlapping zero-downtime process keeps its files.
     /// Other platforms do not provide that overlap-safety guarantee.
     pub fn open(dir: impl Into<PathBuf>, budget_bytes: u64) -> io::Result<Self> {
-        Self::open_inner(dir.into(), budget_bytes, None::<fn()>)
+        Self::open_inner(dir.into(), budget_bytes, None::<fn(SweepHookPoint)>)
     }
 
     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     fn open_with_sweep_hook(
         dir: impl Into<PathBuf>,
         budget_bytes: u64,
-        before_sweep_lock: impl FnOnce(),
+        sweep_hook: impl FnMut(SweepHookPoint),
     ) -> io::Result<Self> {
-        Self::open_inner(dir.into(), budget_bytes, Some(before_sweep_lock))
+        Self::open_inner(dir.into(), budget_bytes, Some(sweep_hook))
     }
 
     fn open_inner(
         dir: PathBuf,
         budget_bytes: u64,
-        before_sweep_lock: Option<impl FnOnce()>,
+        sweep_hook: Option<impl FnMut(SweepHookPoint)>,
     ) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
-        sweep_with_hook(&dir, before_sweep_lock)?;
+        sweep_with_hook(&dir, sweep_hook)?;
         Ok(Self {
             dir,
             budget: Arc::new(SpoolBudget::new(budget_bytes)),
@@ -204,12 +210,18 @@ impl SpoolStore {
     }
 }
 
-fn sweep_with_hook(dir: &Path, before_sweep_lock: Option<impl FnOnce()>) -> io::Result<()> {
+fn sweep_with_hook(
+    dir: &Path,
+    mut sweep_hook: Option<impl FnMut(SweepHookPoint)>,
+) -> io::Result<()> {
     let sweep_lock = open_sweep_lock(dir)?;
-    if let Some(before_sweep_lock) = before_sweep_lock {
-        before_sweep_lock();
+    if let Some(hook) = sweep_hook.as_mut() {
+        hook(SweepHookPoint::BeforeLock);
     }
     lock_exclusive_blocking(&sweep_lock)?;
+    if let Some(hook) = sweep_hook.as_mut() {
+        hook(SweepHookPoint::BeforeScan);
+    }
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -546,10 +558,18 @@ mod tests {
     fn startup_sweep_cannot_delete_a_live_temp_during_create_before_lock() {
         use std::sync::mpsc;
 
+        #[derive(Debug)]
+        enum SweepEvent {
+            BeforeLock { lock_free: bool },
+            ScanReached,
+            ScanLockFree { lock_free: bool },
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let store = SpoolStore::open(dir.path(), 64).unwrap();
         let (created_tx, created_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
+        let (begin_done_tx, begin_done_rx) = mpsc::channel();
         let writer = std::thread::spawn({
             let store = store.clone();
             move || {
@@ -559,6 +579,7 @@ mod tests {
                         resume_rx.recv().unwrap();
                     }))
                     .unwrap();
+                begin_done_tx.send(()).unwrap();
                 file.write(b"live").unwrap();
                 file.finish()
             }
@@ -569,42 +590,67 @@ mod tests {
         assert!(temp_path.exists());
 
         let (sweep_tx, sweep_rx) = mpsc::channel();
+        let (scan_permit_tx, scan_permit_rx) = mpsc::channel();
         let sweeper = std::thread::spawn({
             let spool_dir = dir.path().to_path_buf();
             move || {
-                SpoolStore::open_with_sweep_hook(spool_dir, 64, move || {
-                    sweep_tx.send(()).unwrap();
+                let probe_dir = spool_dir.clone();
+                SpoolStore::open_with_sweep_hook(spool_dir, 64, move |point| match point {
+                    SweepHookPoint::BeforeLock => {
+                        let lock_free = sweep_lock_is_free(&probe_dir).unwrap();
+                        sweep_tx.send(SweepEvent::BeforeLock { lock_free }).unwrap();
+                    }
+                    SweepHookPoint::BeforeScan => {
+                        sweep_tx.send(SweepEvent::ScanReached).unwrap();
+                        scan_permit_rx.recv().unwrap();
+                        let lock_free = sweep_lock_is_free(&probe_dir).unwrap();
+                        sweep_tx
+                            .send(SweepEvent::ScanLockFree { lock_free })
+                            .unwrap();
+                    }
                 })
                 .map(|_| ())
             }
         });
-        sweep_rx
-            .recv()
-            .expect("sweeper must reach the sweep-lock point");
 
-        if sweep_lock_is_free(dir.path()).unwrap() {
-            // Without creation serialization this sweep cannot block. It must
-            // finish while the writer is still parked and remove the unlocked
-            // temp, otherwise the test did not exercise the race.
-            sweeper.join().unwrap().unwrap();
-            assert!(
-                !temp_path.exists(),
-                "unserialized sweep did not exercise the create-before-lock race"
-            );
-            resume_tx.send(()).unwrap();
-            writer
-                .join()
-                .unwrap()
-                .expect("a live overlapping temp spool must survive startup sweep");
-        } else {
-            resume_tx.send(()).unwrap();
-            let spooled = writer
-                .join()
-                .unwrap()
-                .expect("a live overlapping temp spool must survive startup sweep");
-            sweeper.join().unwrap().unwrap();
-            assert_eq!(spooled.read_bytes().unwrap(), Bytes::from_static(b"live"));
+        let creation_lock_free = match sweep_rx
+            .recv()
+            .expect("sweeper must reach the sweep-lock point")
+        {
+            SweepEvent::BeforeLock { lock_free } => lock_free,
+            event => panic!("sweep hook events out of order before lock: {event:?}"),
+        };
+        resume_tx.send(()).unwrap();
+        begin_done_rx
+            .recv()
+            .expect("writer must finish create serialization");
+        match sweep_rx.recv().expect("sweeper must reach the scan gate") {
+            SweepEvent::ScanReached => {}
+            event => panic!("sweep hook events out of order before scan: {event:?}"),
         }
+        scan_permit_tx.send(()).unwrap();
+        let scan_lock_free = match sweep_rx
+            .recv()
+            .expect("sweeper must report the scan lock state")
+        {
+            SweepEvent::ScanLockFree { lock_free } => lock_free,
+            event => panic!("sweep hook events out of order at scan: {event:?}"),
+        };
+
+        let spooled = writer
+            .join()
+            .unwrap()
+            .expect("a live overlapping temp spool must survive startup sweep");
+        sweeper.join().unwrap().unwrap();
+        assert_eq!(spooled.read_bytes().unwrap(), Bytes::from_static(b"live"));
+        assert!(
+            !creation_lock_free,
+            "creation serialization regressed: the sweep lock was free while the writer was parked before temp locking"
+        );
+        assert!(
+            !scan_lock_free,
+            "sweep serialization regressed: the scan ran without the exclusive sweep lock"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
