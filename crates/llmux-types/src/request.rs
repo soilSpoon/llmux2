@@ -2,7 +2,31 @@ use crate::{RequestId, UpstreamError};
 use bytes::Bytes;
 use futures_core::Stream;
 use http::{HeaderMap, StatusCode};
+use serde::Deserialize;
 use std::{pin::Pin, sync::Arc};
+
+/// Accounting identity of the authenticated gateway caller. This is never
+/// caller-asserted: the server derives it from the matched client key policy.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrafficClass {
+    CiBuyerShaped,
+    SyntheticProbe,
+    Internal,
+    #[default]
+    Unknown,
+}
+
+impl TrafficClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CiBuyerShaped => "ci_buyer_shaped",
+            Self::SyntheticProbe => "synthetic_probe",
+            Self::Internal => "internal",
+            Self::Unknown => "unknown",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InboundFormat {

@@ -29,10 +29,11 @@ struct Options {
     dead_after: usize,
     dead_file: Option<PathBuf>,
     sweep: bool,
+    probe_scarce: bool,
 }
 
 fn usage() -> &'static str {
-    "usage: llmux2-probe [-h] [--listen HOST:PORT] [--key-file PATH] [--state-file PATH] [--models a,b,c] [--per-run N] [--timeout SECS] [--all-formats] [--dead-after N] [--dead-file PATH] [--sweep]"
+    "usage: llmux2-probe [-h] [--listen HOST:PORT] [--key-file PATH] [--state-file PATH] [--models a,b,c] [--per-run N] [--timeout SECS] [--all-formats] [--dead-after N] [--dead-file PATH] [--sweep] [--probe-scarce]"
 }
 fn display_args(args: &[OsString]) -> String {
     args.iter()
@@ -63,6 +64,7 @@ fn parse(args: &[OsString]) -> std::result::Result<Option<Options>, String> {
         dead_after: 2,
         dead_file: None,
         sweep: false,
+        probe_scarce: false,
     };
     let mut index = 0;
     while index < args.len() {
@@ -139,6 +141,15 @@ fn parse(args: &[OsString]) -> std::result::Result<Option<Options>, String> {
                     ));
                 }
                 options.sweep = true;
+            }
+            "--probe-scarce" => {
+                if inline.is_some() {
+                    return Err(format!(
+                        "unrecognized arguments: {}",
+                        display_args(&args[index..])
+                    ));
+                }
+                options.probe_scarce = true;
             }
             _ => {
                 return Err(format!(
@@ -443,6 +454,10 @@ fn record(name: &str, start: Instant, result: Result<Response>, ok: bool) -> Val
     }
 }
 
+fn scarce_claude(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("claude")
+}
+
 fn probe(
     options: &Options,
     pin: Option<std::net::SocketAddr>,
@@ -628,6 +643,16 @@ fn run(options: &Options) -> Result<bool> {
             }));
             continue;
         }
+        if scarce_claude(model) && !options.probe_scarce {
+            checks.push(json!({
+                "name": name,
+                "ok": true,
+                "skipped": "scarce_claude",
+                "evidence": "catalog_only",
+                "latency_ms": 0,
+            }));
+            continue;
+        }
         let start = Instant::now();
         let result = probe(
             options,
@@ -698,6 +723,10 @@ fn run(options: &Options) -> Result<bool> {
         } else {
             candidates
         };
+        let candidates: Vec<String> = candidates
+            .into_iter()
+            .filter(|model| options.probe_scarce || !scarce_claude(model))
+            .collect();
         for (format, path, body) in [
             (
                 "responses",

@@ -11,8 +11,8 @@ per-key model restrictions, and image intake.
 
 `[server]` SHALL accept optional `[[server.key_policies]]` entries, each naming
 one `server.client_keys` secret reference as `key` plus glob lists `models` and
-`blocked` and an optional `free_only` flag. A client key with no entry SHALL be
-unrestricted. A `free_only = true` entry SHALL force free-leg-only routing for
+`blocked`, an optional `free_only` flag, and an optional `traffic_class`.
+A client key with no entry SHALL be unrestricted and unclassified. A `free_only = true` entry SHALL force free-leg-only routing for
 that key's requests and SHALL filter `GET /v1/models` to models with a usable
 free leg (see the routing spec's adaptive free-leg advertising). For a listed key,
 the requested `model` field — before alias, canonical, or catch-all resolution —
@@ -23,10 +23,17 @@ call, in the same error shape as per-model `allowed_keys`. Globs SHALL match
 ASCII case-sensitively with `*` spanning any substring including `/` and `?`
 matching exactly one character (a Unicode scalar value, not one byte).
 
+`traffic_class` SHALL be one of `ci_buyer_shaped`, `synthetic_probe`,
+`internal`, or `unknown`. When present, the gateway SHALL attach that class to
+request accounting solely because the request authenticated with the matching
+client key. Caller-supplied headers or body fields SHALL NOT create or change
+the class. A key whose policy has no `traffic_class` SHALL be accounted as
+`unknown`.
+
 Config SHALL reject a `key_policies` entry whose `key` does not resolve to a
 `server.client_keys` value, a repeated key, an empty pattern, and an entry with
-no `models`, no `blocked`, and no `free_only` (allow-all minus nothing is
-meaningless). The
+no `models`, no `blocked`, no `free_only`, and no `traffic_class` (allow-all
+minus nothing is meaningless). The
 check SHALL use the same matched-key identity as authentication and
 `allowed_keys`, so it covers chat completions, `/v1/responses`, and Anthropic
 `/v1/messages` keys presented as bearer or `x-api-key` credentials.
@@ -61,6 +68,11 @@ AND `*` is not listed for any key.
 
 WHEN `key_policies[].key` resolves to a secret absent from `client_keys`
 THEN config load fails with a `client_keys` validation error.
+
+#### Scenario: Probe identity cannot be forged
+
+WHEN a request authenticated with a `ci_buyer_shaped` key sends a caller-asserted probe header
+THEN request accounting remains `ci_buyer_shaped`; only an authenticated key whose policy names `synthetic_probe` receives that class.
 
 ### Requirement: Global model deny
 

@@ -923,6 +923,65 @@ fn sweep_never_probes_a_billed_model() {
     stop.send(()).unwrap();
 }
 
+fn scarce_catalog_reply() -> Reply {
+    Reply::json(
+        200,
+        json!({"object":"list","data":[
+            {"id":"alpha","object":"model","billing":"free"},
+            {"id":"claude-haiku-5.5","object":"model","billing":"free"}
+        ]}),
+    )
+}
+
+#[test]
+fn scarce_claude_defaults_to_catalog_only_without_inference() {
+    let home = Home::new();
+    let ok = || Reply::json(200, json!({"choices":[{"message":{"content":"ok"}}]}));
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        scarce_catalog_reply(),
+        ok(),
+        Reply::json(200, json!({"output":[]})),
+        Reply::json(200, json!({"content":[{"type":"text"}]})),
+    ]);
+    let output = listen_flag(&home, &gateway, &["--sweep", "--all-formats"]);
+    assert_eq!(output.status.code(), Some(0));
+    let probed: Vec<String> = gateway
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.path.starts_with("/v1/") && r.path != "/v1/models")
+        .filter_map(|r| r.body["model"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(probed, ["alpha", "alpha", "alpha"]);
+    let report = summary(&output);
+    let scarce = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "chat:claude-haiku-5.5")
+        .unwrap();
+    assert_eq!(scarce["skipped"], "scarce_claude");
+    assert_eq!(scarce["evidence"], "catalog_only");
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn probe_scarce_flag_is_required_before_a_claude_inference_probe() {
+    let home = Home::new();
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        scarce_catalog_reply(),
+        Reply::json(200, json!({"choices":[{"message":{"content":"ok"}}]})),
+        Reply::json(200, json!({"choices":[{"message":{"content":"ok"}}]})),
+    ]);
+    let output = listen_flag(&home, &gateway, &["--sweep", "--probe-scarce"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(gateway.chat_models(), ["alpha", "claude-haiku-5.5"]);
+    stop.send(()).unwrap();
+}
+
 #[test]
 fn sweep_rejects_a_pinned_model_list() {
     let home = Home::new();

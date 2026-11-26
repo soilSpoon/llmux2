@@ -307,3 +307,111 @@ max_context = 30
     assert_eq!(lines[0]["image_count"], 1);
     assert_eq!(lines[0]["outcome"], "routed");
 }
+
+#[tokio::test]
+async fn request_log_marks_authenticated_traffic_class_and_ignores_caller_headers() {
+    let upstream = Arc::new(Upstream {
+        bodies: Mutex::new(Vec::new()),
+        calls: AtomicUsize::new(0),
+    });
+    let server = TestServer::start(
+        Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(upstream),
+    )
+    .await
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("buyer"), "buyer-key\n").unwrap();
+    fs::write(dir.path().join("probe"), "probe-key\n").unwrap();
+    fs::write(dir.path().join("plain"), "plain-key\n").unwrap();
+    fs::write(dir.path().join("openai"), "test-openai\n").unwrap();
+    let base = dir.path().display();
+    let log_path = dir.path().join("requests.jsonl");
+    let config = format!(
+        r#"
+[server]
+client_keys = ["file:{base}/buyer", "file:{base}/probe", "file:{base}/plain"]
+request_log = "{}"
+
+[[server.key_policies]]
+key = "file:{base}/buyer"
+traffic_class = "ci_buyer_shaped"
+
+[[server.key_policies]]
+key = "file:{base}/probe"
+traffic_class = "synthetic_probe"
+
+[[credentials]]
+id = "openai-key"
+kind = "api_key"
+provider = "openai"
+key = "file:{base}/openai"
+
+[[models]]
+name = "shared"
+[[models.deployments]]
+id = "o1"
+credential = "openai-key"
+base_url = "{}/v1"
+upstream_model = "gpt-x"
+"#,
+        log_path.display(),
+        server.url(),
+    );
+    let gateway = TestServer::start(
+        llmux_server::app(RuntimeConfig::parse(&config).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+    for (key, forged) in [
+        ("buyer-key", true),
+        ("probe-key", false),
+        ("plain-key", false),
+    ] {
+        let mut request = Request::post(format!("{}/v1/chat/completions", gateway.url()))
+            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+            .header(header::CONTENT_TYPE, "application/json");
+        if forged {
+            request = request.header("x-llmux-traffic-class", "synthetic_probe");
+        }
+        let response = client
+            .request(
+                request
+                    .body(Full::new(Bytes::from(
+                        json!({"model":"shared","messages":[{"role":"user","content":"hi"}]})
+                            .to_string(),
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    drop(gateway);
+    drop(server);
+
+    let lines: Vec<Value> = {
+        let mut found = Vec::new();
+        for _ in 0..50 {
+            if let Ok(text) = fs::read_to_string(&log_path) {
+                found = text
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                if found.len() == 3 {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        found
+    };
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0]["traffic_class"], "ci_buyer_shaped");
+    assert_eq!(lines[1]["traffic_class"], "synthetic_probe");
+    assert_eq!(lines[2]["traffic_class"], "unknown");
+}

@@ -225,3 +225,8 @@ journalctl --user -u llmux2-probe.service
 Tune cadence with a timer drop-in and breadth with `--per-run`/`--models` in a
 service drop-in. Probes send real provider traffic (one token per model), so
 keep the total request rate well under the lowest provider RPM limit.
+Claude-family models are scarce by policy and are catalog-only by default: the
+probe records `scarce_claude` evidence without inference. Use `--probe-scarce`
+only for a deliberate one-off verification, never in the scheduled unit. For
+separate accounting, authenticate the probe with a dedicated client key whose
+`[[server.key_policies]]` entry sets `traffic_class = "synthetic_probe"`.

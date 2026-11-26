@@ -4,7 +4,7 @@ use http::{HeaderName, Uri};
 use llmux_types::{
     provider, AcpAgentSpec, AcpSessionMode, Billing, CanonicalModel, Capabilities,
     ChatRequestField, ContextOverflow, Deployment, DeploymentIdx, ErrorKind, NousState,
-    ProviderKind, QuotaSpec,
+    ProviderKind, QuotaSpec, TrafficClass,
 };
 use serde::Deserialize;
 use std::{
@@ -73,6 +73,8 @@ pub struct KeyPolicy {
     /// Free-only key: requests never route to billed legs, and `/v1/models`
     /// advertises only models with at least one usable free leg.
     pub free_only: bool,
+    /// Server-assigned accounting class for requests authenticated by this key.
+    pub traffic_class: Option<TrafficClass>,
 }
 
 pub struct RoutingConfig {
@@ -233,6 +235,7 @@ struct RawKeyPolicy {
     models: Option<Vec<String>>,
     blocked: Option<Vec<String>>,
     free_only: Option<bool>,
+    traffic_class: Option<TrafficClass>,
 }
 
 #[derive(Deserialize)]
@@ -1048,9 +1051,9 @@ fn resolve_key_policies(
         let models = entry.models.unwrap_or_default();
         let blocked = entry.blocked.unwrap_or_default();
         let free_only = entry.free_only.unwrap_or(false);
-        if models.is_empty() && blocked.is_empty() && !free_only {
+        if models.is_empty() && blocked.is_empty() && !free_only && entry.traffic_class.is_none() {
             return Err(invalid(
-                "server.key_policies entries need a nonempty models or blocked list",
+                "server.key_policies entries need a nonempty models or blocked list, free_only, or traffic_class",
             ));
         }
         if models
@@ -1065,6 +1068,7 @@ fn resolve_key_policies(
                 models: models.into(),
                 blocked: blocked.into(),
                 free_only,
+                traffic_class: entry.traffic_class,
             })
             .is_some()
         {
@@ -2184,6 +2188,19 @@ upstream_model = "upstream"
         let entry = parsed.server.key_policies[1].as_ref().unwrap();
         assert!(entry.models.is_empty());
         assert_eq!(entry.blocked.join(","), "zc/*");
+
+        // A traffic-class-only entry is meaningful: it attaches server-side
+        // accounting identity without narrowing the key's model access.
+        let parsed =
+            RuntimeConfig::parse(&base(&policy(ci, "traffic_class = \"synthetic_probe\"")))
+                .unwrap();
+        assert_eq!(
+            parsed.server.key_policies[1]
+                .as_ref()
+                .unwrap()
+                .traffic_class,
+            Some(TrafficClass::SyntheticProbe)
+        );
 
         let err = |policies: &str| {
             RuntimeConfig::parse(&base(policies))
