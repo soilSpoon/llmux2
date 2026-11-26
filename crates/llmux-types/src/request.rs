@@ -35,6 +35,14 @@ pub enum InboundFormat {
     AnthropicMessages,
 }
 
+/// Minimum admission estimate for an OpenAI chat request. The gateway's
+/// minimal chat shape — one user message carrying the smoke-test text `hi` —
+/// has 17 counted prompt bytes, hence `ceil(17 / 4) = 5`. Routing floors
+/// smaller estimates at this value because the byte estimator omits message
+/// framing and tokenizer overhead; catalog availability probes use the same
+/// floor instead of an imaginary one-token request.
+pub const MINIMAL_OPENAI_CHAT_COST: u32 = 5;
+
 pub struct GatewayRequest {
     pub format: InboundFormat,
     pub model: Arc<str>,

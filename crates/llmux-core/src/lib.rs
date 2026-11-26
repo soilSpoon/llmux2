@@ -20,8 +20,8 @@ use limits::{DeploymentLimits, Permit, Window};
 use llmux_config::RuntimeConfig;
 use llmux_types::{
     provider, AuthMaterial, Billing, BuildError, ContextOverflow, CredentialSource, Deployment,
-    DeploymentIdx, ErrorKind, GatewayRequest, GatewayResponse, ProviderAdapter, ProviderRegistry,
-    QuotaSpec, SseCommitment, Support, UpstreamError,
+    DeploymentIdx, ErrorKind, GatewayRequest, GatewayResponse, InboundFormat, ProviderAdapter,
+    ProviderRegistry, QuotaSpec, SseCommitment, Support, UpstreamError,
 };
 use machine::{Built, Effect, Event, Outcome, Phase, State};
 pub use request_log::RequestLog;
@@ -183,6 +183,11 @@ pub struct Executor {
     devin_catalog: Arc<LiveModels>,
     http: HttpClient,
     request_log: Option<RequestLog>,
+}
+
+fn fits_context(dep: &Deployment, needed: u64) -> bool {
+    dep.max_context
+        .is_none_or(|limit| needed <= u64::from(limit))
 }
 
 impl Executor {
@@ -469,6 +474,33 @@ impl Executor {
                 .is_some_and(|ids| !ids.contains(dep.upstream_model.as_ref()))
     }
 
+    /// Whether a deployment can admit a request costing `needed` in `format`
+    /// right now, applying the same disabled, parked, expired,
+    /// stale-upstream, context-fit, cooldown, quota, concurrency, and format
+    /// gates routing applies before `Send`. The probe is read-only: it charges
+    /// no quota and takes no concurrency permit.
+    pub fn deployment_available(
+        &self,
+        idx: DeploymentIdx,
+        format: InboundFormat,
+        needed: u64,
+    ) -> bool {
+        let idx = index(idx);
+        let dep = &self.cfg.deployments[idx];
+        let binding = &self.bindings[idx];
+        if binding.disabled.load(Ordering::Relaxed)
+            || binding.limits.not_provisioned()
+            || binding.adapter.supports(format) == Support::No
+            || dep.expires_at.is_some_and(|end| SystemTime::now() >= end)
+            || self.devin_upstream_missing(dep)
+            || !fits_context(dep, needed)
+        {
+            return false;
+        }
+        let now = Instant::now();
+        binding.limits.available_at(now, needed) == now
+    }
+
     /// Whether the credential is disabled in routing; `None` for unknown ids.
     pub fn credential_disabled(&self, id: &str) -> Option<bool> {
         self.credentials
@@ -615,12 +647,7 @@ impl Executor {
         let needed =
             u64::from(req.est_input_tokens) + u64::from(req.max_output_tokens.unwrap_or(0));
         let check_context = needed > u64::from(order.min_context);
-        let fits = |dep: &Deployment| {
-            !check_context
-                || dep
-                    .max_context
-                    .is_none_or(|limit| needed <= u64::from(limit))
-        };
+        let fits = |dep: &Deployment| !check_context || fits_context(dep, needed);
         if check_context {
             let mut limit = None;
             for &idx in &model.deployments {

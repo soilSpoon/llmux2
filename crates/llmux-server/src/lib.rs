@@ -35,6 +35,7 @@ use llmux_providers::{
 use llmux_types::{
     provider, AcpAgentSpec, Billing, ContextOverflow, CredentialSource, GatewayRequest,
     GatewayResponse, InboundFormat, ProviderRegistry, RequestId, TrafficClass, UpstreamError,
+    MINIMAL_OPENAI_CHAT_COST,
 };
 use serde_json::{json, value::RawValue, Value};
 use sha2::{Digest, Sha256};
@@ -264,15 +265,20 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         .key_policies
         .get(client_key.index)
         .and_then(Option::as_ref);
-    // A usable free leg is a non-fallback deployment marked free whose
-    // credential is not disabled — the same legs a free-only request could
-    // actually route to right now.
+    // A usable free leg is a non-fallback deployment marked free that could
+    // admit an OpenAI chat request right now. Quota, cooldown, parking, expiry,
+    // and stale-catalog state count because ci otherwise keeps buying models
+    // whose every free leg can only return all_candidates_exhausted.
     let has_usable_free_leg = |id: &str| match active.config.model_names.get(id) {
         Some(&index) => active.config.models[index].deployments.iter().any(|idx| {
             let dep = &active.config.deployments[idx.0 as usize];
             !dep.fallback
                 && dep.billing == Billing::Free
-                && active.executor.credential_disabled(&dep.credential) != Some(true)
+                && active.executor.deployment_available(
+                    *idx,
+                    InboundFormat::OpenAiChat,
+                    u64::from(MINIMAL_OPENAI_CHAT_COST),
+                )
         }),
         None => false,
     };
@@ -555,20 +561,27 @@ async fn route_request(
     // The record describes the inbound request; a middle-out retry sends a
     // truncated body but must not shrink the logged image count.
     let image_count = policy::count_images(upstream_body.as_ref());
-    let request = |body: Bytes, prompt_bytes: u64| GatewayRequest {
-        format,
-        model: model.clone(),
-        stream: metadata.stream,
-        est_input_tokens: u32::try_from(prompt_bytes.div_ceil(4)).unwrap_or(u32::MAX),
-        max_output_tokens: metadata.max_output_tokens,
-        context_overflow,
-        free_only,
-        image_count,
-        body,
-        anthropic_headers: anthropic_headers.clone(),
-        request_id: request_id.clone(),
-        end_user: end_user.clone(),
-        client_key: Some(client_key.fingerprint.clone()),
+    let request = |body: Bytes, prompt_bytes: u64| {
+        let estimate = u32::try_from(prompt_bytes.div_ceil(4)).unwrap_or(u32::MAX);
+        GatewayRequest {
+            format,
+            model: model.clone(),
+            stream: metadata.stream,
+            est_input_tokens: if format == InboundFormat::OpenAiChat {
+                estimate.max(MINIMAL_OPENAI_CHAT_COST)
+            } else {
+                estimate
+            },
+            max_output_tokens: metadata.max_output_tokens,
+            context_overflow,
+            free_only,
+            image_count,
+            body,
+            anthropic_headers: anthropic_headers.clone(),
+            request_id: request_id.clone(),
+            end_user: end_user.clone(),
+            client_key: Some(client_key.fingerprint.clone()),
+        }
     };
 
     let mut dropped = 0;
