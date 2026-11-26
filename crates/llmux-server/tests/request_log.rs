@@ -414,4 +414,8 @@ upstream_model = "gpt-x"
     assert_eq!(lines[0]["traffic_class"], "ci_buyer_shaped");
     assert_eq!(lines[1]["traffic_class"], "synthetic_probe");
     assert_eq!(lines[2]["traffic_class"], "unknown");
+    let raw = fs::read_to_string(&log_path).unwrap();
+    for plaintext in ["buyer-key", "probe-key", "plain-key"] {
+        assert!(!raw.contains(plaintext));
+    }
 }

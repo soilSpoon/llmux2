@@ -643,6 +643,34 @@ fn empty_catalog_with_pinned_models_still_verifies() {
 }
 
 #[test]
+fn empty_catalog_pinned_scarce_claude_is_not_healthy_evidence() {
+    let home = Home::new();
+    let (gateway, stop) = Gateway::start(vec![
+        Reply::text(200, "ok"),
+        Reply::json(200, json!({"object":"list","data":[]})),
+    ]);
+    let output = listen_flag(&home, &gateway, &["--models", "claude-missing"]);
+    assert_eq!(output.status.code(), Some(1));
+    let report = summary(&output);
+    assert_eq!(report["ok"], false);
+    let check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "chat:claude-missing")
+        .unwrap();
+    assert_eq!(check["ok"], false);
+    assert_eq!(check["evidence"], "catalog_absent");
+    assert!(check["error"]
+        .as_str()
+        .unwrap()
+        .contains("absent from the authenticated catalog"));
+    assert!(check.get("skipped").is_none());
+    assert_eq!(gateway.paths(), ["GET /healthz", "GET /v1/models"]);
+    stop.send(()).unwrap();
+}
+
+#[test]
 fn empty_models_pin_is_an_argument_error() {
     let home = Home::new();
     let output = home.run(&["--models", ""]);
@@ -964,6 +992,26 @@ fn scarce_claude_defaults_to_catalog_only_without_inference() {
         .unwrap();
     assert_eq!(scarce["skipped"], "scarce_claude");
     assert_eq!(scarce["evidence"], "catalog_only");
+    stop.send(()).unwrap();
+}
+
+#[test]
+fn pinned_present_scarce_claude_stays_catalog_only() {
+    let home = Home::new();
+    let (gateway, stop) = Gateway::start(vec![Reply::text(200, "ok"), scarce_catalog_reply()]);
+    let output = listen_flag(&home, &gateway, &["--models", "claude-haiku-5.5"]);
+    assert_eq!(output.status.code(), Some(0));
+    let report = summary(&output);
+    let check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "chat:claude-haiku-5.5")
+        .unwrap();
+    assert_eq!(check["ok"], true);
+    assert_eq!(check["skipped"], "scarce_claude");
+    assert_eq!(check["evidence"], "catalog_only");
+    assert_eq!(gateway.paths(), ["GET /healthz", "GET /v1/models"]);
     stop.send(()).unwrap();
 }
 

@@ -644,13 +644,23 @@ fn run(options: &Options) -> Result<bool> {
             continue;
         }
         if scarce_claude(model) && !options.probe_scarce {
-            checks.push(json!({
-                "name": name,
-                "ok": true,
-                "skipped": "scarce_claude",
-                "evidence": "catalog_only",
-                "latency_ms": 0,
-            }));
+            if listed.contains(model) {
+                checks.push(json!({
+                    "name": name,
+                    "ok": true,
+                    "skipped": "scarce_claude",
+                    "evidence": "catalog_only",
+                    "latency_ms": 0,
+                }));
+            } else {
+                checks.push(json!({
+                    "name": name,
+                    "ok": false,
+                    "evidence": "catalog_absent",
+                    "error": "scarce model is absent from the authenticated catalog",
+                    "latency_ms": 0,
+                }));
+            }
             continue;
         }
         let start = Instant::now();

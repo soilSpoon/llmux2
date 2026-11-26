@@ -343,7 +343,12 @@ bound each request by `--timeout`, bound response bodies, print a JSON report
 naming each check's status and latency, never print the key, and exit 0 only
 when every probe passes (1 on failure, 2 on usage errors). A
 `llmux2-probe.service`/`llmux2-probe.timer` pair under `deploy/systemd` SHALL
-run it periodically as a oneshot user unit. Claude-family model ids are scarce by policy: rotation, sweeps, pinned model lists, and extra-format probes SHALL NOT send them inference unless `--probe-scarce` is explicitly present. Without that flag a Claude-family candidate SHALL be reported as `skipped = "scarce_claude"` with `evidence = "catalog_only"`, using the authenticated catalog/admission view rather than consuming upstream inference. `--probe-scarce` is the deliberate one-off adoption/verification escape hatch, not a scheduled mode.
+run it periodically as a oneshot user unit. Claude-family model ids are scarce by policy: rotation, sweeps, pinned model lists, and extra-format probes SHALL NOT send them inference unless `--probe-scarce` is explicitly present. Without that flag a Claude-family candidate present in the authenticated catalog SHALL be reported as `skipped = "scarce_claude"` with `evidence = "catalog_only"`, using the authenticated catalog/admission view rather than consuming upstream inference. A pinned Claude-family candidate absent from that catalog SHALL fail with `evidence = "catalog_absent"` rather than reporting healthy catalog-only evidence. `--probe-scarce` is the deliberate one-off adoption/verification escape hatch, not a scheduled mode.
+
+#### Scenario: Pinned scarce model absent from the catalog
+
+WHEN `--models` names a Claude-family model absent from the authenticated catalog and `--probe-scarce` is absent
+THEN the probe sends no inference for that model and fails its check with `evidence = "catalog_absent"` rather than reporting healthy catalog-only evidence.
 
 #### Scenario: Rotating coverage bounds provider cost
 
