@@ -12,10 +12,13 @@ use llmux_config::RuntimeConfig;
 use llmux_testkit::TestServer;
 use serde_json::{json, Value};
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
-use tokio::time::{advance, pause, resume};
+use tokio::time::{advance, pause, resume, sleep};
 
 async fn upstream(
     State(seen): State<Arc<Mutex<Vec<Value>>>>,
@@ -540,6 +543,105 @@ async fn cooling_free_leg_leaves_and_returns_to_the_free_catalog() {
     let (status, body) = chat(&gateway, "ci-key", "cooling-free").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(upstream_state.seen.lock().unwrap().len(), 2);
+}
+
+struct DelayState {
+    entered: AtomicUsize,
+    seen: Mutex<Vec<Value>>,
+}
+
+async fn delayed_upstream(
+    State(state): State<Arc<DelayState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    state.entered.fetch_add(1, Ordering::Relaxed);
+    sleep(Duration::from_millis(300)).await;
+    state.seen.lock().unwrap().push(body);
+    Json(json!({
+        "id":"ok","object":"chat.completion",
+        "choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+    }))
+}
+
+fn free_only_concurrency_config(url: &str, dir: &std::path::Path) -> String {
+    for (file, value) in [("owner", "owner-key"), ("ci", "ci-key")] {
+        std::fs::write(dir.join(file), value).unwrap();
+    }
+    let dir = dir.display();
+    format!(
+        r#"
+[server]
+client_keys = ["file:{dir}/owner", "file:{dir}/ci"]
+
+[[server.key_policies]]
+key = "file:{dir}/ci"
+free_only = true
+
+[[models]]
+name = "busy-free"
+[[models.deployments]]
+id = "busy-free"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-busy-free"
+billing = "free"
+quota = {{ concurrent = 1 }}
+"#
+    )
+}
+
+#[tokio::test]
+async fn full_concurrency_hides_then_releases_the_free_catalog_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream_state = Arc::new(DelayState {
+        entered: AtomicUsize::new(0),
+        seen: Mutex::new(Vec::new()),
+    });
+    let remote = TestServer::start(
+        Router::new()
+            .route("/v1/chat/completions", post(delayed_upstream))
+            .with_state(upstream_state.clone()),
+    )
+    .await
+    .unwrap();
+    let gateway = TestServer::start(
+        llmux_server::app(
+            RuntimeConfig::parse(&free_only_concurrency_config(&remote.url(), dir.path())).unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let gateway = gateway.url();
+
+    assert_eq!(listed(&gateway, "ci-key").await, ["busy-free"]);
+    let first_gateway = gateway.clone();
+    let first = tokio::spawn(async move { chat(&first_gateway, "ci-key", "busy-free").await });
+    for _ in 0..100 {
+        if upstream_state.entered.load(Ordering::Relaxed) == 1 {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(upstream_state.entered.load(Ordering::Relaxed), 1);
+
+    let empty: Vec<String> = Vec::new();
+    assert_eq!(
+        listed(&gateway, "ci-key").await,
+        empty,
+        "busy free leg stayed advertised while its only concurrency slot was full"
+    );
+    assert_eq!(listed(&gateway, "owner-key").await, ["busy-free"]);
+    let (status, body) = chat(&gateway, "ci-key", "busy-free").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(upstream_state.entered.load(Ordering::Relaxed), 1);
+
+    let (first_status, first_body) = first.await.unwrap();
+    assert_eq!(first_status, StatusCode::OK, "{first_body}");
+    assert_eq!(listed(&gateway, "ci-key").await, ["busy-free"]);
 }
 
 fn free_only_token_window_config(url: &str, dir: &std::path::Path) -> String {
