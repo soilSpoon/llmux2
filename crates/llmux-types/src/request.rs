@@ -43,6 +43,7 @@ pub enum InboundFormat {
 /// floor instead of an imaginary one-token request.
 pub const MINIMAL_OPENAI_CHAT_COST: u32 = 5;
 
+#[derive(Clone)]
 pub struct GatewayRequest {
     pub format: InboundFormat,
     pub model: Arc<str>,

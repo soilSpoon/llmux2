@@ -191,9 +191,34 @@ Rejecting is the default. To trim instead, set `context_overflow = "middle-out"`
 Responses request body. It is a positive byte count and defaults to 33554432
 (32 MiB). A larger body returns 413 `invalid_request_error` before body
 validation, routing, or any upstream call; a body exactly at the limit is accepted. Zero
-or a negative value is a config error. The limit is per in-flight request, so
-operators on small hosts should size it together with expected concurrency.
-Older binaries reject the setting; remove it before rolling back.
+or a negative value is a config error.
+
+Large bodies do not stay in memory while they wait for retries.
+`server.request_body_memory_bytes` (default 1048576, 1 MiB) is the per-request
+ingress buffering threshold. Once another chunk would cross it, the body is
+written incrementally to `server.request_body_spool_dir` (default
+`/var/tmp/llmux2-request-bodies` on Unix). Completed spools are immutable,
+mode 0600 on Unix, and atomically renamed; failover re-reads a fresh copy for
+the next candidate and drops that copy when the candidate is done.
+`server.request_body_spool_budget_bytes` (default 536870912, 512 MiB) is the
+total in-flight disk reservation. Reservations are made before writes, so a
+full budget returns a generic 503 before any upstream call and leaves no
+partial spool. Files are removed on success, error, and cancellation. On Linux
+and macOS, startup sweeps llmux orphans without unlinking locked files
+owned by an overlapping zero-downtime process. Other platforms do not provide
+that overlap-safety guarantee.
+
+The disk budget must fit comfortably within free space on the host; on small
+OCI shapes keep it on a disk-backed filesystem, not tmpfs, with the directory
+writable only by the gateway service user. Admission parsing, per-candidate
+materialization, and provider conversion may still hold full transient copies
+of one body, so spooling bounds ingress buffering and retry accumulation; it
+does not make peak memory independent of body size. The conservative 32 MiB
+default reflects that honest peak-memory model: operators that raise
+`max_request_bytes` must budget several transient copies per concurrent large
+request in addition to the spool disk budget. Spooling is request-side only
+and does not interact with streaming responses. Older binaries reject these
+settings; remove them before rolling back.
 
 ### End-user attribution
 

@@ -2,7 +2,10 @@
 listen = "127.0.0.1:8080"
 client_keys = ["env:LLMUX_CLIENT_KEY"]
 request_timeout_ms = 120000
-# max_request_bytes = 33554432 # bytes; positive, default 32 MiB per inbound request body
+# max_request_bytes = 134217728 # bytes; positive, default 128 MiB per inbound request body
+# request_body_memory_bytes = 1048576 # bytes in RAM before ingress rolls over to disk
+# request_body_spool_dir = "/var/tmp/llmux2-request-bodies" # disk-backed dir; restart-only on reload
+# request_body_spool_budget_bytes = 536870912 # total in-flight spool bytes; exhaustion returns 503
 shutdown_timeout_ms = 60000 # drain in-flight requests/streams, then exit; 1–86400000 ms
 drain_grace_ms = 2000 # 0–10000 ms; cap below WatchdogSec=30 (shared-port probes may hit draining slot)
 expose_routing_headers = true
