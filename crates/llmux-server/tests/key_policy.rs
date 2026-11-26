@@ -85,7 +85,12 @@ async fn fixture() -> (
     (dir, remote, gateway, seen)
 }
 
-async fn chat(gateway: &str, key: &str, model: &str) -> (StatusCode, Value) {
+async fn chat_with_content(
+    gateway: &str,
+    key: &str,
+    model: &str,
+    content: &str,
+) -> (StatusCode, Value) {
     let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
     let response = client
         .request(
@@ -93,7 +98,8 @@ async fn chat(gateway: &str, key: &str, model: &str) -> (StatusCode, Value) {
                 .header(header::AUTHORIZATION, format!("Bearer {key}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Full::new(Bytes::from(
-                    json!({"model":model,"messages":[{"role":"user","content":"hi"}]}).to_string(),
+                    json!({"model":model,"messages":[{"role":"user","content":content}]})
+                        .to_string(),
                 )))
                 .unwrap(),
         )
@@ -103,6 +109,14 @@ async fn chat(gateway: &str, key: &str, model: &str) -> (StatusCode, Value) {
     let body =
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     (status, body)
+}
+
+async fn chat(gateway: &str, key: &str, model: &str) -> (StatusCode, Value) {
+    chat_with_content(gateway, key, model, "hi").await
+}
+
+async fn empty_chat(gateway: &str, key: &str, model: &str) -> (StatusCode, Value) {
+    chat_with_content(gateway, key, model, "").await
 }
 
 fn seen_models(seen: &Arc<Mutex<Vec<Value>>>) -> Vec<String> {
@@ -679,6 +693,87 @@ async fn context_too_small_for_minimal_chat_is_not_advertised() {
         0,
         "max_context=4 chat reached upstream"
     );
+}
+
+fn token_floor_config(url: &str, dir: &std::path::Path, cap: u32) -> String {
+    for (file, value) in [
+        ("owner", "owner-key"),
+        ("ci", "ci-key"),
+        ("token-cred", "synthetic-token-cred"),
+    ] {
+        std::fs::write(dir.join(file), value).unwrap();
+    }
+    let dir = dir.display();
+    format!(
+        r#"
+[server]
+client_keys = ["file:{dir}/owner", "file:{dir}/ci"]
+
+[[server.key_policies]]
+key = "file:{dir}/ci"
+free_only = true
+
+[[credentials]]
+id = "token-cred"
+kind = "api_key"
+provider = "openai_compat"
+key = "file:{dir}/token-cred"
+quota = {{ tpm = {cap} }}
+
+[[models]]
+name = "token-floor"
+[[models.deployments]]
+id = "token-floor"
+credential = "token-cred"
+base_url = "{url}/v1"
+upstream_model = "up-token-floor"
+billing = "free"
+"#
+    )
+}
+
+#[tokio::test]
+async fn subfive_openai_chat_estimates_use_the_five_token_floor() {
+    for cap in [4_u32, 5] {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let remote = TestServer::start(
+            Router::new()
+                .route("/v1/chat/completions", post(upstream))
+                .with_state(seen.clone()),
+        )
+        .await
+        .unwrap();
+        let gateway = TestServer::start(
+            llmux_server::app(
+                RuntimeConfig::parse(&token_floor_config(&remote.url(), dir.path(), cap)).unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let gateway = gateway.url();
+
+        let advertised = listed(&gateway, "ci-key")
+            .await
+            .contains(&"token-floor".to_owned());
+        let (status, body) = empty_chat(&gateway, "ci-key", "token-floor").await;
+        let upstream_calls = seen.lock().unwrap().len();
+        if cap == 4 {
+            assert!(!advertised, "cap 4 advertised a sub-five-token chat");
+            assert_eq!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "cap 4 empty chat: {body}"
+            );
+            assert_eq!(upstream_calls, 0, "cap 4 empty chat reached upstream");
+        } else {
+            assert!(advertised, "cap 5 did not advertise the exact floor cost");
+            assert_eq!(status, StatusCode::OK, "cap 5 empty chat: {body}");
+            assert_eq!(upstream_calls, 1, "cap 5 empty chat missed upstream");
+        }
+    }
 }
 
 fn free_only_cred_config(url: &str, dir: &std::path::Path) -> String {
