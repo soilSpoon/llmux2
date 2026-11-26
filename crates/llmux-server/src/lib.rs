@@ -698,27 +698,33 @@ async fn route_request(
         };
         if let Some(truncated) = truncated {
             dropped = truncated.dropped;
+            let truncated_prompt_bytes = truncated.prompt_bytes;
+            let truncated_source = truncated.body;
             drop(inline_body);
-            let truncated_replay = if replay.is_some() {
-                let spooled =
-                    match body_spool::copy_to_spool(store.clone(), truncated.body.clone()).await {
-                        Ok(spooled) => spooled,
-                        Err(error) => return capture_error(error),
-                    };
-                drop(replay);
-                Some(spooled)
-            } else {
-                None
-            };
+            let truncated_replay =
+                if replay.is_some() {
+                    let spooled =
+                        match body_spool::copy_to_spool(store.clone(), truncated_source.clone())
+                            .await
+                        {
+                            Ok(spooled) => spooled,
+                            Err(error) => return capture_error(error),
+                        };
+                    drop(replay);
+                    Some(spooled)
+                } else {
+                    None
+                };
             let truncated_body = if truncated_replay.is_some() {
+                drop(truncated_source);
                 Bytes::new()
             } else {
-                truncated.body
+                truncated_source
             };
             result = active
                 .executor
                 .execute_attributed_with_replay(
-                    request(truncated_body, truncated.prompt_bytes),
+                    request(truncated_body, truncated_prompt_bytes),
                     truncated_replay,
                 )
                 .await;
