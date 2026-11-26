@@ -19,7 +19,9 @@ use thiserror::Error;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 86_400_000;
-const DEFAULT_MAX_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
+const DEFAULT_MAX_REQUEST_BYTES: u64 = 128 * 1024 * 1024;
+const DEFAULT_REQUEST_BODY_MEMORY_BYTES: u64 = 1024 * 1024;
+const DEFAULT_REQUEST_BODY_SPOOL_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -41,6 +43,12 @@ pub struct ServerConfig {
     pub request_timeout: Duration,
     /// Maximum accepted inbound request body size in bytes.
     pub max_request_bytes: usize,
+    /// Inbound bytes buffered in memory before the body rolls over to disk.
+    pub request_body_memory_bytes: usize,
+    /// Directory holding immutable request-body spool files.
+    pub request_body_spool_dir: PathBuf,
+    /// Total bytes of in-flight spooled request bodies admitted at once.
+    pub request_body_spool_budget_bytes: u64,
     pub shutdown_timeout: Duration,
     pub drain_grace: Duration,
     pub expose_routing_headers: bool,
@@ -196,6 +204,9 @@ struct RawServer {
     client_keys: Vec<String>,
     request_timeout_ms: u64,
     max_request_bytes: u64,
+    request_body_memory_bytes: u64,
+    request_body_spool_dir: PathBuf,
+    request_body_spool_budget_bytes: u64,
     shutdown_timeout_ms: u64,
     drain_grace_ms: u64,
     expose_routing_headers: bool,
@@ -210,6 +221,14 @@ struct RawServer {
     deny: Vec<String>,
 }
 
+fn default_request_body_spool_dir() -> PathBuf {
+    if cfg!(windows) {
+        std::env::temp_dir().join("llmux2-request-bodies")
+    } else {
+        PathBuf::from("/var/tmp/llmux2-request-bodies")
+    }
+}
+
 impl Default for RawServer {
     fn default() -> Self {
         Self {
@@ -217,6 +236,9 @@ impl Default for RawServer {
             client_keys: Vec::new(),
             request_timeout_ms: DEFAULT_TIMEOUT_MS,
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            request_body_memory_bytes: DEFAULT_REQUEST_BODY_MEMORY_BYTES,
+            request_body_spool_dir: default_request_body_spool_dir(),
+            request_body_spool_budget_bytes: DEFAULT_REQUEST_BODY_SPOOL_BUDGET_BYTES,
             shutdown_timeout_ms: 60_000,
             drain_grace_ms: 2_000,
             expose_routing_headers: true,
@@ -432,6 +454,17 @@ impl RawConfig {
         }
         let max_request_bytes = usize::try_from(server.max_request_bytes)
             .map_err(|_| invalid("max_request_bytes exceeds this platform"))?;
+        if server.request_body_memory_bytes == 0 {
+            return Err(invalid("request_body_memory_bytes must be positive"));
+        }
+        let request_body_memory_bytes = usize::try_from(server.request_body_memory_bytes)
+            .map_err(|_| invalid("request_body_memory_bytes exceeds this platform"))?;
+        if server.request_body_spool_dir.as_os_str().is_empty() {
+            return Err(invalid("request_body_spool_dir must not be empty"));
+        }
+        if server.request_body_spool_budget_bytes == 0 {
+            return Err(invalid("request_body_spool_budget_bytes must be positive"));
+        }
         if server.drain_grace_ms > 10_000 {
             return Err(invalid("server.drain_grace_ms must be between 0 and 10000"));
         }
@@ -1002,6 +1035,9 @@ impl RawConfig {
                 deny: deny.into_boxed_slice(),
                 request_timeout,
                 max_request_bytes,
+                request_body_memory_bytes,
+                request_body_spool_dir: server.request_body_spool_dir,
+                request_body_spool_budget_bytes: server.request_body_spool_budget_bytes,
                 shutdown_timeout: timeout(server.shutdown_timeout_ms)?,
                 drain_grace: Duration::from_millis(server.drain_grace_ms),
                 expose_routing_headers: server.expose_routing_headers,
@@ -2040,7 +2076,7 @@ strip_request_fields = {fields}
         };
 
         let default = RuntimeConfig::parse(&base).unwrap();
-        assert_eq!(default.server.max_request_bytes, 32 * 1024 * 1024);
+        assert_eq!(default.server.max_request_bytes, 128 * 1024 * 1024);
         let custom = RuntimeConfig::parse(&with("max_request_bytes = 192")).unwrap();
         assert_eq!(custom.server.max_request_bytes, 192);
         let err = RuntimeConfig::parse(&with("max_request_bytes = 0"))
@@ -2052,6 +2088,54 @@ strip_request_fields = {fields}
             "{err}"
         );
         assert!(RuntimeConfig::parse(&with("max_request_bytes = -1")).is_err());
+    }
+
+    #[test]
+    fn request_body_spool_config_defaults_and_rejects_nonpositive_values() {
+        let base = config(REQUIRED);
+        let with = |extra: &str| {
+            base.replace(
+                "client_keys = [\"env:LLMUX_CONFIG_OAUTH_TEST_SECRET\"]\n",
+                &format!("client_keys = [\"env:LLMUX_CONFIG_OAUTH_TEST_SECRET\"]\n{extra}\n"),
+            )
+        };
+
+        let default = RuntimeConfig::parse(&base).unwrap();
+        assert_eq!(default.server.request_body_memory_bytes, 1024 * 1024);
+        assert_eq!(
+            default.server.request_body_spool_budget_bytes,
+            512 * 1024 * 1024
+        );
+        assert!(!default.server.request_body_spool_dir.as_os_str().is_empty());
+
+        let custom = RuntimeConfig::parse(&with(
+            "request_body_memory_bytes = 4096\nrequest_body_spool_dir = \"/tmp/llmux-test-spool\"\nrequest_body_spool_budget_bytes = 8192",
+        ))
+        .unwrap();
+        assert_eq!(custom.server.request_body_memory_bytes, 4096);
+        assert_eq!(
+            custom.server.request_body_spool_dir,
+            PathBuf::from("/tmp/llmux-test-spool")
+        );
+        assert_eq!(custom.server.request_body_spool_budget_bytes, 8192);
+
+        for (field, message) in [
+            (
+                "request_body_memory_bytes",
+                "request_body_memory_bytes must be positive",
+            ),
+            (
+                "request_body_spool_budget_bytes",
+                "request_body_spool_budget_bytes must be positive",
+            ),
+        ] {
+            let err = RuntimeConfig::parse(&with(&format!("{field} = 0")))
+                .err()
+                .expect("zero spool config");
+            assert!(err.to_string().contains(message), "{err}");
+            assert!(RuntimeConfig::parse(&with(&format!("{field} = -1"))).is_err());
+        }
+        assert!(RuntimeConfig::parse(&with("request_body_spool_dir = \"\"")).is_err());
     }
 
     #[test]

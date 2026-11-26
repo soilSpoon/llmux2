@@ -21,7 +21,7 @@ use llmux_config::RuntimeConfig;
 use llmux_types::{
     provider, AuthMaterial, Billing, BuildError, ContextOverflow, CredentialSource, Deployment,
     DeploymentIdx, ErrorKind, GatewayRequest, GatewayResponse, InboundFormat, ProviderAdapter,
-    ProviderRegistry, QuotaSpec, SseCommitment, Support, UpstreamError,
+    ProviderRegistry, QuotaSpec, SpooledBody, SseCommitment, Support, UpstreamError,
 };
 use machine::{Built, Effect, Event, Outcome, Phase, State};
 pub use request_log::RequestLog;
@@ -567,13 +567,24 @@ impl Executor {
         &self,
         req: GatewayRequest,
     ) -> Result<RoutedResponse, RoutedError> {
+        self.execute_attributed_with_replay(req, None).await
+    }
+
+    /// Executes a request whose canonical ingress body may live in a spool.
+    /// Each deployment candidate receives a freshly materialized copy; the
+    /// copy is dropped when that candidate is done so retry memory is not cumulative.
+    pub async fn execute_attributed_with_replay(
+        &self,
+        req: GatewayRequest,
+        replay: Option<Arc<SpooledBody>>,
+    ) -> Result<RoutedResponse, RoutedError> {
         let mut trace = RouteTrace::default();
         let started = Instant::now();
         let request_id = req.request_id.0.clone();
         let model = req.model.clone();
         let client_key = req.client_key.clone();
         let image_count = req.image_count;
-        let result = self.route(req, &mut trace).await;
+        let result = self.route(req, replay, &mut trace).await;
         // A middle-out context rejection is a probe: the server truncates and
         // retries under the same request ID, so logging it would double-count
         // one client request.
@@ -617,6 +628,7 @@ impl Executor {
     async fn route(
         &self,
         req: GatewayRequest,
+        replay: Option<Arc<SpooledBody>>,
         trace: &mut RouteTrace,
     ) -> Result<RoutedResponse, GatewayError> {
         let model_idx = self
@@ -765,6 +777,7 @@ impl Executor {
                 };
                 let mut permit = None;
                 let mut upstream = None;
+                let mut attempt_request = None;
                 let mut attempt_deadline = deadline;
                 let mut result = Err(GatewayError::Internal);
                 loop {
@@ -799,10 +812,15 @@ impl Executor {
                             };
                         }
                         Effect::Build => {
+                            if attempt_request.is_none() {
+                                attempt_request =
+                                    Some(materialize_attempt_request(&req, replay.as_ref()).await?);
+                            }
+                            let request = attempt_request.as_ref().expect("attempt request");
                             attempt_deadline = deadline.min(Instant::now() + dep.timeout);
                             let built = timeout_at(
                                 attempt_deadline,
-                                Self::build_request(&req, dep, binding),
+                                Self::build_request(request, dep, binding),
                             )
                             .await;
                             event = Event::Built(
@@ -862,7 +880,14 @@ impl Executor {
                             result = match upstream {
                                 Ok(Ok(upstream)) => timeout_at(
                                     attempt_deadline,
-                                    self.attempt(&req, dep, binding, upstream, needed, trace),
+                                    self.attempt(
+                                        attempt_request.as_ref().expect("attempt request"),
+                                        dep,
+                                        binding,
+                                        upstream,
+                                        needed,
+                                        trace,
+                                    ),
                                 )
                                 .await
                                 .unwrap_or(timed_out),
@@ -1303,6 +1328,22 @@ fn hold_permit(response: GatewayResponse, permit: Permit) -> GatewayResponse {
 
 fn index(idx: DeploymentIdx) -> usize {
     idx.0 as usize
+}
+
+async fn materialize_attempt_request(
+    req: &GatewayRequest,
+    replay: Option<&Arc<SpooledBody>>,
+) -> Result<GatewayRequest, GatewayError> {
+    let mut materialized = req.clone();
+    if let Some(spool) = replay {
+        let spool = spool.clone();
+        let body = tokio::task::spawn_blocking(move || spool.read_bytes())
+            .await
+            .map_err(|_| GatewayError::Internal)?
+            .map_err(|_| GatewayError::Internal)?;
+        materialized.body = body;
+    }
+    Ok(materialized)
 }
 
 /// Priority a deployment competes with right now: `priority_boost` while its

@@ -1,6 +1,7 @@
 //! Axum boundary for the OpenAI-compatible gateway.
 
 mod admin;
+mod body_spool;
 mod catalog;
 mod dashboard;
 mod lifecycle;
@@ -22,7 +23,6 @@ use axum::{
 };
 use futures_util::StreamExt;
 use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
-use http_body_util::LengthLimitError;
 use llmux_config::{ApiKey, RuntimeConfig};
 use llmux_core::{Executor, GatewayError, InitError, LiveModels, RequestLog, RoutedError};
 use llmux_providers::nous_portal::{NousPortalConfig, NousPortalSource};
@@ -34,8 +34,8 @@ use llmux_providers::{
 };
 use llmux_types::{
     provider, AcpAgentSpec, Billing, ContextOverflow, CredentialSource, GatewayRequest,
-    GatewayResponse, InboundFormat, ProviderRegistry, RequestId, TrafficClass, UpstreamError,
-    MINIMAL_OPENAI_CHAT_COST,
+    GatewayResponse, InboundFormat, ProviderRegistry, RequestId, SpoolStore, TrafficClass,
+    UpstreamError, MINIMAL_OPENAI_CHAT_COST,
 };
 use serde_json::{json, value::RawValue, Value};
 use sha2::{Digest, Sha256};
@@ -58,6 +58,7 @@ struct Active {
 
 struct AppState {
     active: arc_swap::ArcSwap<Active>,
+    spool: SpoolStore,
     dashboard: Option<dashboard::Dashboard>,
     config_path: Option<std::path::PathBuf>,
     reload_lock: tokio::sync::Mutex<()>,
@@ -154,6 +155,10 @@ async fn app_with_state(
     devin: DevinAcpConfig,
 ) -> Result<(Router, Arc<AppState>), Box<dyn Error + Send + Sync>> {
     let catalog = Arc::new(catalog::Catalog::new(devin.clone()));
+    let spool = SpoolStore::open(
+        &config.server.request_body_spool_dir,
+        config.server.request_body_spool_budget_bytes,
+    )?;
     let (config, executor) = build(config, devin, catalog.live()).await?;
     let dashboard = config
         .server
@@ -165,6 +170,7 @@ async fn app_with_state(
             config,
             executor: Arc::new(executor),
         }),
+        spool,
         dashboard,
         config_path,
         reload_lock: tokio::sync::Mutex::new(()),
@@ -380,7 +386,8 @@ async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) 
     };
     let catalog = catalog::has_devin(&active.config).then(|| Arc::clone(&state.catalog));
     let start = state.dashboard.as_ref().map(|_| std::time::Instant::now());
-    let response = execute_authorized(&active, request, format, client_key, catalog).await;
+    let response =
+        execute_authorized(&active, &state.spool, request, format, client_key, catalog).await;
     if let (Some(dashboard), Some(start)) = (&state.dashboard, start) {
         dashboard.record_response(response.status(), start.elapsed());
     }
@@ -399,8 +406,40 @@ fn unauthorized() -> Response {
     response
 }
 
+struct Ingress {
+    store: SpoolStore,
+    captured: body_spool::CapturedBody,
+    body: Bytes,
+}
+
+fn capture_error(kind: body_spool::CaptureError) -> Response {
+    match kind {
+        body_spool::CaptureError::TooLarge => error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request_error",
+            "Request body too large",
+        ),
+        body_spool::CaptureError::Read => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Could not read request body",
+        ),
+        body_spool::CaptureError::BudgetExhausted => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            "Request body storage capacity is temporarily exhausted",
+        ),
+        body_spool::CaptureError::Io => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Gateway could not store the request body",
+        ),
+    }
+}
+
 async fn execute_authorized(
     active: &Active,
+    spool: &SpoolStore,
     request: Request,
     format: InboundFormat,
     client_key: MatchedKey,
@@ -420,26 +459,20 @@ async fn execute_authorized(
         },
     };
     let (parts, body) = request.into_parts();
-    let body = match body::to_bytes(body, active.config.server.max_request_bytes).await {
+    let captured = match body_spool::capture_body(
+        body,
+        spool.clone(),
+        active.config.server.request_body_memory_bytes,
+        active.config.server.max_request_bytes,
+    )
+    .await
+    {
+        Ok(captured) => captured,
+        Err(error) => return capture_error(error),
+    };
+    let body = match captured.bytes().await {
         Ok(body) => body,
-        Err(err)
-            if err
-                .source()
-                .is_some_and(|cause| cause.is::<LengthLimitError>()) =>
-        {
-            return error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "invalid_request_error",
-                "Request body too large",
-            );
-        }
-        Err(_) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "Could not read request body",
-            )
-        }
+        Err(error) => return capture_error(error),
     };
     if let Some(catalog) = catalog {
         catalog.kick();
@@ -456,8 +489,12 @@ async fn execute_authorized(
     };
     let response = route_request(
         active,
+        Ingress {
+            store: spool.clone(),
+            captured,
+            body,
+        },
         &parts.headers,
-        body,
         format,
         context_overflow,
         end_user.clone(),
@@ -469,13 +506,18 @@ async fn execute_authorized(
 
 async fn route_request(
     active: &Active,
+    ingress: Ingress,
     headers: &HeaderMap,
-    body: Bytes,
     format: InboundFormat,
     context_overflow: Option<ContextOverflow>,
     end_user: Option<Arc<str>>,
     client_key: MatchedKey,
 ) -> Response {
+    let Ingress {
+        store,
+        captured,
+        body,
+    } = ingress;
     let Ok(metadata) = RequestMetadata::parse(&body, format) else {
         return error(
             StatusCode::BAD_REQUEST,
@@ -483,6 +525,10 @@ async fn route_request(
             "Expected a JSON object with a nonempty string model and optional boolean stream",
         );
     };
+    let has_gateway_routing_fields = metadata.has_gateway_routing_fields;
+    let request_stream = metadata.stream;
+    let max_output_tokens = metadata.max_output_tokens;
+    let prompt_bytes = metadata.prompt_bytes;
     if let Err(err) = policy::check_images(&body, &active.config.server) {
         return error(err.status(), err.code(), err.message());
     }
@@ -549,7 +595,11 @@ async fn route_request(
         );
     }
     let request_id = RequestId(Arc::from(uuid::Uuid::new_v4().to_string()));
-    let upstream_body = if metadata.has_gateway_routing_fields {
+    let mut replay = match captured {
+        body_spool::CapturedBody::Memory(_) => None,
+        body_spool::CapturedBody::Spooled(spooled) => Some(spooled),
+    };
+    let upstream_body = if has_gateway_routing_fields {
         let Some(clean) = without_gateway_routing_fields(&body) else {
             return error(
                 StatusCode::BAD_REQUEST,
@@ -561,6 +611,12 @@ async fn route_request(
     } else {
         body.clone()
     };
+    if has_gateway_routing_fields && replay.is_some() {
+        match body_spool::copy_to_spool(store.clone(), upstream_body.clone()).await {
+            Ok(spooled) => replay = Some(spooled),
+            Err(error) => return capture_error(error),
+        }
+    }
     let mut anthropic_headers = HeaderMap::new();
     if format == InboundFormat::AnthropicMessages {
         for name in ["anthropic-version", "anthropic-beta"] {
@@ -572,18 +628,25 @@ async fn route_request(
     // The record describes the inbound request; a middle-out retry sends a
     // truncated body but must not shrink the logged image count.
     let image_count = policy::count_images(upstream_body.as_ref());
+    drop(body);
+    let inline_body = if replay.is_some() {
+        drop(upstream_body);
+        None
+    } else {
+        Some(upstream_body)
+    };
     let request = |body: Bytes, prompt_bytes: u64| {
         let estimate = u32::try_from(prompt_bytes.div_ceil(4)).unwrap_or(u32::MAX);
         GatewayRequest {
             format,
             model: model.clone(),
-            stream: metadata.stream,
+            stream: request_stream,
             est_input_tokens: if format == InboundFormat::OpenAiChat {
                 estimate.max(MINIMAL_OPENAI_CHAT_COST)
             } else {
                 estimate
             },
-            max_output_tokens: metadata.max_output_tokens,
+            max_output_tokens,
             context_overflow,
             free_only,
             image_count,
@@ -598,7 +661,10 @@ async fn route_request(
     let mut dropped = 0;
     let mut result = active
         .executor
-        .execute_attributed(request(upstream_body.clone(), metadata.prompt_bytes))
+        .execute_attributed_with_replay(
+            request(inline_body.clone().unwrap_or_default(), prompt_bytes),
+            replay.clone(),
+        )
         .await;
     if let Err(RoutedError {
         error:
@@ -610,17 +676,44 @@ async fn route_request(
         ..
     }) = result
     {
+        let truncate_source = match &inline_body {
+            Some(body) => body.clone(),
+            None => match body_spool::read_spool_bytes(
+                replay.as_ref().expect("spooled body replay").clone(),
+            )
+            .await
+            {
+                Ok(body) => body,
+                Err(error) => return capture_error(error),
+            },
+        };
         if let Some(truncated) = truncate_middle_for_format(
-            &upstream_body,
-            metadata.prompt_bytes,
-            metadata.max_output_tokens,
+            &truncate_source,
+            prompt_bytes,
+            max_output_tokens,
             limit,
             format,
         ) {
             dropped = truncated.dropped;
+            let truncated_replay = if replay.is_some() {
+                match body_spool::copy_to_spool(store.clone(), truncated.body.clone()).await {
+                    Ok(spooled) => Some(spooled),
+                    Err(error) => return capture_error(error),
+                }
+            } else {
+                None
+            };
+            let truncated_body = if truncated_replay.is_some() {
+                Bytes::new()
+            } else {
+                truncated.body
+            };
             result = active
                 .executor
-                .execute_attributed(request(truncated.body, truncated.prompt_bytes))
+                .execute_attributed_with_replay(
+                    request(truncated_body, truncated.prompt_bytes),
+                    truncated_replay,
+                )
                 .await;
         }
     }

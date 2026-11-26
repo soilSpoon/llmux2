@@ -257,6 +257,9 @@ async fn fixture_full(
             deny: Box::new([]),
             request_timeout: Duration::from_secs(5),
             max_request_bytes: 32 * 1024 * 1024,
+            request_body_memory_bytes: 1024 * 1024,
+            request_body_spool_dir: std::path::PathBuf::from("/tmp/llmux-core-test-spool"),
+            request_body_spool_budget_bytes: 512 * 1024 * 1024,
             shutdown_timeout: Duration::from_secs(60),
             drain_grace: Duration::from_secs(2),
             expose_routing_headers: true,
@@ -348,6 +351,29 @@ fn request() -> GatewayRequest {
         image_count: 2,
         free_only: false,
     }
+}
+
+#[tokio::test]
+async fn spooled_replay_is_reread_for_each_failover_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = llmux_types::SpoolStore::open(dir.path(), 4096).unwrap();
+    let replay = store
+        .spool_bytes(br#"{"model":"model","messages":[]}"#)
+        .unwrap();
+    let (executor, _adapter, _credential, _server) = fixture(
+        vec![UpstreamError::RateLimited { retry_after: None }],
+        false,
+    )
+    .await;
+    let mut req = request();
+    req.body = Bytes::new();
+
+    executor
+        .execute_attributed_with_replay(req, Some(replay.clone()))
+        .await
+        .unwrap();
+
+    assert_eq!(replay.read_count(), 2);
 }
 
 #[tokio::test]
@@ -994,6 +1020,9 @@ async fn fixture_shared_group(
             deny: Box::new([]),
             request_timeout: Duration::from_secs(5),
             max_request_bytes: 32 * 1024 * 1024,
+            request_body_memory_bytes: 1024 * 1024,
+            request_body_spool_dir: std::path::PathBuf::from("/tmp/llmux-core-test-spool"),
+            request_body_spool_budget_bytes: 512 * 1024 * 1024,
             shutdown_timeout: Duration::from_secs(60),
             drain_grace: Duration::from_secs(2),
             expose_routing_headers: true,
