@@ -12,13 +12,13 @@ use llmux_config::RuntimeConfig;
 use llmux_testkit::TestServer;
 use serde_json::{json, Value};
 use std::{
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::time::{advance, pause, resume, sleep};
+use tokio::{
+    sync::Notify,
+    time::{advance, pause, resume},
+};
 
 async fn upstream(
     State(seen): State<Arc<Mutex<Vec<Value>>>>,
@@ -546,7 +546,8 @@ async fn cooling_free_leg_leaves_and_returns_to_the_free_catalog() {
 }
 
 struct DelayState {
-    entered: AtomicUsize,
+    entered: Notify,
+    release: Notify,
     seen: Mutex<Vec<Value>>,
 }
 
@@ -554,8 +555,8 @@ async fn delayed_upstream(
     State(state): State<Arc<DelayState>>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    state.entered.fetch_add(1, Ordering::Relaxed);
-    sleep(Duration::from_millis(300)).await;
+    state.entered.notify_one();
+    state.release.notified().await;
     state.seen.lock().unwrap().push(body);
     Json(json!({
         "id":"ok","object":"chat.completion",
@@ -596,7 +597,8 @@ quota = {{ concurrent = 1 }}
 async fn full_concurrency_hides_then_releases_the_free_catalog_entry() {
     let dir = tempfile::tempdir().unwrap();
     let upstream_state = Arc::new(DelayState {
-        entered: AtomicUsize::new(0),
+        entered: Notify::new(),
+        release: Notify::new(),
         seen: Mutex::new(Vec::new()),
     });
     let remote = TestServer::start(
@@ -620,13 +622,7 @@ async fn full_concurrency_hides_then_releases_the_free_catalog_entry() {
     assert_eq!(listed(&gateway, "ci-key").await, ["busy-free"]);
     let first_gateway = gateway.clone();
     let first = tokio::spawn(async move { chat(&first_gateway, "ci-key", "busy-free").await });
-    for _ in 0..100 {
-        if upstream_state.entered.load(Ordering::Relaxed) == 1 {
-            break;
-        }
-        sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(upstream_state.entered.load(Ordering::Relaxed), 1);
+    upstream_state.entered.notified().await;
 
     let empty: Vec<String> = Vec::new();
     assert_eq!(
@@ -637,11 +633,110 @@ async fn full_concurrency_hides_then_releases_the_free_catalog_entry() {
     assert_eq!(listed(&gateway, "owner-key").await, ["busy-free"]);
     let (status, body) = chat(&gateway, "ci-key", "busy-free").await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
-    assert_eq!(upstream_state.entered.load(Ordering::Relaxed), 1);
+    assert_eq!(upstream_state.seen.lock().unwrap().len(), 0);
+    upstream_state.release.notify_one();
 
     let (first_status, first_body) = first.await.unwrap();
     assert_eq!(first_status, StatusCode::OK, "{first_body}");
     assert_eq!(listed(&gateway, "ci-key").await, ["busy-free"]);
+}
+
+async fn no_api_allowance_upstream(
+    State(seen): State<Arc<Mutex<Vec<Value>>>>,
+    Json(body): Json<Value>,
+) -> Response {
+    seen.lock().unwrap().push(body);
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"error":{"code":"no_api_allowance","message":"no api allowance"}})),
+    )
+        .into_response()
+}
+
+fn free_only_expiry_parking_config(url: &str, dir: &std::path::Path) -> String {
+    for (file, value) in [("owner", "owner-key"), ("ci", "ci-key")] {
+        std::fs::write(dir.join(file), value).unwrap();
+    }
+    let dir = dir.display();
+    format!(
+        r#"
+[server]
+client_keys = ["file:{dir}/owner", "file:{dir}/ci"]
+
+[[server.key_policies]]
+key = "file:{dir}/ci"
+free_only = true
+
+[[models]]
+name = "expired-free"
+[[models.deployments]]
+id = "expired-free"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-expired-free"
+billing = "free"
+expires_at = 2000-01-01T00:00:00Z
+
+[[models]]
+name = "parking-free"
+[[models.deployments]]
+id = "parking-free"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-parking-free"
+billing = "free"
+"#
+    )
+}
+
+#[tokio::test]
+async fn expired_and_parked_free_legs_leave_the_free_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let remote = TestServer::start(
+        Router::new()
+            .route("/v1/chat/completions", post(no_api_allowance_upstream))
+            .with_state(seen.clone()),
+    )
+    .await
+    .unwrap();
+    let gateway = TestServer::start(
+        llmux_server::app(
+            RuntimeConfig::parse(&free_only_expiry_parking_config(&remote.url(), dir.path()))
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let gateway = gateway.url();
+
+    assert_eq!(listed(&gateway, "ci-key").await, ["parking-free"]);
+    assert_eq!(
+        listed(&gateway, "owner-key").await,
+        ["expired-free", "parking-free"]
+    );
+
+    let (_status, _body) = chat(&gateway, "ci-key", "parking-free").await;
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "parking probe missed upstream"
+    );
+
+    let empty: Vec<String> = Vec::new();
+    assert_eq!(
+        listed(&gateway, "ci-key").await,
+        empty,
+        "expired or parked free legs still counted for the free catalog"
+    );
+    assert_eq!(
+        listed(&gateway, "owner-key").await,
+        ["expired-free", "parking-free"]
+    );
 }
 
 fn free_only_token_window_config(url: &str, dir: &std::path::Path) -> String {
