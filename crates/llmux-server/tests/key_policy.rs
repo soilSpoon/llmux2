@@ -611,6 +611,76 @@ async fn token_starved_free_legs_stop_counting_for_the_free_catalog() {
     );
 }
 
+fn free_only_tiny_context_config(url: &str, dir: &std::path::Path) -> String {
+    for (file, value) in [("owner", "owner-key"), ("ci", "ci-key")] {
+        std::fs::write(dir.join(file), value).unwrap();
+    }
+    let dir = dir.display();
+    format!(
+        r#"
+[server]
+client_keys = ["file:{dir}/owner", "file:{dir}/ci"]
+
+[[server.key_policies]]
+key = "file:{dir}/ci"
+free_only = true
+
+[[models]]
+name = "tiny-context"
+[[models.deployments]]
+id = "tiny-context"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-tiny-context"
+billing = "free"
+max_context = 4
+"#
+    )
+}
+
+#[tokio::test]
+async fn context_too_small_for_minimal_chat_is_not_advertised() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let remote = TestServer::start(
+        Router::new()
+            .route("/v1/chat/completions", post(upstream))
+            .with_state(seen.clone()),
+    )
+    .await
+    .unwrap();
+    let gateway = TestServer::start(
+        llmux_server::app(
+            RuntimeConfig::parse(&free_only_tiny_context_config(&remote.url(), dir.path()))
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let gateway = gateway.url();
+
+    assert!(
+        !listed(&gateway, "ci-key")
+            .await
+            .contains(&"tiny-context".to_owned()),
+        "max_context=4 cannot fit the minimal OpenAI chat cost but was advertised"
+    );
+    let (status, body) = chat(&gateway, "ci-key", "tiny-context").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "max_context=4 minimal chat: {body}"
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        0,
+        "max_context=4 chat reached upstream"
+    );
+}
+
 fn free_only_cred_config(url: &str, dir: &std::path::Path) -> String {
     for (file, value) in [
         ("owner", "owner-key"),
