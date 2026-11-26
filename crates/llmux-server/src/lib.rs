@@ -47,6 +47,7 @@ const ATTEMPTS_HEADER: HeaderName = HeaderName::from_static("x-llmux-attempts");
 const CONTEXT_OVERFLOW_HEADER: HeaderName = HeaderName::from_static("x-llmux-context-overflow");
 const FREE_ONLY_HEADER: HeaderName = HeaderName::from_static("x-llmux-free-only");
 const DROPPED_MESSAGES_HEADER: HeaderName = HeaderName::from_static("x-llmux-dropped-messages");
+const MAX_MESSAGES_ERROR_BYTES: usize = 16 * 1024 * 1024;
 const ANTHROPIC_KEY_HEADER: HeaderName = HeaderName::from_static(provider::ANTHROPIC_KEY_HEADER);
 const DEEPAI_KEY_HEADER: HeaderName = HeaderName::from_static(provider::DEEPAI_KEY_HEADER);
 
@@ -330,13 +331,12 @@ async fn responses(State(state): State<Arc<AppState>>, request: Request) -> Resp
 }
 
 async fn messages(State(state): State<Arc<AppState>>, request: Request) -> Response {
-    let max_request_bytes = state.active.load().config.server.max_request_bytes;
     let response = execute(state, request, InboundFormat::AnthropicMessages).await;
     if response.status().is_success() {
         return response;
     }
     let (mut parts, body) = response.into_parts();
-    let mut payload: Value = body::to_bytes(body, max_request_bytes)
+    let mut payload: Value = body::to_bytes(body, MAX_MESSAGES_ERROR_BYTES)
         .await
         .ok()
         .and_then(|body| serde_json::from_slice(&body).ok())
@@ -369,11 +369,9 @@ async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) 
     else {
         return unauthorized();
     };
-    if catalog::has_devin(&active.config) {
-        state.catalog.kick();
-    }
+    let catalog = catalog::has_devin(&active.config).then(|| Arc::clone(&state.catalog));
     let start = state.dashboard.as_ref().map(|_| std::time::Instant::now());
-    let response = execute_authorized(&active, request, format, client_key).await;
+    let response = execute_authorized(&active, request, format, client_key, catalog).await;
     if let (Some(dashboard), Some(start)) = (&state.dashboard, start) {
         dashboard.record_response(response.status(), start.elapsed());
     }
@@ -397,6 +395,7 @@ async fn execute_authorized(
     request: Request,
     format: InboundFormat,
     client_key: MatchedKey,
+    catalog: Option<Arc<catalog::Catalog>>,
 ) -> Response {
     let context_overflow = match request.headers().get(CONTEXT_OVERFLOW_HEADER) {
         None => None,
@@ -433,6 +432,9 @@ async fn execute_authorized(
             )
         }
     };
+    if let Some(catalog) = catalog {
+        catalog.kick();
+    }
     let end_user = match policy::resolve_end_user(&active.config.server, &parts.headers, &body) {
         Ok(id) => id,
         Err(err) => {

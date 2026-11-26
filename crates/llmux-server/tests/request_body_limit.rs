@@ -173,3 +173,18 @@ async fn default_request_body_limit_accepts_multi_mebibyte_prompts() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(fixture.calls(), 1);
 }
+
+#[tokio::test]
+async fn small_positive_limit_preserves_messages_413_contract() {
+    let fixture = Fixture::start(Some(64)).await;
+    let payload = payload_with_pad(0);
+    assert!(payload.len() > 64);
+
+    let (status, body) = fixture.send("/v1/messages", payload).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    let payload: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["error"]["message"], "Request body too large");
+    assert_eq!(payload["error"]["code"], "invalid_request_error");
+    assert_eq!(payload["error"]["type"], "request_too_large");
+    assert_eq!(fixture.calls(), 0);
+}

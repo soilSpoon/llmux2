@@ -15,16 +15,31 @@ negative value SHALL make config load fail. Every
 inbound chat completions, Messages, or Responses request body larger than the
 configured limit SHALL be rejected 413 with OpenAI-style code
 `invalid_request_error` and message `Request body too large` before any
-upstream call. A body exactly at the limit SHALL be accepted for normal
-validation and routing. The same byte budget SHALL bound the gateway's
-internal error-payload read when translating failures into Anthropic Messages
-form.
+upstream call or Devin catalog refresh. A body exactly at the limit SHALL be
+accepted for normal validation and routing. The inbound byte budget SHALL NOT
+redact the gateway's own error response. Translating failures into Anthropic
+Messages form SHALL use a fixed 16777216-byte internal error-payload budget
+independent of `max_request_bytes`.
 
 #### Scenario: Configured limit enforced before upstream
 
 WHEN `max_request_bytes = 192` and a chat request body is 193 bytes
 THEN the gateway returns 413 `invalid_request_error` and no upstream call is
 made.
+
+#### Scenario: Small positive limit preserves the Messages 413 contract
+
+WHEN `max_request_bytes` is positive but smaller than the serialized 413 error
+payload and a Messages request body exceeds it
+THEN the gateway returns 413 with message `Request body too large` and
+OpenAI-style code `invalid_request_error`.
+
+#### Scenario: Oversized body does not start a Devin catalog refresh
+
+WHEN the config contains a `devin_acp` deployment and a request body exceeds
+the configured limit
+THEN the gateway returns 413 without starting the `devin models` child
+process.
 
 #### Scenario: Boundary inclusive
 
