@@ -460,7 +460,11 @@ async fn cooling_upstream(
 ) -> Response {
     state.seen.lock().unwrap().push(body);
     if state.seen.lock().unwrap().len() == 1 {
-        (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "5")]).into_response()
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "3600")],
+        )
+            .into_response()
     } else {
         Json(json!({
             "id":"ok","object":"chat.completion",
@@ -536,7 +540,7 @@ async fn cooling_free_leg_leaves_and_returns_to_the_free_catalog() {
     assert_eq!(listed(&gateway, "owner-key").await, ["cooling-free"]);
 
     pause();
-    advance(Duration::from_secs(6)).await;
+    advance(Duration::from_secs(3601)).await;
     resume();
 
     assert_eq!(listed(&gateway, "ci-key").await, ["cooling-free"]);
