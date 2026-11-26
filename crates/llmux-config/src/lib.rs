@@ -119,6 +119,7 @@ pub struct RuntimeConfig {
     pub api_keys: HashMap<Arc<str>, ApiKey>,
     pub oauth: HashMap<Arc<str>, OAuthCredential>,
     pub nous: HashMap<Arc<str>, NousPortalCredential>,
+    pub dahl: HashMap<Arc<str>, DahlCredential>,
     /// Agent-CLI process specs keyed by credential id; the `acp_agent` adapter
     /// spawns the declared child per credential.
     pub acp_agents: HashMap<Arc<str>, AcpAgentSpec>,
@@ -155,6 +156,15 @@ pub struct OAuthCredential {
 pub struct NousPortalCredential {
     pub state_path: PathBuf,
     pub refresh_skew: Duration,
+    pub request_timeout: Duration,
+}
+
+pub struct DahlCredential {
+    pub base_url: String,
+    pub fingerprint: Arc<str>,
+    pub state_path: PathBuf,
+    pub allocation_tokens: Option<u64>,
+    pub allocate_entire_pool: bool,
     pub request_timeout: Duration,
 }
 
@@ -337,6 +347,22 @@ enum RawCredential {
         provider: String,
         state_file: String,
         refresh_skew_ms: Option<u64>,
+        request_timeout_ms: Option<u64>,
+        #[serde(default)]
+        quota: QuotaSpec,
+        /// Start disabled: routing skips every deployment on this credential
+        /// until the admin API re-enables it or the config changes.
+        #[serde(default)]
+        disabled: bool,
+    },
+    Dahl {
+        id: String,
+        provider: String,
+        fingerprint: String,
+        state_file: String,
+        base_url: Option<String>,
+        allocation_tokens: Option<u64>,
+        allocate_entire_pool: Option<bool>,
         request_timeout_ms: Option<u64>,
         #[serde(default)]
         quota: QuotaSpec,
@@ -528,6 +554,7 @@ impl RawConfig {
         let mut api_keys = HashMap::new();
         let mut oauth = HashMap::new();
         let mut nous = HashMap::new();
+        let mut dahl = HashMap::new();
         let mut acp_agents = HashMap::new();
         let mut shared_quotas = HashMap::new();
         for group in raw_shared_quotas {
@@ -569,6 +596,13 @@ impl RawConfig {
                     ..
                 }
                 | RawCredential::NousPortal {
+                    id,
+                    provider,
+                    quota,
+                    disabled,
+                    ..
+                }
+                | RawCredential::Dahl {
                     id,
                     provider,
                     quota,
@@ -700,6 +734,46 @@ impl RawConfig {
                                 RawAcpSessionMode::Persistent => AcpSessionMode::Persistent,
                             },
                             auth_method,
+                        },
+                    );
+                }
+                RawCredential::Dahl {
+                    fingerprint,
+                    state_file,
+                    base_url,
+                    allocation_tokens,
+                    allocate_entire_pool,
+                    request_timeout_ms,
+                    ..
+                } => {
+                    let base_url =
+                        base_url.unwrap_or_else(|| "https://inference.dahl.global".into());
+                    upstream_uri(&base_url).map_err(|_| invalid("dahl base_url must be HTTPS (HTTP only for loopback), without credentials, query or fragment"))?;
+                    let state_path = PathBuf::from(&state_file);
+                    if state_file.is_empty() || !state_path.is_absolute() {
+                        return Err(invalid("dahl state_file must be an absolute path"));
+                    }
+                    let allocate_entire_pool = allocate_entire_pool.unwrap_or(false);
+                    match (allocation_tokens, allocate_entire_pool) {
+                        (Some(0), _) => {
+                            return Err(invalid("dahl allocation_tokens must be positive"));
+                        }
+                        (None, false) => {
+                            return Err(invalid(
+                                "dahl requires allocation_tokens or allocate_entire_pool = true",
+                            ));
+                        }
+                        _ => {}
+                    }
+                    dahl.insert(
+                        id,
+                        DahlCredential {
+                            base_url,
+                            fingerprint: resolve_secret(&fingerprint)?,
+                            state_path,
+                            allocation_tokens,
+                            allocate_entire_pool,
+                            request_timeout: timeout(request_timeout_ms.unwrap_or(30_000))?,
                         },
                     );
                 }
@@ -1061,6 +1135,7 @@ impl RawConfig {
             api_keys,
             oauth,
             nous,
+            dahl,
             acp_agents,
             credential_meta,
             model_names,

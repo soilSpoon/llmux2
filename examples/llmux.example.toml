@@ -50,6 +50,19 @@ key = "env:GROQ_API_KEY"
 # refresh_skew_ms = 60000
 # request_timeout_ms = 30000
 
+# Dahl can rotate an invalid inference key through its account API. Rotation
+# moves existing account-pool tokens; it does not create quota. Choose either
+# allocation_tokens or allocate_entire_pool = true. The fingerprint is the
+# account credential and must stay in a private env/file secret.
+# [[credentials]]
+# id = "dahl-account"
+# kind = "dahl"
+# provider = "openai_compat"
+# fingerprint = "file:/path/to/dahl-fingerprint"
+# state_file = "/var/lib/llmux/dahl-state.json"
+# allocation_tokens = 100000000
+# request_timeout_ms = 30000
+
 [[credentials]]
 id = "together-key"
 kind = "api_key"

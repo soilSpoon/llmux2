@@ -16,6 +16,36 @@ configured deployment with its own credential source.
 WHEN two deployments use OAuth (refreshable) and static API keys respectively
 THEN both are usable through the same gateway configuration.
 
+### Requirement: Dahl account-key rotation
+
+A `dahl` credential SHALL authenticate inference with the current account API
+key from its local state file and SHALL refresh that key when upstream rejects
+it as invalid. Refresh SHALL sign in with the configured fingerprint, inspect
+the account pool and owned key allocation, create a replacement key, allocate
+an explicit token budget, persist the replacement state atomically before use,
+and only then make the replacement current. Rotation SHALL NOT create quota;
+it moves tokens from Dahl's shared account pool. The operator SHALL choose the
+budget with `allocation_tokens` or explicitly opt into `allocate_entire_pool`.
+
+The state file SHALL distinguish keys created by llmux (`owned`) from imported
+or user-managed keys. Rotation SHALL revoke only an owned previous key, because
+Dahl returns its remaining allocation to the shared pool. It SHALL leave
+user-managed keys untouched. Fingerprints, API keys, and session cookies SHALL
+NOT appear in errors or logs.
+
+#### Scenario: Invalid Dahl key rotates and retries
+
+WHEN Dahl rejects the current key as invalid
+THEN the gateway signs in with the fingerprint, creates and allocates a
+replacement key, atomically persists it, revokes only the owned previous key,
+and retries the same deployment with the new bearer token.
+
+#### Scenario: Empty account pool
+
+WHEN the Dahl account pool and the owned previous key have no tokens available
+THEN refresh fails without switching credentials or treating rotation as new
+quota.
+
 ### Requirement: Free and usage-limited providers
 
 The gateway SHALL support providers that are free or carry usage limits
