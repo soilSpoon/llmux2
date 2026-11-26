@@ -185,6 +185,16 @@ Rejecting is the default. To trim instead, set `context_overflow = "middle-out"`
 
 `x-llmux-deployment` and `x-llmux-attempts` identify the winning deployment and number of HTTP attempts (not skipped deployments). Set `server.expose_routing_headers = false` to hide them. A stream commits on the first SSE event that carries content, a tool call, a finish reason, or usage, or on `[DONE]`. OpenAI-compat keepalive chunks (`choices: []` with none of those) do not commit and are dropped until then; after commit they are forwarded. An error frame before commit is classified like a non-stream embedded error and can fail over. After commit, failures end the stream with an error payload rather than replaying the request.
 
+### Request body size
+
+`server.max_request_bytes` caps each inbound chat completions, Messages, or
+Responses request body. It is a positive byte count and defaults to 33554432
+(32 MiB). A larger body returns 413 `invalid_request_error` before body
+validation, routing, or any upstream call; a body exactly at the limit is accepted. Zero
+or a negative value is a config error. The limit is per in-flight request, so
+operators on small hosts should size it together with expected concurrency.
+Older binaries reject the setting; remove it before rolling back.
+
 ### End-user attribution
 
 Off unless `[server] end_user_header` is set. When the inbound request carries that header, the gateway hashes it and sends the hash as Anthropic `metadata.user_id` and, on `openai` / `openai_compat` deployments, as the Chat Completions `user` field. A client-supplied value is overridden. The raw header is not logged, not copied upstream, and not returned. The response header `x-llmux-end-user` is the hash only, including on gateway errors after the hash is computed, whether or not routing headers are exposed.

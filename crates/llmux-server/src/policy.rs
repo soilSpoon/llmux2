@@ -378,6 +378,7 @@ mod tests {
             key_policies: Box::new([]),
             deny: Box::new([]),
             request_timeout: Duration::from_secs(1),
+            max_request_bytes: 32 * 1024 * 1024,
             shutdown_timeout: Duration::from_secs(1),
             drain_grace: Duration::from_millis(0),
             expose_routing_headers: false,

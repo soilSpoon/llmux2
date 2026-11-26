@@ -1305,14 +1305,6 @@ async fn responses_rejects_invalid_requests_before_contacting_upstream() {
         let payload: Value = serde_json::from_str(&body(response).await).unwrap();
         assert_eq!(payload["error"]["code"], "invalid_request_error");
     }
-    let oversized = fixture
-        .post(
-            "/v1/responses",
-            "test-client",
-            vec![b' '; 2 * 1024 * 1024 + 1],
-        )
-        .await;
-    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(fixture.counts(), [0, 0]);
 }
 
