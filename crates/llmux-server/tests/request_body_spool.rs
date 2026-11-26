@@ -96,6 +96,9 @@ struct Fixture {
     gateway: TestServer,
     gate: Arc<Semaphore>,
     spool_dir: PathBuf,
+    config_path: PathBuf,
+    config: String,
+    budget_bytes: u64,
     _upstreams: [TestServer; 2],
     _dir: tempfile::TempDir,
 }
@@ -108,6 +111,48 @@ impl Fixture {
         secondary_gated: bool,
         memory_bytes: u64,
         budget_bytes: u64,
+    ) -> Self {
+        Self::start_with_model_extra(
+            primary_mode,
+            secondary_mode,
+            primary_gated,
+            secondary_gated,
+            memory_bytes,
+            budget_bytes,
+            "",
+        )
+        .await
+    }
+
+    async fn start_middleout(
+        primary_mode: Mode,
+        secondary_mode: Mode,
+        primary_gated: bool,
+        secondary_gated: bool,
+        memory_bytes: u64,
+        budget_bytes: u64,
+    ) -> Self {
+        Self::start_with_model_extra(
+            primary_mode,
+            secondary_mode,
+            primary_gated,
+            secondary_gated,
+            memory_bytes,
+            budget_bytes,
+            "capabilities = { stream = true, max_context = 5 }",
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_with_model_extra(
+        primary_mode: Mode,
+        secondary_mode: Mode,
+        primary_gated: bool,
+        secondary_gated: bool,
+        memory_bytes: u64,
+        budget_bytes: u64,
+        model_extra: &str,
     ) -> Self {
         let gate = Arc::new(Semaphore::new(0));
         let primary = Upstream::new(primary_mode, primary_gated, gate.clone());
@@ -128,7 +173,7 @@ impl Fixture {
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let spool_dir = dir.path().join("spool");
-        for key in ["client", "primary", "secondary"] {
+        for key in ["client", "admin", "primary", "secondary"] {
             fs::write(dir.path().join(key), format!("{key}-key\n")).unwrap();
         }
         let base = dir.path().display();
@@ -137,6 +182,7 @@ impl Fixture {
             r#"
 [server]
 client_keys = ["file:{base}/client"]
+dashboard_key = "file:{base}/admin"
 max_request_bytes = 4096
 request_body_memory_bytes = {memory_bytes}
 request_body_spool_dir = {spool}
@@ -160,6 +206,7 @@ key = "file:{base}/secondary"
 
 [[models]]
 name = "large-context"
+{model_extra}
 
 [[models.deployments]]
 id = "primary"
@@ -176,12 +223,18 @@ upstream_model = "vendor-secondary"
 priority = 10
 "#,
             primary_server.url(),
-            secondary_server.url()
+            secondary_server.url(),
+            model_extra = model_extra
         );
+        let config_path = dir.path().join("llmux.toml");
+        fs::write(&config_path, &config).unwrap();
         let gateway = TestServer::start(
-            llmux_server::app(RuntimeConfig::parse(&config).unwrap())
-                .await
-                .unwrap(),
+            llmux_server::app_with_path(
+                RuntimeConfig::parse(&config).unwrap(),
+                Some(config_path.clone()),
+            )
+            .await
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -191,17 +244,53 @@ priority = 10
             gateway,
             gate,
             spool_dir,
+            config_path,
+            config,
+            budget_bytes,
             _upstreams: [primary_server, secondary_server],
             _dir: dir,
         }
     }
 
-    async fn send(&self, payload: String) -> (StatusCode, HeaderMap, String) {
-        let request = Request::post(format!("{}/v1/chat/completions", self.gateway.url()))
-            .header(header::AUTHORIZATION, "Bearer client-key")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Full::new(Bytes::from(payload)))
+    fn rewrite_spool_budget(&self, budget_bytes: u64) {
+        let old = format!("request_body_spool_budget_bytes = {}", self.budget_bytes);
+        let new = format!("request_body_spool_budget_bytes = {budget_bytes}");
+        fs::write(&self.config_path, self.config.replacen(&old, &new, 1)).unwrap();
+    }
+
+    async fn reload(&self) -> StatusCode {
+        let request = Request::post(format!("{}/admin/reload", self.gateway.url()))
+            .header(header::AUTHORIZATION, "Bearer admin-key")
+            .body(Full::new(Bytes::new()))
             .unwrap();
+        let response = timeout(
+            Duration::from_secs(5),
+            Client::builder(TokioExecutor::new())
+                .build_http()
+                .request(request),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        response.status()
+    }
+
+    async fn send(&self, payload: String) -> (StatusCode, HeaderMap, String) {
+        self.send_with_overflow(payload, None).await
+    }
+
+    async fn send_with_overflow(
+        &self,
+        payload: String,
+        overflow: Option<&str>,
+    ) -> (StatusCode, HeaderMap, String) {
+        let mut request = Request::post(format!("{}/v1/chat/completions", self.gateway.url()))
+            .header(header::AUTHORIZATION, "Bearer client-key")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(overflow) = overflow {
+            request = request.header("x-llmux-context-overflow", overflow);
+        }
+        let request = request.body(Full::new(Bytes::from(payload))).unwrap();
         let response = timeout(
             Duration::from_secs(5),
             Client::builder(TokioExecutor::new())
@@ -269,6 +358,20 @@ async fn wait_for_entries(dir: &Path, expected: usize) -> Vec<PathBuf> {
     .unwrap()
 }
 
+async fn wait_for_at_least_entries(dir: &Path, expected: usize) -> Vec<PathBuf> {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let entries = spool_entries(dir);
+            if entries.len() >= expected {
+                return entries;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn large_body_spools_replays_after_failover_and_cleans_up() {
     let fixture =
@@ -304,6 +407,86 @@ async fn large_body_spools_replays_after_failover_and_cleans_up() {
     let secondary = fixture.secondary.seen();
     assert_eq!(secondary[0]["model"], "vendor-secondary");
     assert_eq!(secondary[0]["pad"].as_str().unwrap().len(), expected_pad);
+    wait_for_entries(&fixture.spool_dir, 0).await;
+}
+
+#[tokio::test]
+async fn admin_reload_reconfigures_the_live_spool_budget() {
+    let fixture =
+        Arc::new(Fixture::start(Mode::Complete, Mode::Complete, true, false, 64, 4096).await);
+    let payload = payload_with_pad("x".repeat(600));
+    let payload_len = payload.len() as u64;
+    let first = {
+        let fixture = fixture.clone();
+        let payload = payload.clone();
+        tokio::spawn(async move { fixture.send(payload).await })
+    };
+    wait_for_calls(&fixture.primary, 1).await;
+    assert_eq!(
+        wait_for_at_least_entries(&fixture.spool_dir, 1).await.len(),
+        1
+    );
+
+    fixture.rewrite_spool_budget(payload_len);
+    assert_eq!(fixture.reload().await, StatusCode::OK);
+    let (status, _, body) = fixture.send(payload.clone()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(fixture.primary.calls(), 1);
+
+    fixture.gate.add_permits(1);
+    let (status, _, body) = first.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    wait_for_entries(&fixture.spool_dir, 0).await;
+
+    let third = {
+        let fixture = fixture.clone();
+        tokio::spawn(async move { fixture.send(payload).await })
+    };
+    wait_for_calls(&fixture.primary, 2).await;
+    fixture.gate.add_permits(1);
+    let (status, _, body) = third.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    wait_for_entries(&fixture.spool_dir, 0).await;
+}
+
+#[tokio::test]
+async fn spooled_middleout_retry_replaces_original_spool_and_cleans_up() {
+    let fixture = Arc::new(
+        Fixture::start_middleout(Mode::Complete, Mode::Complete, true, false, 64, 4096).await,
+    );
+    let payload = json!({
+        "model": "large-context",
+        "messages": [
+            {"role": "user", "content": format!("drop-me-{}", "x".repeat(300))},
+            {"role": "assistant", "content": format!("drop-me-too-{}", "y".repeat(300))},
+            {"role": "user", "content": "hi"}
+        ]
+    })
+    .to_string();
+    let sending = {
+        let fixture = fixture.clone();
+        tokio::spawn(async move {
+            fixture
+                .send_with_overflow(payload, Some("middle-out"))
+                .await
+        })
+    };
+    wait_for_calls(&fixture.primary, 1).await;
+    let entries = wait_for_at_least_entries(&fixture.spool_dir, 1).await;
+    assert_eq!(
+        entries.len(),
+        1,
+        "the retry must replace rather than retain the original spool"
+    );
+
+    fixture.gate.add_permits(1);
+    let (status, headers, body) = sending.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(headers["x-llmux-dropped-messages"], "2");
+    let upstream = fixture.primary.seen();
+    let messages = upstream[0]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert!(!upstream[0].to_string().contains("drop-me"));
     wait_for_entries(&fixture.spool_dir, 0).await;
 }
 
@@ -438,7 +621,7 @@ impl Fixture {
         )
         .await
         .unwrap();
-        for key in ["client", "primary", "secondary"] {
+        for key in ["client", "admin", "primary", "secondary"] {
             fs::write(fixture_dir.path().join(key), format!("{key}-key\n")).unwrap();
         }
         let base = fixture_dir.path().display();
@@ -447,6 +630,7 @@ impl Fixture {
             r#"
 [server]
 client_keys = ["file:{base}/client"]
+dashboard_key = "file:{base}/admin"
 max_request_bytes = 4096
 request_body_memory_bytes = 64
 request_body_spool_dir = {spool}
@@ -482,10 +666,15 @@ priority = 10
             primary_server.url(),
             secondary_server.url()
         );
+        let config_path = fixture_dir.path().join("llmux.toml");
+        fs::write(&config_path, &config).unwrap();
         let gateway = TestServer::start(
-            llmux_server::app(RuntimeConfig::parse(&config).unwrap())
-                .await
-                .unwrap(),
+            llmux_server::app_with_path(
+                RuntimeConfig::parse(&config).unwrap(),
+                Some(config_path.clone()),
+            )
+            .await
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -495,6 +684,9 @@ priority = 10
             gateway,
             gate,
             spool_dir: spool_dir.to_path_buf(),
+            config_path,
+            config,
+            budget_bytes: 4096,
             _upstreams: [primary_server, secondary_server],
             _dir: fixture_dir,
         }

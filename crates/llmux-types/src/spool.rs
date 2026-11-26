@@ -22,6 +22,9 @@ const PREFIX: &str = ".llmux-body-";
 const TEMP_SUFFIX: &str = ".tmp";
 const FINAL_SUFFIX: &str = "spool";
 
+#[cfg(test)]
+static PAUSE_BEFORE_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum SpoolError {
     #[error("request body spool storage capacity exhausted")]
@@ -154,12 +157,19 @@ impl SpoolStore {
     }
 
     pub fn begin(&self) -> Result<SpoolFile, SpoolError> {
+        let sweep_lock = open_sweep_lock(&self.dir).map_err(|_| SpoolError::Io)?;
+        lock_shared(&sweep_lock).map_err(|_| SpoolError::Io)?;
         let file = tempfile::Builder::new()
             .prefix(PREFIX)
             .suffix(TEMP_SUFFIX)
             .tempfile_in(&self.dir)
             .map_err(|_| SpoolError::Io)?;
+        #[cfg(test)]
+        if PAUSE_BEFORE_LOCK.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         lock_exclusive(file.as_file()).map_err(|_| SpoolError::Io)?;
+        drop(sweep_lock);
         Ok(SpoolFile {
             file,
             len: 0,
@@ -175,6 +185,8 @@ impl SpoolStore {
 }
 
 fn sweep(dir: &Path) -> io::Result<()> {
+    let sweep_lock = open_sweep_lock(dir)?;
+    lock_exclusive_blocking(&sweep_lock)?;
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -189,6 +201,51 @@ fn sweep(dir: &Path) -> io::Result<()> {
             remove_if_unlocked(&path);
         }
     }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_sweep_lock(dir: &Path) -> io::Result<File> {
+    File::open(dir)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn open_sweep_lock(dir: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(dir.join(".llmux-body-sweep.lock"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn flock(file: &File, operation: libc::c_int) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), operation) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn lock_shared(file: &File) -> io::Result<()> {
+    flock(file, libc::LOCK_SH)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn lock_exclusive_blocking(file: &File) -> io::Result<()> {
+    flock(file, libc::LOCK_EX)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn lock_shared(_: &File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn lock_exclusive_blocking(_: &File) -> io::Result<()> {
     Ok(())
 }
 
@@ -450,6 +507,29 @@ mod tests {
             truncated.read_bytes().unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
+    }
+
+    #[test]
+    fn startup_sweep_cannot_delete_a_live_temp_during_create_before_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SpoolStore::open(dir.path(), 64).unwrap();
+        PAUSE_BEFORE_LOCK.store(true, Ordering::Relaxed);
+        let writer = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                let mut file = store.begin().unwrap();
+                file.write(b"live").unwrap();
+                file.finish()
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        SpoolStore::open(dir.path(), 64).unwrap();
+        PAUSE_BEFORE_LOCK.store(false, Ordering::Relaxed);
+        let spooled = writer
+            .join()
+            .unwrap()
+            .expect("a live overlapping temp spool must survive startup sweep");
+        assert_eq!(spooled.read_bytes().unwrap(), Bytes::from_static(b"live"));
     }
 
     #[test]

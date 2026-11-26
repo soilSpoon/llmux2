@@ -19,7 +19,7 @@ use thiserror::Error;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 86_400_000;
-const DEFAULT_MAX_REQUEST_BYTES: u64 = 128 * 1024 * 1024;
+const DEFAULT_MAX_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
 const DEFAULT_REQUEST_BODY_MEMORY_BYTES: u64 = 1024 * 1024;
 const DEFAULT_REQUEST_BODY_SPOOL_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -2076,7 +2076,7 @@ strip_request_fields = {fields}
         };
 
         let default = RuntimeConfig::parse(&base).unwrap();
-        assert_eq!(default.server.max_request_bytes, 128 * 1024 * 1024);
+        assert_eq!(default.server.max_request_bytes, 32 * 1024 * 1024);
         let custom = RuntimeConfig::parse(&with("max_request_bytes = 192")).unwrap();
         assert_eq!(custom.server.max_request_bytes, 192);
         let err = RuntimeConfig::parse(&with("max_request_bytes = 0"))

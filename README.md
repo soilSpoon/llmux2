@@ -188,8 +188,8 @@ Rejecting is the default. To trim instead, set `context_overflow = "middle-out"`
 ### Request body size
 
 `server.max_request_bytes` caps each inbound chat completions, Messages, or
-Responses request body. It is a positive byte count and defaults to 134217728
-(128 MiB). A larger body returns 413 `invalid_request_error` before body
+Responses request body. It is a positive byte count and defaults to 33554432
+(32 MiB). A larger body returns 413 `invalid_request_error` before body
 validation, routing, or any upstream call; a body exactly at the limit is accepted. Zero
 or a negative value is a config error.
 
@@ -208,12 +208,16 @@ start sweeps llmux orphans without unlinking locked files owned by an
 overlapping zero-downtime process.
 
 The disk budget must fit comfortably within free space on the host; on small
-OCI shapes keep it on a disk-backed filesystem, not tmpfs. Admission parsing
-and provider conversion may still materialize a transient copy of one body,
-so `max_request_bytes` remains a coarse DoS bound rather than a memory-proof
-guarantee. Spooling is request-side only and does not interact with streaming
-responses. Older binaries reject these settings; remove them before rolling
-back.
+OCI shapes keep it on a disk-backed filesystem, not tmpfs, with the directory
+writable only by the gateway service user. Admission parsing, per-candidate
+materialization, and provider conversion may still hold full transient copies
+of one body, so spooling bounds ingress buffering and retry accumulation; it
+does not make peak memory independent of body size. The conservative 32 MiB
+default reflects that honest peak-memory model: operators that raise
+`max_request_bytes` must budget several transient copies per concurrent large
+request in addition to the spool disk budget. Spooling is request-side only
+and does not interact with streaming responses. Older binaries reject these
+settings; remove them before rolling back.
 
 ### End-user attribution
 

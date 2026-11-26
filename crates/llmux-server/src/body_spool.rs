@@ -6,9 +6,9 @@
 
 use axum::body::{Body, Bytes};
 use futures_util::StreamExt;
+use llmux_types::SpoolFile;
 use llmux_types::{SpoolError, SpoolStore, SpooledBody};
 use std::sync::Arc;
-use tokio::{sync::mpsc, task::JoinHandle};
 
 #[derive(Debug)]
 pub(crate) enum CapturedBody {
@@ -55,12 +55,7 @@ pub(crate) async fn capture_body(
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(chunk) => chunk,
-            Err(_) => {
-                if let Some(writer) = disk.take() {
-                    writer.abort().await;
-                }
-                return Err(CaptureError::Read);
-            }
+            Err(_) => return Err(CaptureError::Read),
         };
         if chunk.is_empty() {
             continue;
@@ -69,29 +64,20 @@ pub(crate) async fn capture_body(
             .checked_add(chunk.len())
             .filter(|total| *total <= max_bytes)
         else {
-            if let Some(writer) = disk.take() {
-                writer.abort().await;
-            }
             return Err(CaptureError::TooLarge);
         };
         total = next_total;
         if let Some(writer) = &mut disk {
-            if writer.send(chunk).await.is_err() {
-                let writer = disk.take().expect("disk writer is present");
-                return Err(writer.finish_error().await);
-            }
+            writer.write(chunk).await?;
         } else if memory.len() + chunk.len() <= memory_threshold {
             memory.extend_from_slice(&chunk);
         } else {
-            let mut writer = DiskWriter::start(store.clone());
-            let buffered = Bytes::copy_from_slice(&memory);
-            memory.clear();
-            if !buffered.is_empty() && writer.send(buffered).await.is_err() {
-                return Err(writer.finish_error().await);
+            let mut writer = DiskWriter::start(store.clone()).await?;
+            let buffered = Bytes::from(std::mem::take(&mut memory));
+            if !buffered.is_empty() {
+                writer.write(buffered).await?;
             }
-            if writer.send(chunk).await.is_err() {
-                return Err(writer.finish_error().await);
-            }
+            writer.write(chunk).await?;
             disk = Some(writer);
         }
     }
@@ -122,65 +108,39 @@ pub(crate) async fn copy_to_spool(
         .map_err(CaptureError::from)
 }
 
-enum WriteCommand {
-    Chunk(Bytes),
-    Finish,
-}
-
 struct DiskWriter {
-    tx: mpsc::Sender<WriteCommand>,
-    task: JoinHandle<Result<SpooledBody, SpoolError>>,
+    file: Option<SpoolFile>,
 }
 
 impl DiskWriter {
-    fn start(store: SpoolStore) -> Self {
-        let (tx, rx) = mpsc::channel(2);
-        let task = tokio::task::spawn_blocking(move || write_spool(store, rx));
-        Self { tx, task }
-    }
-
-    async fn send(&mut self, chunk: Bytes) -> Result<(), ()> {
-        self.tx
-            .send(WriteCommand::Chunk(chunk))
+    async fn start(store: SpoolStore) -> Result<Self, CaptureError> {
+        let file = tokio::task::spawn_blocking(move || store.begin())
             .await
-            .map_err(|_| ())
+            .map_err(|_| CaptureError::Io)?
+            .map_err(CaptureError::from)?;
+        Ok(Self { file: Some(file) })
     }
 
-    async fn finish(self) -> Result<SpooledBody, CaptureError> {
-        let _ = self.tx.send(WriteCommand::Finish).await;
-        drop(self.tx);
-        match self.task.await {
-            Ok(Ok(spool)) => Ok(spool),
-            Ok(Err(error)) => Err(error.into()),
-            Err(_) => Err(CaptureError::Io),
-        }
+    async fn write(&mut self, chunk: Bytes) -> Result<(), CaptureError> {
+        let mut file = self.file.take().expect("disk writer file is present");
+        let (file, result) = tokio::task::spawn_blocking(move || {
+            let result = file.write(&chunk);
+            (file, result)
+        })
+        .await
+        .map_err(|_| CaptureError::Io)?;
+        result.map_err(CaptureError::from)?;
+        self.file = Some(file);
+        Ok(())
     }
 
-    async fn finish_error(self) -> CaptureError {
-        match self.finish().await {
-            Ok(_) => CaptureError::Io,
-            Err(error) => error,
-        }
+    async fn finish(mut self) -> Result<SpooledBody, CaptureError> {
+        let file = self.file.take().expect("disk writer file is present");
+        tokio::task::spawn_blocking(move || file.finish())
+            .await
+            .map_err(|_| CaptureError::Io)?
+            .map_err(CaptureError::from)
     }
-
-    async fn abort(self) {
-        drop(self.tx);
-        let _ = self.task.await;
-    }
-}
-
-fn write_spool(
-    store: SpoolStore,
-    mut rx: mpsc::Receiver<WriteCommand>,
-) -> Result<SpooledBody, SpoolError> {
-    let mut file = store.begin()?;
-    while let Some(command) = rx.blocking_recv() {
-        match command {
-            WriteCommand::Chunk(chunk) => file.write(&chunk)?,
-            WriteCommand::Finish => return file.finish(),
-        }
-    }
-    Err(SpoolError::Cancelled)
 }
 
 #[cfg(test)]
@@ -243,6 +203,53 @@ mod tests {
         assert_eq!(error, CaptureError::TooLarge);
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
         assert_eq!(store.budget().used(), 0);
+    }
+
+    #[test]
+    fn stalled_spooled_ingress_releases_blocking_workers_between_writes() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let store = SpoolStore::open(dir.path(), 4096).unwrap();
+            let first = stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(vec![b'x'; 128]))]);
+            let pending = stream::pending::<Result<Bytes, Infallible>>();
+            let body = Body::from_stream(first.chain(pending));
+            let capture = tokio::spawn(capture_body(body, store.clone(), 8, 4096));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if fs::read_dir(dir.path())
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .any(|entry| {
+                            entry
+                                .file_name()
+                                .to_str()
+                                .is_some_and(|name| name.ends_with(".tmp"))
+                        })
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+
+            let probe =
+                tokio::time::timeout(Duration::from_secs(1), tokio::task::spawn_blocking(|| 42))
+                    .await
+                    .expect("stalled ingress must not occupy the only blocking worker")
+                    .unwrap();
+            assert_eq!(probe, 42);
+
+            capture.abort();
+            let _ = capture.await;
+        });
     }
 
     #[tokio::test]

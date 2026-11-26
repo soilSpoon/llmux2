@@ -676,30 +676,37 @@ async fn route_request(
         ..
     }) = result
     {
-        let truncate_source = match &inline_body {
-            Some(body) => body.clone(),
-            None => match body_spool::read_spool_bytes(
-                replay.as_ref().expect("spooled body replay").clone(),
-            )
-            .await
-            {
-                Ok(body) => body,
-                Err(error) => return capture_error(error),
-            },
-        };
-        if let Some(truncated) = truncate_middle_for_format(
-            &truncate_source,
-            prompt_bytes,
-            max_output_tokens,
-            limit,
-            format,
-        ) {
-            dropped = truncated.dropped;
-            let truncated_replay = if replay.is_some() {
-                match body_spool::copy_to_spool(store.clone(), truncated.body.clone()).await {
-                    Ok(spooled) => Some(spooled),
+        let truncated = {
+            let truncate_source = match &inline_body {
+                Some(body) => body.clone(),
+                None => match body_spool::read_spool_bytes(
+                    replay.as_ref().expect("spooled body replay").clone(),
+                )
+                .await
+                {
+                    Ok(body) => body,
                     Err(error) => return capture_error(error),
-                }
+                },
+            };
+            truncate_middle_for_format(
+                &truncate_source,
+                prompt_bytes,
+                max_output_tokens,
+                limit,
+                format,
+            )
+        };
+        if let Some(truncated) = truncated {
+            dropped = truncated.dropped;
+            drop(inline_body);
+            let truncated_replay = if replay.is_some() {
+                let spooled =
+                    match body_spool::copy_to_spool(store.clone(), truncated.body.clone()).await {
+                        Ok(spooled) => spooled,
+                        Err(error) => return capture_error(error),
+                    };
+                drop(replay);
+                Some(spooled)
             } else {
                 None
             };

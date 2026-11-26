@@ -799,6 +799,27 @@ impl Executor {
                             return Err(GatewayError::Client(UpstreamError::Timeout));
                         }
                         Effect::Admit if machine.phase == Phase::Admit => {
+                            if replay.is_some() && attempt_request.is_none() {
+                                attempt_request = Some({
+                                    let materialize =
+                                        materialize_attempt_request(&req, replay.as_ref());
+                                    tokio::pin!(materialize);
+                                    let materialized = tokio::select! {
+                                        biased;
+                                        result = &mut materialize => Ok(result),
+                                        _ = tokio::time::sleep_until(deadline) => Err(()),
+                                    };
+                                    match materialized {
+                                        Ok(Ok(request)) => request,
+                                        Ok(Err(error)) => return Err(error),
+                                        Err(()) => {
+                                            return Err(GatewayError::Client(
+                                                UpstreamError::Timeout,
+                                            ))
+                                        }
+                                    }
+                                });
+                            }
                             permit = if support == Support::Convert {
                                 None
                             } else {
@@ -1330,6 +1351,17 @@ fn index(idx: DeploymentIdx) -> usize {
     idx.0 as usize
 }
 
+#[cfg(test)]
+type MaterializeTestGate = (
+    std::path::PathBuf,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+);
+
+#[cfg(test)]
+static MATERIALIZE_TEST_GATE: std::sync::Mutex<Vec<MaterializeTestGate>> =
+    std::sync::Mutex::new(Vec::new());
+
 async fn materialize_attempt_request(
     req: &GatewayRequest,
     replay: Option<&Arc<SpooledBody>>,
@@ -1337,6 +1369,19 @@ async fn materialize_attempt_request(
     let mut materialized = req.clone();
     if let Some(spool) = replay {
         let spool = spool.clone();
+        #[cfg(test)]
+        {
+            let gate = MATERIALIZE_TEST_GATE
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .iter()
+                .find(|(path, _, _)| path == spool.path())
+                .map(|(_, started, release)| (started.clone(), release.clone()));
+            if let Some((started, release)) = gate {
+                started.notify_one();
+                release.notified().await;
+            }
+        }
         let body = tokio::task::spawn_blocking(move || spool.read_bytes())
             .await
             .map_err(|_| GatewayError::Internal)?

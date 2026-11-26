@@ -376,6 +376,110 @@ async fn spooled_replay_is_reread_for_each_failover_candidate() {
     assert_eq!(replay.read_count(), 2);
 }
 
+#[cfg(test)]
+fn install_materialize_gate(
+    path: &std::path::Path,
+) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    MATERIALIZE_TEST_GATE.lock().unwrap().push((
+        path.to_path_buf(),
+        started.clone(),
+        release.clone(),
+    ));
+    (started, release)
+}
+
+fn clear_materialize_gate(path: &std::path::Path) {
+    MATERIALIZE_TEST_GATE
+        .lock()
+        .unwrap()
+        .retain(|(gate_path, _, _)| gate_path != path);
+}
+
+#[tokio::test]
+async fn spooled_materialization_finishes_before_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = llmux_types::SpoolStore::open(dir.path(), 4096).unwrap();
+    let replay = store
+        .spool_bytes(br#"{"model":"model","messages":[]}"#)
+        .unwrap();
+    let (executor, _adapter, _credential, _server) = fixture_with_models(
+        vec![],
+        false,
+        [None; 3],
+        &[("model", &[0])],
+        llmux_types::QuotaSpec {
+            concurrent: Some(1),
+            ..Default::default()
+        },
+    )
+    .await;
+    let limits = executor.bindings[0].limits.clone();
+    let replay_path = replay.path().to_path_buf();
+    let (started, release) = install_materialize_gate(&replay_path);
+    let routing = tokio::spawn({
+        let mut req = request();
+        req.body = Bytes::new();
+        async move {
+            executor
+                .execute_attributed_with_replay(req, Some(replay))
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), started.notified())
+        .await
+        .unwrap();
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        limits.inflight(),
+        Some(0),
+        "spool materialization must finish before admission consumes the concurrency permit"
+    );
+    release.notify_one();
+    routing.await.unwrap().unwrap();
+    clear_materialize_gate(&replay_path);
+}
+
+#[tokio::test(start_paused = true)]
+async fn spooled_materialization_uses_the_routing_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = llmux_types::SpoolStore::open(dir.path(), 4096).unwrap();
+    let replay = store
+        .spool_bytes(br#"{"model":"model","messages":[]}"#)
+        .unwrap();
+    let (executor, _adapter, _credential, _server) = fixture(vec![], false).await;
+    let replay_path = replay.path().to_path_buf();
+    let (started, _release) = install_materialize_gate(&replay_path);
+    let routing = tokio::spawn({
+        let mut req = request();
+        req.body = Bytes::new();
+        async move {
+            executor
+                .execute_attributed_with_replay(req, Some(replay))
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), started.notified())
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let result = tokio::time::timeout(Duration::from_secs(1), routing)
+        .await
+        .expect("spool materialization must obey the five-second routing deadline")
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(RoutedError {
+            error: GatewayError::Client(UpstreamError::Timeout),
+            ..
+        })
+    ));
+    clear_materialize_gate(&replay_path);
+}
+
 #[tokio::test]
 async fn refresh_once_then_success() {
     let (executor, adapter, credential, _server) =

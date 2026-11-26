@@ -10,7 +10,7 @@ per-key model restrictions, request size, and image intake.
 ### Requirement: Inbound request body limit
 
 `[server]` SHALL accept optional integer `max_request_bytes` in bytes,
-defaulting to 134217728 (128 MiB). The value SHALL be positive; zero or a
+defaulting to 33554432 (32 MiB). The value SHALL be positive; zero or a
 negative value SHALL make config load fail. Every
 inbound chat completions, Messages, or Responses request body larger than the
 configured limit SHALL be rejected 413 with OpenAI-style code
@@ -80,16 +80,22 @@ in-flight request body spools in the process. Bytes SHALL be reserved before
 they are written. If admission cannot reserve enough bytes, the gateway SHALL
 fail closed with 503 before any upstream call, using a generic error that does
 not copy request content, and SHALL remove every partial file for that request.
+Disk writes SHALL use bounded disk operations that do not retain an async
+runtime blocking worker while the gateway waits for client network input.
 A successfully admitted spool SHALL be deleted when the request completes,
 fails, or is cancelled, and its budget bytes SHALL be released. Startup SHALL
 sweep llmux-named spool orphans without deleting files locked by a live
-overlapping process.
+overlapping process, and sweep SHALL serialize with spool creation so no
+visible temp file remains unlocked before creation completes.
 
 When a spooled request fails over, the next upstream candidate SHALL be built
 from a fresh read of the immutable spool rather than requiring the ingress body
-to remain in memory. Gateway-only routing fields SHALL be stripped before that
-canonical replay body is stored. A middle-out truncated retry of a spooled
-request SHALL receive its own spool and lifecycle.
+to remain in memory. That materialization SHALL run within the overall
+routing deadline and before consuming a local concurrency permit. Gateway-only
+routing fields SHALL be stripped before that canonical replay body is stored.
+A middle-out truncated retry of a spooled request SHALL receive its own spool
+and lifecycle; once the truncated spool is durable, it SHALL replace the
+original replay spool rather than retaining both across the retry.
 
 #### Scenario: Memory below threshold
 
