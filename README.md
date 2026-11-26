@@ -285,6 +285,13 @@ allow-all-minus-`blocked`; an entry with neither is a config error, as is a
 `*` catch-all is never listed for any key. Older binaries reject
 `key_policies`; remove it when rolling back.
 
+`traffic_class = "ci_buyer_shaped" | "synthetic_probe" | "internal" | "unknown"`
+assigns server-side accounting identity for requests authenticated by that key.
+It is written to the request log as `traffic_class`; callers cannot forge it
+with headers or body fields. A traffic-class-only entry is valid and does not
+change routing or model access. Unclassified authenticated keys are logged as
+`unknown`.
+
 `free_only = true` makes a key free-only: every request behaves as if it sent
 `x-llmux-free-only: true` (billed legs are never eligible), and
 `GET /v1/models` advertises only models with at least one usable free leg — a

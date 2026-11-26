@@ -34,7 +34,7 @@ use llmux_providers::{
 };
 use llmux_types::{
     provider, AcpAgentSpec, Billing, ContextOverflow, CredentialSource, GatewayRequest,
-    GatewayResponse, InboundFormat, ProviderRegistry, RequestId, UpstreamError,
+    GatewayResponse, InboundFormat, ProviderRegistry, RequestId, TrafficClass, UpstreamError,
 };
 use serde_json::{json, value::RawValue, Value};
 use sha2::{Digest, Sha256};
@@ -200,7 +200,7 @@ async fn build(
         .server
         .request_log
         .as_deref()
-        .map(RequestLog::open)
+        .map(|path| RequestLog::open_with_traffic_classes(path, traffic_class_map(&config.server)))
         .transpose()
         .map_err(InitError::RequestLog)?;
     for (id, credential) in std::mem::take(&mut config.oauth) {
@@ -727,6 +727,31 @@ fn matched_key(
             index,
             fingerprint: key_fingerprint(keys, &keys[index]),
         })
+}
+
+fn traffic_class_map(
+    server: &llmux_config::ServerConfig,
+) -> std::collections::HashMap<Arc<str>, TrafficClass> {
+    let mut seen = std::collections::HashSet::new();
+    server
+        .client_keys
+        .iter()
+        .enumerate()
+        .filter_map(|(index, key)| {
+            let fingerprint = key_fingerprint(&server.client_keys, key);
+            // Duplicate key values authenticate as their first entry; later
+            // copies must not overwrite that entry's accounting class.
+            if !seen.insert(fingerprint.clone()) {
+                return None;
+            }
+            let class = server
+                .key_policies
+                .get(index)
+                .and_then(Option::as_ref)?
+                .traffic_class?;
+            Some((fingerprint, class))
+        })
+        .collect()
 }
 
 fn key_fingerprint(keys: &[Arc<str>], key: &Arc<str>) -> Arc<str> {

@@ -1,9 +1,10 @@
 //! Durable per-request records: one JSON object per line, for nightly analysis.
 
 use crate::GatewayError;
-use llmux_types::ErrorKind;
+use llmux_types::{ErrorKind, TrafficClass};
 use serde::Serialize;
 use std::{
+    collections::HashMap,
     fs::OpenOptions,
     io::{self, Write},
     path::Path,
@@ -66,6 +67,7 @@ pub struct RequestRecord<'a> {
 }
 
 pub struct RequestLog {
+    traffic_classes: HashMap<Arc<str>, TrafficClass>,
     /// `None` once the queue is disconnected for drain-on-drop.
     tx: Option<SyncSender<Vec<u8>>>,
     dropped: AtomicU64,
@@ -76,8 +78,17 @@ impl RequestLog {
     /// Opens the file and starts its writer thread. The caller's runtime never
     /// touches the filesystem after this.
     pub fn open(path: &Path) -> io::Result<Self> {
+        Self::open_with_traffic_classes(path, HashMap::new())
+    }
+
+    /// Opens the log with server-derived accounting classes keyed by client-key
+    /// fingerprint. Callers cannot assert or alter these classes.
+    pub fn open_with_traffic_classes(
+        path: &Path,
+        traffic_classes: HashMap<Arc<str>, TrafficClass>,
+    ) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self::spawn_writer(file, None))
+        Ok(Self::spawn_writer(file, None, traffic_classes))
     }
 
     /// Test seam: the writer parks on `gate` before draining, so tests can fill
@@ -85,10 +96,14 @@ impl RequestLog {
     #[cfg(test)]
     fn open_gated(path: &Path, gate: Arc<Barrier>) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self::spawn_writer(file, Some(gate)))
+        Ok(Self::spawn_writer(file, Some(gate), HashMap::new()))
     }
 
-    fn spawn_writer(mut file: std::fs::File, gate: Option<Arc<Barrier>>) -> Self {
+    fn spawn_writer(
+        mut file: std::fs::File,
+        gate: Option<Arc<Barrier>>,
+        traffic_classes: HashMap<Arc<str>, TrafficClass>,
+    ) -> Self {
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(QUEUE_CAPACITY);
         let writer = thread::spawn(move || {
             if let Some(gate) = gate {
@@ -101,6 +116,7 @@ impl RequestLog {
             }
         });
         Self {
+            traffic_classes,
             tx: Some(tx),
             dropped: AtomicU64::new(0),
             writer: Some(writer),
@@ -112,7 +128,26 @@ impl RequestLog {
     /// best-effort and never worth stalling routing for — with a rate-limited
     /// warning so the operator can see the loss.
     pub fn record(&self, record: &RequestRecord<'_>) {
-        let Ok(mut line) = serde_json::to_vec(record) else {
+        #[derive(Serialize)]
+        struct Attributed<'a, 'b> {
+            #[serde(flatten)]
+            record: &'a RequestRecord<'b>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            traffic_class: Option<&'static str>,
+        }
+
+        let traffic_class = record.client_key.map(|fingerprint| {
+            self.traffic_classes
+                .get(fingerprint)
+                .copied()
+                .unwrap_or_default()
+                .as_str()
+        });
+        let attributed = Attributed {
+            record,
+            traffic_class,
+        };
+        let Ok(mut line) = serde_json::to_vec(&attributed) else {
             return;
         };
         line.push(b'\n');
