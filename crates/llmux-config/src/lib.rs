@@ -136,6 +136,8 @@ pub struct OAuthCredential {
     pub client_secret: Option<Arc<str>>,
     pub scopes: Option<Vec<String>>,
     pub resource: Option<String>,
+    /// Token response field used as the bearer credential; defaults to `access_token`.
+    pub token_field: Option<String>,
     pub refresh_token_path: Option<PathBuf>,
     pub refresh_skew: Duration,
     pub request_timeout: Duration,
@@ -296,6 +298,7 @@ enum RawCredential {
         client_secret: Option<String>,
         scopes: Option<Vec<String>>,
         resource: Option<String>,
+        token_field: Option<String>,
         refresh_skew_ms: Option<u64>,
         request_timeout_ms: Option<u64>,
         #[serde(default)]
@@ -695,6 +698,7 @@ impl RawConfig {
                     client_secret,
                     scopes,
                     resource,
+                    token_field,
                     refresh_skew_ms,
                     request_timeout_ms,
                     ..
@@ -737,6 +741,9 @@ impl RawConfig {
                     if refresh_skew_ms > MAX_TIMEOUT_MS {
                         return Err(invalid("oauth refresh_skew_ms must be at most 86400000"));
                     }
+                    if token_field.as_deref().is_some_and(str::is_empty) {
+                        return Err(invalid("oauth token_field must be nonempty"));
+                    }
                     oauth.insert(
                         id,
                         OAuthCredential {
@@ -746,6 +753,7 @@ impl RawConfig {
                             client_secret,
                             scopes,
                             resource,
+                            token_field,
                             refresh_token_path,
                             refresh_skew: Duration::from_millis(refresh_skew_ms),
                             request_timeout: timeout(request_timeout_ms.unwrap_or(30_000))?,

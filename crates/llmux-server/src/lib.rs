@@ -215,6 +215,9 @@ async fn build(
         if let Some(resource) = credential.resource {
             oauth.extra_params.push(("resource".into(), resource));
         }
+        if let Some(token_field) = credential.token_field {
+            oauth.token_field = token_field;
+        }
         oauth.refresh_token_path = credential.refresh_token_path;
         oauth.refresh_skew = credential.refresh_skew;
         oauth.request_timeout = credential.request_timeout;

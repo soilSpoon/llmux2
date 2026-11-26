@@ -525,6 +525,14 @@ THEN requests go to inference-api.nousresearch.com with the portal access token
 via `openai_compat`, refreshed ahead of expiry and once on a 401, the model is
 exposed as `nous/<portal id>`, and it never joins another vendor's combo.
 
+#### Scenario: OAuth bearer comes from a configurable token response field
+
+WHEN an `oauth` credential sets `token_field` (default `access_token`)
+THEN the bearer token is read from that field of the token endpoint response —
+for example `id_token` for OIDC issuers whose access token is not the API
+credential — and a response missing the field or carrying it empty fails the
+refresh without exposing any token value in errors or logs.
+
 #### Scenario: Default User-Agent on upstream requests
 
 WHEN any adapter (`openai_compat`, `anthropic`, `openai_responses`), the OAuth

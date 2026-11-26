@@ -486,6 +486,43 @@ Repeat the `[[models]]` block for `deepseek-v4.1-flash`, `glm-5.3-flash`,
 `glm-5.3` = 3, `claude-sonnet-5-5` = 10, `gpt-6.1-sol` = 10 per request)
 without a spending decision; the daily balance is small.
 
+### JetBrains Junie Lite (free tier, ends 2026-12-31)
+
+Junie Lite serves `gpt-6-luna` at zero cost for JetBrains accounts until
+2026-12-31. There is no public API key for the free tier; access is the Junie
+CLI's OAuth login (one browser sign-in, out of band). The refresh token never
+rotates, and the bearer for inference is the OIDC `id_token`, not the access
+token — hence `token_field = "id_token"`. The static headers are required:
+`x-llm-model: openai` routes the request at the edge (a wrong value is a 404),
+and `x-forced-license-free: 2` activates the free license interpretation (a
+missing one is a 403). The credit balance always reads 0.0 even when healthy,
+so quota exhaustion can only be observed through 429/403 responses. Backup/failover
+positioning only: one account, one model, program ends 2026-12-31.
+
+```toml
+[server]
+client_keys = ["env:LLMUX_CLIENT_KEY"]
+
+[[credentials]]
+id = "junie-lite-oauth"
+kind = "oauth"
+provider = "openai_compat"
+token_url = "https://oauth.account.jetbrains.com/oauth2/token"
+client_id = "junie-cli"
+refresh_token = "file:secrets/junie-refresh-token"
+token_field = "id_token"
+
+[[models]]
+name = "gpt-6-luna"
+[[models.deployments]]
+id = "gpt-6-luna-junie-lite"
+credential = "junie-lite-oauth"
+base_url = "https://ingrazzio-cloud-prod.labs.jb.gg/v1"
+upstream_model = "gpt-6-luna"
+headers = { x-llm-model = "openai", x-keep-path = "true", x-forced-license-free = "2", x-client-feature-id = "junie", x-accept-eap-license = "false", x-accept-release-license = "false", openai-version = "2020-11-07" }
+quota = { rpm = 20, concurrent = 3 }
+```
+
 ### Kilo Gateway (official API key)
 
 ```toml
