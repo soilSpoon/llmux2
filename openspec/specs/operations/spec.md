@@ -146,11 +146,22 @@ the gateway client key used (a `key_<16 hex>` hash keyed by the configured
 key set, never the key itself), the count of image inputs in the inbound
 request, and — when the upstream supplies one — the provider-side request ID
 (such as an Anthropic `msg_`/`req_` ID) so a provider flag can be matched by
-ID rather than timestamp alone. Optional fields SHALL be omitted rather than
+ID rather than timestamp alone. When the selected upstream response supplies
+token accounting, the record SHALL carry a `usage` object with the counters
+that are actually present: `input_tokens`, `output_tokens`,
+`cached_input_tokens`, and `cache_creation_input_tokens`. OpenAI-compatible
+`prompt_tokens`/`completion_tokens` and `prompt_tokens_details.cached_tokens`
+SHALL normalize onto those names, as SHALL Anthropic `input_tokens`,
+`output_tokens`, `cache_read_input_tokens`, and
+`cache_creation_input_tokens`. Missing counters SHALL be omitted rather than
+invented as zero. For a streaming response, usage is only knowable after the
+upstream stream is consumed, so the gateway SHALL defer that request record
+until end-of-stream, the first upstream stream error, or cancellation, while
+leaving the response bytes unchanged. Optional fields SHALL be omitted rather than
 written as null, and the file SHALL be
 created on startup, failing startup when it cannot be opened. Records SHALL
-contain no credentials or request bodies. When `server.request_log` is
-unset, no file is written.
+contain no credentials, request bodies, prompts, or response bodies. When
+`server.request_log` is unset, no file is written.
 
 #### Scenario: Failed request still recorded
 - WHEN a request exhausts every candidate
@@ -163,6 +174,14 @@ unset, no file is written.
 #### Scenario: Provider flag traced by upstream ID
 - WHEN an upstream response carries `anthropic-request-id`, `x-request-id` or `request-id`, or a provider-owned body carries `id` or `request_id` (including in an error body)
 - THEN the record includes it as `upstream_request_id`, on success and on failure, preferring the header id when both differ.
+
+#### Scenario: Completion usage recorded without response content
+- WHEN a successful non-streaming response carries OpenAI-compatible usage with cached-token details
+- THEN the record includes normalized numeric token counters and no prompt or response content.
+
+#### Scenario: Stream usage recorded after consumption
+- WHEN a successful stream emits usage in a final usage event and the client consumes or drops the stream
+- THEN the record is written when the stream ends, errors, or is dropped, merging partial Anthropic usage events and omitting counters the upstream never supplied.
 
 #### Scenario: No attempts made
 - WHEN every candidate is cooling or limited before any attempt

@@ -38,6 +38,8 @@ struct Adapter {
     observed: Mutex<Option<LimitObservation>>,
     status: Arc<std::sync::atomic::AtomicU16>,
     stream_errors: Mutex<VecDeque<UpstreamError>>,
+    complete_body: Mutex<Option<Bytes>>,
+    stream_events: Mutex<VecDeque<SseEvent>>,
     calls: Mutex<Vec<(Arc<str>, Arc<str>)>>,
     cool_on_build: Mutex<Option<Arc<DeploymentLimits>>>,
     cool_on_repair: Mutex<Option<Arc<DeploymentLimits>>>,
@@ -100,19 +102,33 @@ impl ProviderAdapter for Adapter {
             return Err(error);
         }
         if req.stream {
-            let event = SseEvent {
-                event: None,
-                data: "{}".into(),
-            };
+            let mut events: Vec<_> = self
+                .stream_events
+                .lock()
+                .unwrap()
+                .drain(..)
+                .map(Ok)
+                .collect();
+            if events.is_empty() {
+                events.push(Ok(SseEvent {
+                    event: None,
+                    data: "{}".into(),
+                }));
+            }
             let tail = self.stream_errors.lock().unwrap().pop_front();
             return Ok(GatewayResponse::Stream(Box::pin(
-                futures_util::stream::iter(std::iter::once(Ok(event)).chain(tail.map(Err))),
+                futures_util::stream::iter(events.into_iter().chain(tail.map(Err))),
             )));
         }
         Ok(GatewayResponse::Complete {
             status: StatusCode::OK,
             headers: HeaderMap::new(),
-            body: Bytes::new(),
+            body: self
+                .complete_body
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_default(),
         })
     }
 
@@ -203,6 +219,8 @@ async fn fixture_full(
         observed: Mutex::new(None),
         status,
         stream_errors: Mutex::new(VecDeque::new()),
+        complete_body: Mutex::new(None),
+        stream_events: Mutex::new(VecDeque::new()),
         calls: Mutex::new(Vec::new()),
         cool_on_build: Mutex::new(None),
         cool_on_repair: Mutex::new(None),
@@ -945,6 +963,8 @@ async fn fixture_shared_group(
         observed: Mutex::new(None),
         status,
         stream_errors: Mutex::new(VecDeque::new()),
+        complete_body: Mutex::new(None),
+        stream_events: Mutex::new(VecDeque::new()),
         calls: Mutex::new(Vec::new()),
         cool_on_build: Mutex::new(None),
         cool_on_repair: Mutex::new(None),
@@ -2348,6 +2368,296 @@ async fn request_log_records_each_request() {
     assert_eq!(lines[0]["upstream_request_id"], "req_fixture_1");
     assert!(lines[1].get("upstream_request_id").is_none());
     assert_eq!(lines[2]["upstream_request_id"], "req_fixture_1");
+}
+
+#[tokio::test]
+async fn request_log_records_complete_response_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, adapter, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [Some(1024); 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+        [None; 3],
+    )
+    .await;
+    *adapter.complete_body.lock().unwrap() = Some(Bytes::from_static(
+        br#"{"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18,"prompt_tokens_details":{"cached_tokens":5}}}"#,
+    ));
+
+    executor.execute(request()).await.unwrap();
+    drop(executor);
+
+    let line = std::fs::read_to_string(&path).unwrap();
+    let record: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(record["usage"]["input_tokens"], 11);
+    assert_eq!(record["usage"]["output_tokens"], 7);
+    assert_eq!(record["usage"]["cached_input_tokens"], 5);
+}
+
+#[tokio::test]
+async fn request_log_records_stream_usage_after_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, adapter, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [Some(1024); 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+        [None; 3],
+    )
+    .await;
+    adapter.stream_events.lock().unwrap().extend([
+        SseEvent {
+            event: None,
+            data: r#"{"choices":[{"delta":{"content":"hi"}}]}"#.into(),
+        },
+        SseEvent {
+            event: None,
+            data: r#"{"choices":[],"usage":{"input_tokens":10,"cache_read_input_tokens":4,"cache_creation_input_tokens":3,"output_tokens":6}}"#.into(),
+        },
+    ]);
+
+    let routed = executor
+        .execute(GatewayRequest {
+            stream: true,
+            ..request()
+        })
+        .await
+        .unwrap();
+    let GatewayResponse::Stream(events) = routed.response else {
+        panic!("expected stream")
+    };
+    let events: Vec<_> = events.collect().await;
+    assert!(events.iter().all(Result::is_ok));
+    drop(executor);
+
+    let line = std::fs::read_to_string(&path).unwrap();
+    let record: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(record["usage"]["input_tokens"], 10);
+    assert_eq!(record["usage"]["output_tokens"], 6);
+    assert_eq!(record["usage"]["cached_input_tokens"], 4);
+    assert_eq!(record["usage"]["cache_creation_input_tokens"], 3);
+}
+
+#[tokio::test]
+async fn request_log_records_nested_responses_stream_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, adapter, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [Some(1024); 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+        [None; 3],
+    )
+    .await;
+    adapter.stream_events.lock().unwrap().extend([SseEvent {
+        event: Some("response.completed".into()),
+        data: r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":13,"output_tokens":5,"input_tokens_details":{"cached_tokens":7}}}}"#.into(),
+    }]);
+
+    let routed = executor
+        .execute(GatewayRequest {
+            stream: true,
+            ..request()
+        })
+        .await
+        .unwrap();
+    let GatewayResponse::Stream(events) = routed.response else {
+        panic!("expected stream")
+    };
+    let events: Vec<_> = events.collect().await;
+    assert!(events.iter().all(Result::is_ok));
+    drop(executor);
+
+    let line = std::fs::read_to_string(&path).unwrap();
+    let record: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(record["usage"]["input_tokens"], 13);
+    assert_eq!(record["usage"]["output_tokens"], 5);
+    assert_eq!(record["usage"]["cached_input_tokens"], 7);
+}
+
+#[tokio::test]
+async fn request_log_merges_split_anthropic_stream_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, adapter, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [Some(1024); 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+        [None; 3],
+    )
+    .await;
+    adapter.stream_events.lock().unwrap().extend([
+        SseEvent {
+            event: Some("message_start".into()),
+            data: r#"{"type":"message_start","message":{"usage":{"input_tokens":21,"cache_read_input_tokens":8,"cache_creation_input_tokens":4}}}"#.into(),
+        },
+        SseEvent {
+            event: Some("message_delta".into()),
+            data: r#"{"type":"message_delta","usage":{"output_tokens":9}}"#.into(),
+        },
+    ]);
+
+    let routed = executor
+        .execute(GatewayRequest {
+            stream: true,
+            ..request()
+        })
+        .await
+        .unwrap();
+    let GatewayResponse::Stream(events) = routed.response else {
+        panic!("expected stream")
+    };
+    let events: Vec<_> = events.collect().await;
+    assert!(events.iter().all(Result::is_ok));
+    drop(executor);
+
+    let line = std::fs::read_to_string(&path).unwrap();
+    let record: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(record["usage"]["input_tokens"], 21);
+    assert_eq!(record["usage"]["output_tokens"], 9);
+    assert_eq!(record["usage"]["cached_input_tokens"], 8);
+    assert_eq!(record["usage"]["cache_creation_input_tokens"], 4);
+}
+
+#[tokio::test]
+async fn request_log_writes_stream_record_on_first_upstream_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let log = Arc::new(RequestLog::open(&path).unwrap());
+    let mut step = 0usize;
+    let inner: llmux_types::BoxStream<'static, Result<SseEvent, UpstreamError>> = Box::pin(
+        futures_util::stream::poll_fn(move |_cx| {
+            step += 1;
+            match step {
+                1 => std::task::Poll::Ready(Some(Ok(SseEvent {
+                    event: None,
+                    data: r#"{"choices":[],"usage":{"prompt_tokens":31,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":6}}}"#.into(),
+                }))),
+                2 => std::task::Poll::Ready(Some(Err(UpstreamError::StreamBroken {
+                    bytes_sent: 17,
+                }))),
+                _ => std::task::Poll::Pending,
+            }
+        }),
+    );
+    let pending = crate::request_log::PendingStreamRecord {
+        log: log.clone(),
+        ts_ms: 0,
+        request_id: "test".into(),
+        model: "model".into(),
+        deployment: Some("dep0".into()),
+        provider: Some("test".into()),
+        client_key: None,
+        image_count: 0,
+        upstream_request_id: None,
+        attempts: 1,
+        legs: vec![],
+        latency_ms: 0,
+        quota_remaining: None,
+    };
+    let mut events = crate::request_log::UsageCaptureStream::new(inner, pending);
+
+    assert!(events.next().await.unwrap().is_ok());
+    assert!(matches!(
+        events.next().await,
+        Some(Err(UpstreamError::StreamBroken { bytes_sent: 17 }))
+    ));
+
+    let mut written = String::new();
+    for _ in 0..200 {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if !contents.trim().is_empty() {
+                written = contents;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !written.is_empty(),
+        "first upstream stream error did not durably write the request record"
+    );
+    let record: serde_json::Value = serde_json::from_str(written.trim()).unwrap();
+    assert_eq!(record["outcome"], "routed");
+    assert_eq!(record["usage"]["input_tokens"], 31);
+    assert_eq!(record["usage"]["output_tokens"], 8);
+    assert_eq!(record["usage"]["cached_input_tokens"], 6);
+    drop(events);
+    drop(log);
+}
+
+#[tokio::test]
+async fn request_log_writes_partial_stream_record_on_cancellation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, adapter, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [Some(1024); 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+        [None; 3],
+    )
+    .await;
+    adapter.stream_events.lock().unwrap().extend([
+        SseEvent {
+            event: None,
+            data: r#"{"choices":[{"delta":{"content":"hi"}}]}"#.into(),
+        },
+        SseEvent {
+            event: None,
+            data: r#"{"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}"#.into(),
+        },
+    ]);
+
+    let routed = executor
+        .execute(GatewayRequest {
+            stream: true,
+            ..request()
+        })
+        .await
+        .unwrap();
+    let GatewayResponse::Stream(mut events) = routed.response else {
+        panic!("expected stream")
+    };
+    assert!(events.next().await.unwrap().is_ok());
+    drop(events);
+    drop(executor);
+
+    let line = std::fs::read_to_string(&path).unwrap();
+    let record: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(record["outcome"], "routed");
+    assert_eq!(record["deployment"], "dep0");
+    assert!(record.get("usage").is_none());
 }
 
 #[tokio::test(start_paused = true)]

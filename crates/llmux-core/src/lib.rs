@@ -182,7 +182,7 @@ pub struct Executor {
     /// Shared with the server so a refresh is visible without rebuilding the executor.
     devin_catalog: Arc<LiveModels>,
     http: HttpClient,
-    request_log: Option<RequestLog>,
+    request_log: Option<Arc<RequestLog>>,
 }
 
 impl Executor {
@@ -451,7 +451,7 @@ impl Executor {
             credentials: disabled,
             devin_catalog: Arc::new(LiveModels::default()),
             http: builder.build(connector),
-            request_log,
+            request_log: request_log.map(Arc::new),
         })
     }
 
@@ -541,7 +541,7 @@ impl Executor {
         let model = req.model.clone();
         let client_key = req.client_key.clone();
         let image_count = req.image_count;
-        let result = self.route(req, &mut trace).await;
+        let mut result = self.route(req, &mut trace).await;
         // A middle-out context rejection is a probe: the server truncates and
         // retries under the same request ID, so logging it would double-count
         // one client request.
@@ -554,24 +554,67 @@ impl Executor {
         );
         if let Some(log) = self.request_log.as_ref().filter(|_| !preliminary) {
             let dep = trace.last_attempted.map(|idx| &self.cfg.deployments[idx]);
-            log.record(&RequestRecord {
-                ts_ms: request_log::now_ms(),
-                request_id: &request_id,
-                model: &model,
-                deployment: dep.map(|dep| dep.id.as_ref()),
-                provider: dep.map(|dep| dep.provider.0.as_ref()),
-                client_key: client_key.as_deref(),
-                image_count,
-                upstream_request_id: trace.upstream_request_id.as_deref(),
-                attempts: trace.attempts,
-                legs: trace.legs,
-                latency_ms: started.elapsed().as_millis() as u64,
-                outcome: if result.is_ok() { "routed" } else { "error" },
-                error_kind: result.as_ref().err().map(request_log::error_kind),
-                quota_remaining: trace
-                    .last_attempted
-                    .map(|idx| self.bindings[idx].limits.remaining(Instant::now())),
-            });
+            let latency_ms = started.elapsed().as_millis() as u64;
+            let quota_remaining = trace
+                .last_attempted
+                .map(|idx| self.bindings[idx].limits.remaining(Instant::now()));
+            let is_stream_success = matches!(
+                &result,
+                Ok(RoutedResponse {
+                    response: GatewayResponse::Stream(_),
+                    ..
+                })
+            );
+            if is_stream_success {
+                let pending = request_log::PendingStreamRecord {
+                    log: Arc::clone(log),
+                    ts_ms: request_log::now_ms(),
+                    request_id: request_id.as_ref().into(),
+                    model: model.as_ref().into(),
+                    deployment: dep.map(|dep| dep.id.as_ref().into()),
+                    provider: dep.map(|dep| dep.provider.0.as_ref().into()),
+                    client_key: client_key.as_deref().map(Into::into),
+                    image_count,
+                    upstream_request_id: trace.upstream_request_id.as_deref().map(Into::into),
+                    attempts: trace.attempts,
+                    legs: trace.legs,
+                    latency_ms,
+                    quota_remaining,
+                };
+                if let Ok(RoutedResponse {
+                    response: GatewayResponse::Stream(events),
+                    ..
+                }) = &mut result
+                {
+                    let inner = std::mem::replace(events, Box::pin(stream::empty()));
+                    *events = Box::pin(request_log::UsageCaptureStream::new(inner, pending));
+                }
+            } else {
+                let usage = match &result {
+                    Ok(RoutedResponse {
+                        response: GatewayResponse::Complete { body, .. },
+                        ..
+                    }) => request_log::usage_from_body(body),
+                    _ => None,
+                };
+                log.record(&RequestRecord {
+                    ts_ms: request_log::now_ms(),
+                    request_id: &request_id,
+                    model: &model,
+                    deployment: dep.map(|dep| dep.id.as_ref()),
+                    provider: dep.map(|dep| dep.provider.0.as_ref()),
+                    client_key: client_key.as_deref(),
+                    image_count,
+                    upstream_request_id: trace.upstream_request_id.as_deref(),
+                    attempts: trace.attempts,
+                    legs: trace.legs,
+                    latency_ms,
+                    outcome: if result.is_ok() { "routed" } else { "error" },
+                    error_kind: result.as_ref().err().map(request_log::error_kind),
+                    quota_remaining,
+                    usage: usage.as_ref(),
+                });
+            }
         }
         result.map_err(|error| RoutedError {
             deployment: trace
