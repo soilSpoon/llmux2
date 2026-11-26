@@ -15,8 +15,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Fetch pinned tla2tools
         run: |
-          curl -fsSL -o tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
-          echo "fdffef247f563ef6edbfd44958d2a82db79e7564e07cb673262d896353fa6713  tla2tools.jar" | sha256sum -c -
+          curl -fsSL -o tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  tla2tools.jar" | sha256sum -c -
       - name: Model check
         working-directory: tla
         run: |
