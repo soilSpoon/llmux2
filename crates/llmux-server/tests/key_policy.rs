@@ -1,11 +1,21 @@
-use axum::{body::Bytes, extract::State, routing::post, Json, Router};
+use axum::{
+    body::Bytes,
+    extract::State,
+    response::{IntoResponse, Response},
+    routing::post,
+    Json, Router,
+};
 use http::{header, Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use llmux_config::RuntimeConfig;
 use llmux_testkit::TestServer;
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::time::{advance, pause, resume};
 
 async fn upstream(
     State(seen): State<Arc<Mutex<Vec<Value>>>>,
@@ -435,6 +445,101 @@ async fn exhausted_free_leg_stops_counting_for_the_free_catalog() {
     let empty: Vec<String> = Vec::new();
     assert_eq!(listed(&gateway, "ci-key").await, empty);
     assert_eq!(listed(&gateway, "owner-key").await, ["quota-draining"]);
+}
+
+struct CoolingUpstream {
+    seen: Mutex<Vec<Value>>,
+}
+
+async fn cooling_upstream(
+    State(state): State<Arc<CoolingUpstream>>,
+    Json(body): Json<Value>,
+) -> Response {
+    state.seen.lock().unwrap().push(body);
+    if state.seen.lock().unwrap().len() == 1 {
+        (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, "5")]).into_response()
+    } else {
+        Json(json!({
+            "id":"ok","object":"chat.completion",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+        }))
+        .into_response()
+    }
+}
+
+fn free_only_cooldown_config(url: &str, dir: &std::path::Path) -> String {
+    for (file, value) in [("owner", "owner-key"), ("ci", "ci-key")] {
+        std::fs::write(dir.join(file), value).unwrap();
+    }
+    let dir = dir.display();
+    format!(
+        r#"
+[server]
+client_keys = ["file:{dir}/owner", "file:{dir}/ci"]
+
+[[server.key_policies]]
+key = "file:{dir}/ci"
+free_only = true
+
+[[models]]
+name = "cooling-free"
+[[models.deployments]]
+id = "cooling-free"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-cooling-free"
+billing = "free"
+"#
+    )
+}
+
+#[tokio::test]
+async fn cooling_free_leg_leaves_and_returns_to_the_free_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream_state = Arc::new(CoolingUpstream {
+        seen: Mutex::new(Vec::new()),
+    });
+    let remote = TestServer::start(
+        Router::new()
+            .route("/v1/chat/completions", post(cooling_upstream))
+            .with_state(upstream_state.clone()),
+    )
+    .await
+    .unwrap();
+    let gateway = TestServer::start(
+        llmux_server::app(
+            RuntimeConfig::parse(&free_only_cooldown_config(&remote.url(), dir.path())).unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let gateway = gateway.url();
+
+    assert_eq!(listed(&gateway, "ci-key").await, ["cooling-free"]);
+    let (status, body) = chat(&gateway, "ci-key", "cooling-free").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(upstream_state.seen.lock().unwrap().len(), 1);
+
+    let empty: Vec<String> = Vec::new();
+    assert_eq!(
+        listed(&gateway, "ci-key").await,
+        empty,
+        "cooling free leg still counted for the free catalog"
+    );
+    assert_eq!(listed(&gateway, "owner-key").await, ["cooling-free"]);
+
+    pause();
+    advance(Duration::from_secs(6)).await;
+    resume();
+
+    assert_eq!(listed(&gateway, "ci-key").await, ["cooling-free"]);
+    let (status, body) = chat(&gateway, "ci-key", "cooling-free").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(upstream_state.seen.lock().unwrap().len(), 2);
 }
 
 fn free_only_token_window_config(url: &str, dir: &std::path::Path) -> String {
