@@ -351,7 +351,8 @@ A usable free deployment is non-fallback, zero-cost, able to serve OpenAI
 chat, and able to admit the shared minimum-cost OpenAI chat request when the
 list is built: its credential is not disabled, it is not expired or parked as
 not-provisioned, its upstream id is not absent from a loaded live catalog,
-and it is not held out by cooldown, quota, or concurrency state. A model
+its context window fits that minimum-cost request, and it is not held out by
+cooldown, quota, or concurrency state. A model
 whose every leg is billed, or whose free legs are all unusable by that rule,
 SHALL NOT appear in that key's `/v1/models` list, while a model shared
 between free and billed legs stays listed as long as a usable free leg

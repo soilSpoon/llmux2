@@ -185,6 +185,11 @@ pub struct Executor {
     request_log: Option<RequestLog>,
 }
 
+fn fits_context(dep: &Deployment, needed: u64) -> bool {
+    dep.max_context
+        .is_none_or(|limit| needed <= u64::from(limit))
+}
+
 impl Executor {
     pub fn validate(
         cfg: &RuntimeConfig,
@@ -471,9 +476,9 @@ impl Executor {
 
     /// Whether a deployment can admit a request costing `needed` in `format`
     /// right now, applying the same disabled, parked, expired,
-    /// stale-upstream, cooldown, quota, concurrency, and format gates routing
-    /// applies before `Send`. The probe is read-only: it charges no quota and
-    /// takes no concurrency permit.
+    /// stale-upstream, context-fit, cooldown, quota, concurrency, and format
+    /// gates routing applies before `Send`. The probe is read-only: it charges
+    /// no quota and takes no concurrency permit.
     pub fn deployment_available(
         &self,
         idx: DeploymentIdx,
@@ -488,6 +493,7 @@ impl Executor {
             || binding.adapter.supports(format) == Support::No
             || dep.expires_at.is_some_and(|end| SystemTime::now() >= end)
             || self.devin_upstream_missing(dep)
+            || !fits_context(dep, needed)
         {
             return false;
         }
@@ -641,12 +647,7 @@ impl Executor {
         let needed =
             u64::from(req.est_input_tokens) + u64::from(req.max_output_tokens.unwrap_or(0));
         let check_context = needed > u64::from(order.min_context);
-        let fits = |dep: &Deployment| {
-            !check_context
-                || dep
-                    .max_context
-                    .is_none_or(|limit| needed <= u64::from(limit))
-        };
+        let fits = |dep: &Deployment| !check_context || fits_context(dep, needed);
         if check_context {
             let mut limit = None;
             for &idx in &model.deployments {

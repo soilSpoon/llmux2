@@ -297,10 +297,10 @@ change routing or model access. Unclassified authenticated keys are logged as
 `GET /v1/models` advertises only models with at least one usable free leg — a
 non-fallback deployment marked `billing = "free"` that could admit a minimal
 OpenAI chat request at that instant. Besides credential state, expiry,
-parking, stale live-catalog ids, and format support, this includes cooldown,
-local quota, and concurrency state. "Free" means zero per-request cost, so
-subscription- or plan-covered legs count too; a model drops from the list
-while its last free leg cannot currently admit, and returns when that state
+parking, stale live-catalog ids, context fit, and format support, this
+includes cooldown, local quota, and concurrency state. "Free" means zero
+per-request cost, so subscription- or plan-covered legs count too; a model
+drops from the list while its last free leg cannot currently admit, and returns when that state
 clears. The list is an admission snapshot, not a guarantee that a larger
 request or one needing unsupported conversion features will fit. A
 `free_only`-only entry needs no `models` or `blocked` lists.
