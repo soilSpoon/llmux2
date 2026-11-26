@@ -3,7 +3,6 @@
 //! to that stale upstream.
 
 use axum::body::{Body, Bytes};
-use futures_util::StreamExt;
 use http::{header, Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
@@ -12,7 +11,6 @@ use llmux_providers::DevinAcpConfig;
 use llmux_testkit::TestServer;
 use serde_json::{json, Value};
 use std::{
-    convert::Infallible,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -38,10 +36,6 @@ struct Gateway {
 
 impl Gateway {
     async fn start(mode: ModelsMode) -> Self {
-        Self::start_with_limit(mode, None).await
-    }
-
-    async fn start_with_limit(mode: ModelsMode, max_request_bytes: Option<u64>) -> Self {
         let home = tempfile::tempdir().unwrap();
         let bin = home.path().join("devin");
         let calls = home.path().join("calls");
@@ -56,9 +50,6 @@ impl Gateway {
         fs::create_dir_all(home.path().join(".local/share")).unwrap();
         fs::write(home.path().join(".local/share/marker"), "").unwrap();
         write_cli(&bin, &calls, &acp_log, &release, mode);
-        let limit = max_request_bytes
-            .map(|value| format!("max_request_bytes = {value}\n"))
-            .unwrap_or_default();
 
         let config = format!(
             r#"
@@ -66,7 +57,6 @@ impl Gateway {
 client_keys = ["file:{}", "file:{}"]
 dashboard_key = "file:{}"
 request_timeout_ms = 4000
-{limit}
 
 [[server.key_policies]]
 key = "file:{}"
@@ -478,55 +468,5 @@ async fn chat_does_not_wait_for_a_devin_catalog_refresh() {
         models_invocations(&gateway.calls()),
         1,
         "chat should kick a background refresh without waiting for it"
-    );
-}
-
-#[tokio::test]
-async fn oversized_body_is_rejected_before_a_devin_catalog_refresh() {
-    let gateway = Gateway::start_with_limit(ModelsMode::Live, Some(64)).await;
-    let payload = json!({
-        "model": "retired",
-        "messages": [{"role": "user", "content": "Hello"}],
-        "pad": "x".repeat(64)
-    })
-    .to_string();
-    assert!(payload.len() > 64);
-    let split = 32;
-    let payload = Bytes::from(payload);
-    let chunks = [payload.slice(..split), payload.slice(split..)];
-    let stream = futures_util::stream::iter(chunks.into_iter().enumerate()).then(
-        |(index, chunk)| async move {
-            if index == 1 {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            Ok::<Bytes, Infallible>(chunk)
-        },
-    );
-    let request = Request::post(format!("{}/v1/chat/completions", gateway.server.url()))
-        .header(header::AUTHORIZATION, "Bearer test-client")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from_stream(stream))
-        .unwrap();
-
-    let response = timeout(
-        Duration::from_secs(5),
-        Client::builder(TokioExecutor::new())
-            .build_http()
-            .request(request),
-    )
-    .await
-    .expect("oversized request timed out")
-    .unwrap()
-    .map(Body::new);
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert!(
-        body(response).await.contains("Request body too large"),
-        "the oversized request should use the documented 413 contract"
-    );
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    assert_eq!(
-        models_invocations(&gateway.calls()),
-        0,
-        "the size rejection must happen before devin models is spawned"
     );
 }

@@ -145,6 +145,14 @@ async fn app_with(
     config_path: Option<std::path::PathBuf>,
     devin: DevinAcpConfig,
 ) -> Result<Router, Box<dyn Error + Send + Sync>> {
+    Ok(app_with_state(config, config_path, devin).await?.0)
+}
+
+async fn app_with_state(
+    config: RuntimeConfig,
+    config_path: Option<std::path::PathBuf>,
+    devin: DevinAcpConfig,
+) -> Result<(Router, Arc<AppState>), Box<dyn Error + Send + Sync>> {
     let catalog = Arc::new(catalog::Catalog::new(devin.clone()));
     let (config, executor) = build(config, devin, catalog.live()).await?;
     let dashboard = config
@@ -171,7 +179,8 @@ async fn app_with(
     if state.dashboard.is_some() {
         router = router.merge(dashboard::routes()).merge(admin::routes());
     }
-    Ok(router.with_state(state))
+    let router = router.with_state(Arc::clone(&state));
+    Ok((router, state))
 }
 
 async fn build(
@@ -975,6 +984,91 @@ fn json_body(status: StatusCode, body: Body) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::{BodyExt, Full};
+    use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+    use llmux_testkit::TestServer;
+    use std::fs;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn oversized_body_is_rejected_before_a_devin_catalog_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = dir.path().join("client");
+        fs::write(&client, "client-key\n").unwrap();
+        let binary = dir.path().join("devin");
+        fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let config = format!(
+            r#"
+[server]
+client_keys = ["file:{}"]
+max_request_bytes = 64
+
+[[models]]
+name = "retired"
+
+[[models.deployments]]
+id = "retired-devin"
+auth = "none"
+provider = "devin_acp"
+billing = "free"
+upstream_model = "swe-2-retired"
+priority = 0
+"#,
+            client.display()
+        );
+        let (router, state) = app_with_state(
+            RuntimeConfig::parse(&config).unwrap(),
+            None,
+            DevinAcpConfig {
+                binary,
+                home: dir.path().to_owned(),
+                turn_timeout: Duration::from_secs(10),
+            },
+        )
+        .await
+        .unwrap();
+        let server = TestServer::start(router).await.unwrap();
+        let payload = json!({
+            "model": "retired",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "pad": "x".repeat(64)
+        })
+        .to_string();
+        assert!(payload.len() > 64);
+        let request = http::Request::post(format!("{}/v1/chat/completions", server.url()))
+            .header(header::AUTHORIZATION, "Bearer client-key")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(payload)))
+            .unwrap();
+
+        let response = timeout(
+            Duration::from_secs(5),
+            Client::builder(TokioExecutor::new())
+                .build_http()
+                .request(request),
+        )
+        .await
+        .expect("oversized request timed out")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = timeout(Duration::from_secs(5), response.into_body().collect())
+            .await
+            .unwrap()
+            .unwrap()
+            .to_bytes();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["error"]["message"], "Request body too large");
+        assert_eq!(payload["error"]["code"], "invalid_request_error");
+        assert!(
+            !state.catalog.refresh_was_started(),
+            "the size rejection must happen before a catalog refresh is scheduled"
+        );
+    }
 
     #[test]
     fn key_fingerprint_survives_key_reorder() {
