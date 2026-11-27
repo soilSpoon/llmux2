@@ -59,6 +59,10 @@ pub struct ImportOptions<'a> {
     pub kilo_free_models: Option<&'a Path>,
     pub kilo_key_file: Option<&'a Path>,
     pub openrouter_replacements: bool,
+    /// Treat keyed official Morph connections as Ultra-plan credentials: emit
+    /// only plan-covered upstream models and record that exact allowlist in
+    /// the credential so hand-added out-of-plan legs fail config validation.
+    pub morph_ultra: bool,
     /// Saved `devin models` output; its `Free` rows rank ahead of Devin-plan models.
     pub devin_models: Option<&'a Path>,
     /// Nous Portal login state (`llmux-login nous`) and a saved `GET /v1/models`
@@ -1279,7 +1283,11 @@ pub fn import_with_options(
                 }
                 let id = unique(&format!("upstream-{source_id}"), &mut ids);
                 let key = write_secret(&dir, &id, value)?;
-                credentials.push(json!({"id":id,"kind":"api_key","provider":kind,"key":key}));
+                let mut credential = json!({"id":id,"kind":"api_key","provider":kind,"key":key});
+                if policy.morph_ultra && base_url == morph::OFFICIAL_URL {
+                    credential["allowed_upstream_models"] = json!(morph::ULTRA_MODELS);
+                }
+                credentials.push(credential);
                 Some(id)
             }
             connection::SelectedAuth::Oauth(oauth) => {
@@ -1340,6 +1348,7 @@ pub fn import_with_options(
                 None
             }
         };
+        let morph_ultra = policy.morph_ultra && keyed && base_url == morph::OFFICIAL_URL;
         connections.push(Connection {
             headers: Value::Object(header_refs),
             source_id: source_id.into(),
@@ -1354,6 +1363,8 @@ pub fn import_with_options(
                 policy::ModelPolicy::Workers
             } else if policy::kilo(identity) && keyed {
                 policy::ModelPolicy::KiloFree
+            } else if morph_ultra {
+                policy::ModelPolicy::MorphUltra
             } else if kind == KIND_DEEPAI {
                 policy::ModelPolicy::DeepAiText
             } else if kind == KIND_OPENAI_COMPAT

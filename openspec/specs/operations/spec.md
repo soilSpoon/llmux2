@@ -515,6 +515,35 @@ WHEN a free leg sits on a host whose reviewed conditions carry an
 THEN the emitted deployment carries that stamp, so the leg stops taking
 requests when the promo ends; billed legs on the same host are unstamped.
 
+### Requirement: Morph Ultra import boundary
+
+With `--morph-ultra`, the importer SHALL treat keyed connections to the
+official Morph endpoint as Ultra-plan credentials: it SHALL emit only the
+reviewed in-scope upstream ids (`morph-kimik31`, `morph-dsv41flash`,
+`morph-dsv41flash-1017`, and `morph-dsv41flash-abliterated`), drop other Morph
+upstream ids with a warning, and write the same exact list as the credential's
+`allowed_upstream_models`.
+This is the reviewed DeepSeek-plus-Kimi-K3.1 subset, not a mirror of every id
+Morph may mark with Ultra metadata. The ambiguous `morph-kimik3` id SHALL
+remain excluded because the reviewed scope uses only canonical Kimi K3.1;
+Morph's machine-readable catalog also identifies it as Kimi K3 rather than
+Kimi K3.1, even where Ultra prose calls it a K3.1 alias. Without the flag,
+Morph imports SHALL remain unfiltered.
+
+#### Scenario: Paid Kimi Abliterated never enters an Ultra config
+
+WHEN an export combo asks for `morph/morph-kimik3-abliterated` and the import
+runs with `--morph-ultra`
+THEN no deployment on the Morph credential contains that per-token model,
+the credential allowlist omits it, and the import warns that it is outside
+the reviewed Morph Ultra scope.
+
+#### Scenario: Opt-in only
+
+WHEN the same export imports without `--morph-ultra`
+THEN existing Morph deployments keep their prior behavior, because not every
+Morph key is an Ultra-plan key.
+
 ### Requirement: Simple and extensible
 
 The codebase SHALL stay simple with low overhead, and be easy to extend and
