@@ -239,6 +239,41 @@ fn policy_errors_do_not_echo_unknown_object_keys() {
 }
 
 #[test]
+fn policy_errors_do_not_echo_unknown_enum_variant_input() {
+    const SYNTHETIC: &str = "probe-unclassified-credential-9z8y";
+
+    for pointer in [
+        "/models/0/fallback",
+        "/defaults/unverified_native",
+        "/models/0/evidence/coverage",
+        "/spellings/0/action",
+        "/catch_all/mode",
+        "/models/0/provenance/decision_source",
+    ] {
+        let mut json: Value = serde_json::from_str(valid_policy_json()).unwrap();
+        *json.pointer_mut(pointer).unwrap() = json!(SYNTHETIC);
+        let error = parse_fallback_policy(&json.to_string()).unwrap_err();
+        assert!(
+            !error.contains(SYNTHETIC),
+            "error leaked enum input at {pointer}: {error}"
+        );
+    }
+}
+
+#[test]
+fn policy_errors_do_not_echo_invalid_type_input() {
+    const SYNTHETIC: &str = "probe-unclassified-credential-9z8y";
+
+    let mut json: Value = serde_json::from_str(valid_policy_json()).unwrap();
+    json["schema_version"] = json!(SYNTHETIC);
+    let error = parse_fallback_policy(&json.to_string()).unwrap_err();
+    assert!(
+        !error.contains(SYNTHETIC),
+        "error leaked invalid-type input: {error}"
+    );
+}
+
+#[test]
 fn policy_rejects_contradictory_spelling_dispositions_across_sections() {
     let mut json: Value = serde_json::from_str(valid_policy_json()).unwrap();
     let spelling = json["spellings"][3]["spelling"]
