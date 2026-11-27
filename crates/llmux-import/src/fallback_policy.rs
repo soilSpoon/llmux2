@@ -477,6 +477,11 @@ fn redaction_scan(value: &Value, path: &str) -> Result<(), String> {
     match value {
         Value::Object(map) => {
             for (key, value) in map {
+                if secret_like(key) {
+                    return Err(format!(
+                        "{path} contains an object key with a secret reference or token that must not appear in fallback artifacts"
+                    ));
+                }
                 let normalized: String = key
                     .bytes()
                     .filter(|byte| byte.is_ascii_alphanumeric())
@@ -490,7 +495,7 @@ fn redaction_scan(value: &Value, path: &str) -> Result<(), String> {
                     || normalized == "key"
                 {
                     return Err(format!(
-                        "{path}.{key} must not copy credential, client key, token, or secret metadata"
+                        "{path} must not copy credential, client key, token, or secret metadata in an object key"
                     ));
                 }
                 redaction_scan(value, &format!("{path}.{key}"))?;
@@ -525,5 +530,5 @@ fn has_secret_marker(text: &str, marker: &str) -> bool {
 }
 
 fn is_secret_marker_boundary(byte: u8) -> bool {
-    !byte.is_ascii_alphanumeric() && byte != b'_'
+    !byte.is_ascii_alphanumeric()
 }

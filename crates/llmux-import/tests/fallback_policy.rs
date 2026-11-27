@@ -148,7 +148,8 @@ fn policy_rejects_secretbearing_metadata_fields() {
             Value::String("synthetic-label".to_owned()),
         );
         let error = parse_fallback_policy(&json.to_string()).unwrap_err();
-        assert!(error.contains(field), "{error}");
+        assert!(!error.contains(field), "{error}");
+        assert!(error.contains("metadata"), "{error}");
     }
 }
 
@@ -171,6 +172,25 @@ fn policy_rejects_embedded_secret_reference_strings() {
     json["models"][0]["fallback"] = json!("copied token sk-synthetic-example");
     let error = parse_fallback_policy(&json.to_string()).unwrap_err();
     assert!(error.contains("secret"), "{error}");
+}
+
+#[test]
+fn policy_errors_do_not_echo_secretbearing_object_keys() {
+    for key in [
+        "api_token_sk-synthetic-example",
+        "unclassified_sk-synthetic-example",
+    ] {
+        let mut json: Value = serde_json::from_str(valid_policy_json()).unwrap();
+        json["models"][0]
+            .as_object_mut()
+            .unwrap()
+            .insert(key.to_owned(), Value::Null);
+        let error = parse_fallback_policy(&json.to_string()).unwrap_err();
+        assert!(
+            !error.contains("sk-synthetic-example"),
+            "error leaked object key: {error}"
+        );
+    }
 }
 
 #[test]
