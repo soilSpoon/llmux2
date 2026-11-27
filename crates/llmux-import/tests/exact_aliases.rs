@@ -27,6 +27,41 @@ fn fixture() -> Value {
 }
 
 #[test]
+fn exact_alias_does_not_remove_direct_route_without_canonical_target() {
+    let root = json!({
+        "_meta": {"version": "omniroute-v3-legacy-export"},
+        "providerNodes": [
+            {"id":"cfpd-node","prefix":"cfpd","type":"openai-compatible","baseUrl":"https://cfpd.example/v1"}
+        ],
+        "providerConnections": [
+            {"id":"cfpd","provider":"cfpd-node","authType":"apikey","apiKey":"synthetic-cfpd"}
+        ],
+        "apiKeys": [{"key":"synthetic-client"}],
+        "combos": [
+            {"id":"cfpd-direct","name":"cfpd-direct-source","models":["cfpd/deepseek-v4.1-flash"]}
+        ]
+    });
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("input.json"), root.to_string()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_llmux-import"))
+        .args(["--input", "input.json", "--output", "out.toml"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = fs::read_to_string(dir.path().join("out.toml")).unwrap();
+    assert!(!text.contains("synthetic-cfpd"));
+    let cfg = RuntimeConfig::parse(&text).unwrap();
+    let index = cfg.model_names["cfpd/deepseek-v4.1-flash"];
+    assert_eq!(cfg.models[index].name.as_ref(), "cfpd/deepseek-v4.1-flash");
+    assert!(!cfg.model_names.contains_key("deepseek-v4.1-flash"));
+}
+
+#[test]
 fn exact_evidence_backed_spellings_alias_canonical_models_without_fallback_removal() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("input.json"), fixture().to_string()).unwrap();

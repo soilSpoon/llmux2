@@ -121,9 +121,17 @@ deployments.
 
 #### Scenario: Exact alias wins over a generated direct spelling
 
-WHEN a reviewed spelling also appears as a generated direct-provider name
+WHEN a reviewed spelling also appears as a generated direct-provider name and
+its canonical target is emitted
 THEN the exact alias wins and no duplicate standalone model is emitted for
 that spelling.
+
+#### Scenario: Missing canonical target keeps the direct route
+
+WHEN a reviewed spelling appears as a generated direct-provider name but its
+canonical target is not emitted
+THEN the direct route remains available instead of being removed with the
+unresolvable alias.
 
 #### Scenario: Similar spellings do not collapse
 

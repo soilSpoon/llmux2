@@ -289,6 +289,29 @@ pub(super) fn prepare(
     }
 }
 
+pub(super) fn remove_reviewed_direct_collisions(
+    models: &mut Vec<Value>,
+    aliases: &BTreeMap<String, String>,
+    warnings: &mut Vec<String>,
+) {
+    for (name, target) in REVIEWED_EXACT_ALIASES {
+        let alias_wins = aliases
+            .get(*name)
+            .is_some_and(|resolved| resolved == target)
+            && models.iter().any(|model| string(model, "name") == *target);
+        if !alias_wins {
+            continue;
+        }
+        let before = models.len();
+        models.retain(|model| string(model, "name") != *name);
+        if models.len() != before {
+            warnings.push(format!(
+                "direct {name}: collision; reviewed exact alias wins"
+            ));
+        }
+    }
+}
+
 pub(super) fn attach(
     models: &mut [Value],
     aliases: BTreeMap<String, String>,

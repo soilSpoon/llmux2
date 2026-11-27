@@ -72,9 +72,6 @@ pub(super) fn collect(
 
 pub(super) fn reserved(root: &Value, name: &str) -> bool {
     root["modelAliases"].get(name).is_some()
-        || super::aliases::REVIEWED_EXACT_ALIASES
-            .iter()
-            .any(|(alias, _)| *alias == name)
         || array(root, "modelComboMappings").iter().any(|row| {
             (row["enabled"] == true || row["enabled"] == 1)
                 && super::aliases::matches(string(row, "pattern"), name)
