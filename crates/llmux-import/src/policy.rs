@@ -106,11 +106,10 @@ pub(super) const WORKERS_DEFAULT_RPM: u32 = 30;
 /// credential, bound across every deployment on the account. Sized so a day
 /// of worst-case billed usage stays under the documented 10,000-neuron free
 /// daily allowance even when output (including hidden reasoning tokens) is
-/// 5x the admitted input: the most expensive routable model
-/// (`@cf/moonshotai/kimi-k2.6`) bills 86,364 neurons/M input tokens and
-/// 363,636 neurons/M output tokens, and 5,200 * (0.086364 + 5 * 0.363636)
-/// is about 9,904 neurons.
-pub(super) const WORKERS_TPD: u32 = 5_200;
+/// 5x the admitted input: the most expensive allowed model
+/// (`@cf/qwen/qwen3.8-27b`) bills 290,909 neurons/M output tokens, and
+/// 6,500 * (0.040909 + 5 * 0.290909) is about 9,720 neurons.
+pub(super) const WORKERS_TPD: u32 = 6_500;
 
 pub(super) struct Policy {
     pub workers: Option<External>,
@@ -371,7 +370,6 @@ pub(super) fn workers_model(raw: &str) -> Option<&'static str> {
     }
     WORKERS
         .iter()
-        .chain(WORKERS_REVIEWED_EXCEPTIONS)
         .find(|id| id.strip_prefix("@cf/") == Some(model))
         .copied()
 }
@@ -395,14 +393,6 @@ const WORKERS: &[&str] = &[
     "@cf/qwen/qwen2.5-coder-32b-instruct",
     // https://developers.cloudflare.com/workers-ai/models/granite-4.0-h-micro/
     "@cf/ibm-granite/granite-4.0-h-micro",
-];
-
-/// Owner-reviewed exceptions to the normal deprecated/paid-method exclusion.
-/// These exact IDs are still billed, are not free-eligibility evidence, and
-/// count in the shared neuron-cap math.
-const WORKERS_REVIEWED_EXCEPTIONS: &[&str] = &[
-    // https://developers.cloudflare.com/workers-ai/models/kimi-k2.6/
-    "@cf/moonshotai/kimi-k2.6",
 ];
 
 /// Upstream model IDs that cannot serve `/v1/chat/completions`: embedding or
@@ -600,8 +590,8 @@ mod tests {
     }
 
     #[test]
-    fn workers_allowlist_uses_exact_official_ids_and_blocks_unreviewed_deprecated_models() {
-        for id in WORKERS.iter().chain(WORKERS_REVIEWED_EXCEPTIONS) {
+    fn workers_allowlist_uses_exact_official_ids_and_never_revives_deprecated_models() {
+        for id in WORKERS {
             assert_eq!(workers_model(id), Some(*id));
         }
         assert_eq!(
@@ -614,6 +604,7 @@ mod tests {
             "meta/llama-3.2-3b-instruct",
             "meta/llama-3.1-8b-instruct-fp8",
             "qwen/qwen3-30b-a3b-fp8",
+            "moonshotai/kimi-k2.6",
             "deepseek-ai/deepseek-v4-flash-0731",
             "zai-org/glm-5.3",
         ] {
@@ -636,7 +627,6 @@ mod tests {
             31_876,
             50_488,
         ),
-        ("@cf/moonshotai/kimi-k2.6", 86_364, 363_636),
         ("@cf/qwen/qwen3.8-27b", 40_909, 290_909),
         ("@cf/meta/llama-3.3-70b-instruct-fp8-fast", 26_668, 204_805),
         ("@cf/meta/llama-4-scout-17b-16e-instruct", 24_545, 77_273),
@@ -647,25 +637,20 @@ mod tests {
     #[test]
     fn workers_daily_cap_stays_under_the_free_neuron_allowance() {
         let mut rated: Vec<_> = WORKERS_NEURON_RATES.iter().map(|(id, ..)| *id).collect();
-        let mut allowed: Vec<_> = WORKERS
-            .iter()
-            .chain(WORKERS_REVIEWED_EXCEPTIONS)
-            .copied()
-            .collect();
+        let mut allowed: Vec<_> = WORKERS.to_vec();
         rated.sort();
         allowed.sort();
-        assert_eq!(allowed, rated, "every routable model needs a neuron rate");
-        let (worst_id, worst_input, worst_output) = WORKERS_NEURON_RATES
+        assert_eq!(allowed, rated, "every allowed model needs a neuron rate");
+        let worst_per_million = WORKERS_NEURON_RATES
             .iter()
-            .copied()
-            .max_by_key(|rate| rate.1 + 5 * rate.2)
+            .map(|(_, input, output)| input + 5 * output)
+            .max()
             .unwrap();
-        let worst_per_million = worst_input + 5 * worst_output;
         let neurons_per_day = u64::from(WORKERS_TPD) * worst_per_million / 1_000_000;
         assert!(
             neurons_per_day < 10_000,
-            "WORKERS_TPD bills {neurons_per_day} neurons/day at the worst routable \
-             model ({worst_per_million} neurons/M for {worst_id}); the free allowance is 10,000"
+            "WORKERS_TPD bills {neurons_per_day} neurons/day at the worst allowed \
+             model (1,495,454 neurons/M for qwen3.8-27b); the free allowance is 10,000"
         );
     }
 }

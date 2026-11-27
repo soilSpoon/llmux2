@@ -1,5 +1,4 @@
 use llmux_config::RuntimeConfig;
-use llmux_types::Billing;
 use serde_json::{json, Value};
 use std::{fs, path::Path, process::Command};
 
@@ -359,7 +358,7 @@ fn workers_options_compose_with_explicit_omniroute_fallback() {
     assert_eq!(first.quota.tpd, None);
     assert_eq!(
         config.credential_quotas[first.credential.as_ref()].tpd,
-        Some(5_200)
+        Some(6_500)
     );
     assert_eq!(last.upstream_model.as_ref(), "workers");
     assert_eq!(last.base_url.to_string(), "http://127.0.0.1:20128/v1");
@@ -712,7 +711,7 @@ fn workers_opt_in_maps_bridges_and_fails_closed_for_unknown_deprecated_and_paid_
     let mut workers = config.credential_quotas.iter().collect::<Vec<_>>();
     assert_eq!(workers.len(), 1);
     let (id, quota) = workers.pop().unwrap();
-    assert_eq!(quota.tpd, Some(5_200));
+    assert_eq!(quota.tpd, Some(6_500));
     for i in 0..5 {
         let model = &config.models[config.model_names[format!("cf-{i}").as_str()]];
         let dep = &config.deployments[model.deployments[0].0 as usize];
@@ -1060,7 +1059,7 @@ fn workers_quota_rpm_is_configurable_and_needs_the_cloudflare_opt_in() {
     assert_eq!(dep.quota.tpd, None);
     assert_eq!(
         config.credential_quotas[dep.credential.as_ref()].tpd,
-        Some(5_200)
+        Some(6_500)
     );
 
     let result = run(&root, dir.path(), &[("--workers-ai-rpm", Path::new("12"))]);
@@ -1101,7 +1100,7 @@ fn malformed_cost_policy_inputs_fail_without_echoing_contents() {
 }
 
 #[test]
-fn kimi_k2_6_workers_native_leg_and_public_spellings() {
+fn kimi_k2_6_workers_lane_is_blocked_without_free_access_evidence() {
     let mut root = fixture();
     root["providerConnections"]
         .as_array_mut()
@@ -1121,7 +1120,7 @@ fn kimi_k2_6_workers_native_leg_and_public_spellings() {
     let token = dir.path().join("token");
     fs::write(&account, "0123456789abcdef0123456789abcdef").unwrap();
     fs::write(&token, "synthetic-token").unwrap();
-    success(&run(
+    let warnings = success(&run(
         &root,
         dir.path(),
         &[
@@ -1130,43 +1129,24 @@ fn kimi_k2_6_workers_native_leg_and_public_spellings() {
         ],
     ));
     let config = RuntimeConfig::load(dir.path().join("out.toml")).unwrap();
-    let canonical = config.model_names["kimi-k2.6"];
     for spelling in [
+        "kimi-k2.6",
         "moonshotai/kimi-k2.6",
         "cfp/moonshotai/kimi-k2.6",
         "cloudflare-playground/moonshotai/kimi-k2.6",
-    ] {
-        assert_eq!(
-            config.model_names.get(spelling),
-            Some(&canonical),
-            "{spelling}"
-        );
-    }
-    for spelling in [
         "cloudflare-direct/moonshotai/kimi-k2.6",
         "cfpd/moonshotai/kimi-k2.6",
     ] {
         assert!(
-            config.model_names.contains_key(spelling),
-            "missing {spelling}"
+            !config.model_names.contains_key(spelling),
+            "{spelling} must not resolve while exact free access is unevidenced"
         );
     }
-    for spelling in [
-        "kimi-k2.6",
-        "cloudflare-direct/moonshotai/kimi-k2.6",
-        "cfpd/moonshotai/kimi-k2.6",
-    ] {
-        let model = &config.models[config.model_names[spelling]];
-        assert_eq!(model.deployments.len(), 1, "{spelling}");
-        let dep = &config.deployments[model.deployments[0].0 as usize];
-        assert_eq!(dep.upstream_model.as_ref(), "@cf/moonshotai/kimi-k2.6");
-        assert_eq!(
-            dep.base_url.to_string(),
-            "https://api.cloudflare.com/client/v4/accounts/0123456789abcdef0123456789abcdef/ai/v1"
-        );
-        assert!(!dep.credential.is_empty());
-        assert_eq!(dep.billing, Billing::Billed);
-        assert_eq!(dep.quota.rpm, Some(30));
-        assert!(!dep.base_url.to_string().starts_with("http://127.0.0.1"));
+    for deployment in &config.deployments {
+        assert!(!deployment.upstream_model.contains("kimi-k2.6"));
     }
+    assert!(warnings.contains("combo kimi-k2.6"));
+    assert!(warnings.contains("unknown or deprecated Workers AI model (or requires paid access)"));
+    let text = fs::read_to_string(dir.path().join("out.toml")).unwrap();
+    assert!(!text.contains("@cf/moonshotai/kimi-k2.6"));
 }

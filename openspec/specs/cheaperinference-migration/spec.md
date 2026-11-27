@@ -513,33 +513,33 @@ connections respectively, with reviewed exact `@cf/` upstream IDs.
 
 #### Scenario: Unsupported or unapproved Workers AI route
 
-WHEN opt-in is absent or a model is unknown, deprecated, or excluded
+WHEN opt-in is absent or a model is unknown, deprecated, paid-access-only,
+or otherwise excluded
 THEN no Workers AI deployment is emitted for that leg and a warning explains
-the omission, including for `@cf/meta/llama-3.2-1b-instruct`. The sole
-owner-reviewed exception is Kimi K2.6 below.
+the omission, including for `@cf/meta/llama-3.2-1b-instruct` and
+`@cf/moonshotai/kimi-k2.6`.
 
-#### Scenario: Owner-reviewed Kimi K2.6 native leg
+#### Scenario: Kimi K2.6 remains blocked without free-access evidence
 
 WHEN an opted-in Cloudflare bridge leg targets `moonshotai/kimi-k2.6`
-THEN it uses the exact upstream ID `@cf/moonshotai/kimi-k2.6` on the official
-Workers AI account endpoint and remains `billed`. Cloudflare documents this
-model as requiring paid access and marks it deprecated. This exact-ID exception
-prepares native routing; it is not evidence of free eligibility or long-term
-availability.
+THEN no Workers AI deployment or alias is emitted for that leg and a warning
+explains the omission. Cloudflare documents the exact upstream ID as deprecated
+and requiring paid access. Catalog presence and neuron prices are not evidence
+that the exact model is allowed under the relevant free allowance, so the lane
+remains blocked unless official evidence establishes that free access.
 
 #### Scenario: Workers AI quota is not a spending guarantee
 
 WHEN a Workers AI deployment is emitted
 THEN it has `rpm = 30` (configurable with `--workers-ai-rpm`, which requires
 the Cloudflare opt-in), and the shared Workers AI credential has
-`tpd = 5200`, a hard daily cap on estimated input tokens bound across every
+`tpd = 6500`, a hard daily cap on estimated input tokens bound across every
 deployment on the account, sized so a day of admitted input with output up to
 5x larger stays under the documented 10,000-neuron free daily allowance even
-at the most expensive routable model's rates. The current worst case is the
-reviewed Kimi K2.6 exception. Credential quota windows are hard ceilings: a
-request whose estimate exceeds the remaining window is rejected even when the
-window is empty, while a deployment quota still admits one oversized request
-to an idle deployment.
+at the most expensive allowed model's rates. Credential quota windows are
+hard ceilings: a request whose estimate exceeds the remaining window is
+rejected even when the window is empty, while a deployment quota still admits
+one oversized request to an idle deployment.
 Documentation warns that these are not account-wide neuron accounting or a
 guarantee against paid overage.
 
