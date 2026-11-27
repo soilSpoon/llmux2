@@ -10,6 +10,7 @@ mod devin;
 mod direct;
 pub mod discovery;
 mod fallback;
+pub mod fallback_policy;
 mod free_conditions;
 mod morph;
 mod nous;
