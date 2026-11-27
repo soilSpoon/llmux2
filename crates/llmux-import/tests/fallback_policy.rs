@@ -372,6 +372,15 @@ fn fallback_audit_rejects_invalid_schema_scalars() {
 }
 
 #[test]
+fn fallback_audit_rejects_legacy_private_key_banner_marker_without_echo() {
+    let mut audit = audit();
+    audit.decisions[0].reason = "copied begin private key synthetic-not-a-real-key".to_owned();
+    let error = serialize_fallback_audit(&audit).unwrap_err();
+    assert!(error.contains("secret"), "{error}");
+    assert!(!error.contains("synthetic-not-a-real-key"), "{error}");
+}
+
+#[test]
 fn fallback_audit_rejects_algorithm_qualified_private_keys_without_echo() {
     for algorithm in ["RSA", "EC", "OPENSSH"] {
         let key = format!(

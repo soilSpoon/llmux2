@@ -650,7 +650,8 @@ fn redaction_scan(value: &Value, path: &str) -> Result<(), String> {
 
 fn secret_like(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.contains("private key-----")
+    lower.contains("begin private key")
+        || lower.contains("private key-----")
         || contains_jwt(text)
         || ["env:", "file:", "sk-", "ghp_", "gho_", "xoxb-", "xoxp-"]
             .iter()
