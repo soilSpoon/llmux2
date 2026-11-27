@@ -103,6 +103,9 @@ struct RouteTrace {
     /// Every upstream send, in send order — failover hides the losing legs
     /// from `last_attempted`, so they are kept here for the request record.
     legs: Vec<request_log::AttemptLeg>,
+    /// Last upstream failure kind reached by a send, even when the terminal
+    /// routing error hides it behind an aggregate kind.
+    last_upstream_error_kind: Option<&'static str>,
 }
 
 type HttpClient = llmux_types::HttpClient;
@@ -611,6 +614,11 @@ impl Executor {
                 latency_ms: started.elapsed().as_millis() as u64,
                 outcome: if result.is_ok() { "routed" } else { "error" },
                 error_kind: result.as_ref().err().map(request_log::error_kind),
+                last_upstream_error_kind: if result.is_err() {
+                    trace.last_upstream_error_kind
+                } else {
+                    None
+                },
                 quota_remaining: trace
                     .last_attempted
                     .map(|idx| self.bindings[idx].limits.remaining(Instant::now())),
@@ -930,6 +938,10 @@ impl Executor {
                                 Ok(Err(_)) => Err(GatewayError::Internal),
                                 Err(_) => timed_out,
                             };
+                            if let Err(GatewayError::Client(error)) = &result {
+                                trace.last_upstream_error_kind =
+                                    Some(request_log::upstream_error_kind(error));
+                            }
                             if let Some(stats) = &binding.stats {
                                 stats.record_attempt(result.as_ref().err());
                             }

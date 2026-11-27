@@ -62,6 +62,10 @@ pub struct RequestRecord<'a> {
     pub outcome: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<&'a str>,
+    /// Last upstream failure kind seen by a failed request, even when the
+    /// aggregate routing error hides it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_upstream_error_kind: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_remaining: Option<QuotaRemaining>,
 }
@@ -246,6 +250,7 @@ mod tests {
                 latency_ms: 42,
                 outcome: "routed",
                 error_kind: None,
+                last_upstream_error_kind: None,
                 quota_remaining: Some(QuotaRemaining {
                     rpm: Some(9),
                     concurrent: None,
@@ -293,6 +298,7 @@ mod tests {
             latency_ms: 1000,
             outcome: "error",
             error_kind: Some("rate_limited"),
+            last_upstream_error_kind: None,
             quota_remaining: None,
         });
         drop(log);
@@ -328,6 +334,7 @@ mod tests {
             latency_ms: 1,
             outcome: "routed",
             error_kind: None,
+            last_upstream_error_kind: None,
             quota_remaining: None,
         };
         // The writer is parked on the barrier, so these fill the bounded queue.

@@ -135,7 +135,10 @@ object per routed request as a JSONL line. Each record SHALL carry the
 timestamp, request ID, requested model, last-attempted deployment ID and
 provider, attempt count, total latency, the outcome (`routed` or `error`),
 the failure kind on errors, and the remaining RPM/concurrency headroom of
-the last-attempted deployment. Each record SHALL also carry a `legs` list
+the last-attempted deployment. A failed request that reached an upstream
+SHALL also carry `last_upstream_error_kind` with the last upstream failure
+kind, even when the terminal routing failure is an aggregate kind such as
+`all_candidates_exhausted`. Each record SHALL also carry a `legs` list
 with one entry per upstream send, in send order — including each body
 repaired and resent to the same deployment — naming that leg's
 deployment ID and provider and its outcome — `routed` when the leg served
