@@ -108,6 +108,34 @@ fn export_aliases_win_over_reviewed_exact_defaults() {
 }
 
 #[test]
+fn winning_wildcard_mapping_resolves_reviewed_spelling_before_default_suppression() {
+    let mut root = fixture();
+    root["modelComboMappings"] = json!([
+        {"enabled":true,"pattern":"morph-*","comboId":"morph","priority":100}
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("input.json"), root.to_string()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_llmux-import"))
+        .args(["--input", "input.json", "--output", "out.toml"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cfg =
+        RuntimeConfig::parse(&fs::read_to_string(dir.path().join("out.toml")).unwrap()).unwrap();
+    let canonical = cfg.model_names["morph-kimi-k3-abliterated"];
+    assert_eq!(
+        cfg.model_names.get("morph-kimik3-abliterated"),
+        Some(&canonical)
+    );
+    assert_eq!(cfg.model_names.get("public-morph"), Some(&canonical));
+}
+
+#[test]
 fn exact_evidence_backed_spellings_alias_canonical_models_without_fallback_removal() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("input.json"), fixture().to_string()).unwrap();

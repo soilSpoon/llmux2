@@ -139,6 +139,16 @@ pub(super) fn prepare(
     let mappings = sorted_mappings(root);
     let mut names: BTreeSet<_> = aliases.keys().cloned().collect();
     names.extend(direct.keys().cloned());
+    names.extend(
+        REVIEWED_EXACT_ALIASES
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .filter(|name| {
+                mappings
+                    .iter()
+                    .any(|row| matches(string(row, "pattern"), name))
+            }),
+    );
     if official_replacements {
         names.extend(
             combos
