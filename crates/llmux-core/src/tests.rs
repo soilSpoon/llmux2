@@ -353,6 +353,14 @@ fn request() -> GatewayRequest {
     }
 }
 
+/// Skip cooldown time without letting virtual time fire network timeouts:
+/// pause only after the request's I/O has completed, advance, then resume.
+async fn elapse(duration: Duration) {
+    tokio::time::pause();
+    tokio::time::advance(duration).await;
+    tokio::time::resume();
+}
+
 #[tokio::test]
 async fn spooled_replay_is_reread_for_each_failover_candidate() {
     let dir = tempfile::tempdir().unwrap();
@@ -1950,7 +1958,7 @@ async fn repeated_limit_errors_after_stream_start_back_off() {
         let now = Instant::now();
         let until = executor.bindings[0].limits.cooldown_until(now).unwrap();
         cooldowns.push(until - now);
-        tokio::time::sleep(until - now + Duration::from_millis(50)).await;
+        elapse(until - now + Duration::from_millis(50)).await;
     }
     assert!(
         cooldowns[1] > Duration::from_millis(1500),
@@ -2048,7 +2056,7 @@ async fn after_a_cooldown_other_requests_fall_back_while_a_probe_is_open() {
             .as_ref(),
         "dep2"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    elapse(Duration::from_millis(100)).await;
     let streaming = GatewayRequest {
         stream: true,
         ..request()
@@ -2195,7 +2203,7 @@ async fn credential_peers_cool_only_until_the_quota_resets() {
         ..request()
     };
     assert!(executor.execute(to("a")).await.is_err());
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    elapse(Duration::from_millis(100)).await;
     executor.execute(to("b")).await.unwrap();
     let served: Vec<_> = adapter
         .calls
