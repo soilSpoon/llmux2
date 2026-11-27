@@ -598,6 +598,7 @@ struct Expander<'a> {
     exhausted: bool,
     policy: &'a policy::Policy,
     dead: &'a HashSet<String>,
+    fallback_blocked: &'a mut HashSet<String>,
 }
 
 fn interrupted_direct_model(
@@ -727,6 +728,7 @@ impl Expander<'_> {
                     self.warnings.push(format!(
                         "combo {name} step {index}: skipped dead reference {target}"
                     ));
+                    self.fallback_blocked.insert(stack[0].clone());
                     continue;
                 }
                 self.warnings.push(format!("combo {name} step {index}: expanded nested combo {target} inline; nested routing policy is not preserved"));
@@ -743,6 +745,7 @@ impl Expander<'_> {
                 self.warnings.push(format!(
                     "combo {name} step {index}: skipped interrupted direct upstream model {raw}"
                 ));
+                self.fallback_blocked.insert(stack[0].clone());
                 continue;
             }
             let pinned = string(step, "connectionId");
@@ -1581,6 +1584,7 @@ pub fn import_with_options(
         replacements::seed(&mut direct, &connections);
         bridge::seed(&mut direct, nodes, &connections);
     }
+    let mut fallback_blocked = HashSet::new();
     let mut unavailable_combos = HashSet::new();
     if policy.openrouter_replacements {
         let mappings = aliases::sorted_mappings(&root);
@@ -1603,6 +1607,7 @@ pub fn import_with_options(
                     exhausted: false,
                     policy: &policy,
                     dead: &dead,
+                    fallback_blocked: &mut fallback_blocked,
                 }
                 .expand(target, &mut Vec::new(), &mut deployments);
                 if deployments.is_empty() {
@@ -1624,6 +1629,7 @@ pub fn import_with_options(
                                 exhausted: false,
                                 policy: &policy,
                                 dead: &dead,
+                                fallback_blocked: &mut fallback_blocked,
                             }
                             .expand(
                                 target,
@@ -1759,6 +1765,7 @@ pub fn import_with_options(
             exhausted: false,
             policy: &policy,
             dead: &dead,
+            fallback_blocked: &mut fallback_blocked,
         }
         .expand(&name, &mut Vec::new(), &mut deployments);
         // Discovered DeepAI Code legs are catalog-free and expand before the
@@ -1779,6 +1786,7 @@ pub fn import_with_options(
                         exhausted: false,
                         policy: &policy,
                         dead: &dead,
+                        fallback_blocked: &mut fallback_blocked,
                     }
                     .expand(&name, &mut Vec::new(), &mut discovered);
                     let mut added = false;
@@ -1831,6 +1839,7 @@ pub fn import_with_options(
                 exhausted: false,
                 policy: &policy,
                 dead: &dead,
+                fallback_blocked: &mut fallback_blocked,
             }
             .expand(&name, &mut Vec::new(), &mut free);
             xplabs::place(&name, &mut deployments, free, &connections, &mut warnings);
@@ -1858,6 +1867,7 @@ pub fn import_with_options(
                     exhausted: false,
                     policy: &policy,
                     dead: &dead,
+                    fallback_blocked: &mut fallback_blocked,
                 }
                 .expand(&name, &mut Vec::new(), &mut deployments);
             }
@@ -1913,6 +1923,7 @@ pub fn import_with_options(
         );
         let mut exclusions = exclusions.clone();
         exclusions.extend(dead.iter().cloned());
+        exclusions.extend(fallback_blocked.iter().cloned());
         let session_excluded = exclusions.clone();
         fallback::append(
             &mut models,
@@ -2111,65 +2122,63 @@ pub fn import_with_options(
             }
         }
         merge_overlay(&mut config, overlay)?;
-        // Overlay models are routes too: drop the ones the sweep marked dead
-        // and shield their names from the catch-all.
-        if !dead.is_empty() {
-            if let Some(list) = config["models"].as_array_mut() {
-                let mut collapsed = Vec::new();
-                for model in list.iter_mut() {
-                    let model_name = string(model, "name").to_owned();
-                    let alias_names: Vec<_> = array(model, "aliases")
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect();
-                    let mut dropped = Vec::new();
-                    if let Some(deployments) =
-                        model.get_mut("deployments").and_then(Value::as_array_mut)
-                    {
-                        deployments.retain(|deployment| {
-                            let upstream = string(deployment, "upstream_model");
-                            let keep = approved_drops::lookup(upstream).is_none();
-                            if !keep {
-                                dropped.push(upstream.to_owned());
-                            }
-                            keep
-                        });
-                        if !dropped.is_empty() {
-                            warnings.push(format!(
-                                "overlay model {model_name}: dropped interrupted upstream deployment(s) {}",
-                                dropped.join(", ")
-                            ));
-                            if deployments.is_empty() {
-                                collapsed.push(model_name);
-                                collapsed.extend(alias_names);
-                            }
+    }
+    // Every assembled model source obeys the same approved-upstream cleanup;
+    // overlay-only filtering leaves catalog additions able to revive drops.
+    if !dead.is_empty() {
+        if let Some(list) = config["models"].as_array_mut() {
+            let mut collapsed = Vec::new();
+            for model in list.iter_mut() {
+                let model_name = string(model, "name").to_owned();
+                let alias_names: Vec<_> = array(model, "aliases")
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+                let mut dropped = Vec::new();
+                if let Some(deployments) =
+                    model.get_mut("deployments").and_then(Value::as_array_mut)
+                {
+                    deployments.retain(|deployment| {
+                        let upstream = string(deployment, "upstream_model");
+                        let keep = approved_drops::lookup(upstream).is_none();
+                        if !keep {
+                            dropped.push(upstream.to_owned());
+                        }
+                        keep
+                    });
+                    if !dropped.is_empty() {
+                        warnings.push(format!(
+                            "model {model_name}: dropped interrupted upstream deployment(s) {}",
+                            dropped.join(", ")
+                        ));
+                        if deployments.is_empty() {
+                            collapsed.push(model_name);
+                            collapsed.extend(alias_names);
                         }
                     }
                 }
-                for spelling in collapsed {
-                    if !spelling.is_empty() {
-                        dead.insert(spelling);
-                    }
+            }
+            for spelling in collapsed {
+                if !spelling.is_empty() {
+                    dead.insert(spelling);
                 }
-                list.retain(|model| !dead.contains(model["name"].as_str().unwrap_or("")));
-                for model in list.iter_mut() {
-                    if let Some(aliases) = model.get_mut("aliases").and_then(Value::as_array_mut) {
-                        aliases.retain(|alias| !dead.contains(alias.as_str().unwrap_or("")));
-                    }
-                    if model["name"].as_str() == Some("*") {
-                        if model.get("exclude").is_none() {
-                            if let Some(object) = model.as_object_mut() {
-                                object.insert("exclude".to_owned(), json!([]));
-                            }
+            }
+            list.retain(|model| !dead.contains(model["name"].as_str().unwrap_or("")));
+            for model in list.iter_mut() {
+                if let Some(aliases) = model.get_mut("aliases").and_then(Value::as_array_mut) {
+                    aliases.retain(|alias| !dead.contains(alias.as_str().unwrap_or("")));
+                }
+                if model["name"].as_str() == Some("*") {
+                    if model.get("exclude").is_none() {
+                        if let Some(object) = model.as_object_mut() {
+                            object.insert("exclude".to_owned(), json!([]));
                         }
-                        if let Some(exclude) =
-                            model.get_mut("exclude").and_then(Value::as_array_mut)
-                        {
-                            for name in &dead {
-                                if !exclude.iter().any(|e| e.as_str() == Some(name)) {
-                                    exclude.push(json!(name));
-                                }
+                    }
+                    if let Some(exclude) = model.get_mut("exclude").and_then(Value::as_array_mut) {
+                        for name in &dead {
+                            if !exclude.iter().any(|e| e.as_str() == Some(name)) {
+                                exclude.push(json!(name));
                             }
                         }
                     }

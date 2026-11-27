@@ -544,3 +544,55 @@ fn structured_interrupted_step_collapses_without_blocking_other_providers() {
         "unrelated provider leg missing"
     );
 }
+
+#[test]
+fn mixed_combo_with_interrupted_leg_does_not_fall_back_to_original_combo() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let key = dir.path().join("omniroute-key");
+    fs::write(&key, "synthetic-omniroute").unwrap();
+    let key_ref = format!("file:{}", key.display());
+    let mut root = fixture();
+    root["combos"].as_array_mut().unwrap().push(json!({
+        "id":"mixed","name":"mixed","models":["cfpd/moonshotai/kimi-k2.6","cfpd/moonshotai/kimi-k2.7"]
+    }));
+    llmux_import::import_with_options(
+        &root.to_string(),
+        &output,
+        None,
+        &llmux_import::ImportOptions {
+            omniroute_fallback: Some(llmux_import::OmniRouteFallback {
+                base_url: "http://127.0.0.1:20128/v1",
+                key: &key_ref,
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let cfg = RuntimeConfig::load(&output).unwrap();
+    assert!(
+        cfg.model_names.contains_key("mixed"),
+        "mixed should survive through its unrelated native leg"
+    );
+    let mixed_idx = cfg.model_names["mixed"];
+    let upstreams: Vec<_> = cfg.models[mixed_idx]
+        .deployments
+        .iter()
+        .map(|i| cfg.deployments[i.0 as usize].upstream_model.to_string())
+        .collect();
+    assert!(
+        upstreams.iter().any(|u| u == "moonshotai/kimi-k2.7"),
+        "unrelated native leg missing: {upstreams:?}"
+    );
+    assert!(
+        upstreams.iter().all(|u| u != "mixed"),
+        "mixed falls back to the original OmniRoute combo and can reselect the interrupted leg: {upstreams:?}"
+    );
+    assert!(
+        cfg.catch_all_exclude
+            .iter()
+            .any(|excluded| excluded == "mixed"),
+        "mixed can fall through to the original OmniRoute combo: {:?}",
+        cfg.catch_all_exclude
+    );
+}
