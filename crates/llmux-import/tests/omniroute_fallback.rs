@@ -113,12 +113,20 @@ fn fallback_is_last_and_codex_routes_are_excluded() {
     assert_eq!(
         cfg.catch_all_exclude,
         [
+            "cfp/moonshotai/kimi-k2.6",
+            "cfpd/moonshotai/kimi-k2.6",
             "chain",
+            "cloudflare-direct/moonshotai/kimi-k2.6",
+            "cloudflare-playground/moonshotai/kimi-k2.6",
             "codex-only",
             "codex/*",
             "cx/*",
+            "ddgw/gpt-5.4-mini",
             "direct-owner",
+            "duckduckgo-web/ddgw/gpt-5.4-mini",
+            "kimi-k2.6",
             "mapped-owner",
+            "moonshotai/kimi-k2.6",
             "nested-owner",
             "owner",
             "owner-alias",
@@ -401,8 +409,16 @@ fn fallback_only_import_preserves_env_reference() {
     assert_eq!(
         config["models"][0]["exclude"].as_array().unwrap(),
         &[
+            toml::Value::String("cfp/moonshotai/kimi-k2.6".into()),
+            toml::Value::String("cfpd/moonshotai/kimi-k2.6".into()),
+            toml::Value::String("cloudflare-direct/moonshotai/kimi-k2.6".into()),
+            toml::Value::String("cloudflare-playground/moonshotai/kimi-k2.6".into()),
             toml::Value::String("codex/*".into()),
             toml::Value::String("cx/*".into()),
+            toml::Value::String("ddgw/gpt-5.4-mini".into()),
+            toml::Value::String("duckduckgo-web/ddgw/gpt-5.4-mini".into()),
+            toml::Value::String("kimi-k2.6".into()),
+            toml::Value::String("moonshotai/kimi-k2.6".into()),
         ]
     );
 }

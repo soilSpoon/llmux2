@@ -790,7 +790,7 @@ THEN the fallback leg remains, with its `omniroute-fallback-*` id and a priority
 WHEN two models each use the same connection and upstream model
 THEN each model keeps its own deployment.
 
-### Requirement: Dead and non-chat routes are never advertised
+### Requirement: Dead, user-interrupted, and non-chat routes are never advertised
 
 `/v1/models` SHALL list only models that can be served. The importer SHALL
 accept `--exclude-models PATH`, a JSON array of model names (the shape
@@ -799,6 +799,23 @@ emit: its model entry, combo legs, and aliases resolving to it SHALL be
 dropped with a warning, and with `--omniroute-fallback` the names SHALL join
 the catch-all `exclude` set. Malformed or unreadable lists SHALL abort the
 import before any output is written.
+
+The importer SHALL also carry a reviewed exact table of user-approved
+buyer-visible interruptions for models with no compliant free exact native
+lane. The WO-189 rows are `kimi-k2.6`, `moonshotai/kimi-k2.6`,
+`cloudflare-direct/moonshotai/kimi-k2.6`, `cfp/moonshotai/kimi-k2.6`,
+`cfpd/moonshotai/kimi-k2.6`, `cloudflare-playground/moonshotai/kimi-k2.6`,
+`ddgw/gpt-5.4-mini`, and `duckduckgo-web/ddgw/gpt-5.4-mini`. Each exact row
+SHALL be excluded even when it is absent from `--exclude-models`: no servable
+model entry, alias, deployment, generated OmniRoute fallback leg, or catalog
+spelling is emitted, and the exact spelling joins the catch-all `exclude` set
+when the transition catch-all exists. Bare `gpt-5.4-mini` and neighboring
+Kimi, DeepSeek, and GPT spellings SHALL NOT be added by this correction.
+Importer warnings and the canonical-map `drop_decisions` artifact SHALL record
+the non-secret user approval source and reason so the absence is auditable as
+a deliberate removal. This exact table is the current-importer migration
+input for explicit fallback-policy `drop` spellings when the WO-175 policy
+schema lands.
 
 Upstream model IDs that cannot serve chat-completions-class endpoints —
 embedding or typed-endpoint models listed in `src/policy.rs`'s reviewed
@@ -813,6 +830,14 @@ match is on the emitted id's leaf segment with any `:variant` suffix
 WHEN a probe-confirmed dead model is listed in `--exclude-models`
 THEN its name and aliases never reach `/v1/models`, and the catch-all cannot
 serve it under another name.
+
+#### Scenario: User-approved no-free-lane model fails closed
+
+WHEN a WO-189 exact spelling is present in the export, aliases, overlay, or a
+request falls through to the transition catch-all
+THEN no servable deployment or catalog entry is generated for that spelling,
+the request remains unknown rather than using OmniRoute, and the audit output
+records the explicit user-approved drop.
 
 #### Scenario: Embedding model classified out
 

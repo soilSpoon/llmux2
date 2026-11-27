@@ -1,6 +1,7 @@
 //! Import OmniRoute JSON exports and SQLite table dumps into a static llmux configuration.
 
 mod aliases;
+mod approved_drops;
 mod bridge;
 mod connection;
 mod context;
@@ -1050,25 +1051,28 @@ pub fn import_with_options(
     options: &ImportOptions<'_>,
 ) -> Result<ImportReport, String> {
     let policy = policy::Policy::load(options)?;
-    let mut dead: HashSet<String> = match options.exclude_models {
-        Some(path) => serde_json::from_str::<Vec<String>>(
+    let mut dead: HashSet<String> = approved_drops::USER_APPROVED_DROPS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    if let Some(path) = options.exclude_models {
+        let listed = serde_json::from_str::<Vec<String>>(
             &fs::read_to_string(path)
                 .map_err(|e| format!("could not read --exclude-models {}: {e}", path.display()))?,
         )
         .ok()
-        .and_then(|list| {
+        .filter(|list| {
             list.iter()
                 .all(|name| !name.is_empty() && !name.contains('*'))
-                .then(|| list.into_iter().collect())
         })
         .ok_or_else(|| {
             format!(
                 "--exclude-models {} must be a JSON array of nonempty model names",
                 path.display()
             )
-        })?,
-        None => HashSet::new(),
-    };
+        })?;
+        dead.extend(listed);
+    }
     let nous = match (options.nous_state, options.nous_models) {
         (None, None) => None,
         (Some(state), Some(models)) => Some(nous::Nous::load(state, models)?),
@@ -1680,9 +1684,17 @@ pub fn import_with_options(
     let mut deployment_ids = HashSet::new();
     for name in order {
         if dead.contains(&name) {
-            warnings.push(format!(
-                "model {name}: dropped dead route listed in --exclude-models"
-            ));
+            if approved_drops::user_approved(&name) {
+                warnings.push(format!(
+                    "model {name}: dropped user-approved buyer-visible interruption ({}; {})",
+                    approved_drops::APPROVAL_SOURCE,
+                    approved_drops::REASON
+                ));
+            } else {
+                warnings.push(format!(
+                    "model {name}: dropped dead route listed in --exclude-models"
+                ));
+            }
             continue;
         }
         let lookup = if synthetic.contains_key(&name) {
@@ -2113,6 +2125,18 @@ fn write_canonical_map(
         .values()
         .map(|names| names.as_array().map_or(0, Vec::len))
         .sum();
+    let drop_decisions: Vec<_> = approved_drops::USER_APPROVED_DROPS
+        .iter()
+        .map(|spelling| {
+            json!({
+                "spelling": spelling,
+                "action": "drop",
+                "decision_source": "user-approved",
+                "approval": approved_drops::APPROVAL_SOURCE,
+                "reason": approved_drops::REASON,
+            })
+        })
+        .collect();
     let doc = json!({
         "clusters": map
             .values()
@@ -2121,6 +2145,7 @@ fn write_canonical_map(
         "entries_before": spellings,
         "entries_after": map.len(),
         "map": Value::Object(map),
+        "drop_decisions": drop_decisions,
     });
     std::fs::write(
         path,
