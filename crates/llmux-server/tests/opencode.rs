@@ -448,6 +448,55 @@ async fn gv5_free_tier_errors_cool_the_leg_without_billed_fallback() {
 }
 
 #[tokio::test]
+async fn gv5_unrestricted_quota_errors_never_fall_through_to_billed() {
+    for status in [402, 429] {
+        let fixture = start_fixture(Mode::Error(status), false, true).await;
+        let response = post_chat(&fixture, payload(false)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "status fixture {status}"
+        );
+        let text = body_string(response).await;
+        let error: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(error["error"]["code"], "rate_limit_exceeded");
+        assert!(!text.contains(MARKER));
+        assert!(!text.contains("synthetic-client-key"));
+        assert!(!text.contains("synthetic-upstream-key"));
+        assert_eq!(fixture.capture.requests.lock().unwrap().len(), 1);
+        assert_eq!(fixture.billed_calls.load(Ordering::SeqCst), 0);
+
+        let second = post_chat(&fixture, payload(false)).await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        drop(body_string(second).await);
+        assert_eq!(
+            fixture.capture.requests.lock().unwrap().len(),
+            1,
+            "the opencode leg must cool down after unrestricted status {status}"
+        );
+        assert_eq!(fixture.billed_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn image_inputs_are_rejected_before_any_upstream_call() {
+    let fixture = start_fixture(Mode::Stream, true, false).await;
+    let mut body = payload(false);
+    body["messages"][1]["content"] = json!([
+        {"type":"text","text":MARKER},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,aGk="}}
+    ]);
+    let response = post_chat(&fixture, body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let text = body_string(response).await;
+    let error: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(error["error"]["code"], "invalid_request_error");
+    assert!(!text.contains(MARKER));
+    assert_eq!(fixture.capture.requests.lock().unwrap().len(), 0);
+    assert_eq!(fixture.billed_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn gv6_client_disconnect_closes_upstream_without_retry_or_dead_mark() {
     let fixture = start_fixture(Mode::Hanging, false, false).await;
     let request = Request::post(format!("{}/v1/chat/completions", fixture.gateway.url()))
