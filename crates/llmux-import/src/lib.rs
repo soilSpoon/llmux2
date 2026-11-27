@@ -600,8 +600,13 @@ struct Expander<'a> {
     dead: &'a HashSet<String>,
 }
 
+fn interrupted_direct_model(raw: &str, model: &str) -> bool {
+    approved_drops::lookup(raw).is_some() || approved_drops::lookup(model).is_some()
+}
+
 fn references_dead(
     combos: &HashMap<String, Value>,
+    nodes: &[Value],
     name: &str,
     dead: &HashSet<String>,
     visited: &mut HashSet<String>,
@@ -628,7 +633,13 @@ fn references_dead(
             ""
         };
         if !target.is_empty()
-            && (dead.contains(target) || references_dead(combos, target, dead, visited))
+            && (dead.contains(target) || references_dead(combos, nodes, target, dead, visited))
+        {
+            return true;
+        }
+        if target.is_empty()
+            && upstream::model_target(step, nodes)
+                .is_some_and(|(_, model)| interrupted_direct_model(raw, model))
         {
             return true;
         }
@@ -709,6 +720,12 @@ impl Expander<'_> {
                 ));
                 continue;
             };
+            if interrupted_direct_model(raw, model) {
+                self.warnings.push(format!(
+                    "combo {name} step {index}: skipped interrupted direct upstream model {raw}"
+                ));
+                continue;
+            }
             let pinned = string(step, "connectionId");
             let allowed = array(step, "allowedConnectionIds");
             if !connection::valid_restrictions(step) {
@@ -1848,7 +1865,7 @@ pub fn import_with_options(
             warnings.push(format!("combo {name}: skipped: no deployments"));
             // A combo that collapsed entirely into dead references is dead
             // itself: the catch-all must not serve its name either.
-            if references_dead(lookup, &name, &dead, &mut HashSet::new()) {
+            if references_dead(lookup, nodes, &name, &dead, &mut HashSet::new()) {
                 dead.insert(name.clone());
             }
             continue;
@@ -2081,8 +2098,18 @@ pub fn import_with_options(
             if let Some(list) = config["models"].as_array_mut() {
                 list.retain(|model| !dead.contains(model["name"].as_str().unwrap_or("")));
                 for model in list.iter_mut() {
+                    if let Some(aliases) = model.get_mut("aliases").and_then(Value::as_array_mut) {
+                        aliases.retain(|alias| !dead.contains(alias.as_str().unwrap_or("")));
+                    }
                     if model["name"].as_str() == Some("*") {
-                        if let Some(exclude) = model["exclude"].as_array_mut() {
+                        if model.get("exclude").is_none() {
+                            if let Some(object) = model.as_object_mut() {
+                                object.insert("exclude".to_owned(), json!([]));
+                            }
+                        }
+                        if let Some(exclude) =
+                            model.get_mut("exclude").and_then(Value::as_array_mut)
+                        {
                             for name in &dead {
                                 if !exclude.iter().any(|e| e.as_str() == Some(name)) {
                                     exclude.push(json!(name));

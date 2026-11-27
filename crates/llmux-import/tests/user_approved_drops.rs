@@ -269,3 +269,152 @@ fn user_approved_no_free_native_lane_models_fail_closed_exactly() {
         );
     }
 }
+
+fn write_overlay(dir: &tempfile::TempDir, models_toml: &str) -> std::path::PathBuf {
+    unsafe { std::env::set_var("WO189_OVERLAY_KEY", "synthetic-overlay") };
+    let overlay = dir.path().join("site.toml");
+    fs::write(
+        &overlay,
+        format!(
+            "[[credentials]]\nid = \"overlay-omni\"\nkind = \"api_key\"\nprovider = \"openai_compat\"\nkey = \"env:WO189_OVERLAY_KEY\"\n{models_toml}"
+        ),
+    )
+    .unwrap();
+    overlay
+}
+
+fn import_with_overlay(input: &Value, overlay: &std::path::Path, output: &std::path::Path) {
+    llmux_import::import_with_options(
+        &input.to_string(),
+        output,
+        None,
+        &llmux_import::ImportOptions {
+            overlay: Some(overlay),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn overlay_alias_to_interrupted_spelling_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let overlay = write_overlay(
+        &dir,
+        "[[models]]\nname = \"overlay-survivor\"\naliases = [\"kimi-k2.6\", \"overlay-alias\"]\n[[models.deployments]]\nid = \"overlay-survivor-0\"\ncredential = \"overlay-omni\"\nupstream_model = \"overlay-survivor-upstream\"\nbase_url = \"https://overlay.example/v1\"\n",
+    );
+    import_with_overlay(&fixture(), &overlay, &output);
+    let cfg = RuntimeConfig::load(&output).unwrap();
+    assert!(cfg.model_names.contains_key("overlay-survivor"));
+    assert!(
+        cfg.model_names.contains_key("overlay-alias"),
+        "unrelated overlay alias was removed"
+    );
+    assert!(
+        !cfg.model_names.contains_key("kimi-k2.6"),
+        "overlay alias makes interrupted spelling resolve to a servable model"
+    );
+}
+
+#[test]
+fn mixed_combo_drops_only_interrupted_direct_upstream_leg() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let mut root = fixture();
+    root["combos"].as_array_mut().unwrap().push(json!({
+        "id":"mixed","name":"mixed","models":["cfpd/moonshotai/kimi-k2.6","cfpd/moonshotai/kimi-k2.7"]
+    }));
+    llmux_import::import_with_options(
+        &root.to_string(),
+        &output,
+        None,
+        &llmux_import::ImportOptions::default(),
+    )
+    .unwrap();
+    let cfg = RuntimeConfig::load(&output).unwrap();
+    assert!(
+        cfg.model_names.contains_key("mixed"),
+        "mixed should survive through its unrelated leg"
+    );
+    let mixed_idx = cfg.model_names["mixed"];
+    let upstreams: Vec<_> = cfg.models[mixed_idx]
+        .deployments
+        .iter()
+        .map(|i| cfg.deployments[i.0 as usize].upstream_model.to_string())
+        .collect();
+    assert!(
+        upstreams.iter().any(|u| u == "moonshotai/kimi-k2.7"),
+        "unrelated mixed leg missing: {upstreams:?}"
+    );
+    assert!(
+        upstreams.iter().all(|u| u != "moonshotai/kimi-k2.6"),
+        "interrupted direct upstream leg survives in mixed: {upstreams:?}"
+    );
+    assert!(
+        cfg.deployments
+            .iter()
+            .all(|deployment| deployment.upstream_model.as_ref() != "moonshotai/kimi-k2.6"),
+        "interrupted moonshotai/kimi-k2.6 still has a servable deployment"
+    );
+}
+
+#[test]
+fn overlay_catchall_without_exclude_is_closed_to_interruptions() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let overlay = write_overlay(
+        &dir,
+        "[[models]]\nname = \"*\"\n[[models.deployments]]\nid = \"overlay-catchall\"\ncredential = \"overlay-omni\"\nupstream_model = \"*\"\nbase_url = \"https://overlay.example/v1\"\npriority = 0\nfallback = true\nbilling = \"billed\"\n",
+    );
+    import_with_overlay(&fixture(), &overlay, &output);
+    let cfg = RuntimeConfig::load(&output).unwrap();
+    assert!(cfg.catch_all.is_some(), "overlay catch-all missing");
+    for spelling in REMOVED {
+        assert!(
+            cfg.catch_all_exclude
+                .iter()
+                .any(|excluded| excluded == spelling),
+            "overlay catch-all without exclude can serve {spelling}: {:?}",
+            cfg.catch_all_exclude
+        );
+    }
+}
+
+#[test]
+fn interrupted_only_combo_collapses_and_cannot_fall_through() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let key = dir.path().join("omniroute-key");
+    fs::write(&key, "synthetic-omniroute").unwrap();
+    let key_ref = format!("file:{}", key.display());
+    let mut root = fixture();
+    root["combos"].as_array_mut().unwrap().push(json!({
+        "id":"interrupted-only","name":"interrupted-only","models":["cfpd/moonshotai/kimi-k2.6"]
+    }));
+    llmux_import::import_with_options(
+        &root.to_string(),
+        &output,
+        None,
+        &llmux_import::ImportOptions {
+            omniroute_fallback: Some(llmux_import::OmniRouteFallback {
+                base_url: "http://127.0.0.1:20128/v1",
+                key: &key_ref,
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let cfg = RuntimeConfig::load(&output).unwrap();
+    assert!(
+        !cfg.model_names.contains_key("interrupted-only"),
+        "combo with only an interrupted direct upstream leg stayed servable"
+    );
+    assert!(
+        cfg.catch_all_exclude
+            .iter()
+            .any(|excluded| excluded == "interrupted-only"),
+        "collapsed interrupted-only combo can fall through to the catch-all: {:?}",
+        cfg.catch_all_exclude
+    );
+}
