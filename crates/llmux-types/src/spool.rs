@@ -409,6 +409,16 @@ impl SpooledBody {
     /// Callers on an async runtime should run this in a blocking thread.
     pub fn read_bytes(&self) -> io::Result<Bytes> {
         self.read_count.fetch_add(1, Ordering::Relaxed);
+        self.read_limited(self.len)
+    }
+
+    /// Reads a bounded prefix without counting as a replay materialization.
+    /// Callers on an async runtime should run this in a blocking thread.
+    pub fn read_prefix(&self, max_bytes: usize) -> io::Result<Bytes> {
+        self.read_limited(self.len.min(max_bytes as u64))
+    }
+
+    fn read_limited(&self, limit: u64) -> io::Result<Bytes> {
         let mut guard = self
             .file
             .lock()
@@ -417,7 +427,7 @@ impl SpooledBody {
             return Err(io::Error::new(io::ErrorKind::NotFound, "spool file closed"));
         };
         file.seek(SeekFrom::Start(0))?;
-        let len = usize::try_from(self.len).map_err(|_| {
+        let len = usize::try_from(limit).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "spool body does not fit in memory",
@@ -449,6 +459,18 @@ impl Drop for SpooledBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_prefix_is_bounded_without_counting_as_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SpoolStore::open(dir.path(), 4096).unwrap();
+        let body = store.spool_bytes(b"abcdef").unwrap();
+
+        assert_eq!(body.read_prefix(3).unwrap(), Bytes::from_static(b"abc"));
+        assert_eq!(body.read_count(), 0);
+        assert_eq!(body.read_bytes().unwrap(), Bytes::from_static(b"abcdef"));
+        assert_eq!(body.read_count(), 1);
+    }
 
     #[test]
     fn empty_spool_roundtrips_and_exposes_store_metadata() {

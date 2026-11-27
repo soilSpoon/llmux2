@@ -230,30 +230,32 @@ relative to time until expiry, not expiry time alone.
 WHEN a deployment expires soon but has almost no quota left
 THEN a fuller deployment with a slightly later expiry may outrank it.
 
-### Requirement: Concentrate on the best route
+### Requirement: Cache-aware spread across same-level routes
 
-The gateway SHALL send traffic to the top-ranked deployment until it nears its
-limits, and only then spill to the next. Load spreading is a safety valve for
-avoiding rate-limit and latency spikes, not a goal in itself.
+Within one effective priority level, the gateway SHALL spread distinct cache
+keys across the eligible deployments instead of concentrating all traffic on
+one leg. The same cache key SHALL start at the same deployment while it remains
+eligible, so repeated or prefix-sharing requests keep warm provider caches;
+different cache keys spread across the same-level deployments. A cache key is
+built from the hashed end user or client-key fingerprint when present plus
+stable prompt/session material such as system instructions, never the changing
+conversation tail alone; unparsable formats fall back to stable leading body
+bytes. When no cache key exists, same-level deployments SHALL rotate so traffic
+still spreads. Eligibility, quota, cooldown, quality, and free-before-paid ordering still outrank affinity: a saturated or degraded
+deployment spills to the next eligible same-level deployment before any lower
+level is considered.
 
-#### Scenario: Spillover near the cap
+#### Scenario: Prompt-prefix affinity within a spread group
 
-WHEN the top deployment approaches its request or concurrency limit
-THEN overflow requests go to the next-ranked eligible deployment.
+WHEN two deployments at the same effective priority can serve a model
+THEN requests sharing a cache key start at the same deployment while it is eligible
+AND requests with different cache keys spread across those deployments.
 
-### Requirement: Cache-aware matching
+#### Scenario: Saturation overrides affinity
 
-When ranking is otherwise close, the gateway SHALL prefer the deployment most
-likely to hold a warm prefix cache for the request — matching requests from
-the same session to the same deployment — so cache hit rates stay high across
-many concurrent sessions.
-
-#### Scenario: Session affinity for cache hits
-
-WHEN a session's next request shares a long prompt prefix with its previous
-one
-THEN it is routed to the same deployment when it remains eligible, rather than
-spreading evenly and cold-starting the cache.
+WHEN the cache-affine same-level deployment is cooling down or out of quota
+THEN the request tries another eligible same-level deployment before falling
+through to a lower-priority level.
 
 ### Requirement: Quality floor
 

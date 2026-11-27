@@ -731,12 +731,14 @@ impl Executor {
         } else {
             (&model.deployments[..], &order.groups[..])
         };
+        let deadline = Instant::now() + self.cfg.server.request_timeout;
         let sequence = if groups.iter().any(|group| group.len() > 1) {
-            order.next.fetch_add(1, Ordering::Relaxed)
+            cache_seed_for_request(&req, replay.as_ref(), deadline)
+                .await?
+                .unwrap_or_else(|| order.next.fetch_add(1, Ordering::Relaxed))
         } else {
             0
         };
-        let deadline = Instant::now() + self.cfg.server.request_timeout;
         let mut last_transient = None;
         let mut incompatible = Vec::new();
         let mut unavailable = false;
@@ -1363,6 +1365,482 @@ fn hold_permit(response: GatewayResponse, permit: Permit) -> GatewayResponse {
 
 fn index(idx: DeploymentIdx) -> usize {
     idx.0 as usize
+}
+
+/// Only stable prompt/session material feeds cache affinity. Raw JSON cannot
+/// be used directly: ordinary chat bodies are often shorter than the byte cap,
+/// so their changing conversation tail would poison the key even when the
+/// cacheable system prefix is identical. 8 KiB bounds the selection-path copy.
+const CACHE_PREFIX_BYTES: usize = 8 * 1024;
+
+async fn cache_seed_for_request(
+    req: &GatewayRequest,
+    replay: Option<&Arc<SpooledBody>>,
+    deadline: Instant,
+) -> Result<Option<usize>, GatewayError> {
+    let Some(spool) = replay.filter(|_| req.body.is_empty()) else {
+        return Ok(cache_seed(req));
+    };
+    let spool = spool.clone();
+    let read = tokio::task::spawn_blocking(move || spool.read_prefix(CACHE_SCAN_BYTES));
+    tokio::pin!(read);
+    let prefix = tokio::select! {
+        biased;
+        result = &mut read => result
+            .map_err(|_| GatewayError::Internal)?
+            .map_err(|_| GatewayError::Internal)?,
+        _ = tokio::time::sleep_until(deadline) => {
+            return Err(GatewayError::Client(UpstreamError::Timeout));
+        }
+    };
+    let mut seeded = req.clone();
+    seeded.body = prefix;
+    Ok(cache_seed(&seeded))
+}
+
+fn cache_seed(req: &GatewayRequest) -> Option<usize> {
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut present = false;
+    for part in [req.end_user.as_deref(), req.client_key.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        hash = fnv_part(hash, part.as_bytes());
+        present = true;
+    }
+    let prompt_parts = stable_prompt_parts(req);
+    if prompt_parts.is_empty() {
+        let prefix = &req.body[..req.body.len().min(CACHE_PREFIX_BYTES)];
+        if !prefix.is_empty() {
+            hash = fnv_part(hash, prefix);
+            present = true;
+        }
+    } else {
+        for part in prompt_parts {
+            hash = fnv_part(hash, &part);
+        }
+        present = true;
+    }
+    present.then_some(hash as usize)
+}
+
+/// The extractor is deliberately lexical rather than a full JSON parse. It
+/// scans only a small bounded prefix: enough for the 8 KiB affinity material
+/// plus object/array punctuation. Large conversation tails and inline images
+/// after the leading non-system message are never walked on the routing hot
+/// path. Malformed or unusually ordered input simply falls back to the raw
+/// bounded body prefix below.
+const CACHE_SCAN_BYTES: usize = CACHE_PREFIX_BYTES + 1024;
+
+#[derive(Clone)]
+struct JsonScan<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    limit: usize,
+}
+
+struct ScannedString<'a> {
+    inner: &'a [u8],
+    complete: bool,
+}
+
+struct ScannedValue<'a> {
+    raw: &'a [u8],
+    complete: bool,
+    string: bool,
+}
+
+impl<'a> JsonScan<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            pos: 0,
+            limit: bytes.len().min(CACHE_SCAN_BYTES),
+        }
+    }
+
+    fn skip_ws(&mut self) {
+        while self.pos < self.limit && self.bytes[self.pos].is_ascii_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn consume(&mut self, byte: u8) -> bool {
+        self.skip_ws();
+        if self.pos < self.limit && self.bytes[self.pos] == byte {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek(&mut self) -> Option<u8> {
+        self.skip_ws();
+        (self.pos < self.limit).then(|| self.bytes[self.pos])
+    }
+
+    fn scan_string_prefix(&mut self, max_inner_bytes: usize) -> Option<ScannedString<'a>> {
+        self.skip_ws();
+        if self.pos >= self.limit || self.bytes[self.pos] != b'"' {
+            return None;
+        }
+        self.pos += 1;
+        let start = self.pos;
+        let scan_end = self
+            .limit
+            .min(start.saturating_add(max_inner_bytes.saturating_add(1)));
+        let mut escaped = false;
+        while self.pos < scan_end {
+            let byte = self.bytes[self.pos];
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                let inner = &self.bytes[start..self.pos];
+                self.pos += 1;
+                return Some(ScannedString {
+                    inner,
+                    complete: true,
+                });
+            }
+            self.pos += 1;
+        }
+        let end = start.saturating_add(max_inner_bytes).min(self.limit);
+        (end > start).then(|| ScannedString {
+            inner: &self.bytes[start..end],
+            complete: false,
+        })
+    }
+
+    fn scan_key(&mut self) -> Option<&'a [u8]> {
+        let key = self.scan_string_prefix(128)?;
+        key.complete.then_some(key.inner)
+    }
+
+    fn scan_composite_prefix(&mut self, max_bytes: usize) -> Option<ScannedValue<'a>> {
+        self.skip_ws();
+        let start = self.pos;
+        let scan_end = self
+            .limit
+            .min(start.saturating_add(max_bytes.saturating_add(1)));
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        while self.pos < scan_end {
+            let byte = self.bytes[self.pos];
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+            } else if byte == b'"' {
+                in_string = true;
+            } else if byte == b'{' || byte == b'[' {
+                depth += 1;
+            } else if byte == b'}' || byte == b']' {
+                depth = depth.checked_sub(1)?;
+                self.pos += 1;
+                if depth == 0 {
+                    return Some(ScannedValue {
+                        raw: &self.bytes[start..self.pos],
+                        complete: true,
+                        string: false,
+                    });
+                }
+                continue;
+            }
+            self.pos += 1;
+        }
+        let end = start.saturating_add(max_bytes).min(self.limit);
+        (end > start).then(|| ScannedValue {
+            raw: &self.bytes[start..end],
+            complete: false,
+            string: false,
+        })
+    }
+
+    fn scan_primitive_prefix(&mut self, max_bytes: usize) -> Option<ScannedValue<'a>> {
+        self.skip_ws();
+        let start = self.pos;
+        while self.pos < self.limit {
+            if matches!(self.bytes[self.pos], b',' | b'}' | b']')
+                || self.bytes[self.pos].is_ascii_whitespace()
+            {
+                break;
+            }
+            self.pos += 1;
+            if self.pos - start >= max_bytes {
+                break;
+            }
+        }
+        (self.pos > start).then(|| ScannedValue {
+            raw: &self.bytes[start..self.pos],
+            complete: true,
+            string: false,
+        })
+    }
+
+    fn scan_value_prefix(&mut self, max_bytes: usize) -> Option<ScannedValue<'a>> {
+        match self.peek()? {
+            b'"' => {
+                let string = self.scan_string_prefix(max_bytes)?;
+                Some(ScannedValue {
+                    raw: string.inner,
+                    complete: string.complete,
+                    string: true,
+                })
+            }
+            b'{' | b'[' => self.scan_composite_prefix(max_bytes),
+            _ => self.scan_primitive_prefix(max_bytes),
+        }
+    }
+
+    fn skip_value(&mut self) -> bool {
+        self.scan_value_prefix(CACHE_SCAN_BYTES)
+            .is_some_and(|value| value.complete)
+    }
+}
+
+fn stable_prompt_parts(req: &GatewayRequest) -> Vec<Vec<u8>> {
+    let mut scan = JsonScan::new(&req.body);
+    let mut parts = Vec::new();
+    let mut remaining = CACHE_PREFIX_BYTES;
+    if !scan.consume(b'{') {
+        return parts;
+    }
+    loop {
+        scan.skip_ws();
+        if scan.consume(b'}') || scan.pos >= scan.limit {
+            break;
+        }
+        let Some(key) = scan.scan_key() else {
+            break;
+        };
+        if !scan.consume(b':') {
+            break;
+        }
+        let handled = match (req.format, key) {
+            (InboundFormat::OpenAiChat, b"messages") => {
+                if !scan_leading_system_parts(&mut scan, &mut parts, &mut remaining) {
+                    break;
+                }
+                true
+            }
+            (InboundFormat::AnthropicMessages, b"system") => {
+                scan_prompt_content(&mut scan, &mut parts, "system", &mut remaining);
+                true
+            }
+            (InboundFormat::OpenAiResponses, b"instructions") => {
+                scan_prompt_content(&mut scan, &mut parts, "system", &mut remaining);
+                true
+            }
+            (InboundFormat::OpenAiResponses, b"input") => {
+                // Extract any leading system-like input without depending on
+                // where that extraction stops, then skip the complete input
+                // value so a later top-level `instructions` key is still seen.
+                // The skip remains bounded by CACHE_SCAN_BYTES; oversized input
+                // simply ends extraction rather than walking the request tail.
+                let mut lookahead = scan.clone();
+                scan_leading_system_parts(&mut lookahead, &mut parts, &mut remaining);
+                scan.skip_value();
+                true
+            }
+            _ => false,
+        };
+        if remaining == 0 {
+            break;
+        }
+        if !handled && !scan.skip_value() {
+            break;
+        }
+        scan.skip_ws();
+        if scan.consume(b',') {
+            continue;
+        }
+        break;
+    }
+    parts
+}
+
+fn scan_leading_system_parts(
+    scan: &mut JsonScan<'_>,
+    parts: &mut Vec<Vec<u8>>,
+    remaining: &mut usize,
+) -> bool {
+    if !scan.consume(b'[') {
+        return false;
+    }
+    loop {
+        scan.skip_ws();
+        if scan.consume(b']') {
+            return true;
+        }
+        if scan.pos >= scan.limit || *remaining == 0 {
+            return false;
+        }
+        if !scan.consume(b'{') {
+            return false;
+        }
+        let mut role = None;
+        let mut content = None;
+        loop {
+            scan.skip_ws();
+            if scan.consume(b'}') {
+                break;
+            }
+            if scan.pos >= scan.limit {
+                return false;
+            }
+            let Some(key) = scan.scan_key() else {
+                return false;
+            };
+            if !scan.consume(b':') {
+                return false;
+            }
+            match key {
+                b"role" => {
+                    let Some(value) = scan.scan_string_prefix(32) else {
+                        return false;
+                    };
+                    if !value.complete {
+                        return false;
+                    }
+                    role = Some(value.inner);
+                    if !matches!(role, Some(b"system" | b"developer")) {
+                        return false;
+                    }
+                }
+                b"content" => {
+                    let budget = remaining.saturating_add(1);
+                    let Some(value) = scan.scan_value_prefix(budget) else {
+                        return false;
+                    };
+                    let scanned = if value.string {
+                        value.raw[..value.raw.len().min(*remaining)].to_vec()
+                    } else {
+                        bounded_json_bytes(value.raw, *remaining)
+                    };
+                    if !value.complete {
+                        if matches!(role, Some(b"system" | b"developer")) {
+                            push_prompt_bytes(parts, role.unwrap(), &scanned, remaining);
+                        }
+                        return false;
+                    }
+                    content = Some(scanned);
+                }
+                _ => {
+                    if !scan.skip_value() {
+                        return false;
+                    }
+                }
+            }
+            scan.skip_ws();
+            if scan.consume(b',') {
+                continue;
+            }
+            if scan.consume(b'}') {
+                break;
+            }
+            return false;
+        }
+        let is_system = matches!(role, Some(b"system" | b"developer"));
+        if is_system {
+            if let Some(content) = content {
+                push_prompt_bytes(parts, role.unwrap(), &content, remaining);
+            }
+        }
+        if !is_system || *remaining == 0 {
+            return false;
+        }
+        scan.skip_ws();
+        if scan.consume(b',') {
+            continue;
+        }
+        if scan.consume(b']') {
+            return true;
+        }
+        return false;
+    }
+}
+
+fn scan_prompt_content(
+    scan: &mut JsonScan<'_>,
+    parts: &mut Vec<Vec<u8>>,
+    role: &str,
+    remaining: &mut usize,
+) {
+    let budget = remaining.saturating_add(1);
+    let Some(value) = scan.scan_value_prefix(budget) else {
+        return;
+    };
+    let content = if value.string {
+        value.raw[..value.raw.len().min(*remaining)].to_vec()
+    } else {
+        bounded_json_bytes(value.raw, *remaining)
+    };
+    push_prompt_bytes(parts, role.as_bytes(), &content, remaining);
+}
+
+fn push_prompt_bytes(parts: &mut Vec<Vec<u8>>, role: &[u8], content: &[u8], remaining: &mut usize) {
+    if *remaining == 0 || content.is_empty() {
+        return;
+    }
+    let role_len = role.len().min(*remaining);
+    if role_len > 0 {
+        parts.push(role[..role_len].to_vec());
+        *remaining -= role_len;
+    }
+    if *remaining == 0 {
+        return;
+    }
+    let len = content.len().min(*remaining);
+    parts.push(content[..len].to_vec());
+    *remaining -= len;
+}
+
+/// Copies at most `cap` bytes of a borrowed JSON value. Whitespace outside
+/// strings is insignificant in JSON, so dropping it keeps affinity stable
+/// across equivalent client serialization without materializing the tail.
+fn bounded_json_bytes(raw: &[u8], cap: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len().min(cap));
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in raw {
+        if out.len() == cap {
+            break;
+        }
+        if in_string {
+            out.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+            out.push(byte);
+        } else if !byte.is_ascii_whitespace() {
+            out.push(byte);
+        }
+    }
+    out
+}
+
+fn fnv_part(mut hash: u64, part: &[u8]) -> u64 {
+    for byte in (part.len() as u64).to_le_bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
+    for &byte in part {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 #[cfg(test)]

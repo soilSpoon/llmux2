@@ -600,6 +600,282 @@ async fn expired_deployments_are_skipped() {
 }
 
 #[tokio::test]
+async fn same_level_spread_keeps_a_prompt_prefix_on_one_deployment() {
+    let future = SystemTime::now() + Duration::from_secs(60);
+    let (executor, _, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("model", &[0, 1, 2])],
+        Default::default(),
+        Default::default(),
+        false,
+        None,
+        [None; 3],
+        [Some((0, future)); 3],
+    )
+    .await;
+    let repeated = || GatewayRequest {
+        body: Bytes::from_static(b"shared-cache-prefix"),
+        ..request()
+    };
+
+    let first = executor.execute(repeated()).await.unwrap().deployment;
+    for _ in 0..4 {
+        assert_eq!(
+            executor.execute(repeated()).await.unwrap().deployment,
+            first
+        );
+    }
+
+    let mut spread = HashSet::new();
+    for i in 0..24 {
+        let routed = executor
+            .execute(GatewayRequest {
+                body: Bytes::from(format!("shared-cache-prefix-{i}")),
+                ..request()
+            })
+            .await
+            .unwrap()
+            .deployment;
+        spread.insert(routed);
+    }
+    assert!(
+        spread.len() > 1,
+        "distinct cache keys should spread across same-level deployments"
+    );
+}
+
+#[tokio::test]
+async fn spooled_replay_preserves_cache_affinity() {
+    let future = SystemTime::now() + Duration::from_secs(60);
+    let (executor, _, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("model", &[0, 1, 2])],
+        Default::default(),
+        Default::default(),
+        false,
+        None,
+        [None; 3],
+        [Some((0, future)); 3],
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = llmux_types::SpoolStore::open(dir.path(), 4096).unwrap();
+    let replay = store
+        .spool_bytes(
+            br#"{"model":"model","messages":[{"role":"system","content":"shared cache prefix"},{"role":"user","content":"question"}]}"#,
+        )
+        .unwrap();
+    let spooled_request = || GatewayRequest {
+        body: Bytes::new(),
+        end_user: None,
+        client_key: None,
+        ..request()
+    };
+
+    let first = executor
+        .execute_attributed_with_replay(spooled_request(), Some(replay.clone()))
+        .await
+        .unwrap()
+        .deployment;
+    for _ in 0..4 {
+        assert_eq!(
+            executor
+                .execute_attributed_with_replay(spooled_request(), Some(replay.clone()))
+                .await
+                .unwrap()
+                .deployment,
+            first,
+            "a spooled repeated prompt prefix should keep cache affinity"
+        );
+    }
+}
+
+#[tokio::test]
+async fn spooled_replay_spreads_distinct_prompts_with_one_client_key() {
+    let future = SystemTime::now() + Duration::from_secs(60);
+    let (executor, _, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("model", &[0, 1, 2])],
+        Default::default(),
+        Default::default(),
+        false,
+        None,
+        [None; 3],
+        [Some((0, future)); 3],
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = llmux_types::SpoolStore::open(dir.path(), 1_000_000).unwrap();
+    let mut spread = HashSet::new();
+    for i in 0..24 {
+        let body = format!(
+            r#"{{"model":"model","messages":[{{"role":"system","content":"cache prefix {i}"}},{{"role":"user","content":"question"}}]}}"#
+        );
+        let replay = store.spool_bytes(body.as_bytes()).unwrap();
+        let routed = executor
+            .execute_attributed_with_replay(
+                GatewayRequest {
+                    body: Bytes::new(),
+                    ..request()
+                },
+                Some(replay),
+            )
+            .await
+            .unwrap()
+            .deployment;
+        spread.insert(routed);
+    }
+    assert!(
+        spread.len() > 1,
+        "distinct spooled cache keys should spread even for one client key"
+    );
+}
+
+#[test]
+fn stable_prompt_extraction_stops_before_large_conversation_tail() {
+    let tail = "x".repeat(1_800_000);
+    let body = Bytes::from(format!(
+        r#"{{"messages":[{{"role":"system","content":"shared system prompt with spaces"}},{{"role":"user","content":"{tail}"#
+    ));
+    let parts = stable_prompt_parts(&GatewayRequest { body, ..request() });
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0], b"system");
+    assert_eq!(parts[1], b"shared system prompt with spaces");
+}
+
+#[test]
+fn stable_prompt_extraction_reads_multiple_leading_system_messages() {
+    let parts = stable_prompt_parts(&GatewayRequest {
+        body: Bytes::from_static(
+            br#"{"messages":[{"role":"system","content":"first prefix"},{"role":"developer","content":"second prefix"},{"role":"user","content":"tail"}]}"#,
+        ),
+        ..request()
+    });
+    assert_eq!(parts.len(), 4);
+    assert_eq!(parts[0], b"system");
+    assert_eq!(parts[1], b"first prefix");
+    assert_eq!(parts[2], b"developer");
+    assert_eq!(parts[3], b"second prefix");
+}
+
+#[test]
+fn stable_prompt_extraction_does_not_treat_nested_message_keys_as_top_level() {
+    let parts = stable_prompt_parts(&GatewayRequest {
+        body: Bytes::from_static(
+            br#"{"messages":[{"role":"system","content":"shared prefix"},{"role":"user","content":"tail","messages":[{"role":"system","content":"nested poison"}]}]}"#,
+        ),
+        ..request()
+    });
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0], b"system");
+    assert_eq!(parts[1], b"shared prefix");
+}
+
+#[test]
+fn stable_prompt_extraction_reads_responses_instructions_after_input() {
+    for body in [
+        br#"{"input":"First question","instructions":"shared system prompt"}"#.as_slice(),
+        br#"{"input":[{"role":"user","content":"First question"}],"instructions":"shared system prompt"}"#.as_slice(),
+    ] {
+        let parts = stable_prompt_parts(&GatewayRequest {
+            format: InboundFormat::OpenAiResponses,
+            body: Bytes::copy_from_slice(body),
+            ..request()
+        });
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], b"system");
+        assert_eq!(parts[1], b"shared system prompt");
+    }
+}
+
+#[test]
+fn stable_prompt_extraction_covers_anthropic_and_responses_formats() {
+    let anthropic = stable_prompt_parts(&GatewayRequest {
+        format: InboundFormat::AnthropicMessages,
+        body: Bytes::from_static(
+            br#"{"system":"anthropic system prompt","messages":[{"role":"user","content":"tail"}]}"#,
+        ),
+        ..request()
+    });
+    assert_eq!(anthropic.len(), 2);
+    assert_eq!(anthropic[0], b"system");
+    assert_eq!(anthropic[1], b"anthropic system prompt");
+
+    let responses = stable_prompt_parts(&GatewayRequest {
+        format: InboundFormat::OpenAiResponses,
+        body: Bytes::from_static(
+            br#"{"instructions":"responses instructions","input":[{"role":"developer","content":"developer prefix"},{"role":"user","content":"tail"}]}"#,
+        ),
+        ..request()
+    });
+    assert_eq!(responses.len(), 4);
+    assert_eq!(responses[0], b"system");
+    assert_eq!(responses[1], b"responses instructions");
+    assert_eq!(responses[2], b"developer");
+    assert_eq!(responses[3], b"developer prefix");
+}
+
+#[tokio::test]
+async fn cache_affinity_uses_stable_system_prompt_not_conversation_tail() {
+    let future = SystemTime::now() + Duration::from_secs(60);
+    let (executor, _, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("model", &[0, 1, 2])],
+        Default::default(),
+        Default::default(),
+        false,
+        None,
+        [None; 3],
+        [Some((0, future)); 3],
+    )
+    .await;
+    let system = "shared-system-prefix-".repeat(300);
+    let body = |user: &str| {
+        Bytes::from(
+            serde_json::json!({
+                "model": "model",
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            })
+            .to_string(),
+        )
+    };
+
+    let first = executor
+        .execute(GatewayRequest {
+            body: body("First question"),
+            ..request()
+        })
+        .await
+        .unwrap()
+        .deployment;
+    for user in ["Second question", "Third question"] {
+        assert_eq!(
+            executor
+                .execute(GatewayRequest {
+                    body: body(user),
+                    ..request()
+                })
+                .await
+                .unwrap()
+                .deployment,
+            first,
+            "same stable system prefix should keep cache affinity despite a changing tail"
+        );
+    }
+}
+
+#[tokio::test]
 async fn priority_boost_promotes_until_deadline_then_reverts() {
     let future = SystemTime::now() + Duration::from_secs(3600);
     let past = SystemTime::now() - Duration::from_secs(60);
