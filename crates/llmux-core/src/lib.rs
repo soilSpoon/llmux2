@@ -29,7 +29,7 @@ use request_log::RequestRecord;
 use stats::{AttemptStats, SkipReason};
 pub use stats::{CatchAllStats, DeploymentStats, FallbackStats};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ops::Range,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -106,6 +106,16 @@ struct RouteTrace {
     /// Last upstream failure kind reached by a send, even when the terminal
     /// routing error hides it behind an aggregate kind.
     last_upstream_error_kind: Option<&'static str>,
+    candidates_total: Option<usize>,
+    candidates_considered: usize,
+    candidate_skip_reasons: BTreeMap<&'static str, u64>,
+    candidate_retry_after: Option<Duration>,
+}
+
+impl RouteTrace {
+    fn record_candidate_skip(&mut self, reason: &'static str) {
+        *self.candidate_skip_reasons.entry(reason).or_insert(0) += 1;
+    }
 }
 
 type HttpClient = llmux_types::HttpClient;
@@ -587,6 +597,7 @@ impl Executor {
         let model = req.model.clone();
         let client_key = req.client_key.clone();
         let image_count = req.image_count;
+        let free_only = req.free_only;
         let result = self.route(req, replay, &mut trace).await;
         // A middle-out context rejection is a probe: the server truncates and
         // retries under the same request ID, so logging it would double-count
@@ -619,6 +630,18 @@ impl Executor {
                 } else {
                     None
                 },
+                candidate_selection: trace.candidates_total.map(|total| {
+                    request_log::CandidateSelection {
+                        total,
+                        considered: trace.candidates_considered,
+                        max_attempts: self.cfg.routing.max_attempts,
+                        free_only,
+                        retry_after_ms: trace
+                            .candidate_retry_after
+                            .map(|wait| wait.as_millis() as u64),
+                        skip_reasons: trace.candidate_skip_reasons,
+                    }
+                }),
                 quota_remaining: trace
                     .last_attempted
                     .map(|idx| self.bindings[idx].limits.remaining(Instant::now())),
@@ -739,6 +762,7 @@ impl Executor {
         } else {
             (&model.deployments[..], &order.groups[..])
         };
+        trace.candidates_total = Some(deployments.len());
         let deadline = Instant::now() + self.cfg.server.request_timeout;
         let sequence = if groups.iter().any(|group| group.len() > 1) {
             cache_seed_for_request(&req, replay.as_ref(), deadline)
@@ -757,6 +781,7 @@ impl Executor {
             let (before, after) = deployments[group.clone()].split_at(shift);
             for &idx in after.iter().chain(before) {
                 let idx = index(idx);
+                trace.candidates_considered += 1;
                 let dep = &self.cfg.deployments[idx];
                 let binding = &self.bindings[idx];
                 let support = binding.adapter.supports(req.format);
@@ -766,30 +791,35 @@ impl Executor {
                 {
                     block_billed_after_terminal_quota = true;
                 }
-                if block_billed_after_terminal_quota
-                    && (dep.billing == Billing::Billed || dep.fallback)
-                {
-                    continue;
-                }
                 // A free-only probe never routes to a billed leg, so a sweep
                 // cannot spend on paid or quota-capped legs — including billed
                 // fallback legs a dying free leg would otherwise fall through
                 // to. Skipping is not dead evidence: only an upstream's own
                 // model-not-found counts, so exhaustion stays a retryable 429.
                 if req.free_only && dep.billing == Billing::Billed {
+                    trace.record_candidate_skip("free_only_billed");
+                    continue;
+                }
+                if block_billed_after_terminal_quota
+                    && (dep.billing == Billing::Billed || dep.fallback)
+                {
+                    trace.record_candidate_skip("terminal_quota_billed");
                     continue;
                 }
                 machine.select();
                 let mut skip_reason = binding.skip_reason(support, fits(dep), dep.expires_at);
+                let mut skip_log_key = skip_reason.map(skip_reason_log_key);
                 let mut event = if skip_reason.is_some() {
                     Event::Ineligible
                 } else if support != Support::Convert
                     && binding.limits.cooldown_until(now).is_some()
                 {
                     skip_reason = Some(SkipReason::Cooldown);
+                    skip_log_key = Some("cooldown");
                     Event::Cooling
                 } else if support != Support::Convert && self.devin_upstream_missing(dep) {
                     skip_reason = Some(SkipReason::UpstreamUnavailable);
+                    skip_log_key = Some("upstream_unavailable");
                     Event::Cooling
                 } else if now >= deadline {
                     Event::DeadlinePassed
@@ -810,6 +840,8 @@ impl Executor {
                             if let Some(reason) = skip_reason {
                                 binding.record_skip(reason);
                             }
+                            trace
+                                .record_candidate_skip(skip_log_key.unwrap_or("admission_limited"));
                             if cooling {
                                 unavailable = true;
                                 last_transient = None;
@@ -844,11 +876,15 @@ impl Executor {
                             permit = if support == Support::Convert {
                                 None
                             } else {
-                                binding.limits.admit(needed)
+                                match binding.limits.admit_with_reason(needed) {
+                                    Ok(permit) => Some(permit),
+                                    Err(denial) => {
+                                        skip_reason = Some(deny_reason(denial));
+                                        skip_log_key = Some(denial.log_key());
+                                        None
+                                    }
+                                }
                             };
-                            if support != Support::Convert && permit.is_none() {
-                                skip_reason = Some(deny_reason(&binding.limits));
-                            }
                             event = Event::Admit {
                                 permit: support == Support::Convert || permit.is_some(),
                             };
@@ -876,6 +912,7 @@ impl Executor {
                         }
                         Effect::Incompatible => {
                             binding.record_skip(SkipReason::UnsupportedConversion);
+                            trace.record_candidate_skip("unsupported_conversion");
                             incompatible.push(idx);
                             break;
                         }
@@ -886,13 +923,18 @@ impl Executor {
                                 // a cooling deployment is never sent traffic.
                                 permit = None;
                                 skip_reason = Some(SkipReason::Cooldown);
+                                skip_log_key = Some("cooldown");
                             } else if permit.is_none() {
                                 // Convert deployments admit here, after a
                                 // successful conversion build.
-                                permit = binding.limits.admit(needed);
-                                if permit.is_none() {
-                                    skip_reason = Some(deny_reason(&binding.limits));
-                                }
+                                permit = match binding.limits.admit_with_reason(needed) {
+                                    Ok(permit) => Some(permit),
+                                    Err(denial) => {
+                                        skip_reason = Some(deny_reason(denial));
+                                        skip_log_key = Some(denial.log_key());
+                                        None
+                                    }
+                                };
                             }
                             event = Event::Gate {
                                 permit: permit.is_some(),
@@ -1129,9 +1171,11 @@ impl Executor {
             })
             .map(|binding| binding.limits.available_at(now, needed))
             .min();
+        let retry_after = earliest.map(|ready| ready.saturating_duration_since(Instant::now()));
+        trace.candidate_retry_after = retry_after;
         Err(GatewayError::AllCandidatesExhausted {
             attempts: machine.attempts as _,
-            retry_after: earliest.map(|ready| ready.saturating_duration_since(Instant::now())),
+            retry_after,
         })
     }
 
@@ -1328,11 +1372,25 @@ impl Executor {
     }
 }
 
+fn skip_reason_log_key(reason: SkipReason) -> &'static str {
+    match reason {
+        SkipReason::Disabled => "disabled",
+        SkipReason::UnsupportedFormat => "unsupported_format",
+        SkipReason::ContextLength => "context_length",
+        SkipReason::Cooldown => "cooldown",
+        SkipReason::AdmissionLimited => "admission_limited",
+        SkipReason::UnsupportedConversion => "unsupported_conversion",
+        SkipReason::UpstreamUnavailable => "upstream_unavailable",
+        SkipReason::Expired => "expired",
+        SkipReason::NotProvisioned => "not_provisioned",
+    }
+}
+
 /// A refused admission is a cooldown when the deployment is cooling — even
 /// one that landed after the caller's own check — and a quota or concurrency
 /// limit otherwise.
-fn deny_reason(limits: &DeploymentLimits) -> SkipReason {
-    if limits.cooldown_until(Instant::now()).is_some() {
+fn deny_reason(denial: limits::AdmissionDenial) -> SkipReason {
+    if denial == limits::AdmissionDenial::Cooldown {
         SkipReason::Cooldown
     } else {
         SkipReason::AdmissionLimited

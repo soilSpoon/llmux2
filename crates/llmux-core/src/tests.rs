@@ -2811,6 +2811,105 @@ async fn request_log_preserves_upstream_error_kind_when_auth_fatal_is_masked() {
     assert_eq!(lines[0]["last_upstream_error_kind"], "auth");
 }
 
+#[tokio::test]
+async fn request_log_explains_zero_attempt_free_only_billed_skip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, _adapter, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [Some(1024); 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+        [None; 3],
+    )
+    .await;
+
+    let error = executor
+        .execute(GatewayRequest {
+            free_only: true,
+            ..request()
+        })
+        .await
+        .err()
+        .expect("a free-only request must not use the billed leg");
+    assert!(matches!(
+        &error,
+        GatewayError::AllCandidatesExhausted { attempts: 0, .. }
+    ));
+    drop(executor);
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(
+        lines[0]["candidate_selection"],
+        serde_json::json!({
+            "total": 1,
+            "considered": 1,
+            "max_attempts": 4,
+            "free_only": true,
+            "skip_reasons": {"free_only_billed": 1},
+        })
+    );
+}
+
+#[tokio::test]
+async fn request_log_names_the_admission_window_that_zeroed_attempts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, _adapter, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [Some(1024); 3],
+        &[("model", &[0])],
+        llmux_types::QuotaSpec {
+            rpm: Some(1),
+            ..Default::default()
+        },
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+        [None; 3],
+    )
+    .await;
+
+    executor.execute(request()).await.unwrap();
+    let error = executor
+        .execute(request())
+        .await
+        .err()
+        .expect("the spent rpm window must reject the next request");
+    assert!(matches!(
+        &error,
+        GatewayError::AllCandidatesExhausted { attempts: 0, .. }
+    ));
+    drop(executor);
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    let selection = &lines[1]["candidate_selection"];
+    assert_eq!(selection["total"], 1);
+    assert_eq!(selection["considered"], 1);
+    assert_eq!(
+        selection["skip_reasons"],
+        serde_json::json!({"rpm_limited": 1})
+    );
+    assert!(selection["retry_after_ms"].is_number());
+}
+
 #[tokio::test(start_paused = true)]
 async fn request_log_lists_every_attempt_leg() {
     let dir = tempfile::tempdir().unwrap();

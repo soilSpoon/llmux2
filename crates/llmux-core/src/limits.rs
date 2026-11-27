@@ -13,6 +13,35 @@ const MINUTE: Duration = Duration::from_secs(60);
 const DAY: Duration = Duration::from_secs(86_400);
 const CONCURRENCY_RETRY: Duration = Duration::from_secs(1);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AdmissionDenial {
+    Cooldown,
+    Probe,
+    Concurrency,
+    RequestsPerMinute,
+    RequestsPerDay,
+    TokensPerMinute,
+    TokensPerDay,
+    FixedRequests,
+    FixedTokens,
+}
+
+impl AdmissionDenial {
+    pub fn log_key(self) -> &'static str {
+        match self {
+            Self::Cooldown => "cooldown",
+            Self::Probe => "limit_probe",
+            Self::Concurrency => "concurrency_limited",
+            Self::RequestsPerMinute => "rpm_limited",
+            Self::RequestsPerDay => "rpd_limited",
+            Self::TokensPerMinute => "tpm_limited",
+            Self::TokensPerDay => "tpd_limited",
+            Self::FixedRequests => "fixed_request_quota",
+            Self::FixedTokens => "fixed_token_quota",
+        }
+    }
+}
+
 pub(super) struct DeploymentLimits {
     baseline: Instant,
     cooldown_until_ns: AtomicU64,
@@ -209,10 +238,15 @@ impl DeploymentLimits {
         ready
     }
 
+    #[cfg(test)]
     pub fn admit(self: &Arc<Self>, tokens: u64) -> Option<Permit> {
+        self.admit_with_reason(tokens).ok()
+    }
+
+    pub fn admit_with_reason(self: &Arc<Self>, tokens: u64) -> Result<Permit, AdmissionDenial> {
         let _admission = self.admission.lock().unwrap_or_else(|err| err.into_inner());
         if self.cooldown_until(Instant::now()).is_some() {
-            return None;
+            return Err(AdmissionDenial::Cooldown);
         }
         let mut probe = Permit(None, None);
         if self.limit_strikes.load(Ordering::Relaxed) > 0 {
@@ -221,7 +255,7 @@ impl DeploymentLimits {
                 .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
                 .is_err()
             {
-                return None;
+                return Err(AdmissionDenial::Probe);
             }
             probe.1 = Some(self.clone());
         }
@@ -229,7 +263,7 @@ impl DeploymentLimits {
             let mut inflight = self.inflight.load(Ordering::Relaxed);
             loop {
                 if inflight >= max {
-                    return None;
+                    return Err(AdmissionDenial::Concurrency);
                 }
                 match self.inflight.compare_exchange_weak(
                     inflight,
@@ -245,20 +279,18 @@ impl DeploymentLimits {
         } else {
             Permit(None, None)
         };
-        if !self.charge_windows(tokens, Instant::now()) {
-            return None;
-        }
+        self.charge_windows(tokens, Instant::now())?;
         permit.1 = probe.1.take();
-        Some(permit)
+        Ok(permit)
     }
 
     pub fn admit_repair(&self, tokens: u64) -> bool {
         let _admission = self.admission.lock().unwrap_or_else(|err| err.into_inner());
         let now = Instant::now();
-        self.cooldown_until(now).is_none() && self.charge_windows(tokens, now)
+        self.cooldown_until(now).is_none() && self.charge_windows(tokens, now).is_ok()
     }
 
-    fn charge_windows(&self, tokens: u64, now: Instant) -> bool {
+    fn charge_windows(&self, tokens: u64, now: Instant) -> Result<(), AdmissionDenial> {
         let mut windows: Vec<_> = self
             .windows
             .iter()
@@ -267,7 +299,7 @@ impl DeploymentLimits {
         for (window, used) in &windows {
             let cost = window.unit.cost(tokens);
             if used.total() + cost > window.max && (window.hard || used.total() > 0) {
-                return false;
+                return Err(window.denial());
             }
         }
         for (window, used) in &mut windows {
@@ -276,7 +308,7 @@ impl DeploymentLimits {
                 used.charge(now, cost);
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -390,6 +422,17 @@ impl WindowGuard<'_> {
 }
 
 impl Window {
+    fn denial(&self) -> AdmissionDenial {
+        match (&self.kind, self.unit, self.span) {
+            (WindowKind::Sliding(_), Unit::Requests, MINUTE) => AdmissionDenial::RequestsPerMinute,
+            (WindowKind::Sliding(_), Unit::Requests, DAY) => AdmissionDenial::RequestsPerDay,
+            (WindowKind::Sliding(_), Unit::Tokens, MINUTE) => AdmissionDenial::TokensPerMinute,
+            (WindowKind::Sliding(_), Unit::Tokens, DAY) => AdmissionDenial::TokensPerDay,
+            (_, Unit::Requests, _) => AdmissionDenial::FixedRequests,
+            (_, Unit::Tokens, _) => AdmissionDenial::FixedTokens,
+        }
+    }
+
     /// Deployment-level quota windows. A request larger than the limit is
     /// admitted on an empty window so an undersized quota cannot deadlock an
     /// idle deployment.
