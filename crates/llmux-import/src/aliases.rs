@@ -13,6 +13,11 @@ const MEANINGFUL_SUFFIXES: &[&str] = &[
     "low", "medium", "high", "xhigh", "fast", "no-think", "nothink", "thinking",
 ];
 
+pub(super) const REVIEWED_EXACT_ALIASES: &[(&str, &str)] = &[
+    ("morph-kimik3-abliterated", "morph-kimi-k3-abliterated"),
+    ("cfpd/deepseek-v4.1-flash", "deepseek-v4.1-flash"),
+];
+
 /// Ordered meaningful suffixes on a name's leaf (last `/` segment), matched
 /// outermost-first — `vendor/x-fast-low` yields `["low", "fast"]`.
 pub(super) fn meaningful_suffixes(name: &str) -> Vec<&'static str> {
@@ -51,6 +56,11 @@ pub(super) fn alias_map(root: &Value, warnings: &mut Vec<String>) -> BTreeMap<St
         } else {
             warnings.push("ignored malformed modelAliases".into());
         }
+    }
+    for (name, target) in REVIEWED_EXACT_ALIASES {
+        result
+            .entry((*name).to_owned())
+            .or_insert_with(|| (*target).to_owned());
     }
     result
 }
