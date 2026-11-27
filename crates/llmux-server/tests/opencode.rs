@@ -480,20 +480,27 @@ async fn gv5_unrestricted_quota_errors_never_fall_through_to_billed() {
 
 #[tokio::test]
 async fn image_inputs_are_rejected_before_any_upstream_call() {
-    let fixture = start_fixture(Mode::Stream, true, false).await;
-    let mut body = payload(false);
-    body["messages"][1]["content"] = json!([
-        {"type":"text","text":MARKER},
-        {"type":"image_url","image_url":{"url":"data:image/png;base64,aGk="}}
-    ]);
-    let response = post_chat(&fixture, body).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let text = body_string(response).await;
-    let error: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(error["error"]["code"], "invalid_request_error");
-    assert!(!text.contains(MARKER));
-    assert_eq!(fixture.capture.requests.lock().unwrap().len(), 0);
-    assert_eq!(fixture.billed_calls.load(Ordering::SeqCst), 0);
+    for free_only in [true, false] {
+        let fixture = start_fixture(Mode::Stream, free_only, false).await;
+        let mut body = payload(false);
+        body["messages"][1]["content"] = json!([
+            {"type":"text","text":MARKER},
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,aGk="}}
+        ]);
+        let response = post_chat(&fixture, body).await;
+        let status = response.status();
+        let text = body_string(response).await;
+        let opencode_calls = fixture.capture.requests.lock().unwrap().len();
+        let billed_calls = fixture.billed_calls.load(Ordering::SeqCst);
+        assert_eq!(
+            (status, opencode_calls, billed_calls),
+            (StatusCode::BAD_REQUEST, 0, 0),
+            "free_only={free_only}; body={text}"
+        );
+        let error: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(error["error"]["code"], "invalid_request_error");
+        assert!(!text.contains(MARKER));
+    }
 }
 
 #[tokio::test]
