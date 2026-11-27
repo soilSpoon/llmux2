@@ -1,0 +1,13 @@
+# PROPOSED SYNTHETIC FIXTURE — not approved production input.
+# Active-config shape used only by the inert structural buyer-key proof tests.
+
+[server]
+client_keys = [
+  "env:LLMUX_SYNTHETIC_BIGPICKLE_BUYER_KEY",
+  "env:LLMUX_SYNTHETIC_BIGPICKLE_NONBUYER_KEY",
+]
+
+[[server.key_policies]]
+key = "env:LLMUX_SYNTHETIC_BIGPICKLE_BUYER_KEY"
+models = ["big-pickle"]
+free_only = true

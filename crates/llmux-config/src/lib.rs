@@ -1552,8 +1552,14 @@ mod tests {
                     assert_eq!(dep.expires_at, Some(expiry(1_797_465_599)), "{}", dep.id)
                 }
                 "zen-hy4-flash" => assert_eq!(dep.expires_at, Some(expiry(1_796_083_199))),
-                "zen-deepseek-v4.1-flash" | "zen-big-pickle" => {
-                    assert_eq!(dep.expires_at, None, "{}", dep.id)
+                "zen-deepseek-v4.1-flash" => assert_eq!(dep.expires_at, None, "{}", dep.id),
+                "opencode-big-pickle" => {
+                    assert_eq!(dep.expires_at, None, "{}", dep.id);
+                    assert_eq!(dep.provider.0.as_ref(), provider::OPENCODE);
+                    assert!(dep.credential.is_empty());
+                    assert_eq!(dep.base_url.to_string(), provider::OPENCODE_BASE_URL);
+                    assert_eq!(dep.billing, Billing::Free);
+                    assert_eq!(dep.max_context, None);
                 }
                 "nvidia-gemma-4-31b" => {
                     assert_eq!(dep.expires_at, None);
@@ -1573,7 +1579,7 @@ mod tests {
             "nvidia-gemma-4-31b",
             "zen-hy4-flash",
             "zen-deepseek-v4.1-flash",
-            "zen-big-pickle",
+            "opencode-big-pickle",
             "freemodel-claude-fable-5",
         ] {
             assert!(seen.contains(id), "example config is missing {id}");

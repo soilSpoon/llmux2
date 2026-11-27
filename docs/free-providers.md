@@ -66,7 +66,7 @@ ban.
 | `packet-minimax-m3.1-flash` | `api.packet.ai/v1`, `MiniMaxAI/MiniMax-M3.1-Flash` | same window | `expires_at = 2026-12-16T23:59:59Z` |
 | `zen-hy4-flash` | `opencode.ai/inference/openai/v1`, `hy4-flash-free` | “for a limited time”, no date on the page | `expires_at = 2026-11-30T23:59:59Z` (the window this project was given, not an official date) |
 | `zen-deepseek-v4.1-flash` | same endpoint, `deepseek-v4.1-flash-free` | “for a limited time” | none, because no end date is announced |
-| `zen-big-pickle` | same endpoint, `big-pickle` | “for a limited time” | none |
+| `opencode-big-pickle` | native `opencode` adapter default endpoint, `big-pickle` | “for a limited time” | none |
 | `nvidia-gemma-4-31b` | `integrate.api.nvidia.com/v1`, `google/gemma-4-31b-it` | Free Endpoint Available; no announced end | none |
 | `freemodel-claude-fable-5` | `https://freemodel.in/v1`, `claude-fable-5` | 1M tokens/month on the Free plan, reset monthly | none; a recurring allowance is not an expiry |
 
@@ -90,7 +90,9 @@ Caveats that decide whether you can send real prompts to each one:
   page says the team is using the window “to collect feedback and improve the
   model” [Z1]. The zero-retention sentence on that page belongs to DeepSeek V4.1
   Flash Free and Hy4 Flash Free, not to Big Pickle, so assume prompts sent to
-  Big Pickle may be used for training.
+  Big Pickle may be used for training. The copyable example uses the native
+  `opencode` adapter with `auth = "none"`; do not copy the withdrawn plain
+  `openai_compat` direct shape for it.
 - **freemodel.in** is a third-party aggregator in front of other providers'
   models. Its own terms are the only retention statement you get, and it resells
   upstream capacity: retention and resale permissions of the upstream model
@@ -708,7 +710,10 @@ Free-tier models are documented for the OpenCode client, so an outside caller ma
 be refused with `429 FreeUsageLimitError`, which `llmux2` treats as rate limiting
 and cools down. Only DeepSeek V4.1 Flash Free and Hy4 Flash Free are documented as
 zero-retention; Big Pickle's page only promises feedback collection, so assume it
-may train on prompts.
+may train on prompts. Big Pickle uses llmux2's native `opencode` adapter: omit
+`base_url` so the adapter's documented default endpoint applies, and `auth = "none"`
+means no operator credential is configured, not that the adapter omits its pinned
+public client identity upstream.
 
 ```toml
 [server]
@@ -743,12 +748,13 @@ expires_at = 2026-11-30T23:59:59Z
 
 [[models]]
 name = "big-pickle"
-capabilities = { stream = true, max_context = 200000 }
+capabilities = { stream = true }
 [[models.deployments]]
-id = "zen-big-pickle"
-credential = "zen-key"
-base_url = "https://opencode.ai/inference/openai/v1"
+id = "opencode-big-pickle"
+auth = "none"
+provider = "opencode"
 upstream_model = "big-pickle"
+billing = "free"
 timeout_ms = 60000
 ```
 
