@@ -6,8 +6,9 @@ use http::{header, HeaderMap};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use llmux_types::{BoxStream, SseEvent, UpstreamError};
-use serde::Deserialize;
+use serde::{de, Deserialize};
 use serde_json::Value;
+use std::fmt;
 
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
 
@@ -32,19 +33,182 @@ pub(crate) fn decode(body: Incoming) -> BoxStream<'static, Result<SseEvent, Upst
     decode_until(body, false)
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum UsageMode {
+    Root,
+    StreamOptions,
+    IncludeUsage,
+    Ignore,
+}
+
+struct UsageSeed(UsageMode);
+
+impl<'de> de::DeserializeSeed<'de> for UsageSeed {
+    type Value = Option<bool>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(UsageVisitor(self.0))
+    }
+}
+
+fn consume_seq<'de, A>(mut seq: A) -> Result<(), A::Error>
+where
+    A: de::SeqAccess<'de>,
+{
+    while seq
+        .next_element_seed(UsageSeed(UsageMode::Ignore))?
+        .is_some()
+    {}
+    Ok(())
+}
+
+fn consume_map<'de, A>(mut map: A) -> Result<(), A::Error>
+where
+    A: de::MapAccess<'de>,
+{
+    while map.next_key::<de::IgnoredAny>()?.is_some() {
+        map.next_value_seed(UsageSeed(UsageMode::Ignore))?;
+    }
+    Ok(())
+}
+
+struct UsageVisitor(UsageMode);
+
+impl<'de> de::Visitor<'de> for UsageVisitor {
+    type Value = Option<bool>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok((self.0 == UsageMode::IncludeUsage).then_some(value))
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        consume_seq(seq)?;
+        Ok(None)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: de::MapAccess<'de>,
+    {
+        if matches!(self.0, UsageMode::IncludeUsage | UsageMode::Ignore) {
+            consume_map(map)?;
+            return Ok(None);
+        }
+
+        let mut include_usage = None;
+        while let Some(key) = map.next_key::<UsageKey>()? {
+            let mode = match (self.0, key) {
+                (UsageMode::Root, UsageKey::StreamOptions) => UsageMode::StreamOptions,
+                (UsageMode::StreamOptions, UsageKey::IncludeUsage) => UsageMode::IncludeUsage,
+                _ => UsageMode::Ignore,
+            };
+            let value = map.next_value_seed(UsageSeed(mode))?;
+            if mode != UsageMode::Ignore {
+                include_usage = value;
+            }
+        }
+        Ok(include_usage)
+    }
+}
+
+enum UsageKey {
+    StreamOptions,
+    IncludeUsage,
+    Other,
+}
+
+impl<'de> Deserialize<'de> for UsageKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_identifier(UsageKeyVisitor)
+    }
+}
+
+struct UsageKeyVisitor;
+
+impl de::Visitor<'_> for UsageKeyVisitor {
+    type Value = UsageKey;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a JSON object key")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(match value {
+            "stream_options" => UsageKey::StreamOptions,
+            "include_usage" => UsageKey::IncludeUsage,
+            _ => UsageKey::Other,
+        })
+    }
+}
+
+struct RequestedUsage(Option<bool>);
+
+impl<'de> Deserialize<'de> for RequestedUsage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        de::DeserializeSeed::deserialize(UsageSeed(UsageMode::Root), deserializer).map(Self)
+    }
+}
+
 pub(crate) fn requested_usage(body: &[u8]) -> Option<bool> {
-    #[derive(Deserialize)]
-    struct Chat {
-        stream_options: Option<StreamOptions>,
-    }
-    #[derive(Deserialize)]
-    struct StreamOptions {
-        include_usage: Option<bool>,
-    }
-    serde_json::from_slice::<Chat>(body)
-        .ok()?
-        .stream_options?
-        .include_usage
+    serde_json::from_slice::<RequestedUsage>(body).ok()?.0
 }
 
 pub(crate) fn with_chat_usage(
@@ -276,6 +440,135 @@ mod tests {
         let mut parser = Parser::default();
         let mut oversized = Bytes::from(vec![b'a'; MAX_EVENT_BYTES + 1]);
         assert!(parser.next(&mut oversized).is_err());
+    }
+
+    fn dom_requested_usage(body: &[u8]) -> Option<bool> {
+        let value: Value = serde_json::from_slice(body).ok()?;
+        value["stream_options"]["include_usage"].as_bool()
+    }
+
+    #[test]
+    fn requested_usage_matches_dom_last_duplicate_wins() {
+        let cases = [
+            (
+                "include_usage false then true",
+                r#"{"stream_options":{"include_usage":false,"include_usage":true}}"#,
+            ),
+            (
+                "include_usage true then false",
+                r#"{"stream_options":{"include_usage":true,"include_usage":false}}"#,
+            ),
+            (
+                "stream_options false then true",
+                r#"{"stream_options":{"include_usage":false},"stream_options":{"include_usage":true}}"#,
+            ),
+            (
+                "stream_options true then false",
+                r#"{"stream_options":{"include_usage":true},"stream_options":{"include_usage":false}}"#,
+            ),
+            (
+                "escaped duplicate include_usage",
+                r#"{"stream_options":{"include_usage":false,"includ\u0065_usage":true}}"#,
+            ),
+            (
+                "stream_options overwritten by null",
+                r#"{"stream_options":{"include_usage":true},"stream_options":null}"#,
+            ),
+            (
+                "null stream_options overwritten by an object",
+                r#"{"stream_options":null,"stream_options":{"include_usage":true}}"#,
+            ),
+            (
+                "array stream_options overwritten by an object",
+                r#"{"stream_options":[],"stream_options":{"include_usage":true}}"#,
+            ),
+            (
+                "null include_usage overwritten by true",
+                r#"{"stream_options":{"include_usage":null,"include_usage":true}}"#,
+            ),
+            (
+                "object include_usage overwritten by false",
+                r#"{"stream_options":{"include_usage":{"nested":true},"include_usage":false}}"#,
+            ),
+            (
+                "same names nested in ignored objects do not count",
+                r#"{"noise":{"stream_options":{"include_usage":true}},"stream_options":{"include_usage":false}}"#,
+            ),
+            (
+                "deeply nested ignored objects do not count",
+                r#"{"noise":{"a":[{"b":{"stream_options":{"include_usage":true}}}]},"stream_options":{"include_usage":false}}"#,
+            ),
+        ];
+        for (name, body) in cases {
+            assert_eq!(
+                requested_usage(body.as_bytes()),
+                dom_requested_usage(body.as_bytes()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn requested_usage_matches_dom_for_bounded_duplicate_combinations() {
+        let include_values = ["null", "true", "false", "0", r#""text""#, "[]", "{}"];
+        for first in include_values {
+            for second in include_values {
+                let body = format!(
+                    r#"{{"stream_options":{{"include_usage":{first},"include_usage":{second}}}}}"#
+                );
+                assert_eq!(
+                    requested_usage(body.as_bytes()),
+                    dom_requested_usage(body.as_bytes()),
+                    "include_usage {first} then {second}"
+                );
+            }
+        }
+
+        let stream_values = [
+            "null",
+            "true",
+            "false",
+            "0",
+            r#""text""#,
+            "[]",
+            "{}",
+            r#"{"include_usage":true}"#,
+            r#"{"include_usage":false}"#,
+            r#"{"include_usage":null}"#,
+            r#"{"include_usage":true,"include_usage":false}"#,
+        ];
+        for first in stream_values {
+            for second in stream_values {
+                let body = format!(r#"{{"stream_options":{first},"stream_options":{second}}}"#);
+                assert_eq!(
+                    requested_usage(body.as_bytes()),
+                    dom_requested_usage(body.as_bytes()),
+                    "stream_options {first} then {second}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn requested_usage_rejects_malformed_duplicate_value() {
+        let body = r#"{"stream_options":{"include_usage":true},"stream_options":{"include_usage":"#;
+        assert_eq!(requested_usage(body.as_bytes()), None);
+    }
+
+    #[test]
+    fn requested_usage_matches_dom_for_deeply_nested_ignored_values() {
+        for depth in [1, 64, 127, 128, 129] {
+            let mut nested = "null".to_owned();
+            for _ in 0..depth {
+                nested = format!("[{nested}]");
+            }
+            let body = format!(r#"{{"noise":{nested},"stream_options":{{"include_usage":true}}}}"#);
+            assert_eq!(
+                requested_usage(body.as_bytes()),
+                dom_requested_usage(body.as_bytes()),
+                "depth {depth}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -49,13 +49,17 @@ fn completed() -> Value {
 }
 
 async fn send(url: &str, path: &str, key: &str, body: Value) -> (StatusCode, String) {
+    send_raw(url, path, key, body.to_string()).await
+}
+
+async fn send_raw(url: &str, path: &str, key: &str, body: String) -> (StatusCode, String) {
     let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
     let response = client
         .request(
             Request::post(format!("{url}/v1/{path}"))
                 .header(header::AUTHORIZATION, format!("Bearer {key}"))
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Full::new(Bytes::from(body.to_string())))
+                .body(Full::new(Bytes::from(body)))
                 .unwrap(),
         )
         .await
@@ -562,6 +566,54 @@ priority = 1
             .unwrap()
             .contains("stream_broken"));
         assert_eq!(hits.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[tokio::test]
+async fn chat_duplicate_stream_usage_keys_use_the_last_value() {
+    let (_dir, _upstream, gateway, _) = fixture(events(), false).await;
+    let cases = [
+        (
+            "duplicate include_usage false then true",
+            r#"{"model":"codex","stream":true,"messages":[],"stream_options":{"include_usage":false,"include_usage":true}}"#,
+            true,
+        ),
+        (
+            "duplicate include_usage true then false",
+            r#"{"model":"codex","stream":true,"messages":[],"stream_options":{"include_usage":true,"include_usage":false}}"#,
+            false,
+        ),
+        (
+            "duplicate stream_options false then true",
+            r#"{"model":"codex","stream":true,"messages":[],"stream_options":{"include_usage":false},"stream_options":{"include_usage":true}}"#,
+            true,
+        ),
+        (
+            "duplicate stream_options true then false",
+            r#"{"model":"codex","stream":true,"messages":[],"stream_options":{"include_usage":true},"stream_options":{"include_usage":false}}"#,
+            false,
+        ),
+    ];
+    for (name, request, expect_usage) in cases {
+        let (status, body) = send_raw(
+            &gateway.url(),
+            "chat/completions",
+            "owner-key",
+            request.to_owned(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body}");
+        let chunks: Vec<Value> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect();
+        assert_eq!(chunks.len(), if expect_usage { 3 } else { 2 }, "{name}");
+        if expect_usage {
+            assert_eq!(chunks[2]["choices"], json!([]), "{name}");
+            assert_eq!(chunks[2]["usage"]["total_tokens"], 5, "{name}");
+        }
     }
 }
 
