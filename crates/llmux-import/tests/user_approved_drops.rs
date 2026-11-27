@@ -260,9 +260,10 @@ fn user_approved_no_free_native_lane_models_fail_closed_exactly() {
                     && decision["approval"]
                         .as_str()
                         .is_some_and(|approval| approval.contains(marker))
-                    && decision["reason"]
-                        .as_str()
-                        .is_some_and(|reason| reason.contains("free lane"))
+                    && decision["reason"].as_str().is_some_and(|reason| {
+                        reason.contains("no adoptable free exact native lane")
+                            && reason.contains("parked/rejected under current evidence")
+                    })
             }),
             "missing free-lane-constraint parking decision for {spelling}: {audit}"
         );

@@ -13,7 +13,7 @@ const WO189_REASON: &str = "no compliant free exact native lane";
 const WO187_APPROVAL: &str = "WO-187 user constraint: free lanes only";
 const WO188_APPROVAL: &str = "WO-188 user constraint: free lanes only";
 const PARKED_REASON: &str =
-    "no compliant free exact native lane; free lane candidates parked by the free-lane constraint";
+    "no adoptable free exact native lane; candidates parked/rejected under current evidence";
 
 pub(crate) const USER_APPROVED_DROPS: &[ApprovedDrop] = &[
     ApprovedDrop {

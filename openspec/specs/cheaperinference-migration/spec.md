@@ -819,7 +819,8 @@ lane. The WO-189 rows are `kimi-k2.6`, `moonshotai/kimi-k2.6`,
 `ddgw/gpt-5.4-mini`, and `duckduckgo-web/ddgw/gpt-5.4-mini`. The WO-187 row
 is `big-pickle`; the WO-188 rows are `gpt-5.6-luna` and
 `duckduckgo-web/ddgw/gpt-5.6-luna`. Those rows are deliberate free-lane-constraint
-parked candidates, not accidental omissions. Each exact row SHALL be excluded
+parked/rejected candidates under current evidence, not conditional candidates
+or accidental omissions. Each exact row SHALL be excluded
 even when it is absent from `--exclude-models`: no servable model entry,
 alias, deployment, generated OmniRoute fallback leg, OpenCode loopback lane,
 or catalog spelling is emitted, and the exact spelling joins the catch-all
