@@ -444,6 +444,11 @@ fn mutate_first_deployment(model: &mut Table, mutate: impl FnOnce(&mut Table)) {
 }
 
 fn generate_candidate() -> (String, tempfile::TempDir) {
+    std::env::set_var("LLMUX_SYNTHETIC_BIGPICKLE_BUYER_KEY", "synthetic-buyer-key");
+    std::env::set_var(
+        "LLMUX_SYNTHETIC_BIGPICKLE_NONBUYER_KEY",
+        "synthetic-nonbuyer-key",
+    );
     let root = json!({
         "providerConnections":[{"id":"openai","provider":"openai","authType":"apikey","apiKey":"synthetic-upstream"}],
         "apiKeys":[{"key":"synthetic-client"}],
