@@ -553,9 +553,18 @@ shared fallback pool.
 WHEN a deployment uses an OAuth credential minted by `llmux-login xai`
 or imported from an `xai-oauth` connection
 (the public Grok CLI client on auth.x.ai)
-THEN requests go to api.x.ai with the OAuth bearer. Chat models use Chat
-Completions and the responses-only catalog ids use Responses. A client effort
-suffix is stripped before the upstream id.
+THEN requests go to the configured xAI base URL with the OAuth bearer. Chat
+models use Chat Completions and the responses-only catalog ids use Responses;
+`grok-4.7` is one of those ids. A client effort suffix is stripped before the
+upstream id.
+
+#### Scenario: xAI subscription proxy identity
+
+WHEN an xAI deployment's base URL host is `cli-chat-proxy.grok.com`
+THEN the request carries `x-xai-token-auth: xai-grok-cli`,
+`x-grok-client-identifier: grok-shell`, and `x-grok-client-version: 1.0.46`
+unless the deployment's `headers` already set the same header, and no other
+host receives those identity headers.
 
 #### Scenario: Nous Portal subscription deployment
 
