@@ -151,6 +151,8 @@ fn exact_evidence_backed_spellings_alias_canonical_models_without_fallback_remov
             "http://127.0.0.1:20128/v1",
             "--omniroute-key",
             &key_ref,
+            "--canonical-map",
+            "canonical-map.json",
         ])
         .current_dir(dir.path())
         .output()
@@ -221,6 +223,31 @@ fn exact_evidence_backed_spellings_alias_canonical_models_without_fallback_remov
     assert_eq!(cfg.model_names.get("public-cfpd"), Some(&deepseek_index));
     let morph_index = cfg.model_names["morph-kimi-k3-abliterated"];
     assert_eq!(cfg.model_names.get("public-morph"), Some(&morph_index));
+
+    let map_doc: Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("canonical-map.json")).unwrap())
+            .unwrap();
+    let map = &map_doc["map"];
+    for (spelling, canonical) in [
+        ("morph-kimik3-abliterated", "morph-kimi-k3-abliterated"),
+        ("cfpd/deepseek-v4.1-flash", "deepseek-v4.1-flash"),
+    ] {
+        assert!(map[canonical]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == spelling));
+        assert!(!map.as_object().unwrap().contains_key(spelling));
+    }
+    for spelling in [
+        "claude-opus-5.5-low",
+        "gpt-5.6-luna",
+        "big-pickle",
+        "morph/morph-kimi-k3-abliterated",
+    ] {
+        assert!(!cfg.model_names.contains_key(spelling));
+        assert!(!map.as_object().unwrap().contains_key(spelling));
+    }
 
     for spelling in [
         "cfpd/deepseek-ai/deepseek-v4.1-flash",
