@@ -418,3 +418,63 @@ fn interrupted_only_combo_collapses_and_cannot_fall_through() {
         cfg.catch_all_exclude
     );
 }
+
+#[test]
+fn overlay_deployments_drop_interrupted_upstream_but_preserve_survivors() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let overlay = write_overlay(
+        &dir,
+        "[[models]]\nname = \"overlay-mixed\"\naliases = [\"overlay-mixed-alias\"]\n[[models.deployments]]\nid = \"overlay-mixed-interrupted\"\ncredential = \"overlay-omni\"\nupstream_model = \"moonshotai/kimi-k2.6\"\nbase_url = \"https://overlay.example/v1\"\n[[models.deployments]]\nid = \"overlay-mixed-survivor\"\ncredential = \"overlay-omni\"\nupstream_model = \"surviving-upstream\"\nbase_url = \"https://overlay.example/v1\"\n",
+    );
+    import_with_overlay(&fixture(), &overlay, &output);
+    let cfg = RuntimeConfig::load(&output).unwrap();
+    assert!(cfg.model_names.contains_key("overlay-mixed"));
+    assert!(cfg.model_names.contains_key("overlay-mixed-alias"));
+    let mixed_idx = cfg.model_names["overlay-mixed"];
+    let upstreams: Vec<_> = cfg.models[mixed_idx]
+        .deployments
+        .iter()
+        .map(|i| cfg.deployments[i.0 as usize].upstream_model.to_string())
+        .collect();
+    assert!(
+        upstreams.iter().any(|u| u == "surviving-upstream"),
+        "unrelated overlay deployment was removed: {upstreams:?}"
+    );
+    assert!(
+        upstreams.iter().all(|u| u != "moonshotai/kimi-k2.6"),
+        "interrupted overlay deployment survives in overlay-mixed: {upstreams:?}"
+    );
+    assert!(
+        cfg.deployments
+            .iter()
+            .all(|deployment| deployment.upstream_model.as_ref() != "moonshotai/kimi-k2.6"),
+        "interrupted moonshotai/kimi-k2.6 still has a servable deployment"
+    );
+}
+
+#[test]
+fn overlay_model_with_only_interrupted_deployments_cannot_fall_through() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let overlay = write_overlay(
+        &dir,
+        "[[models]]\nname = \"overlay-collapsed\"\naliases = [\"overlay-collapsed-alias\"]\n[[models.deployments]]\nid = \"overlay-collapsed-0\"\ncredential = \"overlay-omni\"\nupstream_model = \"moonshotai/kimi-k2.6\"\nbase_url = \"https://overlay.example/v1\"\n[[models]]\nname = \"*\"\n[[models.deployments]]\nid = \"overlay-catchall\"\ncredential = \"overlay-omni\"\nupstream_model = \"*\"\nbase_url = \"https://overlay.example/v1\"\npriority = 0\nfallback = true\nbilling = \"billed\"\n",
+    );
+    import_with_overlay(&fixture(), &overlay, &output);
+    let cfg = RuntimeConfig::load(&output).unwrap();
+    assert!(cfg.catch_all.is_some(), "overlay catch-all missing");
+    for spelling in ["overlay-collapsed", "overlay-collapsed-alias"] {
+        assert!(
+            !cfg.model_names.contains_key(spelling),
+            "collapsed overlay spelling stayed servable: {spelling}"
+        );
+        assert!(
+            cfg.catch_all_exclude
+                .iter()
+                .any(|excluded| excluded == spelling),
+            "collapsed overlay spelling can fall through to the catch-all: {spelling}: {:?}",
+            cfg.catch_all_exclude
+        );
+    }
+}

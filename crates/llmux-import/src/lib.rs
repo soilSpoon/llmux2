@@ -2096,6 +2096,43 @@ pub fn import_with_options(
         // and shield their names from the catch-all.
         if !dead.is_empty() {
             if let Some(list) = config["models"].as_array_mut() {
+                let mut collapsed = Vec::new();
+                for model in list.iter_mut() {
+                    let model_name = string(model, "name").to_owned();
+                    let alias_names: Vec<_> = array(model, "aliases")
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect();
+                    let mut dropped = Vec::new();
+                    if let Some(deployments) =
+                        model.get_mut("deployments").and_then(Value::as_array_mut)
+                    {
+                        deployments.retain(|deployment| {
+                            let upstream = string(deployment, "upstream_model");
+                            let keep = approved_drops::lookup(upstream).is_none();
+                            if !keep {
+                                dropped.push(upstream.to_owned());
+                            }
+                            keep
+                        });
+                        if !dropped.is_empty() {
+                            warnings.push(format!(
+                                "overlay model {model_name}: dropped interrupted upstream deployment(s) {}",
+                                dropped.join(", ")
+                            ));
+                            if deployments.is_empty() {
+                                collapsed.push(model_name);
+                                collapsed.extend(alias_names);
+                            }
+                        }
+                    }
+                }
+                for spelling in collapsed {
+                    if !spelling.is_empty() {
+                        dead.insert(spelling);
+                    }
+                }
                 list.retain(|model| !dead.contains(model["name"].as_str().unwrap_or("")));
                 for model in list.iter_mut() {
                     if let Some(aliases) = model.get_mut("aliases").and_then(Value::as_array_mut) {
