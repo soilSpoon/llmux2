@@ -71,9 +71,5 @@ pub(super) fn collect(
 }
 
 pub(super) fn reserved(root: &Value, name: &str) -> bool {
-    root["modelAliases"].get(name).is_some()
-        || array(root, "modelComboMappings").iter().any(|row| {
-            (row["enabled"] == true || row["enabled"] == 1)
-                && super::aliases::matches(string(row, "pattern"), name)
-        })
+    super::aliases::source_reservation(root, name)
 }

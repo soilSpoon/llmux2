@@ -101,6 +101,51 @@ THEN it writes `canonical-map.json` mapping every emitted model name to the
 spellings resolving to it; a spelling kept distinct by the suffix rule
 appears as its own entry keyed by itself.
 
+### Requirement: Reviewed exact spelling aliases
+
+The importer SHALL carry exactly two reviewed spelling aliases as defaults when
+the export does not already map those spellings: `morph-kimik3-abliterated` to
+`morph-kimi-k3-abliterated`, and `cfpd/deepseek-v4.1-flash` to
+`deepseek-v4.1-flash`. It SHALL NOT infer other `morph` or `cfpd/` spellings
+by provider-prefix stripping, fuzzy matching, or suffix normalization. These
+are public spellings only: they SHALL NOT rewrite a deployment's
+`upstream_model`, suppress a native deployment, or remove an additive fallback
+deployment.
+
+#### Scenario: Evidence-backed spelling resolves to the canonical model
+
+WHEN either canonical target is emitted
+THEN its reviewed spelling is an alias on the same model entry, not a duplicate
+fallback-only model, and the entry keeps its native and additive fallback
+deployments.
+
+#### Scenario: Exact alias wins over a generated direct spelling
+
+WHEN a reviewed spelling also appears as a generated direct-provider name and
+its canonical target is emitted
+THEN the exact alias wins and no duplicate standalone model is emitted for
+that spelling.
+
+#### Scenario: Missing canonical target keeps the direct route
+
+WHEN a reviewed spelling appears as a generated direct-provider name but its
+canonical target is not emitted
+THEN the direct route remains available instead of being removed with the
+unresolvable alias.
+
+#### Scenario: Dependent aliases follow the available route
+
+WHEN a source alias targets a reviewed spelling
+THEN it resolves to the canonical model when that target is emitted, and
+otherwise keeps resolving to an available direct route for the reviewed
+spelling.
+
+#### Scenario: Similar spellings do not collapse
+
+WHEN another `cfpd/...` or `morph...` spelling appears
+THEN the importer does not attach it to either canonical target unless that
+spelling has its own reviewed alias or source mapping.
+
 ### Requirement: Name resolution costs O(1) on the request path
 
 Canonical and alias resolution SHALL happen through a precomputed lookup built
