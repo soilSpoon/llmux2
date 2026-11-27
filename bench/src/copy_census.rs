@@ -225,7 +225,7 @@ priority = {first_priority}
     )
 }
 
-async fn end_to_end_case(case: EndToEndCase) -> Result<String> {
+async fn end_to_end_case(case: EndToEndCase, pairs: usize) -> Result<String> {
     std::env::set_var("LLMUX_BENCH_CENSUS_CLIENT_KEY", CLIENT_KEY);
     std::env::set_var("LLMUX_BENCH_CENSUS_UPSTREAM_KEY", "mock-backend");
     let upstream = TestServer::start(mock_load_upstream::router(false, Duration::ZERO)).await?;
@@ -250,10 +250,10 @@ async fn end_to_end_case(case: EndToEndCase) -> Result<String> {
     }
     tokio::time::sleep(Duration::from_millis(5)).await;
 
-    let mut pairs = Vec::new();
+    let mut measurements = Vec::new();
     let mut response_bytes = 0;
     let mut attempts_seen = None;
-    for _ in 0..PAIRS {
+    for _ in 0..pairs {
         let (direct, direct_response, _) = measure_endpoint(
             &client,
             &direct_uri,
@@ -272,11 +272,21 @@ async fn end_to_end_case(case: EndToEndCase) -> Result<String> {
         .await?;
         response_bytes = response_bytes.max(direct_response).max(gateway_response);
         attempts_seen = attempts_seen.or(attempts);
-        pairs.push(PairResult { direct, gateway });
+        measurements.push(PairResult { direct, gateway });
     }
 
-    let direct = median_batch(&pairs.iter().map(|pair| pair.direct).collect::<Vec<_>>());
-    let gateway = median_batch(&pairs.iter().map(|pair| pair.gateway).collect::<Vec<_>>());
+    let direct = median_batch(
+        &measurements
+            .iter()
+            .map(|pair| pair.direct)
+            .collect::<Vec<_>>(),
+    );
+    let gateway = median_batch(
+        &measurements
+            .iter()
+            .map(|pair| pair.gateway)
+            .collect::<Vec<_>>(),
+    );
     let actual_attempts = attempts_seen.unwrap_or(1);
     if case.retry && actual_attempts != 2 {
         return Err(format!(
@@ -499,7 +509,7 @@ pub async fn run(_args: &[String]) -> Result<()> {
 
     let mut end_to_end_rows = String::new();
     for case in cases {
-        end_to_end_rows.push_str(&end_to_end_case(case).await?);
+        end_to_end_rows.push_str(&end_to_end_case(case, PAIRS).await?);
     }
     let build_rows = adapter_census().await?;
     let admission_rows = admission_parse_census();
@@ -558,5 +568,52 @@ mod tests {
         let anthropic: Value =
             serde_json::from_slice(&anthropic_body(GATEWAY_MODEL, 1024)).unwrap();
         assert_eq!(anthropic["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn median_batch_uses_middle_values() {
+        let batch = median_batch(&[
+            Batch {
+                allocations: 1.0,
+                bytes: 10.0,
+            },
+            Batch {
+                allocations: 3.0,
+                bytes: 30.0,
+            },
+            Batch {
+                allocations: 2.0,
+                bytes: 20.0,
+            },
+        ]);
+        assert_eq!(batch.allocations, 2.0);
+        assert_eq!(batch.bytes, 20.0);
+    }
+
+    #[tokio::test]
+    async fn spooled_retry_census_and_isolated_parser_measurements_smoke() {
+        let row = end_to_end_case(
+            EndToEndCase {
+                name: "test spooled retry",
+                target_bytes: 2048,
+                stream: false,
+                memory_bytes: 128,
+                retry: true,
+                requests: 2,
+            },
+            1,
+        )
+        .await
+        .unwrap();
+        assert!(row.contains("test spooled retry"));
+        assert!(row.contains("| 2 |"));
+
+        let build_rows = adapter_census().await.unwrap();
+        assert!(build_rows.contains("OpenAI Responses → chat conversion"));
+        assert!(build_rows.contains("Anthropic Messages → chat conversion"));
+
+        let admission_rows = admission_parse_census();
+        assert!(admission_rows.contains("RequestMetadata::parse"));
+        assert!(admission_rows.contains("serde_json::Value full-body parse"));
     }
 }
