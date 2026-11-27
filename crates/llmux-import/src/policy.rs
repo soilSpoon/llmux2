@@ -383,6 +383,9 @@ const WORKERS: &[&str] = &[
     "@cf/openai/gpt-oss-120b",
     // https://developers.cloudflare.com/workers-ai/models/mistral-small-3.1-24b-instruct/
     "@cf/mistralai/mistral-small-3.1-24b-instruct",
+    // Owner-reviewed paid/deprecated exception for the Kimi K2.6 native-leg migration.
+    // https://developers.cloudflare.com/workers-ai/models/kimi-k2.6/
+    "@cf/moonshotai/kimi-k2.6",
     // https://developers.cloudflare.com/workers-ai/models/qwen3.8-27b/
     "@cf/qwen/qwen3.8-27b",
     // https://developers.cloudflare.com/workers-ai/models/llama-3.3-70b-instruct-fp8-fast/
@@ -604,7 +607,6 @@ mod tests {
             "meta/llama-3.2-3b-instruct",
             "meta/llama-3.1-8b-instruct-fp8",
             "qwen/qwen3-30b-a3b-fp8",
-            "moonshotai/kimi-k2.6",
             "deepseek-ai/deepseek-v4-flash-0731",
             "zai-org/glm-5.3",
         ] {

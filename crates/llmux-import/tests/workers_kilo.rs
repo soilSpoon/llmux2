@@ -1,4 +1,5 @@
 use llmux_config::RuntimeConfig;
+use llmux_types::Billing;
 use serde_json::{json, Value};
 use std::{fs, path::Path, process::Command};
 
@@ -1096,5 +1097,76 @@ fn malformed_cost_policy_inputs_fail_without_echoing_contents() {
         assert!(!result.status.success());
         assert!(!String::from_utf8_lossy(&result.stderr).contains(content));
         assert!(!dir.path().join("out.toml").exists());
+    }
+}
+
+#[test]
+fn kimi_k2_6_workers_native_leg_and_public_spellings() {
+    let mut root = fixture();
+    root["providerConnections"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"cf","provider":"cloudflare-direct","authType":"none"}));
+    root["combos"].as_array_mut().unwrap().push(json!({
+        "name":"kimi-k2.6",
+        "models":["cfpd/moonshotai/kimi-k2.6"]
+    }));
+    root["modelAliases"] = json!({
+        "moonshotai/kimi-k2.6":"kimi-k2.6",
+        "cfp/moonshotai/kimi-k2.6":"kimi-k2.6",
+        "cloudflare-playground/moonshotai/kimi-k2.6":"kimi-k2.6"
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let account = dir.path().join("account");
+    let token = dir.path().join("token");
+    fs::write(&account, "0123456789abcdef0123456789abcdef").unwrap();
+    fs::write(&token, "synthetic-token").unwrap();
+    success(&run(
+        &root,
+        dir.path(),
+        &[
+            ("--cloudflare-account-id-file", &account),
+            ("--cloudflare-token-file", &token),
+        ],
+    ));
+    let config = RuntimeConfig::load(dir.path().join("out.toml")).unwrap();
+    let canonical = config.model_names["kimi-k2.6"];
+    for spelling in [
+        "moonshotai/kimi-k2.6",
+        "cfp/moonshotai/kimi-k2.6",
+        "cloudflare-playground/moonshotai/kimi-k2.6",
+    ] {
+        assert_eq!(
+            config.model_names.get(spelling),
+            Some(&canonical),
+            "{spelling}"
+        );
+    }
+    for spelling in [
+        "cloudflare-direct/moonshotai/kimi-k2.6",
+        "cfpd/moonshotai/kimi-k2.6",
+    ] {
+        assert!(
+            config.model_names.contains_key(spelling),
+            "missing {spelling}"
+        );
+    }
+    for spelling in [
+        "kimi-k2.6",
+        "cloudflare-direct/moonshotai/kimi-k2.6",
+        "cfpd/moonshotai/kimi-k2.6",
+    ] {
+        let model = &config.models[config.model_names[spelling]];
+        assert_eq!(model.deployments.len(), 1, "{spelling}");
+        let dep = &config.deployments[model.deployments[0].0 as usize];
+        assert_eq!(dep.upstream_model.as_ref(), "@cf/moonshotai/kimi-k2.6");
+        assert_eq!(
+            dep.base_url.to_string(),
+            "https://api.cloudflare.com/client/v4/accounts/0123456789abcdef0123456789abcdef/ai/v1"
+        );
+        assert!(!dep.credential.is_empty());
+        assert_eq!(dep.billing, Billing::Billed);
+        assert_eq!(dep.quota.rpm, Some(30));
+        assert!(!dep.base_url.to_string().starts_with("http://127.0.0.1"));
     }
 }

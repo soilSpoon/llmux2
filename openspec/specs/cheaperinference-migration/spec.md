@@ -515,7 +515,17 @@ connections respectively, with reviewed exact `@cf/` upstream IDs.
 
 WHEN opt-in is absent or a model is unknown, deprecated, or excluded
 THEN no Workers AI deployment is emitted for that leg and a warning explains
-the omission, including for `@cf/meta/llama-3.2-1b-instruct`.
+the omission, including for `@cf/meta/llama-3.2-1b-instruct`. The sole
+owner-reviewed exception is Kimi K2.6 below.
+
+#### Scenario: Owner-reviewed Kimi K2.6 native leg
+
+WHEN an opted-in Cloudflare bridge leg targets `moonshotai/kimi-k2.6`
+THEN it uses the exact upstream ID `@cf/moonshotai/kimi-k2.6` on the official
+Workers AI account endpoint and remains `billed`. Cloudflare documents this
+model as requiring paid access and marks it deprecated, so this exact-ID
+exception is preparatory native routing evidence, not a claim of free
+eligibility or long-term availability.
 
 #### Scenario: Workers AI quota is not a spending guarantee
 
