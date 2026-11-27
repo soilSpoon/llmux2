@@ -189,6 +189,17 @@ fn policy_rejects_jwt_shaped_tokens_in_free_text() {
 }
 
 #[test]
+fn policy_rejects_algorithm_qualified_private_keys_without_echo() {
+    let key =
+        "-----BEGIN RSA PRIVATE KEY-----\nsynthetic-not-a-real-key\n-----END RSA PRIVATE KEY-----";
+    let mut json: Value = serde_json::from_str(valid_policy_json()).unwrap();
+    json["models"][0]["fallback"] = json!(format!("copied\n{key}"));
+    let error = parse_fallback_policy(&json.to_string()).unwrap_err();
+    assert!(error.contains("secret"), "{error}");
+    assert!(!error.contains("synthetic-not-a-real-key"), "{error}");
+}
+
+#[test]
 fn policy_rejects_duplicate_json_object_keys() {
     for duplicated in [
         valid_policy_json().replacen(
@@ -357,6 +368,20 @@ fn fallback_audit_rejects_invalid_schema_scalars() {
         mutate(&mut audit);
         let error = serialize_fallback_audit(&audit).unwrap_err();
         assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn fallback_audit_rejects_algorithm_qualified_private_keys_without_echo() {
+    for algorithm in ["RSA", "EC", "OPENSSH"] {
+        let key = format!(
+            "-----BEGIN {algorithm} PRIVATE KEY-----\nsynthetic-not-a-real-key\n-----END {algorithm} PRIVATE KEY-----"
+        );
+        let mut audit = audit();
+        audit.decisions[0].reason = format!("copied\n{key}");
+        let error = serialize_fallback_audit(&audit).unwrap_err();
+        assert!(error.contains("secret"), "{error}");
+        assert!(!error.contains("synthetic-not-a-real-key"), "{error}");
     }
 }
 
