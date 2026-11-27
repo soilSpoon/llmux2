@@ -106,6 +106,7 @@ struct RouteTrace {
     /// Last upstream failure kind reached by a send, even when the terminal
     /// routing error hides it behind an aggregate kind.
     last_upstream_error_kind: Option<&'static str>,
+    current_leg_status: Option<u16>,
     candidates_total: Option<usize>,
     candidates_considered: usize,
     candidate_skip_reasons: BTreeMap<&'static str, u64>,
@@ -994,6 +995,15 @@ impl Executor {
                                     outcome: result
                                         .as_ref()
                                         .map_or_else(request_log::error_kind, |_| "routed"),
+                                    status: trace.current_leg_status,
+                                    error_detail: result.as_ref().err().and_then(
+                                        |error| match error {
+                                            GatewayError::Client(error) => {
+                                                request_log::upstream_error_detail(error)
+                                            }
+                                            _ => None,
+                                        },
+                                    ),
                                 });
                             }
                             last_transient = None;
@@ -1222,6 +1232,7 @@ impl Executor {
         trace: &mut RouteTrace,
     ) -> Result<GatewayResponse, GatewayError> {
         trace.upstream_request_id = None;
+        trace.current_leg_status = None;
         let response = match binding.adapter.invoke(req, dep).await {
             Some(local) => local.map_err(GatewayError::Client)?,
             None => {
@@ -1244,6 +1255,8 @@ impl Executor {
                             .limits
                             .observe(observed, self.cfg.cooldown.quota_max);
                     }
+                    let upstream_status = response.status().as_u16();
+                    trace.current_leg_status = Some(upstream_status);
                     trace.upstream_request_id = binding
                         .adapter
                         .upstream_request_id(response.headers(), None);
@@ -1266,6 +1279,8 @@ impl Executor {
                                 deployment: dep.id.as_ref().into(),
                                 provider: dep.provider.0.as_ref().into(),
                                 outcome: request_log::upstream_error_kind(&error),
+                                status: Some(upstream_status),
+                                error_detail: request_log::upstream_error_detail(&error),
                             });
                             upstream = Request::from_parts(parts, repaired);
                             repairs += 1;

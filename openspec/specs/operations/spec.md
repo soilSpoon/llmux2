@@ -154,8 +154,14 @@ with one entry per upstream send, in send order — including each body
 repaired and resent to the same deployment — naming that leg's
 deployment ID and provider and its outcome — `routed` when the leg served
 the response, otherwise the failure kind — so failover legs that the
-last-attempted fields hide stay visible. An attempt whose request could
-not be built SHALL leave no leg. Each record SHALL also carry a fingerprint of
+last-attempted fields hide stay visible. When the leg received an upstream
+HTTP response, the leg SHALL carry the exact numeric `status`. A leg whose
+broad outcome is `bad_request` because the upstream reported that the model
+is absent SHALL also carry `error_detail: "model_not_found"`; the broad
+outcome remains unchanged for backward compatibility. Local provider
+invocations and sends that never receive a response SHALL omit `status`. An
+attempt whose request could not be built SHALL leave no leg. Each record
+SHALL also carry a fingerprint of
 the gateway client key used (a `key_<16 hex>` hash keyed by the configured
 key set, never the key itself), the server-assigned `traffic_class` for that
 authenticated key (`ci_buyer_shaped`, `synthetic_probe`, `internal`, or

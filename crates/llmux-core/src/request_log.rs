@@ -36,6 +36,14 @@ pub struct AttemptLeg {
     pub deployment: Box<str>,
     pub provider: Box<str>,
     pub outcome: &'static str,
+    /// Exact upstream HTTP status when this leg received one. Local provider
+    /// invocations and sends that never received a response omit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// More specific additive detail for outcomes whose kind is intentionally
+    /// broad for backward compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<&'static str>,
 }
 
 #[derive(Default, Serialize)]
@@ -209,6 +217,13 @@ pub fn error_kind(error: &GatewayError) -> &'static str {
 }
 
 /// The same vocabulary for an upstream error seen mid-attempt.
+pub fn upstream_error_detail(error: &llmux_types::UpstreamError) -> Option<&'static str> {
+    match error {
+        llmux_types::UpstreamError::ModelNotFound { .. } => Some("model_not_found"),
+        _ => None,
+    }
+}
+
 pub fn upstream_error_kind(error: &llmux_types::UpstreamError) -> &'static str {
     match error.kind() {
         ErrorKind::RateLimited => "rate_limited",
@@ -256,11 +271,15 @@ mod tests {
                         deployment: "dep-a".into(),
                         provider: "openai_compat".into(),
                         outcome: "rate_limited",
+                        status: None,
+                        error_detail: None,
                     },
                     AttemptLeg {
                         deployment: "dep".into(),
                         provider: "openai_compat".into(),
                         outcome: "routed",
+                        status: None,
+                        error_detail: None,
                     },
                 ],
                 latency_ms: 42,
