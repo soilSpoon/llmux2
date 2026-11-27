@@ -10,13 +10,18 @@ fn fixture() -> Value {
         ],
         "providerConnections": [
             {"id":"openai","provider":"openai","authType":"apikey","apiKey":"synthetic-upstream"},
-            {"id":"cfpd","provider":"cfpd-node","authType":"apikey","apiKey":"synthetic-cfpd"}
+            {"id":"cfpd","provider":"cfpd-node","authType":"apikey","apiKey":"synthetic-cfpd"},
+            {"id":"morph-connection","provider":"morph","authType":"apikey","apiKey":"synthetic-morph"}
         ],
         "apiKeys": [{"key":"synthetic-client"}],
         "combos": [
             {"id":"morph","name":"morph-kimi-k3-abliterated","models":["openai/morph-native-upstream"]},
             {"id":"deepseek","name":"deepseek-v4.1-flash","models":["openai/deepseek-native-upstream"]},
-            {"id":"cfpd-direct","name":"cfpd-direct-source","models":["cfpd/deepseek-v4.1-flash"]}
+            {"id":"cfpd-direct","name":"cfpd-direct-source","models":["cfpd/deepseek-v4.1-flash"]},
+            {"id":"unrelated-cfpd","name":"unrelated-cfpd-source","models":["cfpd/deepseek-ai/deepseek-v4.1-flash","cfpd/other-model"]},
+            {"id":"morph-base","name":"morph-kimik3","models":["morph/morph-kimik3"]},
+            {"id":"morph-fast","name":"morph-kimik3-fast","models":["morph/morph-kimik3-fast"]},
+            {"id":"prefixed-morph","name":"unrelated-prefixed-morph-source","models":["morph/morph-kimik3-abliterated"]}
         ]
     })
 }
@@ -49,6 +54,7 @@ fn exact_evidence_backed_spellings_alias_canonical_models_without_fallback_remov
     let text = fs::read_to_string(dir.path().join("out.toml")).unwrap();
     assert!(!text.contains("synthetic-upstream"));
     assert!(!text.contains("synthetic-cfpd"));
+    assert!(!text.contains("synthetic-morph"));
     assert!(!text.contains("synthetic-omniroute"));
     let cfg = RuntimeConfig::parse(&text).unwrap();
 
@@ -109,9 +115,17 @@ fn exact_evidence_backed_spellings_alias_canonical_models_without_fallback_remov
         "morph-kimik3-fast",
         "morph/morph-kimik3-abliterated",
     ] {
-        assert!(
-            !cfg.model_names.contains_key(spelling),
-            "unrelated spelling collapsed: {spelling}"
+        let index = *cfg
+            .model_names
+            .get(spelling)
+            .unwrap_or_else(|| panic!("unrelated spelling missing: {spelling}"));
+        assert_ne!(
+            index, cfg.model_names["morph-kimi-k3-abliterated"],
+            "unrelated spelling collapsed onto morph canonical: {spelling}"
+        );
+        assert_ne!(
+            index, cfg.model_names["deepseek-v4.1-flash"],
+            "unrelated spelling collapsed onto deepseek canonical: {spelling}"
         );
     }
 }
