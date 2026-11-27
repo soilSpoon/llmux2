@@ -123,7 +123,7 @@ pub struct PolicyEvidence {
     pub coverage: Option<NativeCoverage>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyProvenance {
     pub decision_source: DecisionSource,
@@ -445,6 +445,7 @@ fn canonicalize_audit(audit: &mut FallbackAudit) {
             .then(left.reason.cmp(&right.reason))
             .then(left.target.cmp(&right.target))
             .then(left.native_legs.cmp(&right.native_legs))
+            .then(left.policy_provenance.cmp(&right.policy_provenance))
     });
 }
 
@@ -511,13 +512,18 @@ fn redaction_scan(value: &Value, path: &str) -> Result<(), String> {
 }
 
 fn secret_like(text: &str) -> bool {
-    let lower = text.trim_start().to_ascii_lowercase();
-    lower.starts_with("env:")
-        || lower.starts_with("file:")
-        || lower.starts_with("sk-")
-        || lower.starts_with("ghp_")
-        || lower.starts_with("gho_")
-        || lower.starts_with("xoxb-")
-        || lower.starts_with("xoxp-")
-        || lower.contains("begin private key")
+    let lower = text.to_ascii_lowercase();
+    lower.contains("begin private key")
+        || ["env:", "file:", "sk-", "ghp_", "gho_", "xoxb-", "xoxp-"]
+            .iter()
+            .any(|marker| has_secret_marker(&lower, marker))
+}
+
+fn has_secret_marker(text: &str, marker: &str) -> bool {
+    text.match_indices(marker)
+        .any(|(index, _)| index == 0 || is_secret_marker_boundary(text.as_bytes()[index - 1]))
+}
+
+fn is_secret_marker_boundary(byte: u8) -> bool {
+    !byte.is_ascii_alphanumeric() && byte != b'_'
 }

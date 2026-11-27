@@ -161,6 +161,19 @@ fn policy_rejects_secret_reference_strings() {
 }
 
 #[test]
+fn policy_rejects_embedded_secret_reference_strings() {
+    let mut json: Value = serde_json::from_str(valid_policy_json()).unwrap();
+    json["models"][0]["reason"] = json!("copied token sk-synthetic-example");
+    let error = parse_fallback_policy(&json.to_string()).unwrap_err();
+    assert!(error.contains("secret"), "{error}");
+
+    let mut json: Value = serde_json::from_str(valid_policy_json()).unwrap();
+    json["models"][0]["fallback"] = json!("copied token sk-synthetic-example");
+    let error = parse_fallback_policy(&json.to_string()).unwrap_err();
+    assert!(error.contains("secret"), "{error}");
+}
+
+#[test]
 fn user_approved_decisions_require_a_named_approval_source() {
     let mut json: Value = serde_json::from_str(valid_policy_json()).unwrap();
     let provenance = json["spellings"][2]["provenance"].as_object_mut().unwrap();
@@ -277,6 +290,44 @@ fn fallback_audit_serializes_deterministically() {
 }
 
 #[test]
+fn fallback_audit_allows_non_secret_words_that_only_contain_marker_text() {
+    let mut audit = audit();
+    audit.decisions[0].reason = "disk-shaped xenv:synthetic".to_owned();
+    assert!(serialize_fallback_audit(&audit).is_ok());
+}
+
+#[test]
+fn fallback_audit_ordering_includes_provenance_tiebreakers() {
+    let first = decision(
+        "canonical-model",
+        AuditAction::SuppressedFallback,
+        "native-working",
+        vec!["canonical-model-a"],
+        None,
+    );
+    let mut second = first.clone();
+    second.policy_provenance = automatic_provenance("other-rule");
+
+    let mut audit = audit();
+    audit.decisions = vec![first, second];
+    audit.summary = AuditSummary {
+        fallback_legs_emitted: 0,
+        fallback_legs_suppressed: 2,
+        aliases_added: 0,
+        spellings_dropped: 0,
+        catchall_retained: 0,
+        needs_review: 0,
+    };
+    let mut reversed = audit.clone();
+    reversed.decisions.reverse();
+
+    assert_eq!(
+        serialize_fallback_audit(&audit).unwrap(),
+        serialize_fallback_audit(&reversed).unwrap()
+    );
+}
+
+#[test]
 fn fallback_audit_file_write_uses_the_same_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fallback-audit.json");
@@ -293,6 +344,20 @@ fn fallback_audit_rejects_secret_reference_strings() {
     audit.decisions[0].reason = "file:/tmp/synthetic-secret".to_owned();
     let error = serialize_fallback_audit(&audit).unwrap_err();
     assert!(error.contains("secret"), "{error}");
+}
+
+#[test]
+fn fallback_audit_rejects_embedded_secret_reference_strings() {
+    for text in [
+        "copied token sk-synthetic-example",
+        "source: env:SYNTHETIC_KEY",
+        "copied-token-sk-synthetic-example",
+    ] {
+        let mut audit = audit();
+        audit.decisions[0].reason = text.to_owned();
+        let error = serialize_fallback_audit(&audit).unwrap_err();
+        assert!(error.contains("secret"), "{error}");
+    }
 }
 
 #[test]
