@@ -1,0 +1,28 @@
+# PROPOSED SYNTHETIC FIXTURE — not approved production input.
+# Narrowed G1a native `opencode` adaptation of the withdrawn bridge/openai_compat oracle.
+# D4-A buyer-only exact-row request authorization; no catalog_visible_keys server semantics.
+
+[server]
+client_keys = [
+  "env:LLMUX_SYNTHETIC_BIGPICKLE_BUYER_KEY",
+  "env:LLMUX_SYNTHETIC_BIGPICKLE_NONBUYER_KEY",
+]
+
+[[server.key_policies]]
+key = "env:LLMUX_SYNTHETIC_BIGPICKLE_BUYER_KEY"
+models = ["big-pickle"]
+free_only = true
+
+[[models]]
+name = "big-pickle"
+allowed_keys = ["env:LLMUX_SYNTHETIC_BIGPICKLE_BUYER_KEY"]
+capabilities = { stream = true }
+
+[[models.deployments]]
+id = "opencode-big-pickle"
+auth = "none"
+provider = "opencode"
+upstream_model = "big-pickle"
+billing = "free"
+priority = 0
+timeout_ms = 300000
