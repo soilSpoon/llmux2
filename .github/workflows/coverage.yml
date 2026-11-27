@@ -28,8 +28,16 @@ jobs:
         with:
           tool: cargo-llvm-cov,cargo-nextest
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-workspace-crates: true
+          key: workspace-artifacts-v1
+      - name: Remove stale coverage data
+        run: |
+          cargo llvm-cov clean --profraw-only --locked
+          rm -f target/llvm-cov-target/*.profdata target/llvm-cov-target/*-profraw-list
+          rm -rf target/llvm-cov
       - name: Run Rust unit and integration tests with coverage
-        run: cargo llvm-cov nextest --locked --workspace --json --summary-only --output-path coverage.json
+        run: cargo llvm-cov nextest --locked --workspace --no-clean --json --summary-only --output-path coverage.json
       - name: Enforce coverage floor
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
