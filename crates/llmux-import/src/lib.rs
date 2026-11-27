@@ -627,9 +627,16 @@ fn references_dead(
             .as_str()
             .unwrap_or_else(|| string(step, "model"))
             .trim();
+        let provider_id = match string(step, "providerId") {
+            "" => string(step, "provider"),
+            id => id,
+        };
         let target = if string(step, "kind") == "combo-ref" {
             string(step, "comboName")
-        } else if combos.contains_key(raw) {
+        } else if string(step, "kind") != "model"
+            && provider_id.is_empty()
+            && combos.contains_key(raw)
+        {
             raw
         } else {
             ""

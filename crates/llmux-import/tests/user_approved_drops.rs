@@ -490,6 +490,7 @@ fn structured_interrupted_step_collapses_without_blocking_other_providers() {
     root["combos"].as_array_mut().unwrap().extend([
         json!({"id":"structured-interrupted","name":"structured-interrupted","models":[{"kind":"model","providerId":"ddgw","model":"gpt-5.4-mini"}]}),
         json!({"id":"other-mini","name":"other-mini","models":[{"kind":"model","providerId":"cfpd","model":"gpt-5.4-mini"}]}),
+        json!({"id":"collision-survivor","name":"gpt-5.4-mini","models":["cfpd/moonshotai/kimi-k2.7"]}),
     ]);
     llmux_import::import_with_options(
         &root.to_string(),
@@ -515,6 +516,10 @@ fn structured_interrupted_step_collapses_without_blocking_other_providers() {
             .any(|excluded| excluded == "structured-interrupted"),
         "structured interrupted combo can fall through: {:?}",
         cfg.catch_all_exclude
+    );
+    assert!(
+        cfg.model_names.contains_key("gpt-5.4-mini"),
+        "unrelated surviving combo with the colliding model name was removed"
     );
     assert!(
         cfg.model_names.contains_key("other-mini"),
