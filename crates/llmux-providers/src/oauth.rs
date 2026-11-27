@@ -32,6 +32,9 @@ pub struct OAuthConfig {
     pub scopes: Option<Vec<String>>,
     /// Additional form fields; standard OAuth refresh fields cannot be overridden.
     pub extra_params: Vec<(String, String)>,
+    /// Token response field used as the bearer credential. Defaults to `access_token`;
+    /// OIDC issuers may require `id_token` instead.
+    pub token_field: String,
     /// Best-effort atomic storage for rotated refresh tokens. Failures retain the
     /// in-memory token, but the application may need to reauthorize after restart.
     pub refresh_token_path: Option<PathBuf>,
@@ -48,6 +51,7 @@ impl OAuthConfig {
             client_secret: None,
             scopes: None,
             extra_params: Vec::new(),
+            token_field: "access_token".into(),
             refresh_token_path: None,
             refresh_skew: Duration::from_secs(60),
             request_timeout: Duration::from_secs(30),
@@ -68,6 +72,10 @@ struct TokenResponse {
     expires_in: Option<u64>,
     refresh_token: Option<String>,
     error: Option<String>,
+    /// Non-standard fields (for example OIDC `id_token`); the configured
+    /// `token_field` is looked up here when it is not `access_token`.
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 struct RefreshState {
@@ -261,10 +269,16 @@ impl Inner {
         {
             return Err(AuthError::RefreshFailed);
         }
-        let access = response
-            .access_token
-            .filter(|t| !t.is_empty())
-            .ok_or(AuthError::RefreshFailed)?;
+        let access = if self.config.token_field == "access_token" {
+            response.access_token
+        } else {
+            response
+                .extra
+                .get(&self.config.token_field)
+                .and_then(|value| value.as_str().map(str::to_owned))
+        }
+        .filter(|t| !t.is_empty())
+        .ok_or(AuthError::RefreshFailed)?;
         let mut value = HeaderValue::from_str(&format!("Bearer {access}"))
             .map_err(|_| AuthError::RefreshFailed)?;
         value.set_sensitive(true);

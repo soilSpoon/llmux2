@@ -211,3 +211,112 @@ upstream_model = "upstream"
     assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert_eq!(fs::read_to_string(&refresh).unwrap(), "original");
 }
+
+#[tokio::test]
+async fn oauth_token_field_id_token_is_used_as_bearer() {
+    let secrets = tempfile::tempdir().unwrap();
+    for (name, value) in [("client", "gateway-key"), ("refresh", "refresh-secret")] {
+        fs::write(secrets.path().join(name), value).unwrap();
+    }
+    let path = secrets.path().display();
+    let upstream = TestServer::start(Router::new()
+        .route("/token", post(|body: String| async move {
+            assert_eq!(body, "grant_type=refresh_token&client_id=client-id&refresh_token=refresh-secret");
+            Json(json!({"access_token":"access-token","id_token":"id-token-value","token_type":"Bearer","expires_in":3600}))
+        }))
+        .route("/v1/chat/completions", post(|headers: HeaderMap, Json(body): Json<serde_json::Value>| async move {
+            assert_eq!(headers[header::AUTHORIZATION], "Bearer id-token-value");
+            assert_eq!(body["model"], "upstream");
+            Json(json!({"id":"oauth-response"}))
+        }))).await.unwrap();
+    let text = format!(
+        r#"
+[server]
+client_keys = ["file:{path}/client"]
+[[credentials]]
+id = "oauth"
+kind = "oauth"
+provider = "openai_compat"
+token_url = "{url}/token"
+client_id = "client-id"
+refresh_token = "file:{path}/refresh"
+token_field = "id_token"
+[[models]]
+name = "model"
+[[models.deployments]]
+id = "oauth-deployment"
+credential = "oauth"
+base_url = "{url}/v1"
+upstream_model = "upstream"
+"#,
+        path = path,
+        url = upstream.url()
+    );
+    let gateway = TestServer::start(
+        llmux_server::app(RuntimeConfig::parse(&text).unwrap())
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+    let response = client
+        .request(
+            Request::post(format!("{}/v1/chat/completions", gateway.url()))
+                .header(header::AUTHORIZATION, "Bearer gateway-key")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from_static(
+                    br#"{"model":"model","messages":[{"role":"user","content":"Hello"}]}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn oauth_token_field_missing_field_fails_without_leaking() {
+    let secrets = tempfile::tempdir().unwrap();
+    for (name, value) in [("client", "gateway-key"), ("refresh", "refresh-secret")] {
+        fs::write(secrets.path().join(name), value).unwrap();
+    }
+    let path = secrets.path().display();
+    let upstream = TestServer::start(Router::new().route(
+        "/token",
+        post(|| async move {
+            Json(json!({"access_token":"access-token","token_type":"Bearer","expires_in":3600}))
+        }),
+    ))
+    .await
+    .unwrap();
+    let text = format!(
+        r#"
+[server]
+client_keys = ["file:{path}/client"]
+[[credentials]]
+id = "oauth"
+kind = "oauth"
+provider = "openai_compat"
+token_url = "{url}/token"
+client_id = "client-id"
+refresh_token = "file:{path}/refresh"
+token_field = "id_token"
+[[models]]
+name = "model"
+[[models.deployments]]
+id = "deployment"
+credential = "oauth"
+base_url = "{url}/v1"
+upstream_model = "upstream"
+"#,
+        path = path,
+        url = upstream.url()
+    );
+    let error = llmux_server::app(RuntimeConfig::parse(&text).unwrap())
+        .await
+        .expect_err("startup must fail when the configured token field is absent")
+        .to_string();
+    assert!(!error.contains("access-token"));
+    assert!(!error.contains("refresh-secret"));
+}
