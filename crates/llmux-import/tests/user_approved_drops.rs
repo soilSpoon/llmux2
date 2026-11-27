@@ -478,3 +478,54 @@ fn overlay_model_with_only_interrupted_deployments_cannot_fall_through() {
         );
     }
 }
+
+#[test]
+fn structured_interrupted_step_collapses_without_blocking_other_providers() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let key = dir.path().join("omniroute-key");
+    fs::write(&key, "synthetic-omniroute").unwrap();
+    let key_ref = format!("file:{}", key.display());
+    let mut root = fixture();
+    root["combos"].as_array_mut().unwrap().extend([
+        json!({"id":"structured-interrupted","name":"structured-interrupted","models":[{"kind":"model","providerId":"ddgw","model":"gpt-5.4-mini"}]}),
+        json!({"id":"other-mini","name":"other-mini","models":[{"kind":"model","providerId":"cfpd","model":"gpt-5.4-mini"}]}),
+    ]);
+    llmux_import::import_with_options(
+        &root.to_string(),
+        &output,
+        None,
+        &llmux_import::ImportOptions {
+            omniroute_fallback: Some(llmux_import::OmniRouteFallback {
+                base_url: "http://127.0.0.1:20128/v1",
+                key: &key_ref,
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let cfg = RuntimeConfig::load(&output).unwrap();
+    assert!(
+        !cfg.model_names.contains_key("structured-interrupted"),
+        "structured interrupted step stayed servable"
+    );
+    assert!(
+        cfg.catch_all_exclude
+            .iter()
+            .any(|excluded| excluded == "structured-interrupted"),
+        "structured interrupted combo can fall through: {:?}",
+        cfg.catch_all_exclude
+    );
+    assert!(
+        cfg.model_names.contains_key("other-mini"),
+        "unrelated provider's bare gpt-5.4-mini was globally blocked"
+    );
+    let other_idx = cfg.model_names["other-mini"];
+    assert!(
+        cfg.models[other_idx]
+            .deployments
+            .iter()
+            .any(|i| cfg.deployments[i.0 as usize].upstream_model.as_ref() == "gpt-5.4-mini"),
+        "unrelated provider leg missing"
+    );
+}
