@@ -24,7 +24,8 @@ fn fixture() -> Value {
             {"id":"prefixed-morph","name":"unrelated-prefixed-morph-source","models":["morph/morph-kimik3-abliterated"]}
         ],
         "modelAliases": {
-            "public-cfpd":"cfpd/deepseek-v4.1-flash"
+            "public-cfpd":"cfpd/deepseek-v4.1-flash",
+            "public-morph":"morph-kimik3-abliterated"
         }
     })
 }
@@ -190,6 +191,8 @@ fn exact_evidence_backed_spellings_alias_canonical_models_without_fallback_remov
 
     let deepseek_index = cfg.model_names["deepseek-v4.1-flash"];
     assert_eq!(cfg.model_names.get("public-cfpd"), Some(&deepseek_index));
+    let morph_index = cfg.model_names["morph-kimi-k3-abliterated"];
+    assert_eq!(cfg.model_names.get("public-morph"), Some(&morph_index));
 
     for spelling in [
         "cfpd/deepseek-ai/deepseek-v4.1-flash",

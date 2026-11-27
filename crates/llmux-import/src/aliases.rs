@@ -267,11 +267,16 @@ pub(super) fn prepare(
             let direct = terminal
                 .split_once('/')
                 .is_some_and(|(provider, model)| exact(provider) && exact(model));
-            if !direct {
+            let reviewed_terminal = REVIEWED_EXACT_ALIASES
+                .iter()
+                .any(|(name, target)| terminal == *name && combos.contains_key(*target));
+            if !direct && !reviewed_terminal {
                 warnings.push(format!("alias {name}: target unavailable"));
                 continue;
             }
-            direct_targets.insert(terminal.clone());
+            if direct {
+                direct_targets.insert(terminal.clone());
+            }
         }
         resolved.insert(name.clone(), terminal);
     }
