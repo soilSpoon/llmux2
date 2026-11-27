@@ -1,6 +1,10 @@
-use serde::{Deserialize, Serialize};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use serde::{
+    de::{DeserializeSeed, MapAccess, SeqAccess, Visitor},
+    Deserialize, Serialize,
+};
 use serde_json::Value;
-use std::{collections::HashSet, path::Path};
+use std::{collections::HashSet, fmt, path::Path};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub const FALLBACK_POLICY_SCHEMA_VERSION: u32 = 1;
@@ -205,14 +209,135 @@ pub struct AuditDecision {
     pub policy_provenance: PolicyProvenance,
 }
 
+struct UniqueJson(Value);
+
+impl<'de> Deserialize<'de> for UniqueJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueValueVisitor).map(Self)
+    }
+}
+
+struct UniqueValueSeed;
+
+impl<'de> DeserializeSeed<'de> for UniqueValueSeed {
+    type Value = Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueValueVisitor)
+    }
+}
+
+struct UniqueValueVisitor;
+
+impl<'de> Visitor<'de> for UniqueValueVisitor {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Value::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .ok_or_else(|| serde::de::Error::custom("invalid floating-point number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Value::String(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Value::String(value))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element_seed(UniqueValueSeed)? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if object.contains_key(&key) {
+                return Err(serde::de::Error::custom("duplicate object key"));
+            }
+            let value = map.next_value_seed(UniqueValueSeed)?;
+            object.insert(key, value);
+        }
+        Ok(Value::Object(object))
+    }
+}
+
 pub fn parse_fallback_policy(input: &str) -> Result<FallbackPolicy, String> {
-    let raw: Value = serde_json::from_str(input)
-        .map_err(|error| format!("invalid fallback policy JSON: {error}"))?;
+    let raw = serde_json::from_str::<UniqueJson>(input)
+        .map_err(|error| format!("invalid fallback policy JSON: {error}"))?
+        .0;
     redaction_scan(&raw, "$")?;
-    let policy: FallbackPolicy = serde_json::from_value(raw)
-        .map_err(|error| format!("invalid fallback policy JSON: {error}"))?;
+    let policy: FallbackPolicy =
+        serde_json::from_value(raw).map_err(fallback_policy_schema_error)?;
     validate_policy(&policy)?;
     Ok(policy)
+}
+
+fn fallback_policy_schema_error(error: serde_json::Error) -> String {
+    let error = error.to_string();
+    if error.starts_with("unknown field") {
+        "invalid fallback policy JSON: unknown object key".to_owned()
+    } else {
+        format!("invalid fallback policy JSON: {error}")
+    }
 }
 
 pub fn serialize_fallback_audit(audit: &FallbackAudit) -> Result<String, String> {
@@ -264,6 +389,7 @@ fn validate_policy(policy: &FallbackPolicy) -> Result<(), String> {
     }
 
     let mut spellings = HashSet::new();
+    let mut spelling_dispositions = HashSet::new();
     for (index, spelling) in policy.spellings.iter().enumerate() {
         let path = format!("spellings[{index}]");
         validate_spelling_row(
@@ -282,6 +408,7 @@ fn validate_policy(policy: &FallbackPolicy) -> Result<(), String> {
                 "{path}.spelling duplicates a fallback policy spelling"
             ));
         }
+        spelling_dispositions.insert(spelling.spelling.clone());
     }
 
     let mut catchall_spellings = HashSet::new();
@@ -302,6 +429,11 @@ fn validate_policy(policy: &FallbackPolicy) -> Result<(), String> {
             if !catchall_spellings.insert(row.spelling.clone()) {
                 return Err(format!(
                     "{path}.spelling duplicates a catch-all policy spelling"
+                ));
+            }
+            if !spelling_dispositions.insert(row.spelling.clone()) {
+                return Err(format!(
+                    "{path}.spelling gives a spelling more than one disposition"
                 ));
             }
         }
@@ -498,7 +630,7 @@ fn redaction_scan(value: &Value, path: &str) -> Result<(), String> {
                         "{path} must not copy credential, client key, token, or secret metadata in an object key"
                     ));
                 }
-                redaction_scan(value, &format!("{path}.{key}"))?;
+                redaction_scan(value, &format!("{path}.<object-key>"))?;
             }
         }
         Value::Array(items) => {
@@ -519,9 +651,61 @@ fn redaction_scan(value: &Value, path: &str) -> Result<(), String> {
 fn secret_like(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("begin private key")
+        || contains_jwt(text)
         || ["env:", "file:", "sk-", "ghp_", "gho_", "xoxb-", "xoxp-"]
             .iter()
             .any(|marker| has_secret_marker(&lower, marker))
+}
+
+fn contains_jwt(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    (0..bytes.len()).any(|start| {
+        is_base64url_byte(bytes[start])
+            && (start == 0 || !is_base64url_byte(bytes[start - 1]))
+            && jwt_at(text, start)
+    })
+}
+
+fn jwt_at(text: &str, start: usize) -> bool {
+    let bytes = text.as_bytes();
+    let header_end = scan_base64url(bytes, start);
+    if header_end == start || bytes.get(header_end) != Some(&b'.') {
+        return false;
+    }
+
+    let payload_start = header_end + 1;
+    let payload_end = scan_base64url(bytes, payload_start);
+    if payload_end == payload_start || bytes.get(payload_end) != Some(&b'.') {
+        return false;
+    }
+
+    let signature_start = payload_end + 1;
+    let signature_end = scan_base64url(bytes, signature_start);
+    if signature_end == signature_start {
+        return false;
+    }
+
+    jwt_segment_is_json_object(&text[start..header_end])
+        && jwt_segment_is_json_object(&text[payload_start..payload_end])
+}
+
+fn scan_base64url(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() && is_base64url_byte(bytes[index]) {
+        index += 1;
+    }
+    index
+}
+
+fn is_base64url_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+}
+
+fn jwt_segment_is_json_object(segment: &str) -> bool {
+    URL_SAFE_NO_PAD
+        .decode(segment)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .is_some_and(|value| value.is_object())
 }
 
 fn has_secret_marker(text: &str, marker: &str) -> bool {

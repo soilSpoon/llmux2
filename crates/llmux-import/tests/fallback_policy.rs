@@ -5,6 +5,8 @@ use llmux_import::fallback_policy::{
 };
 use serde_json::{json, Value};
 
+const SYNTHETIC_JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.synthetic";
+
 fn valid_policy_json() -> &'static str {
     include_str!("fixtures/fallback-policy-valid.json")
 }
@@ -172,6 +174,69 @@ fn policy_rejects_embedded_secret_reference_strings() {
     json["models"][0]["fallback"] = json!("copied token sk-synthetic-example");
     let error = parse_fallback_policy(&json.to_string()).unwrap_err();
     assert!(error.contains("secret"), "{error}");
+}
+
+#[test]
+fn policy_rejects_jwt_shaped_tokens_in_free_text() {
+    let mut json: Value = serde_json::from_str(valid_policy_json()).unwrap();
+    json["models"][0]["reason"] = json!(format!("copied JWT {SYNTHETIC_JWT}"));
+    let error = parse_fallback_policy(&json.to_string()).unwrap_err();
+    assert!(
+        error.contains("secret") || error.contains("token"),
+        "{error}"
+    );
+    assert!(!error.contains(SYNTHETIC_JWT), "{error}");
+}
+
+#[test]
+fn policy_rejects_duplicate_json_object_keys() {
+    for duplicated in [
+        valid_policy_json().replacen(
+            "{\n  \"schema_version\": 1,",
+            "{\n  \"schema_version\": 2,\n  \"schema_version\": 1,",
+            1,
+        ),
+        valid_policy_json().replacen(
+            "\"name\": \"native-ok\",",
+            "\"name\": \"wrong-first\",\n      \"name\": \"native-ok\",",
+            1,
+        ),
+    ] {
+        let error = parse_fallback_policy(&duplicated).unwrap_err();
+        assert!(error.contains("duplicate object key"), "{error}");
+    }
+}
+
+#[test]
+fn policy_errors_do_not_echo_unknown_object_keys() {
+    for (key, value) in [
+        (SYNTHETIC_JWT, Value::Null),
+        ("opaque-unclassified-abcdef123456", Value::Null),
+        (
+            "opaque-unclassified-abcdef123456-nested",
+            Value::String("sk-synthetic-example".to_owned()),
+        ),
+    ] {
+        let mut json: Value = serde_json::from_str(valid_policy_json()).unwrap();
+        json["models"][0]
+            .as_object_mut()
+            .unwrap()
+            .insert(key.to_owned(), value);
+        let error = parse_fallback_policy(&json.to_string()).unwrap_err();
+        assert!(!error.contains(key), "error leaked object key: {error}");
+    }
+}
+
+#[test]
+fn policy_rejects_contradictory_spelling_dispositions_across_sections() {
+    let mut json: Value = serde_json::from_str(valid_policy_json()).unwrap();
+    let spelling = json["spellings"][3]["spelling"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    json["catch_all"]["retain"][0]["spelling"] = Value::String(spelling);
+    let error = parse_fallback_policy(&json.to_string()).unwrap_err();
+    assert!(error.contains("disposition"), "{error}");
 }
 
 #[test]
@@ -364,6 +429,18 @@ fn fallback_audit_rejects_secret_reference_strings() {
     audit.decisions[0].reason = "file:/tmp/synthetic-secret".to_owned();
     let error = serialize_fallback_audit(&audit).unwrap_err();
     assert!(error.contains("secret"), "{error}");
+}
+
+#[test]
+fn fallback_audit_rejects_jwt_shaped_tokens_in_free_text() {
+    let mut audit = audit();
+    audit.decisions[0].reason = format!("copied JWT {SYNTHETIC_JWT}");
+    let error = serialize_fallback_audit(&audit).unwrap_err();
+    assert!(
+        error.contains("secret") || error.contains("token"),
+        "{error}"
+    );
+    assert!(!error.contains(SYNTHETIC_JWT), "{error}");
 }
 
 #[test]

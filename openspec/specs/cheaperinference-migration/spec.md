@@ -434,8 +434,11 @@ carry provenance. `automatic-rule` provenance SHALL name its rule, and
 `user-approved` provenance SHALL name a non-secret `approval_source`.
 
 The artifact schema SHALL have no credential, client-key, token, or secret
-fields and SHALL reject unknown fields. Validation SHALL fail closed rather
-than emit recognizable secret references or tokens in free text. The
+fields and SHALL reject unknown fields. The JSON parser SHALL reject duplicate
+object keys at any depth rather than collapse them. Validation SHALL fail
+closed rather than emit recognizable secret references or tokens in free text,
+and validation errors SHALL NOT echo unknown object keys. A spelling SHALL NOT
+appear in more than one spelling or catch-all disposition row. The
 `fallback-audit.json` writer SHALL produce deterministic bytes for equivalent
 input by sorting decisions and native-leg ids, and its summary SHALL agree
 with the decision rows. Needs-verification and held-unresolved rows count

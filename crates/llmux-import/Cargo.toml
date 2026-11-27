@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64.workspace = true
 http.workspace = true
 llmux-config.workspace = true
 llmux-types.workspace = true
