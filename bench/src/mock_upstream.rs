@@ -449,6 +449,10 @@ fn pss_kib(servers: &[Server]) -> Result<f64> {
         })
         .sum()
 }
+fn memory_measurement_available() -> bool {
+    Path::new("/proc/self/smaps_rollup").is_file()
+}
+
 async fn memory(target: &Target, concurrency: usize) -> Result<f64> {
     target.chat.request(None, true).await?;
     let baseline = pss_kib(&target.servers)?;
@@ -498,11 +502,6 @@ impl Args {
                 _ => return Err("unknown mock-upstream option".into()),
             }
         }
-        if !Path::new("/proc/self/smaps_rollup").is_file() {
-            return Err(
-                "Linux with /proc/<pid>/smaps_rollup is required for PSS measurement".into(),
-            );
-        }
         if config.concurrency < 1 || config.concurrency > config.requests || config.workers < 1 {
             return Err("require 1 <= concurrency <= requests and workers >= 1".into());
         }
@@ -536,13 +535,15 @@ pub async fn run(flags: &[String]) -> Result<()> {
                 row.push(first);
             }
         }
-        row.push(
+        row.push(if memory_measurement_available() {
             memory(
                 &Target::new(&binaries, gateway, true, &args)?,
                 args.concurrency,
             )
-            .await?,
-        );
+            .await?
+        } else {
+            f64::NAN
+        });
         rows.push(row);
     }
     let mut pairs = Vec::new();
@@ -579,12 +580,16 @@ pub async fn run(flags: &[String]) -> Result<()> {
     .iter()
     .enumerate()
     {
-        println!(
-            "| {label} | {:.3} | {:.3} | {:+.3} |",
-            rows[0][i],
-            rows[1][i],
-            rows[1][i] - rows[0][i]
-        );
+        if rows[0][i].is_nan() || rows[1][i].is_nan() {
+            println!("| {label} | n/a | n/a | n/a |");
+        } else {
+            println!(
+                "| {label} | {:.3} | {:.3} | {:+.3} |",
+                rows[0][i],
+                rows[1][i],
+                rows[1][i] - rows[0][i]
+            );
+        }
     }
     print!("{}", report_fixed_rate(&pairs));
     Ok(())
@@ -641,6 +646,11 @@ mod tests {
         ] {
             assert!(text.contains(expected), "{text}");
         }
+    }
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn args_parse_where_pss_is_unavailable() {
+        assert!(Args::parse(&[]).is_ok());
     }
     fn chat(server: &llmux_testkit::TestServer, streaming: bool) -> Chat {
         Chat {

@@ -11,13 +11,18 @@ hyper-util.workspace = true
 hyper-rustls = { workspace = true, features = ["native-tokio"] }
 url.workspace = true
 time.workspace = true
+http.workspace = true
 http-body-util.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 futures-util.workspace = true
-
-[dev-dependencies]
 axum.workspace = true
+bytes.workspace = true
+tempfile.workspace = true
 llmux-config.workspace = true
 llmux-server = { path = "../crates/llmux-server" }
 llmux-testkit.workspace = true
+llmux-types.workspace = true
+llmux-providers.workspace = true
+
+[dev-dependencies]

@@ -669,7 +669,7 @@ offline providers.
 
 ## Mock-upstream load benchmark
 
-On Linux with Cargo and readable `/proc/<pid>/smaps_rollup`, run:
+With Cargo, run:
 
 ```sh
 cargo xtask bench mock-upstream
@@ -704,10 +704,25 @@ workers per server process.
   differences, not the difference of the route medians, is compared to the
   design's **< 1 ms** target. The verdict is advisory, not a CI gate; a wide
   range signals noisy measurements.
-- **Memory:** In fresh processes primed with one JSON request, capture idle
-  proportional set size (PSS), open the configured number of streams, and hold
-  them after their first content event. Report the median of five PSS samples
-  minus idle PSS, divided by the number of held streams. Direct measures the
-  mock process; via-gateway sums the mock and gateway PSS. The difference is
-  added userspace memory per stream at that concurrency, including connection
-  and allocator overhead, but excluding the client and kernel socket buffers.
+- **Memory:** On Linux with readable `/proc/<pid>/smaps_rollup`, in fresh
+  processes primed with one JSON request, capture idle proportional set size
+  (PSS), open the configured number of streams, and hold them after their
+  first content event. Report the median of five PSS samples minus idle PSS,
+  divided by the number of held streams. Direct measures the mock process;
+  via-gateway sums the mock and gateway PSS. The difference is added
+  userspace memory per stream at that concurrency, including connection and
+  allocator overhead, but excluding the client and kernel socket buffers.
+  Other platforms still run the latency and throughput measurements and print
+  `n/a` for this row.
+
+For a bench-only allocation census of the routed request path, run:
+
+```sh
+cargo xtask bench copy-census
+```
+
+The census uses in-process loopback servers and a process-wide benchmark
+allocator. It reports gross allocator requests and bytes for paired direct and
+via-gateway batches, plus isolated admission-parse and provider-build cases.
+Allocator bytes are not memcpy counts; use the static copy-point analysis with
+these numbers when attributing costs.
