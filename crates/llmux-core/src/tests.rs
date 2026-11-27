@@ -2950,8 +2950,8 @@ async fn request_log_lists_every_attempt_leg() {
     assert_eq!(
         record["legs"],
         serde_json::json!([
-            {"deployment": "dep0", "provider": "test", "outcome": "rate_limited"},
-            {"deployment": "dep2", "provider": "test", "outcome": "routed"},
+            {"deployment": "dep0", "provider": "test", "outcome": "rate_limited", "status": 200},
+            {"deployment": "dep2", "provider": "test", "outcome": "routed", "status": 200},
         ])
     );
 }
@@ -3039,10 +3039,84 @@ async fn request_log_lists_repair_resends_for_one_attempt() {
     assert_eq!(
         lines[0]["legs"],
         serde_json::json!([
-            {"deployment": "dep0", "provider": "test", "outcome": "bad_request"},
-            {"deployment": "dep0", "provider": "test", "outcome": "routed"},
+            {"deployment": "dep0", "provider": "test", "outcome": "bad_request", "status": 200},
+            {"deployment": "dep0", "provider": "test", "outcome": "routed", "status": 200},
         ])
     );
+}
+
+#[tokio::test]
+async fn request_log_leg_records_exact_upstream_http_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, adapter, _, _server) = fixture_full(
+        vec![UpstreamError::Auth { refreshable: false }],
+        false,
+        [Some(1024); 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+        [None; 3],
+    )
+    .await;
+    adapter.status.store(403, Ordering::Relaxed);
+
+    assert!(matches!(
+        executor.execute(request()).await,
+        Err(GatewayError::AllCandidatesExhausted { .. })
+    ));
+    drop(executor);
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["legs"][0]["outcome"], "auth");
+    assert_eq!(lines[0]["legs"][0]["status"], 403);
+}
+
+#[tokio::test]
+async fn request_log_leg_distinguishes_model_not_found_from_bad_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, adapter, _, _server) = fixture_full(
+        vec![UpstreamError::ModelNotFound {
+            status: StatusCode::NOT_FOUND,
+            body: Bytes::new(),
+        }],
+        false,
+        [Some(1024); 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+        [None; 3],
+    )
+    .await;
+    adapter.status.store(404, Ordering::Relaxed);
+
+    assert!(matches!(
+        executor.execute(request()).await,
+        Err(GatewayError::Client(UpstreamError::ModelNotFound { .. }))
+    ));
+    drop(executor);
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["legs"][0]["outcome"], "bad_request");
+    assert_eq!(lines[0]["legs"][0]["error_detail"], "model_not_found");
+    assert_eq!(lines[0]["legs"][0]["status"], 404);
 }
 
 #[tokio::test]
