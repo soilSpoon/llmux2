@@ -892,7 +892,9 @@ impl Executor {
                             let upstream = upstream.take().expect("built before send");
                             if matches!(
                                 upstream,
-                                Ok(Err(BuildError::InvalidBody | BuildError::UnsupportedFormat))
+                                Ok(Err(BuildError::InvalidBody
+                                    | BuildError::UnsupportedFormat
+                                    | BuildError::ProviderContractViolation))
                             ) {
                                 return Err(GatewayError::InvalidRequest);
                             }

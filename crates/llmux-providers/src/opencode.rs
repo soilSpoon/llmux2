@@ -106,7 +106,7 @@ impl ProviderAdapter for OpenCode {
             return Err(BuildError::UnsupportedFormat);
         }
         if req.image_count > 0 {
-            return Err(BuildError::UnsupportedConversion);
+            return Err(BuildError::ProviderContractViolation);
         }
         let mut request = self.0.build_request(req, dep, &AuthMaterial::None).await?;
         let (body, identity) = rewrite_body(request.body(), req)?;

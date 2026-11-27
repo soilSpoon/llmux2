@@ -62,9 +62,12 @@ Free-tier quota evidence (`FreeUsageLimitError` in any supported envelope, or
 HTTP 402) SHALL be classified as exhausted quota and SHALL NOT fall back to a
 billed or OmniRoute leg for any caller, including an unrestricted key. A 403
 free-tier client-gate refusal SHALL be surfaced to the caller rather than
-treated as a refreshable credential failure. Image inputs SHALL make the
-OpenCode leg ineligible before any upstream call because `big-pickle` has no
-image input support. Client cancellation SHALL close the upstream response
+treated as a refreshable credential failure. Image inputs SHALL fail as a
+terminal invalid request before any upstream call or fallback because
+`big-pickle` has no image input support. This provider-contract refusal SHALL
+NOT use per-leg unsupported-conversion fallback; ordinary conversion
+incompatibility remains non-terminal for other providers. Client cancellation
+SHALL close the upstream response
 without a compensating request or immediate replay. The adapter SHALL NOT claim
 that the provider's free-tier admission gate is proven; the embedded artifact
 records only the pinned public CLI shape.
