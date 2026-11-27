@@ -558,15 +558,14 @@ A small reviewed table in `src/approved_drops.rs` also interrupts exact
 buyer-visible spellings whose owner approved removal because no compliant
 free exact native lane exists. WO-189 covers the active `kimi-k2.6` public
 spelling set and the two equivalent DDGW `gpt-5.4-mini` spellings. Under the
-user's free-lanes-only constraint, WO-187 parks exact `big-pickle` and WO-188
-parks exact `gpt-5.6-luna` plus `duckduckgo-web/ddgw/gpt-5.6-luna`: no
-adoptable free exact native lane exists under current evidence, the OpenCode
-loopback lane is not generated, and the billed OmniRoute-only DDGW spelling is
-not emitted. CleanAPIs is parked/rejected under current public evidence rather
+user's free-lanes-only constraint, WO-188 parks exact `gpt-5.6-luna` plus
+`duckduckgo-web/ddgw/gpt-5.6-luna`: no adoptable free exact native lane exists
+under current evidence, and the billed OmniRoute-only DDGW spelling is not
+emitted. CleanAPIs is parked/rejected under current public evidence rather
 than treated as a conditional candidate.
 The correction does not reintroduce bare `gpt-5.4-mini`, does not alias
 `gpt-5.6-luna` to `gpt-6-luna`, and does not affect neighboring Kimi,
-DeepSeek, Big Pickle, or GPT spellings. These rows behave like exact
+DeepSeek or GPT spellings. These rows behave like exact
 exclusions on every import, join the catch-all exclusion while that
 transition catch-all exists, and are reported in warnings plus canonical-map
 `drop_decisions` with non-secret approval provenance. The same exact rows are

@@ -11,7 +11,6 @@ const REMOVED: &[&str] = &[
     "cloudflare-playground/moonshotai/kimi-k2.6",
     "ddgw/gpt-5.4-mini",
     "duckduckgo-web/ddgw/gpt-5.4-mini",
-    "big-pickle",
     "gpt-5.6-luna",
     "duckduckgo-web/ddgw/gpt-5.6-luna",
 ];
@@ -22,27 +21,23 @@ fn fixture() -> Value {
         "providerNodes": [
             {"id":"cfpd","prefix":"cfpd","type":"openai-compatible","apiType":"chat","baseUrl":"https://cfpd.example/v1"},
             {"id":"ddgw","prefix":"ddgw","type":"openai-compatible","apiType":"chat","baseUrl":"https://ddgw.example/v1"},
-            {"id":"opencode-free","prefix":"opencode-free","type":"openai-compatible","apiType":"chat","baseUrl":"http://127.0.0.1:8790/opencode/v1"}
         ],
         "providerConnections": [
             {"id":"cfpd","provider":"cfpd","authType":"apikey","apiKey":"synthetic-cfpd"},
-            {"id":"ddgw","provider":"ddgw","authType":"apikey","apiKey":"synthetic-ddgw"},
-            {"id":"opencode","provider":"opencode-free","authType":"apikey","apiKey":"synthetic-opencode"}
+            {"id":"ddgw","provider":"ddgw","authType":"apikey","apiKey":"synthetic-ddgw"}
         ],
-        "apiKeys": [{"key":"synthetic-client"},{"key":"synthetic-buyer","isActive":true,"modelAccessMode":"restricted","allowedModels":["big-pickle","gpt-5.6-luna","cfpd/*"],"blockedModels":[]},{"key":"synthetic-drop-only","isActive":true,"modelAccessMode":"restricted","allowedModels":["big-pickle"],"blockedModels":[]}],
+        "apiKeys": [{"key":"synthetic-client"},{"key":"synthetic-buyer","isActive":true,"modelAccessMode":"restricted","allowedModels":["gpt-5.6-luna","cfpd/*"],"blockedModels":[]},{"key":"synthetic-drop-only","isActive":true,"modelAccessMode":"restricted","allowedModels":["gpt-5.6-luna"],"blockedModels":[]}],
         "combos": [
             {"id":"kimi","name":"kimi-k2.6","models":["cfpd/moonshotai/kimi-k2.6"]},
             {"id":"ddgw","name":"ddgw/gpt-5.4-mini","models":["ddgw/gpt-5.4-mini"]},
             {"id":"duck","name":"duckduckgo-web/ddgw/gpt-5.4-mini","models":["ddgw/gpt-5.4-mini"]},
-            {"id":"big","name":"big-pickle","models":["opencode-free/big-pickle"]},
             {"id":"luna","name":"gpt-5.6-luna","models":["ddgw/gpt-5.6-luna"]},
             {"id":"luna-ddgw","name":"duckduckgo-web/ddgw/gpt-5.6-luna","models":["ddgw/gpt-5.6-luna"]},
             {"id":"near-kimi","name":"kimi-k2.7","models":["cfpd/moonshotai/kimi-k2.7"]},
             {"id":"near-mini","name":"ddgw/gpt-5.4-nano","models":["ddgw/gpt-5.4-nano"]},
             {"id":"near-deepseek","name":"deepseek-v4.1-flash","models":["ddgw/deepseek-v4.1-flash"]},
             {"id":"near-gpt","name":"gpt-6-luna","models":["ddgw/gpt-6-luna"]},
-            {"id":"near-luna","name":"gpt-5.6-nano","models":["ddgw/gpt-5.6-nano"]},
-            {"id":"near-pickle","name":"big-pickle-v2","models":["ddgw/big-pickle-v2"]}
+            {"id":"near-luna","name":"gpt-5.6-nano","models":["ddgw/gpt-5.6-nano"]}
         ],
         "modelAliases": {
             "moonshotai/kimi-k2.6":"kimi-k2.6",
@@ -92,7 +87,6 @@ fn user_approved_no_free_native_lane_models_fail_closed_exactly() {
         "kimi-k2.6",
         "ddgw/gpt-5.4-mini",
         "duckduckgo-web/ddgw/gpt-5.4-mini",
-        "big-pickle",
         "gpt-5.6-luna",
         "duckduckgo-web/ddgw/gpt-5.6-luna",
     ] {
@@ -113,9 +107,6 @@ fn user_approved_no_free_native_lane_models_fail_closed_exactly() {
     assert!(!text.contains("synthetic-client"));
     assert!(!text.contains("synthetic-overlay"));
     assert!(!text.contains("synthetic-omniroute"));
-    assert!(!text.contains("synthetic-opencode"));
-    assert!(!text.contains("127.0.0.1:8790"));
-    assert!(!text.contains("zen-big-pickle"));
     assert!(!text.contains("cloudflare-direct-moonshotai-kimi-k2-6"));
     for deployment_id in [
         "omniroute-fallback-kimi-k2.6",
@@ -152,7 +143,6 @@ fn user_approved_no_free_native_lane_models_fail_closed_exactly() {
         "deepseek-v4.1-flash",
         "gpt-6-luna",
         "gpt-5.6-nano",
-        "big-pickle-v2",
     ] {
         assert!(
             cfg.model_names.contains_key(spelling),
@@ -165,7 +155,6 @@ fn user_approved_no_free_native_lane_models_fail_closed_exactly() {
         "cfpd/moonshotai/kimi-k2.6",
         "ddgw/gpt-5.4-mini",
         "duckduckgo-web/ddgw/gpt-5.4-mini",
-        "big-pickle",
         "gpt-5.6-luna",
         "duckduckgo-web/ddgw/gpt-5.6-luna",
     ] {
@@ -195,12 +184,11 @@ fn user_approved_no_free_native_lane_models_fail_closed_exactly() {
     let buyer_policy = cfg.server.key_policies[buyer_idx]
         .as_ref()
         .expect("restricted buyer key keeps its portable policy");
-    for spelling in ["big-pickle", "gpt-5.6-luna"] {
-        assert!(
-            !buyer_policy.models.iter().any(|model| model == spelling),
-            "buyer key policy still advertises {spelling}"
-        );
-    }
+    let interrupted = "gpt-5.6-luna";
+    assert!(
+        !buyer_policy.models.iter().any(|model| model == interrupted),
+        "buyer key policy still advertises {interrupted}"
+    );
     assert!(
         buyer_policy.models.iter().any(|model| model == "cfpd/*"),
         "unrelated buyer key policy wildcard was removed"
@@ -239,7 +227,7 @@ fn user_approved_no_free_native_lane_models_fail_closed_exactly() {
                     && decision["action"] == json!("drop")
                     && decision["decision_source"] == json!("user-approved")
                     && decision["approval"].as_str().is_some_and(|approval| {
-                        if *spelling == "big-pickle" || spelling.contains("gpt-5.6-luna") {
+                        if spelling.contains("gpt-5.6-luna") {
                             approval.contains("WO-")
                         } else {
                             approval.contains("WO-189")
@@ -250,7 +238,6 @@ fn user_approved_no_free_native_lane_models_fail_closed_exactly() {
         );
     }
     for (spelling, marker) in [
-        ("big-pickle", "WO-187"),
         ("gpt-5.6-luna", "WO-188"),
         ("duckduckgo-web/ddgw/gpt-5.6-luna", "WO-188"),
     ] {

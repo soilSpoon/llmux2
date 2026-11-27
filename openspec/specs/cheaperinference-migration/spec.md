@@ -447,8 +447,8 @@ THEN the emitted config authenticates the key and binds it to a
 
 #### Scenario: User-interrupted allow-list entries are not advertised
 
-WHEN a restricted export key allows `big-pickle` or `gpt-5.6-luna` together
-with an unrelated still-servable glob
+WHEN a restricted export key allows `gpt-5.6-luna` together with an
+unrelated still-servable glob
 THEN the emitted key policy removes only the exact interrupted spellings,
 keeps the unrelated glob, and the warnings record the deliberate removal.
 
@@ -816,16 +816,15 @@ buyer-visible interruptions for models with no compliant free exact native
 lane. The WO-189 rows are `kimi-k2.6`, `moonshotai/kimi-k2.6`,
 `cloudflare-direct/moonshotai/kimi-k2.6`, `cfp/moonshotai/kimi-k2.6`,
 `cfpd/moonshotai/kimi-k2.6`, `cloudflare-playground/moonshotai/kimi-k2.6`,
-`ddgw/gpt-5.4-mini`, and `duckduckgo-web/ddgw/gpt-5.4-mini`. The WO-187 row
-is `big-pickle`; the WO-188 rows are `gpt-5.6-luna` and
-`duckduckgo-web/ddgw/gpt-5.6-luna`. Those rows are deliberate free-lane-constraint
+`ddgw/gpt-5.4-mini`, and `duckduckgo-web/ddgw/gpt-5.4-mini`. The WO-188 rows
+are `gpt-5.6-luna` and `duckduckgo-web/ddgw/gpt-5.6-luna`. Those rows are deliberate free-lane-constraint
 parked/rejected candidates under current evidence, not conditional candidates
 or accidental omissions. Each exact row SHALL be excluded
 even when it is absent from `--exclude-models`: no servable model entry,
-alias, deployment, generated OmniRoute fallback leg, OpenCode loopback lane,
-or catalog spelling is emitted, and the exact spelling joins the catch-all
+alias, deployment, generated OmniRoute fallback leg, or catalog
+spelling is emitted, and the exact spelling joins the catch-all
 `exclude` set when the transition catch-all exists. Bare `gpt-5.4-mini` and
-neighboring Kimi, DeepSeek, Big Pickle, and GPT spellings SHALL NOT be added
+neighboring Kimi, DeepSeek, and GPT spellings SHALL NOT be added
 by this correction. `gpt-5.6-luna` SHALL NOT alias to `gpt-6-luna`.
 Importer warnings and the canonical-map `drop_decisions` artifact SHALL record
 the non-secret user approval source and reason so the absence is auditable as

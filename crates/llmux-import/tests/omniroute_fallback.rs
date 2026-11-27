@@ -113,7 +113,6 @@ fn fallback_is_last_and_codex_routes_are_excluded() {
     assert_eq!(
         cfg.catch_all_exclude,
         [
-            "big-pickle",
             "cfp/moonshotai/kimi-k2.6",
             "cfpd/moonshotai/kimi-k2.6",
             "chain",
@@ -412,7 +411,6 @@ fn fallback_only_import_preserves_env_reference() {
     assert_eq!(
         config["models"][0]["exclude"].as_array().unwrap(),
         &[
-            toml::Value::String("big-pickle".into()),
             toml::Value::String("cfp/moonshotai/kimi-k2.6".into()),
             toml::Value::String("cfpd/moonshotai/kimi-k2.6".into()),
             toml::Value::String("cloudflare-direct/moonshotai/kimi-k2.6".into()),

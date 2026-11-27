@@ -10,7 +10,6 @@ pub(crate) struct ApprovedDrop {
 
 const WO189_APPROVAL: &str = "WO-189 user decision: buyer-visible interruption";
 const WO189_REASON: &str = "no compliant free exact native lane";
-const WO187_APPROVAL: &str = "WO-187 user constraint: free lanes only";
 const WO188_APPROVAL: &str = "WO-188 user constraint: free lanes only";
 const PARKED_REASON: &str =
     "no adoptable free exact native lane; candidates parked/rejected under current evidence";
@@ -55,11 +54,6 @@ pub(crate) const USER_APPROVED_DROPS: &[ApprovedDrop] = &[
         spelling: "duckduckgo-web/ddgw/gpt-5.4-mini",
         approval: WO189_APPROVAL,
         reason: WO189_REASON,
-    },
-    ApprovedDrop {
-        spelling: "big-pickle",
-        approval: WO187_APPROVAL,
-        reason: PARKED_REASON,
     },
     ApprovedDrop {
         spelling: "gpt-5.6-luna",

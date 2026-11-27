@@ -108,6 +108,19 @@ timeout_ms = 60000
 expires_at = 2026-11-30T23:59:59Z
 
 [[models]]
+name = "big-pickle"
+capabilities = { stream = true, max_context = 200000 }
+
+# Free "for a limited time" with no stated end date, so no expires_at. The
+# provider may train on conversations sent to it; see docs/free-providers.md.
+[[models.deployments]]
+id = "zen-big-pickle"
+credential = "zen-key"
+base_url = "https://opencode.ai/inference/openai/v1"
+upstream_model = "big-pickle"
+timeout_ms = 60000
+
+[[models]]
 name = "claude-fable-5"
 capabilities = { stream = true, max_context = 1000000 }
 
