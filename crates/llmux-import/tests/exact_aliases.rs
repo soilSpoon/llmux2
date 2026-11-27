@@ -22,7 +22,10 @@ fn fixture() -> Value {
             {"id":"morph-base","name":"morph-kimik3","models":["morph/morph-kimik3"]},
             {"id":"morph-fast","name":"morph-kimik3-fast","models":["morph/morph-kimik3-fast"]},
             {"id":"prefixed-morph","name":"unrelated-prefixed-morph-source","models":["morph/morph-kimik3-abliterated"]}
-        ]
+        ],
+        "modelAliases": {
+            "public-cfpd":"cfpd/deepseek-v4.1-flash"
+        }
     })
 }
 
@@ -39,7 +42,10 @@ fn exact_alias_does_not_remove_direct_route_without_canonical_target() {
         "apiKeys": [{"key":"synthetic-client"}],
         "combos": [
             {"id":"cfpd-direct","name":"cfpd-direct-source","models":["cfpd/deepseek-v4.1-flash"]}
-        ]
+        ],
+        "modelAliases": {
+            "public-cfpd":"cfpd/deepseek-v4.1-flash"
+        }
     });
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("input.json"), root.to_string()).unwrap();
@@ -58,7 +64,46 @@ fn exact_alias_does_not_remove_direct_route_without_canonical_target() {
     let cfg = RuntimeConfig::parse(&text).unwrap();
     let index = cfg.model_names["cfpd/deepseek-v4.1-flash"];
     assert_eq!(cfg.models[index].name.as_ref(), "cfpd/deepseek-v4.1-flash");
+    assert_eq!(cfg.model_names.get("public-cfpd"), Some(&index));
     assert!(!cfg.model_names.contains_key("deepseek-v4.1-flash"));
+}
+
+#[test]
+fn export_aliases_win_over_reviewed_exact_defaults() {
+    let mut root = fixture();
+    root["modelAliases"]["morph-kimik3-abliterated"] = json!("morph-kimik3");
+    root["modelAliases"]["cfpd/deepseek-v4.1-flash"] =
+        json!("cfpd/deepseek-ai/deepseek-v4.1-flash");
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("input.json"), root.to_string()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_llmux-import"))
+        .args(["--input", "input.json", "--output", "out.toml"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = fs::read_to_string(dir.path().join("out.toml")).unwrap();
+    let cfg = RuntimeConfig::parse(&text).unwrap();
+    assert_eq!(
+        cfg.model_names.get("morph-kimik3-abliterated"),
+        cfg.model_names.get("morph-kimik3")
+    );
+    assert_ne!(
+        cfg.model_names.get("morph-kimik3-abliterated"),
+        cfg.model_names.get("morph-kimi-k3-abliterated")
+    );
+    assert_eq!(
+        cfg.model_names.get("cfpd/deepseek-v4.1-flash"),
+        cfg.model_names.get("cfpd/deepseek-ai/deepseek-v4.1-flash")
+    );
+    assert_ne!(
+        cfg.model_names.get("cfpd/deepseek-v4.1-flash"),
+        cfg.model_names.get("deepseek-v4.1-flash")
+    );
 }
 
 #[test]
@@ -142,6 +187,9 @@ fn exact_evidence_backed_spellings_alias_canonical_models_without_fallback_remov
             "{spelling} must stay a public alias, not an upstream substitution"
         );
     }
+
+    let deepseek_index = cfg.model_names["deepseek-v4.1-flash"];
+    assert_eq!(cfg.model_names.get("public-cfpd"), Some(&deepseek_index));
 
     for spelling in [
         "cfpd/deepseek-ai/deepseek-v4.1-flash",

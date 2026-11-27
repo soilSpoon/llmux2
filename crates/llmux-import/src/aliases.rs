@@ -57,12 +57,14 @@ pub(super) fn alias_map(root: &Value, warnings: &mut Vec<String>) -> BTreeMap<St
             warnings.push("ignored malformed modelAliases".into());
         }
     }
-    for (name, target) in REVIEWED_EXACT_ALIASES {
-        result
-            .entry((*name).to_owned())
-            .or_insert_with(|| (*target).to_owned());
-    }
     result
+}
+
+pub(super) fn source_reservation(root: &Value, name: &str) -> bool {
+    root["modelAliases"].get(name).is_some()
+        || array(root, "modelComboMappings").iter().any(|row| {
+            (row["enabled"] == true || row["enabled"] == 1) && matches(string(row, "pattern"), name)
+        })
 }
 
 pub(super) fn matches(pattern: &str, name: &str) -> bool {
@@ -289,17 +291,21 @@ pub(super) fn prepare(
     }
 }
 
-pub(super) fn remove_reviewed_direct_collisions(
+pub(super) fn apply_reviewed_exact_aliases(
+    root: &Value,
+    combos: &HashMap<String, Value>,
+    dead: &HashSet<String>,
     models: &mut Vec<Value>,
-    aliases: &BTreeMap<String, String>,
+    aliases: &mut BTreeMap<String, String>,
     warnings: &mut Vec<String>,
 ) {
     for (name, target) in REVIEWED_EXACT_ALIASES {
-        let alias_wins = aliases
-            .get(*name)
-            .is_some_and(|resolved| resolved == target)
-            && models.iter().any(|model| string(model, "name") == *target);
-        if !alias_wins {
+        if combos.contains_key(*name)
+            || dead.contains(*name)
+            || dead.contains(*target)
+            || source_reservation(root, name)
+            || !models.iter().any(|model| string(model, "name") == *target)
+        {
             continue;
         }
         let before = models.len();
@@ -309,6 +315,12 @@ pub(super) fn remove_reviewed_direct_collisions(
                 "direct {name}: collision; reviewed exact alias wins"
             ));
         }
+        for resolved in aliases.values_mut() {
+            if resolved == name {
+                *resolved = (*target).to_owned();
+            }
+        }
+        aliases.insert((*name).to_owned(), (*target).to_owned());
     }
 }
 

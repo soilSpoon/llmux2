@@ -1857,7 +1857,14 @@ pub fn import_with_options(
         }
         keep
     });
-    aliases::remove_reviewed_direct_collisions(&mut models, &aliases, &mut warnings);
+    aliases::apply_reviewed_exact_aliases(
+        &root,
+        &combos,
+        &dead,
+        &mut models,
+        &mut aliases,
+        &mut warnings,
+    );
     aliases::attach(&mut models, aliases, &mut warnings);
     context.report(&mut warnings);
     if let (Some(options), Some(exclusions)) = (fallback, fallback_exclusions) {

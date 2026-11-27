@@ -133,6 +133,13 @@ canonical target is not emitted
 THEN the direct route remains available instead of being removed with the
 unresolvable alias.
 
+#### Scenario: Dependent aliases follow the available route
+
+WHEN a source alias targets a reviewed spelling
+THEN it resolves to the canonical model when that target is emitted, and
+otherwise keeps resolving to an available direct route for the reviewed
+spelling.
+
 #### Scenario: Similar spellings do not collapse
 
 WHEN another `cfpd/...` or `morph...` spelling appears
