@@ -33,6 +33,21 @@ pub(crate) fn decode(body: Incoming) -> BoxStream<'static, Result<SseEvent, Upst
     decode_until(body, false)
 }
 
+pub(crate) fn requested_usage(body: &[u8]) -> Option<bool> {
+    #[derive(Deserialize)]
+    struct Chat {
+        stream_options: Option<StreamOptions>,
+    }
+    #[derive(Deserialize)]
+    struct StreamOptions {
+        include_usage: Option<bool>,
+    }
+    serde_json::from_slice::<Chat>(body)
+        .ok()?
+        .stream_options?
+        .include_usage
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum UsageMode {
     Root,
@@ -207,7 +222,7 @@ impl<'de> Deserialize<'de> for RequestedUsage {
     }
 }
 
-pub(crate) fn requested_usage(body: &[u8]) -> Option<bool> {
+pub(crate) fn requested_usage_last_duplicate(body: &[u8]) -> Option<bool> {
     serde_json::from_slice::<RequestedUsage>(body).ok()?.0
 }
 
@@ -448,6 +463,19 @@ mod tests {
     }
 
     #[test]
+    fn requested_usage_preserves_compat_duplicate_and_deep_ignored_semantics() {
+        let duplicate = r#"{"stream_options":{"include_usage":false,"include_usage":true}}"#;
+        assert_eq!(requested_usage(duplicate.as_bytes()), None);
+
+        let mut nested = "null".to_owned();
+        for _ in 0..129 {
+            nested = format!("[{nested}]");
+        }
+        let deep = format!(r#"{{"noise":{nested},"stream_options":{{"include_usage":true}}}}"#);
+        assert_eq!(requested_usage(deep.as_bytes()), Some(true));
+    }
+
+    #[test]
     fn requested_usage_matches_dom_last_duplicate_wins() {
         let cases = [
             (
@@ -501,7 +529,7 @@ mod tests {
         ];
         for (name, body) in cases {
             assert_eq!(
-                requested_usage(body.as_bytes()),
+                requested_usage_last_duplicate(body.as_bytes()),
                 dom_requested_usage(body.as_bytes()),
                 "{name}"
             );
@@ -517,7 +545,7 @@ mod tests {
                     r#"{{"stream_options":{{"include_usage":{first},"include_usage":{second}}}}}"#
                 );
                 assert_eq!(
-                    requested_usage(body.as_bytes()),
+                    requested_usage_last_duplicate(body.as_bytes()),
                     dom_requested_usage(body.as_bytes()),
                     "include_usage {first} then {second}"
                 );
@@ -541,7 +569,7 @@ mod tests {
             for second in stream_values {
                 let body = format!(r#"{{"stream_options":{first},"stream_options":{second}}}"#);
                 assert_eq!(
-                    requested_usage(body.as_bytes()),
+                    requested_usage_last_duplicate(body.as_bytes()),
                     dom_requested_usage(body.as_bytes()),
                     "stream_options {first} then {second}"
                 );
@@ -552,7 +580,7 @@ mod tests {
     #[test]
     fn requested_usage_rejects_malformed_duplicate_value() {
         let body = r#"{"stream_options":{"include_usage":true},"stream_options":{"include_usage":"#;
-        assert_eq!(requested_usage(body.as_bytes()), None);
+        assert_eq!(requested_usage_last_duplicate(body.as_bytes()), None);
     }
 
     #[test]
@@ -564,7 +592,7 @@ mod tests {
             }
             let body = format!(r#"{{"noise":{nested},"stream_options":{{"include_usage":true}}}}"#);
             assert_eq!(
-                requested_usage(body.as_bytes()),
+                requested_usage_last_duplicate(body.as_bytes()),
                 dom_requested_usage(body.as_bytes()),
                 "depth {depth}"
             );
