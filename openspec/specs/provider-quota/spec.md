@@ -122,9 +122,10 @@ legs.
 
 #### Scenario: Morph plan boundary
 
-WHEN the morph credential's reviewed Ultra scope covers Kimi K3.1
-(`morph-kimik31`) and the DeepSeek V4.1 Flash variants (`morph-dsv41flash`,
-`morph-dsv41flash-1017`, and privileged-access `morph-dsv41flash-abliterated`)
+WHEN the morph credential's reviewed Ultra scope is the DeepSeek plus Kimi
+K3.1 subset — `morph-kimik31`, `morph-dsv41flash`, `morph-dsv41flash-1017`,
+and privileged-access `morph-dsv41flash-abliterated` — rather than every id
+Morph may mark with Ultra metadata
 THEN a deployment on that credential naming `morph-kimik3`,
 `morph-kimik3-fast`, `morph-kimik3-abliterated`, or any other out-of-scope
 upstream model fails config validation, while the listed Kimi K3.1 and

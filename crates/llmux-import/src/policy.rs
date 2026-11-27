@@ -334,7 +334,7 @@ impl Policy {
             ModelPolicy::MorphUltra => crate::morph::ULTRA_MODELS
                 .contains(&model)
                 .then(|| model.to_owned())
-                .ok_or("outside the Morph Ultra plan"),
+                .ok_or("outside the reviewed Morph Ultra scope"),
         }
     }
 }

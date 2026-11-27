@@ -250,7 +250,7 @@ fn morph_ultra_opt_in_filters_out_of_plan_models_and_marks_the_credential() {
     assert!(report
         .warnings
         .iter()
-        .any(|warning| warning.contains("outside the Morph Ultra plan")));
+        .any(|warning| warning.contains("outside the reviewed Morph Ultra scope")));
 
     let output = dir.path().join("default.toml");
     llmux_import::import(&root.to_string(), &output, None).unwrap();

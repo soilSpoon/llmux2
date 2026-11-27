@@ -178,9 +178,11 @@ To roll back, remove the reviewed
 Morph endpoint exception and combo-order policy before regenerating config.
 
 `--morph-ultra` marks keyed connections to the official Morph endpoint as
-Ultra-plan credentials. The importer keeps only the reviewed in-scope upstream
-ids `morph-kimik31`, `morph-dsv41flash`, `morph-dsv41flash-1017`, and
-`morph-dsv41flash-abliterated`, warns and drops other Morph upstream ids, and
+Ultra-plan credentials. The importer keeps only the reviewed DeepSeek plus
+Kimi K3.1 subset — `morph-kimik31`, `morph-dsv41flash`,
+`morph-dsv41flash-1017`, and `morph-dsv41flash-abliterated` — not every id
+Morph may mark with Ultra metadata. It warns and drops other Morph upstream
+ids, and
 writes the same exact list as the credential's `allowed_upstream_models` so
 later hand-added out-of-plan legs fail config validation. `morph-kimik3` and
 `morph-kimik3-fast` are excluded even though the Ultra prose calls
