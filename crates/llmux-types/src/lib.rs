@@ -9,6 +9,7 @@ mod nous;
 mod persist;
 pub mod provider;
 mod request;
+mod spool;
 mod upstream;
 
 pub use acp::*;
@@ -19,4 +20,5 @@ pub use model::*;
 pub use nous::*;
 pub use persist::*;
 pub use request::*;
+pub use spool::*;
 pub use upstream::*;

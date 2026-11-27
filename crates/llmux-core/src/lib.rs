@@ -21,7 +21,7 @@ use llmux_config::RuntimeConfig;
 use llmux_types::{
     provider, AuthMaterial, Billing, BuildError, ContextOverflow, CredentialSource, Deployment,
     DeploymentIdx, ErrorKind, GatewayRequest, GatewayResponse, InboundFormat, ProviderAdapter,
-    ProviderRegistry, QuotaSpec, SseCommitment, Support, UpstreamError,
+    ProviderRegistry, QuotaSpec, SpooledBody, SseCommitment, Support, UpstreamError,
 };
 use machine::{Built, Effect, Event, Outcome, Phase, State};
 pub use request_log::RequestLog;
@@ -183,6 +183,11 @@ pub struct Executor {
     devin_catalog: Arc<LiveModels>,
     http: HttpClient,
     request_log: Option<RequestLog>,
+}
+
+fn fits_context(dep: &Deployment, needed: u64) -> bool {
+    dep.max_context
+        .is_none_or(|limit| needed <= u64::from(limit))
 }
 
 impl Executor {
@@ -469,6 +474,33 @@ impl Executor {
                 .is_some_and(|ids| !ids.contains(dep.upstream_model.as_ref()))
     }
 
+    /// Whether a deployment can admit a request costing `needed` in `format`
+    /// right now, applying the same disabled, parked, expired,
+    /// stale-upstream, context-fit, cooldown, quota, concurrency, and format
+    /// gates routing applies before `Send`. The probe is read-only: it charges
+    /// no quota and takes no concurrency permit.
+    pub fn deployment_available(
+        &self,
+        idx: DeploymentIdx,
+        format: InboundFormat,
+        needed: u64,
+    ) -> bool {
+        let idx = index(idx);
+        let dep = &self.cfg.deployments[idx];
+        let binding = &self.bindings[idx];
+        if binding.disabled.load(Ordering::Relaxed)
+            || binding.limits.not_provisioned()
+            || binding.adapter.supports(format) == Support::No
+            || dep.expires_at.is_some_and(|end| SystemTime::now() >= end)
+            || self.devin_upstream_missing(dep)
+            || !fits_context(dep, needed)
+        {
+            return false;
+        }
+        let now = Instant::now();
+        binding.limits.available_at(now, needed) == now
+    }
+
     /// Whether the credential is disabled in routing; `None` for unknown ids.
     pub fn credential_disabled(&self, id: &str) -> Option<bool> {
         self.credentials
@@ -535,13 +567,24 @@ impl Executor {
         &self,
         req: GatewayRequest,
     ) -> Result<RoutedResponse, RoutedError> {
+        self.execute_attributed_with_replay(req, None).await
+    }
+
+    /// Executes a request whose canonical ingress body may live in a spool.
+    /// Each deployment candidate receives a freshly materialized copy; the
+    /// copy is dropped when that candidate is done so retry memory is not cumulative.
+    pub async fn execute_attributed_with_replay(
+        &self,
+        req: GatewayRequest,
+        replay: Option<Arc<SpooledBody>>,
+    ) -> Result<RoutedResponse, RoutedError> {
         let mut trace = RouteTrace::default();
         let started = Instant::now();
         let request_id = req.request_id.0.clone();
         let model = req.model.clone();
         let client_key = req.client_key.clone();
         let image_count = req.image_count;
-        let result = self.route(req, &mut trace).await;
+        let result = self.route(req, replay, &mut trace).await;
         // A middle-out context rejection is a probe: the server truncates and
         // retries under the same request ID, so logging it would double-count
         // one client request.
@@ -585,6 +628,7 @@ impl Executor {
     async fn route(
         &self,
         req: GatewayRequest,
+        replay: Option<Arc<SpooledBody>>,
         trace: &mut RouteTrace,
     ) -> Result<RoutedResponse, GatewayError> {
         let model_idx = self
@@ -615,12 +659,7 @@ impl Executor {
         let needed =
             u64::from(req.est_input_tokens) + u64::from(req.max_output_tokens.unwrap_or(0));
         let check_context = needed > u64::from(order.min_context);
-        let fits = |dep: &Deployment| {
-            !check_context
-                || dep
-                    .max_context
-                    .is_none_or(|limit| needed <= u64::from(limit))
-        };
+        let fits = |dep: &Deployment| !check_context || fits_context(dep, needed);
         if check_context {
             let mut limit = None;
             for &idx in &model.deployments {
@@ -692,22 +731,38 @@ impl Executor {
         } else {
             (&model.deployments[..], &order.groups[..])
         };
+        let deadline = Instant::now() + self.cfg.server.request_timeout;
         let sequence = if groups.iter().any(|group| group.len() > 1) {
-            cache_seed(&req).unwrap_or_else(|| order.next.fetch_add(1, Ordering::Relaxed))
+            cache_seed_for_request(&req, replay.as_ref(), deadline)
+                .await?
+                .unwrap_or_else(|| order.next.fetch_add(1, Ordering::Relaxed))
         } else {
             0
         };
-        let deadline = Instant::now() + self.cfg.server.request_timeout;
         let mut last_transient = None;
         let mut incompatible = Vec::new();
         let mut unavailable = false;
         let mut machine = State::new(self.cfg.routing.max_attempts as u32);
+        let mut block_billed_after_terminal_quota = false;
         'groups: for group in groups {
             let shift = sequence % group.len();
             let (before, after) = deployments[group.clone()].split_at(shift);
             for &idx in after.iter().chain(before) {
                 let idx = index(idx);
                 let dep = &self.cfg.deployments[idx];
+                let binding = &self.bindings[idx];
+                let support = binding.adapter.supports(req.format);
+                let now = Instant::now();
+                if !binding.adapter.fallback_on_quota_exhausted()
+                    && binding.limits.quota_cooldown_until(now).is_some()
+                {
+                    block_billed_after_terminal_quota = true;
+                }
+                if block_billed_after_terminal_quota
+                    && (dep.billing == Billing::Billed || dep.fallback)
+                {
+                    continue;
+                }
                 // A free-only probe never routes to a billed leg, so a sweep
                 // cannot spend on paid or quota-capped legs — including billed
                 // fallback legs a dying free leg would otherwise fall through
@@ -716,9 +771,6 @@ impl Executor {
                 if req.free_only && dep.billing == Billing::Billed {
                     continue;
                 }
-                let binding = &self.bindings[idx];
-                let support = binding.adapter.supports(req.format);
-                let now = Instant::now();
                 machine.select();
                 let mut skip_reason = binding.skip_reason(support, fits(dep), dep.expires_at);
                 let mut event = if skip_reason.is_some() {
@@ -738,6 +790,7 @@ impl Executor {
                 };
                 let mut permit = None;
                 let mut upstream = None;
+                let mut attempt_request = None;
                 let mut attempt_deadline = deadline;
                 let mut result = Err(GatewayError::Internal);
                 loop {
@@ -759,6 +812,27 @@ impl Executor {
                             return Err(GatewayError::Client(UpstreamError::Timeout));
                         }
                         Effect::Admit if machine.phase == Phase::Admit => {
+                            if replay.is_some() && attempt_request.is_none() {
+                                attempt_request = Some({
+                                    let materialize =
+                                        materialize_attempt_request(&req, replay.as_ref());
+                                    tokio::pin!(materialize);
+                                    let materialized = tokio::select! {
+                                        biased;
+                                        result = &mut materialize => Ok(result),
+                                        _ = tokio::time::sleep_until(deadline) => Err(()),
+                                    };
+                                    match materialized {
+                                        Ok(Ok(request)) => request,
+                                        Ok(Err(error)) => return Err(error),
+                                        Err(()) => {
+                                            return Err(GatewayError::Client(
+                                                UpstreamError::Timeout,
+                                            ))
+                                        }
+                                    }
+                                });
+                            }
                             permit = if support == Support::Convert {
                                 None
                             } else {
@@ -772,10 +846,15 @@ impl Executor {
                             };
                         }
                         Effect::Build => {
+                            if attempt_request.is_none() {
+                                attempt_request =
+                                    Some(materialize_attempt_request(&req, replay.as_ref()).await?);
+                            }
+                            let request = attempt_request.as_ref().expect("attempt request");
                             attempt_deadline = deadline.min(Instant::now() + dep.timeout);
                             let built = timeout_at(
                                 attempt_deadline,
-                                Self::build_request(&req, dep, binding),
+                                Self::build_request(request, dep, binding),
                             )
                             .await;
                             event = Event::Built(
@@ -815,7 +894,9 @@ impl Executor {
                             let upstream = upstream.take().expect("built before send");
                             if matches!(
                                 upstream,
-                                Ok(Err(BuildError::InvalidBody | BuildError::UnsupportedFormat))
+                                Ok(Err(BuildError::InvalidBody
+                                    | BuildError::UnsupportedFormat
+                                    | BuildError::ProviderContractViolation))
                             ) {
                                 return Err(GatewayError::InvalidRequest);
                             }
@@ -835,7 +916,14 @@ impl Executor {
                             result = match upstream {
                                 Ok(Ok(upstream)) => timeout_at(
                                     attempt_deadline,
-                                    self.attempt(&req, dep, binding, upstream, needed, trace),
+                                    self.attempt(
+                                        attempt_request.as_ref().expect("attempt request"),
+                                        dep,
+                                        binding,
+                                        upstream,
+                                        needed,
+                                        trace,
+                                    ),
                                 )
                                 .await
                                 .unwrap_or(timed_out),
@@ -883,7 +971,8 @@ impl Executor {
                                         .cfg
                                         .routing
                                         .fallback_on
-                                        .contains(&ErrorKind::QuotaExhausted),
+                                        .contains(&ErrorKind::QuotaExhausted)
+                                        && binding.adapter.fallback_on_quota_exhausted(),
                                 },
                                 Err(GatewayError::Client(UpstreamError::NotProvisioned)) => {
                                     Outcome::NotProvisioned
@@ -1283,6 +1372,31 @@ fn index(idx: DeploymentIdx) -> usize {
 /// so their changing conversation tail would poison the key even when the
 /// cacheable system prefix is identical. 8 KiB bounds the selection-path copy.
 const CACHE_PREFIX_BYTES: usize = 8 * 1024;
+
+async fn cache_seed_for_request(
+    req: &GatewayRequest,
+    replay: Option<&Arc<SpooledBody>>,
+    deadline: Instant,
+) -> Result<Option<usize>, GatewayError> {
+    let Some(spool) = replay.filter(|_| req.body.is_empty()) else {
+        return Ok(cache_seed(req));
+    };
+    let spool = spool.clone();
+    let read = tokio::task::spawn_blocking(move || spool.read_prefix(CACHE_SCAN_BYTES));
+    tokio::pin!(read);
+    let prefix = tokio::select! {
+        biased;
+        result = &mut read => result
+            .map_err(|_| GatewayError::Internal)?
+            .map_err(|_| GatewayError::Internal)?,
+        _ = tokio::time::sleep_until(deadline) => {
+            return Err(GatewayError::Client(UpstreamError::Timeout));
+        }
+    };
+    let mut seeded = req.clone();
+    seeded.body = prefix;
+    Ok(cache_seed(&seeded))
+}
 
 fn cache_seed(req: &GatewayRequest) -> Option<usize> {
     let mut hash = 0xcbf29ce484222325u64;
@@ -1727,6 +1841,46 @@ fn fnv_part(mut hash: u64, part: &[u8]) -> u64 {
         hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+#[cfg(test)]
+type MaterializeTestGate = (
+    std::path::PathBuf,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+);
+
+#[cfg(test)]
+static MATERIALIZE_TEST_GATE: std::sync::Mutex<Vec<MaterializeTestGate>> =
+    std::sync::Mutex::new(Vec::new());
+
+async fn materialize_attempt_request(
+    req: &GatewayRequest,
+    replay: Option<&Arc<SpooledBody>>,
+) -> Result<GatewayRequest, GatewayError> {
+    let mut materialized = req.clone();
+    if let Some(spool) = replay {
+        let spool = spool.clone();
+        #[cfg(test)]
+        {
+            let gate = MATERIALIZE_TEST_GATE
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .iter()
+                .find(|(path, _, _)| path == spool.path())
+                .map(|(_, started, release)| (started.clone(), release.clone()));
+            if let Some((started, release)) = gate {
+                started.notify_one();
+                release.notified().await;
+            }
+        }
+        let body = tokio::task::spawn_blocking(move || spool.read_bytes())
+            .await
+            .map_err(|_| GatewayError::Internal)?
+            .map_err(|_| GatewayError::Internal)?;
+        materialized.body = body;
+    }
+    Ok(materialized)
 }
 
 /// Priority a deployment competes with right now: `priority_boost` while its

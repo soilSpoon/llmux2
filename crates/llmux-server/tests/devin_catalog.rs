@@ -42,8 +42,10 @@ impl Gateway {
         let acp_log = home.path().join("acp.log");
         let release = home.path().join("release");
         let key = home.path().join("client");
+        let ci_key = home.path().join("ci");
         let dashboard_key = home.path().join("dashboard");
         fs::write(&key, "test-client\n").unwrap();
+        fs::write(&ci_key, "test-ci\n").unwrap();
         fs::write(&dashboard_key, "test-dashboard\n").unwrap();
         fs::create_dir_all(home.path().join(".local/share")).unwrap();
         fs::write(home.path().join(".local/share/marker"), "").unwrap();
@@ -52,9 +54,13 @@ impl Gateway {
         let config = format!(
             r#"
 [server]
-client_keys = ["file:{}"]
+client_keys = ["file:{}", "file:{}"]
 dashboard_key = "file:{}"
 request_timeout_ms = 4000
+
+[[server.key_policies]]
+key = "file:{}"
+free_only = true
 
 [[models]]
 name = "retired"
@@ -64,6 +70,7 @@ aliases = ["old-swe"]
 id = "retired-devin"
 auth = "none"
 provider = "devin_acp"
+billing = "free"
 upstream_model = "swe-2-retired"
 priority = 0
 
@@ -75,6 +82,7 @@ aliases = ["swe-alias"]
 id = "swe-stale"
 auth = "none"
 provider = "devin_acp"
+billing = "free"
 upstream_model = "swe-2-retired"
 priority = 0
 
@@ -82,6 +90,7 @@ priority = 0
 id = "swe-live"
 auth = "none"
 provider = "devin_acp"
+billing = "free"
 upstream_model = "swe-2-high"
 priority = 10
 
@@ -92,6 +101,7 @@ name = "combo"
 id = "combo-stale"
 auth = "none"
 provider = "devin_acp"
+billing = "free"
 upstream_model = "swe-2-retired"
 priority = 0
 
@@ -121,11 +131,14 @@ name = "gone"
 id = "gone-devin"
 auth = "none"
 provider = "devin_acp"
+billing = "free"
 upstream_model = "swe-2-retired"
 priority = 0
 "#,
             key.display(),
-            dashboard_key.display()
+            ci_key.display(),
+            dashboard_key.display(),
+            ci_key.display()
         );
 
         let router = llmux_server::app_with_devin(
@@ -161,9 +174,13 @@ priority = 0
     }
 
     async fn models(&self) -> Vec<String> {
+        self.models_as("test-client").await
+    }
+
+    async fn models_as(&self, key: &str) -> Vec<String> {
         let response = request(
             &self.server,
-            "test-client",
+            key,
             "GET",
             "/v1/models",
             None,
@@ -310,6 +327,21 @@ async fn stale_devin_id_is_omitted_after_a_successful_catalog_load() {
         models_invocations(&gateway.calls()),
         1,
         "a second list within the refresh interval must reuse the cached catalog"
+    );
+}
+
+#[tokio::test]
+async fn stale_free_devin_leg_does_not_count_for_the_free_catalog() {
+    let gateway = Gateway::start(ModelsMode::Live).await;
+    assert_eq!(
+        gateway.models().await,
+        ["combo", "plain", "swe", "swe-alias"],
+        "the unrestricted key must still list the mixed-provider model"
+    );
+    assert_eq!(
+        gateway.models_as("test-ci").await,
+        ["swe", "swe-alias"],
+        "stale free Devin legs and billed OpenAI-compatible legs must not count for the free-only catalog"
     );
 }
 

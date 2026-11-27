@@ -95,6 +95,21 @@ fn every_pull_request_job_is_required() {
     assert_eq!(required, jobs);
 }
 #[test]
+fn tla2tools_pin_uses_the_static_v174_release() {
+    let text = fs::read_to_string(root().join(".github/workflows/tla.yml")).unwrap();
+    assert!(
+        text.contains("https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar"),
+        "tlc must use the static v1.7.4 release artifact; upstream force-retags v1.8.0/rolling"
+    );
+    assert!(
+        text.contains("936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"),
+        "tla2tools.jar must keep the SHA256 pin for the verified v1.7.4 artifact"
+    );
+    assert!(!text.contains("releases/download/v1.8.0/tla2tools.jar"));
+    assert!(!text.contains("releases/download/rolling/tla2tools.jar"));
+}
+
+#[test]
 fn requires_engineering_workflow_plugins() {
     let config = load(".devin/config.json");
     let entries = config["requiredPlugins"].as_array().unwrap();

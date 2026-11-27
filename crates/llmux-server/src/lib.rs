@@ -1,6 +1,7 @@
 //! Axum boundary for the OpenAI-compatible gateway.
 
 mod admin;
+mod body_spool;
 mod catalog;
 mod dashboard;
 mod lifecycle;
@@ -22,31 +23,31 @@ use axum::{
 };
 use futures_util::StreamExt;
 use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
-use http_body_util::LengthLimitError;
 use llmux_config::{ApiKey, RuntimeConfig};
 use llmux_core::{Executor, GatewayError, InitError, LiveModels, RequestLog, RoutedError};
 use llmux_providers::nous_portal::{NousPortalConfig, NousPortalSource};
 use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
 use llmux_providers::{
     truncate_middle_for_format, AcpAgent, Anthropic, Antigravity, AwsQuick, DeepAi, DevinAcp,
-    DevinAcpConfig, Freebuff, NoAuthSource, OpenAiCompat, OpenAiResponses, RequestMetadata,
-    StaticKey, Xai,
+    DevinAcpConfig, Freebuff, NoAuthSource, OpenAiCompat, OpenAiResponses, OpenCode,
+    RequestMetadata, StaticKey, Xai,
 };
 use llmux_types::{
     provider, AcpAgentSpec, Billing, ContextOverflow, CredentialSource, GatewayRequest,
-    GatewayResponse, InboundFormat, ProviderRegistry, RequestId, UpstreamError,
+    GatewayResponse, InboundFormat, ProviderRegistry, RequestId, SpoolStore, TrafficClass,
+    UpstreamError, MINIMAL_OPENAI_CHAT_COST,
 };
 use serde_json::{json, value::RawValue, Value};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, convert::Infallible, error::Error, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 
-const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const DEPLOYMENT_HEADER: HeaderName = HeaderName::from_static("x-llmux-deployment");
 const ATTEMPTS_HEADER: HeaderName = HeaderName::from_static("x-llmux-attempts");
 const CONTEXT_OVERFLOW_HEADER: HeaderName = HeaderName::from_static("x-llmux-context-overflow");
 const FREE_ONLY_HEADER: HeaderName = HeaderName::from_static("x-llmux-free-only");
 const DROPPED_MESSAGES_HEADER: HeaderName = HeaderName::from_static("x-llmux-dropped-messages");
+const MAX_MESSAGES_ERROR_BYTES: usize = 16 * 1024 * 1024;
 const ANTHROPIC_KEY_HEADER: HeaderName = HeaderName::from_static(provider::ANTHROPIC_KEY_HEADER);
 const DEEPAI_KEY_HEADER: HeaderName = HeaderName::from_static(provider::DEEPAI_KEY_HEADER);
 
@@ -57,6 +58,7 @@ struct Active {
 
 struct AppState {
     active: arc_swap::ArcSwap<Active>,
+    spool: SpoolStore,
     dashboard: Option<dashboard::Dashboard>,
     config_path: Option<std::path::PathBuf>,
     reload_lock: tokio::sync::Mutex<()>,
@@ -68,11 +70,16 @@ fn provider_registry(
     acp_agents: &std::collections::HashMap<Arc<str>, AcpAgentSpec>,
 ) -> ProviderRegistry {
     let mut registry = ProviderRegistry::default();
-    for kind in [provider::OPENAI, provider::OPENAI_COMPAT] {
+    for kind in [
+        provider::OPENAI,
+        provider::OPENAI_COMPAT,
+        provider::DEEPAI_CODE,
+    ] {
         registry.register(Arc::new(OpenAiCompat::new(kind)));
     }
     registry.register(Arc::new(Anthropic::new(provider::ANTHROPIC)));
     registry.register(Arc::new(OpenAiResponses::new()));
+    registry.register(Arc::new(OpenCode::new()));
     registry.register(Arc::new(DeepAi::new()));
     registry.register(Arc::new(Freebuff::new()));
     registry.register(Arc::new(Xai::new()));
@@ -93,6 +100,7 @@ fn static_sources(
             let source = match provider.0.as_ref() {
                 provider::ANTHROPIC => StaticKey::header(ANTHROPIC_KEY_HEADER, &key)?,
                 provider::DEEPAI => StaticKey::header(DEEPAI_KEY_HEADER, &key)?,
+                provider::DEEPAI_CODE => StaticKey::header(DEEPAI_KEY_HEADER, &key)?,
                 _ => StaticKey::bearer(&key)?,
             };
             Ok((id, Arc::new(source) as Arc<dyn CredentialSource>))
@@ -139,7 +147,19 @@ async fn app_with(
     config_path: Option<std::path::PathBuf>,
     devin: DevinAcpConfig,
 ) -> Result<Router, Box<dyn Error + Send + Sync>> {
+    Ok(app_with_state(config, config_path, devin).await?.0)
+}
+
+async fn app_with_state(
+    config: RuntimeConfig,
+    config_path: Option<std::path::PathBuf>,
+    devin: DevinAcpConfig,
+) -> Result<(Router, Arc<AppState>), Box<dyn Error + Send + Sync>> {
     let catalog = Arc::new(catalog::Catalog::new(devin.clone()));
+    let spool = SpoolStore::open(
+        &config.server.request_body_spool_dir,
+        config.server.request_body_spool_budget_bytes,
+    )?;
     let (config, executor) = build(config, devin, catalog.live()).await?;
     let dashboard = config
         .server
@@ -151,6 +171,7 @@ async fn app_with(
             config,
             executor: Arc::new(executor),
         }),
+        spool,
         dashboard,
         config_path,
         reload_lock: tokio::sync::Mutex::new(()),
@@ -165,7 +186,8 @@ async fn app_with(
     if state.dashboard.is_some() {
         router = router.merge(dashboard::routes()).merge(admin::routes());
     }
-    Ok(router.with_state(state))
+    let router = router.with_state(Arc::clone(&state));
+    Ok((router, state))
 }
 
 async fn build(
@@ -195,7 +217,7 @@ async fn build(
         .server
         .request_log
         .as_deref()
-        .map(RequestLog::open)
+        .map(|path| RequestLog::open_with_traffic_classes(path, traffic_class_map(&config.server)))
         .transpose()
         .map_err(InitError::RequestLog)?;
     for (id, credential) in std::mem::take(&mut config.oauth) {
@@ -259,15 +281,20 @@ async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         .key_policies
         .get(client_key.index)
         .and_then(Option::as_ref);
-    // A usable free leg is a non-fallback deployment marked free whose
-    // credential is not disabled — the same legs a free-only request could
-    // actually route to right now.
+    // A usable free leg is a non-fallback deployment marked free that could
+    // admit an OpenAI chat request right now. Quota, cooldown, parking, expiry,
+    // and stale-catalog state count because ci otherwise keeps buying models
+    // whose every free leg can only return all_candidates_exhausted.
     let has_usable_free_leg = |id: &str| match active.config.model_names.get(id) {
         Some(&index) => active.config.models[index].deployments.iter().any(|idx| {
             let dep = &active.config.deployments[idx.0 as usize];
             !dep.fallback
                 && dep.billing == Billing::Free
-                && active.executor.credential_disabled(&dep.credential) != Some(true)
+                && active.executor.deployment_available(
+                    *idx,
+                    InboundFormat::OpenAiChat,
+                    u64::from(MINIMAL_OPENAI_CHAT_COST),
+                )
         }),
         None => false,
     };
@@ -325,7 +352,7 @@ async fn messages(State(state): State<Arc<AppState>>, request: Request) -> Respo
         return response;
     }
     let (mut parts, body) = response.into_parts();
-    let mut payload: Value = body::to_bytes(body, MAX_REQUEST_BYTES)
+    let mut payload: Value = body::to_bytes(body, MAX_MESSAGES_ERROR_BYTES)
         .await
         .ok()
         .and_then(|body| serde_json::from_slice(&body).ok())
@@ -358,11 +385,10 @@ async fn execute(state: Arc<AppState>, request: Request, format: InboundFormat) 
     else {
         return unauthorized();
     };
-    if catalog::has_devin(&active.config) {
-        state.catalog.kick();
-    }
+    let catalog = catalog::has_devin(&active.config).then(|| Arc::clone(&state.catalog));
     let start = state.dashboard.as_ref().map(|_| std::time::Instant::now());
-    let response = execute_authorized(&active, request, format, client_key).await;
+    let response =
+        execute_authorized(&active, &state.spool, request, format, client_key, catalog).await;
     if let (Some(dashboard), Some(start)) = (&state.dashboard, start) {
         dashboard.record_response(response.status(), start.elapsed());
     }
@@ -381,11 +407,44 @@ fn unauthorized() -> Response {
     response
 }
 
+struct Ingress {
+    store: SpoolStore,
+    captured: body_spool::CapturedBody,
+    body: Bytes,
+}
+
+fn capture_error(kind: body_spool::CaptureError) -> Response {
+    match kind {
+        body_spool::CaptureError::TooLarge => error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request_error",
+            "Request body too large",
+        ),
+        body_spool::CaptureError::Read => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Could not read request body",
+        ),
+        body_spool::CaptureError::BudgetExhausted => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            "Request body storage capacity is temporarily exhausted",
+        ),
+        body_spool::CaptureError::Io => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Gateway could not store the request body",
+        ),
+    }
+}
+
 async fn execute_authorized(
     active: &Active,
+    spool: &SpoolStore,
     request: Request,
     format: InboundFormat,
     client_key: MatchedKey,
+    catalog: Option<Arc<catalog::Catalog>>,
 ) -> Response {
     let context_overflow = match request.headers().get(CONTEXT_OVERFLOW_HEADER) {
         None => None,
@@ -401,27 +460,24 @@ async fn execute_authorized(
         },
     };
     let (parts, body) = request.into_parts();
-    let body = match body::to_bytes(body, MAX_REQUEST_BYTES).await {
-        Ok(body) => body,
-        Err(err)
-            if err
-                .source()
-                .is_some_and(|cause| cause.is::<LengthLimitError>()) =>
-        {
-            return error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "invalid_request_error",
-                "Request body too large",
-            );
-        }
-        Err(_) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "Could not read request body",
-            )
-        }
+    let captured = match body_spool::capture_body(
+        body,
+        spool.clone(),
+        active.config.server.request_body_memory_bytes,
+        active.config.server.max_request_bytes,
+    )
+    .await
+    {
+        Ok(captured) => captured,
+        Err(error) => return capture_error(error),
     };
+    let body = match captured.bytes().await {
+        Ok(body) => body,
+        Err(error) => return capture_error(error),
+    };
+    if let Some(catalog) = catalog {
+        catalog.kick();
+    }
     let end_user = match policy::resolve_end_user(&active.config.server, &parts.headers, &body) {
         Ok(id) => id,
         Err(err) => {
@@ -434,8 +490,12 @@ async fn execute_authorized(
     };
     let response = route_request(
         active,
+        Ingress {
+            store: spool.clone(),
+            captured,
+            body,
+        },
         &parts.headers,
-        body,
         format,
         context_overflow,
         end_user.clone(),
@@ -447,13 +507,18 @@ async fn execute_authorized(
 
 async fn route_request(
     active: &Active,
+    ingress: Ingress,
     headers: &HeaderMap,
-    body: Bytes,
     format: InboundFormat,
     context_overflow: Option<ContextOverflow>,
     end_user: Option<Arc<str>>,
     client_key: MatchedKey,
 ) -> Response {
+    let Ingress {
+        store,
+        captured,
+        body,
+    } = ingress;
     let Ok(metadata) = RequestMetadata::parse(&body, format) else {
         return error(
             StatusCode::BAD_REQUEST,
@@ -461,6 +526,10 @@ async fn route_request(
             "Expected a JSON object with a nonempty string model and optional boolean stream",
         );
     };
+    let has_gateway_routing_fields = metadata.has_gateway_routing_fields;
+    let request_stream = metadata.stream;
+    let max_output_tokens = metadata.max_output_tokens;
+    let prompt_bytes = metadata.prompt_bytes;
     if let Err(err) = policy::check_images(&body, &active.config.server) {
         return error(err.status(), err.code(), err.message());
     }
@@ -527,7 +596,11 @@ async fn route_request(
         );
     }
     let request_id = RequestId(Arc::from(uuid::Uuid::new_v4().to_string()));
-    let upstream_body = if metadata.has_gateway_routing_fields {
+    let mut replay = match captured {
+        body_spool::CapturedBody::Memory(_) => None,
+        body_spool::CapturedBody::Spooled(spooled) => Some(spooled),
+    };
+    let upstream_body = if has_gateway_routing_fields {
         let Some(clean) = without_gateway_routing_fields(&body) else {
             return error(
                 StatusCode::BAD_REQUEST,
@@ -539,6 +612,12 @@ async fn route_request(
     } else {
         body.clone()
     };
+    if has_gateway_routing_fields && replay.is_some() {
+        match body_spool::copy_to_spool(store.clone(), upstream_body.clone()).await {
+            Ok(spooled) => replay = Some(spooled),
+            Err(error) => return capture_error(error),
+        }
+    }
     let mut anthropic_headers = HeaderMap::new();
     if format == InboundFormat::AnthropicMessages {
         for name in ["anthropic-version", "anthropic-beta"] {
@@ -550,26 +629,43 @@ async fn route_request(
     // The record describes the inbound request; a middle-out retry sends a
     // truncated body but must not shrink the logged image count.
     let image_count = policy::count_images(upstream_body.as_ref());
-    let request = |body: Bytes, prompt_bytes: u64| GatewayRequest {
-        format,
-        model: model.clone(),
-        stream: metadata.stream,
-        est_input_tokens: u32::try_from(prompt_bytes.div_ceil(4)).unwrap_or(u32::MAX),
-        max_output_tokens: metadata.max_output_tokens,
-        context_overflow,
-        free_only,
-        image_count,
-        body,
-        anthropic_headers: anthropic_headers.clone(),
-        request_id: request_id.clone(),
-        end_user: end_user.clone(),
-        client_key: Some(client_key.fingerprint.clone()),
+    drop(body);
+    let inline_body = if replay.is_some() {
+        drop(upstream_body);
+        None
+    } else {
+        Some(upstream_body)
+    };
+    let request = |body: Bytes, prompt_bytes: u64| {
+        let estimate = u32::try_from(prompt_bytes.div_ceil(4)).unwrap_or(u32::MAX);
+        GatewayRequest {
+            format,
+            model: model.clone(),
+            stream: request_stream,
+            est_input_tokens: if format == InboundFormat::OpenAiChat {
+                estimate.max(MINIMAL_OPENAI_CHAT_COST)
+            } else {
+                estimate
+            },
+            max_output_tokens,
+            context_overflow,
+            free_only,
+            image_count,
+            body,
+            anthropic_headers: anthropic_headers.clone(),
+            request_id: request_id.clone(),
+            end_user: end_user.clone(),
+            client_key: Some(client_key.fingerprint.clone()),
+        }
     };
 
     let mut dropped = 0;
     let mut result = active
         .executor
-        .execute_attributed(request(upstream_body.clone(), metadata.prompt_bytes))
+        .execute_attributed_with_replay(
+            request(inline_body.clone().unwrap_or_default(), prompt_bytes),
+            replay.clone(),
+        )
         .await;
     if let Err(RoutedError {
         error:
@@ -581,17 +677,57 @@ async fn route_request(
         ..
     }) = result
     {
-        if let Some(truncated) = truncate_middle_for_format(
-            &upstream_body,
-            metadata.prompt_bytes,
-            metadata.max_output_tokens,
-            limit,
-            format,
-        ) {
+        let truncated = {
+            let truncate_source = match &inline_body {
+                Some(body) => body.clone(),
+                None => match body_spool::read_spool_bytes(
+                    replay.as_ref().expect("spooled body replay").clone(),
+                )
+                .await
+                {
+                    Ok(body) => body,
+                    Err(error) => return capture_error(error),
+                },
+            };
+            truncate_middle_for_format(
+                &truncate_source,
+                prompt_bytes,
+                max_output_tokens,
+                limit,
+                format,
+            )
+        };
+        if let Some(truncated) = truncated {
             dropped = truncated.dropped;
+            let truncated_prompt_bytes = truncated.prompt_bytes;
+            let truncated_source = truncated.body;
+            drop(inline_body);
+            let truncated_replay =
+                if replay.is_some() {
+                    let spooled =
+                        match body_spool::copy_to_spool(store.clone(), truncated_source.clone())
+                            .await
+                        {
+                            Ok(spooled) => spooled,
+                            Err(error) => return capture_error(error),
+                        };
+                    drop(replay);
+                    Some(spooled)
+                } else {
+                    None
+                };
+            let truncated_body = if truncated_replay.is_some() {
+                drop(truncated_source);
+                Bytes::new()
+            } else {
+                truncated_source
+            };
             result = active
                 .executor
-                .execute_attributed(request(truncated.body, truncated.prompt_bytes))
+                .execute_attributed_with_replay(
+                    request(truncated_body, truncated_prompt_bytes),
+                    truncated_replay,
+                )
                 .await;
         }
     }
@@ -722,6 +858,31 @@ fn matched_key(
             index,
             fingerprint: key_fingerprint(keys, &keys[index]),
         })
+}
+
+fn traffic_class_map(
+    server: &llmux_config::ServerConfig,
+) -> std::collections::HashMap<Arc<str>, TrafficClass> {
+    let mut seen = std::collections::HashSet::new();
+    server
+        .client_keys
+        .iter()
+        .enumerate()
+        .filter_map(|(index, key)| {
+            let fingerprint = key_fingerprint(&server.client_keys, key);
+            // Duplicate key values authenticate as their first entry; later
+            // copies must not overwrite that entry's accounting class.
+            if !seen.insert(fingerprint.clone()) {
+                return None;
+            }
+            let class = server
+                .key_policies
+                .get(index)
+                .and_then(Option::as_ref)?
+                .traffic_class?;
+            Some((fingerprint, class))
+        })
+        .collect()
 }
 
 fn key_fingerprint(keys: &[Arc<str>], key: &Arc<str>) -> Arc<str> {
@@ -930,6 +1091,91 @@ fn json_body(status: StatusCode, body: Body) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::{BodyExt, Full};
+    use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+    use llmux_testkit::TestServer;
+    use std::fs;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn oversized_body_is_rejected_before_a_devin_catalog_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = dir.path().join("client");
+        fs::write(&client, "client-key\n").unwrap();
+        let binary = dir.path().join("devin");
+        fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let config = format!(
+            r#"
+[server]
+client_keys = ["file:{}"]
+max_request_bytes = 64
+
+[[models]]
+name = "retired"
+
+[[models.deployments]]
+id = "retired-devin"
+auth = "none"
+provider = "devin_acp"
+billing = "free"
+upstream_model = "swe-2-retired"
+priority = 0
+"#,
+            client.display()
+        );
+        let (router, state) = app_with_state(
+            RuntimeConfig::parse(&config).unwrap(),
+            None,
+            DevinAcpConfig {
+                binary,
+                home: dir.path().to_owned(),
+                turn_timeout: Duration::from_secs(10),
+            },
+        )
+        .await
+        .unwrap();
+        let server = TestServer::start(router).await.unwrap();
+        let payload = json!({
+            "model": "retired",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "pad": "x".repeat(64)
+        })
+        .to_string();
+        assert!(payload.len() > 64);
+        let request = http::Request::post(format!("{}/v1/chat/completions", server.url()))
+            .header(header::AUTHORIZATION, "Bearer client-key")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(payload)))
+            .unwrap();
+
+        let response = timeout(
+            Duration::from_secs(5),
+            Client::builder(TokioExecutor::new())
+                .build_http()
+                .request(request),
+        )
+        .await
+        .expect("oversized request timed out")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = timeout(Duration::from_secs(5), response.into_body().collect())
+            .await
+            .unwrap()
+            .unwrap()
+            .to_bytes();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["error"]["message"], "Request body too large");
+        assert_eq!(payload["error"]["code"], "invalid_request_error");
+        assert!(
+            !state.catalog.refresh_was_started(),
+            "the size rejection must happen before a catalog refresh is scheduled"
+        );
+    }
 
     #[test]
     fn key_fingerprint_survives_key_reorder() {

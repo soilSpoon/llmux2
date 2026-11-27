@@ -174,6 +174,9 @@ async fn reload(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     state.catalog.set_config(devin.clone());
     match build(config, devin, state.catalog.live()).await {
         Ok((config, executor)) => {
+            state
+                .spool
+                .set_budget(config.server.request_body_spool_budget_bytes);
             let models: Vec<String> = config
                 .models
                 .iter()
@@ -190,6 +193,11 @@ async fn reload(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
                 (
                     "drain_grace",
                     previous.config.server.drain_grace != config.server.drain_grace,
+                ),
+                (
+                    "request_body_spool_dir",
+                    previous.config.server.request_body_spool_dir
+                        != config.server.request_body_spool_dir,
                 ),
             ];
             let warnings: Vec<String> = restart_only

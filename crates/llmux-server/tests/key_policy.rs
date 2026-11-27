@@ -1,11 +1,24 @@
-use axum::{body::Bytes, extract::State, routing::post, Json, Router};
+use axum::{
+    body::Bytes,
+    extract::State,
+    response::{IntoResponse, Response},
+    routing::post,
+    Json, Router,
+};
 use http::{header, Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use llmux_config::RuntimeConfig;
 use llmux_testkit::TestServer;
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::{
+    sync::Notify,
+    time::{advance, pause, resume},
+};
 
 async fn upstream(
     State(seen): State<Arc<Mutex<Vec<Value>>>>,
@@ -85,7 +98,12 @@ async fn fixture() -> (
     (dir, remote, gateway, seen)
 }
 
-async fn chat(gateway: &str, key: &str, model: &str) -> (StatusCode, Value) {
+async fn chat_with_content(
+    gateway: &str,
+    key: &str,
+    model: &str,
+    content: &str,
+) -> (StatusCode, Value) {
     let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
     let response = client
         .request(
@@ -93,7 +111,8 @@ async fn chat(gateway: &str, key: &str, model: &str) -> (StatusCode, Value) {
                 .header(header::AUTHORIZATION, format!("Bearer {key}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Full::new(Bytes::from(
-                    json!({"model":model,"messages":[{"role":"user","content":"hi"}]}).to_string(),
+                    json!({"model":model,"messages":[{"role":"user","content":content}]})
+                        .to_string(),
                 )))
                 .unwrap(),
         )
@@ -103,6 +122,14 @@ async fn chat(gateway: &str, key: &str, model: &str) -> (StatusCode, Value) {
     let body =
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     (status, body)
+}
+
+async fn chat(gateway: &str, key: &str, model: &str) -> (StatusCode, Value) {
+    chat_with_content(gateway, key, model, "hi").await
+}
+
+async fn empty_chat(gateway: &str, key: &str, model: &str) -> (StatusCode, Value) {
+    chat_with_content(gateway, key, model, "").await
 }
 
 fn seen_models(seen: &Arc<Mutex<Vec<Value>>>) -> Vec<String> {
@@ -353,6 +380,706 @@ async fn free_only_key_sees_no_billed_only_models() {
     let response = client.request(messages("mixed", "ci-key")).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(seen_models(&seen), ["up-mixed-free"]);
+}
+
+fn free_only_quota_config(url: &str, dir: &std::path::Path) -> String {
+    for (file, value) in [("owner", "owner-key"), ("ci", "ci-key")] {
+        std::fs::write(dir.join(file), value).unwrap();
+    }
+    let dir = dir.display();
+    format!(
+        r#"
+[server]
+client_keys = ["file:{dir}/owner", "file:{dir}/ci"]
+
+[[server.key_policies]]
+key = "file:{dir}/ci"
+free_only = true
+
+[[models]]
+name = "quota-draining"
+[[models.deployments]]
+id = "free-quota"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-free-quota"
+billing = "free"
+quota = {{ rpm = 1 }}
+"#
+    )
+}
+
+#[tokio::test]
+async fn exhausted_free_leg_stops_counting_for_the_free_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let remote = TestServer::start(
+        Router::new()
+            .route("/v1/chat/completions", post(upstream))
+            .with_state(seen.clone()),
+    )
+    .await
+    .unwrap();
+    let gateway = TestServer::start(
+        llmux_server::app(
+            RuntimeConfig::parse(&free_only_quota_config(&remote.url(), dir.path())).unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let gateway = gateway.url();
+
+    assert_eq!(listed(&gateway, "ci-key").await, ["quota-draining"]);
+    let (status, _) = chat(&gateway, "ci-key", "quota-draining").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(seen_models(&seen), ["up-free-quota"]);
+
+    let (status, _) = chat(&gateway, "ci-key", "quota-draining").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        seen_models(&seen),
+        ["up-free-quota"],
+        "no second upstream call"
+    );
+
+    let empty: Vec<String> = Vec::new();
+    assert_eq!(listed(&gateway, "ci-key").await, empty);
+    assert_eq!(listed(&gateway, "owner-key").await, ["quota-draining"]);
+}
+
+struct CoolingUpstream {
+    seen: Mutex<Vec<Value>>,
+}
+
+async fn cooling_upstream(
+    State(state): State<Arc<CoolingUpstream>>,
+    Json(body): Json<Value>,
+) -> Response {
+    state.seen.lock().unwrap().push(body);
+    if state.seen.lock().unwrap().len() == 1 {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "3600")],
+        )
+            .into_response()
+    } else {
+        Json(json!({
+            "id":"ok","object":"chat.completion",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+        }))
+        .into_response()
+    }
+}
+
+fn free_only_cooldown_config(url: &str, dir: &std::path::Path) -> String {
+    for (file, value) in [("owner", "owner-key"), ("ci", "ci-key")] {
+        std::fs::write(dir.join(file), value).unwrap();
+    }
+    let dir = dir.display();
+    format!(
+        r#"
+[server]
+client_keys = ["file:{dir}/owner", "file:{dir}/ci"]
+
+[[server.key_policies]]
+key = "file:{dir}/ci"
+free_only = true
+
+[[models]]
+name = "cooling-free"
+[[models.deployments]]
+id = "cooling-free"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-cooling-free"
+billing = "free"
+"#
+    )
+}
+
+#[tokio::test]
+async fn cooling_free_leg_leaves_and_returns_to_the_free_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream_state = Arc::new(CoolingUpstream {
+        seen: Mutex::new(Vec::new()),
+    });
+    let remote = TestServer::start(
+        Router::new()
+            .route("/v1/chat/completions", post(cooling_upstream))
+            .with_state(upstream_state.clone()),
+    )
+    .await
+    .unwrap();
+    let gateway = TestServer::start(
+        llmux_server::app(
+            RuntimeConfig::parse(&free_only_cooldown_config(&remote.url(), dir.path())).unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let gateway = gateway.url();
+
+    assert_eq!(listed(&gateway, "ci-key").await, ["cooling-free"]);
+    let (status, body) = chat(&gateway, "ci-key", "cooling-free").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(upstream_state.seen.lock().unwrap().len(), 1);
+
+    let empty: Vec<String> = Vec::new();
+    assert_eq!(
+        listed(&gateway, "ci-key").await,
+        empty,
+        "cooling free leg still counted for the free catalog"
+    );
+    assert_eq!(listed(&gateway, "owner-key").await, ["cooling-free"]);
+
+    pause();
+    advance(Duration::from_secs(3601)).await;
+    resume();
+
+    assert_eq!(listed(&gateway, "ci-key").await, ["cooling-free"]);
+    let (status, body) = chat(&gateway, "ci-key", "cooling-free").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(upstream_state.seen.lock().unwrap().len(), 2);
+}
+
+struct DelayState {
+    entered: Notify,
+    release: Notify,
+    seen: Mutex<Vec<Value>>,
+}
+
+async fn delayed_upstream(
+    State(state): State<Arc<DelayState>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    state.entered.notify_one();
+    state.release.notified().await;
+    state.seen.lock().unwrap().push(body);
+    Json(json!({
+        "id":"ok","object":"chat.completion",
+        "choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+    }))
+}
+
+fn free_only_concurrency_config(url: &str, dir: &std::path::Path) -> String {
+    for (file, value) in [("owner", "owner-key"), ("ci", "ci-key")] {
+        std::fs::write(dir.join(file), value).unwrap();
+    }
+    let dir = dir.display();
+    format!(
+        r#"
+[server]
+client_keys = ["file:{dir}/owner", "file:{dir}/ci"]
+
+[[server.key_policies]]
+key = "file:{dir}/ci"
+free_only = true
+
+[[models]]
+name = "busy-free"
+[[models.deployments]]
+id = "busy-free"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-busy-free"
+billing = "free"
+quota = {{ concurrent = 1 }}
+"#
+    )
+}
+
+#[tokio::test]
+async fn full_concurrency_hides_then_releases_the_free_catalog_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream_state = Arc::new(DelayState {
+        entered: Notify::new(),
+        release: Notify::new(),
+        seen: Mutex::new(Vec::new()),
+    });
+    let remote = TestServer::start(
+        Router::new()
+            .route("/v1/chat/completions", post(delayed_upstream))
+            .with_state(upstream_state.clone()),
+    )
+    .await
+    .unwrap();
+    let gateway = TestServer::start(
+        llmux_server::app(
+            RuntimeConfig::parse(&free_only_concurrency_config(&remote.url(), dir.path())).unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let gateway = gateway.url();
+
+    assert_eq!(listed(&gateway, "ci-key").await, ["busy-free"]);
+    let first_gateway = gateway.clone();
+    let first = tokio::spawn(async move { chat(&first_gateway, "ci-key", "busy-free").await });
+    upstream_state.entered.notified().await;
+
+    let empty: Vec<String> = Vec::new();
+    assert_eq!(
+        listed(&gateway, "ci-key").await,
+        empty,
+        "busy free leg stayed advertised while its only concurrency slot was full"
+    );
+    assert_eq!(listed(&gateway, "owner-key").await, ["busy-free"]);
+    let (status, body) = chat(&gateway, "ci-key", "busy-free").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(upstream_state.seen.lock().unwrap().len(), 0);
+    upstream_state.release.notify_one();
+
+    let (first_status, first_body) = first.await.unwrap();
+    assert_eq!(first_status, StatusCode::OK, "{first_body}");
+    assert_eq!(listed(&gateway, "ci-key").await, ["busy-free"]);
+}
+
+async fn no_api_allowance_upstream(
+    State(seen): State<Arc<Mutex<Vec<Value>>>>,
+    Json(body): Json<Value>,
+) -> Response {
+    seen.lock().unwrap().push(body);
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"error":{"code":"no_api_allowance","message":"no api allowance"}})),
+    )
+        .into_response()
+}
+
+fn free_only_expiry_parking_config(url: &str, dir: &std::path::Path) -> String {
+    for (file, value) in [("owner", "owner-key"), ("ci", "ci-key")] {
+        std::fs::write(dir.join(file), value).unwrap();
+    }
+    let dir = dir.display();
+    format!(
+        r#"
+[server]
+client_keys = ["file:{dir}/owner", "file:{dir}/ci"]
+
+[[server.key_policies]]
+key = "file:{dir}/ci"
+free_only = true
+
+[[models]]
+name = "expired-free"
+[[models.deployments]]
+id = "expired-free"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-expired-free"
+billing = "free"
+expires_at = 2000-01-01T00:00:00Z
+
+[[models]]
+name = "parking-free"
+[[models.deployments]]
+id = "parking-free"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-parking-free"
+billing = "free"
+"#
+    )
+}
+
+#[tokio::test]
+async fn expired_and_parked_free_legs_leave_the_free_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let remote = TestServer::start(
+        Router::new()
+            .route("/v1/chat/completions", post(no_api_allowance_upstream))
+            .with_state(seen.clone()),
+    )
+    .await
+    .unwrap();
+    let gateway = TestServer::start(
+        llmux_server::app(
+            RuntimeConfig::parse(&free_only_expiry_parking_config(&remote.url(), dir.path()))
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let gateway = gateway.url();
+
+    assert_eq!(listed(&gateway, "ci-key").await, ["parking-free"]);
+    assert_eq!(
+        listed(&gateway, "owner-key").await,
+        ["expired-free", "parking-free"]
+    );
+
+    let (_status, _body) = chat(&gateway, "ci-key", "parking-free").await;
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "parking probe missed upstream"
+    );
+
+    let empty: Vec<String> = Vec::new();
+    assert_eq!(
+        listed(&gateway, "ci-key").await,
+        empty,
+        "expired or parked free legs still counted for the free catalog"
+    );
+    assert_eq!(
+        listed(&gateway, "owner-key").await,
+        ["expired-free", "parking-free"]
+    );
+}
+
+fn free_only_token_window_config(url: &str, dir: &std::path::Path) -> String {
+    for (file, value) in [
+        ("owner", "owner-key"),
+        ("ci", "ci-key"),
+        ("token-cred", "synthetic-token-cred"),
+    ] {
+        std::fs::write(dir.join(file), value).unwrap();
+    }
+    let dir = dir.display();
+    format!(
+        r#"
+[server]
+client_keys = ["file:{dir}/owner", "file:{dir}/ci"]
+
+[[server.key_policies]]
+key = "file:{dir}/ci"
+free_only = true
+
+[[shared_quotas]]
+name = "token-family"
+tpm = 6
+
+[[credentials]]
+id = "token-cred"
+kind = "api_key"
+provider = "openai_compat"
+key = "file:{dir}/token-cred"
+quota = {{ tpd = 6 }}
+
+[[models]]
+name = "deployment-token-starved"
+[[models.deployments]]
+id = "deployment-token"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-deployment-token"
+billing = "free"
+quota = {{ tpm = 6 }}
+
+[[models]]
+name = "deployment-token-tight"
+[[models.deployments]]
+id = "deployment-token-tight"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-deployment-token-tight"
+billing = "free"
+quota = {{ tpm = 9 }}
+
+[[models]]
+name = "deployment-token-exact"
+[[models.deployments]]
+id = "deployment-token-exact"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-deployment-token-exact"
+billing = "free"
+quota = {{ tpm = 10 }}
+
+[[models]]
+name = "credential-token-starved"
+[[models.deployments]]
+id = "credential-token"
+credential = "token-cred"
+base_url = "{url}/v1"
+upstream_model = "up-credential-token"
+billing = "free"
+
+[[models]]
+name = "shared-token-starved"
+[[models.deployments]]
+id = "shared-token"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-shared-token"
+billing = "free"
+shared_quota = "token-family"
+"#
+    )
+}
+
+#[tokio::test]
+async fn token_starved_free_legs_stop_counting_for_the_free_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let remote = TestServer::start(
+        Router::new()
+            .route("/v1/chat/completions", post(upstream))
+            .with_state(seen.clone()),
+    )
+    .await
+    .unwrap();
+    let gateway = TestServer::start(
+        llmux_server::app(
+            RuntimeConfig::parse(&free_only_token_window_config(&remote.url(), dir.path()))
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let gateway = gateway.url();
+
+    for model in [
+        "deployment-token-starved",
+        "credential-token-starved",
+        "shared-token-starved",
+        "deployment-token-tight",
+        "deployment-token-exact",
+    ] {
+        assert!(listed(&gateway, "ci-key").await.contains(&model.to_owned()));
+    }
+
+    // A lower boundary: after the first minimal chat the tight model has four
+    // units left. A cost-1 probe would still admit, but another minimal chat
+    // must not, so the model must leave the catalog.
+    let tight = "deployment-token-tight";
+    let before = seen.lock().unwrap().len();
+    let (status, _) = chat(&gateway, "ci-key", tight).await;
+    assert_eq!(status, StatusCode::OK, "{tight}: first minimal chat");
+    assert_eq!(seen.lock().unwrap().len(), before + 1);
+    let (status, _) = chat(&gateway, "ci-key", tight).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{tight}: four units cannot admit another minimal chat"
+    );
+    assert_eq!(seen.lock().unwrap().len(), before + 1);
+    assert!(!listed(&gateway, "ci-key").await.contains(&tight.to_owned()));
+
+    // A positive boundary: after the first minimal chat the exact model has
+    // five units left, exactly the minimum OpenAI chat admission cost, so it
+    // must remain advertised and admit the second minimal chat.
+    let exact = "deployment-token-exact";
+    let before = seen.lock().unwrap().len();
+    let (status, _) = chat(&gateway, "ci-key", exact).await;
+    assert_eq!(status, StatusCode::OK, "{exact}: first minimal chat");
+    assert_eq!(seen.lock().unwrap().len(), before + 1);
+    assert!(listed(&gateway, "ci-key").await.contains(&exact.to_owned()));
+    let (status, _) = chat(&gateway, "ci-key", exact).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{exact}: exact remaining minimum cost"
+    );
+    assert_eq!(seen.lock().unwrap().len(), before + 2);
+
+    let mut wrongly_advertised = Vec::new();
+    for model in [
+        "deployment-token-starved",
+        "credential-token-starved",
+        "shared-token-starved",
+    ] {
+        let before = seen.lock().unwrap().len();
+        let (status, _) = chat(&gateway, "ci-key", model).await;
+        assert_eq!(status, StatusCode::OK, "{model}: first minimal chat");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            before + 1,
+            "{model}: first chat reached upstream"
+        );
+
+        let (status, _) = chat(&gateway, "ci-key", model).await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{model}: second minimal chat has only one token unit left"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            before + 1,
+            "{model}: token-starved second chat made an upstream call"
+        );
+        if listed(&gateway, "ci-key").await.contains(&model.to_owned()) {
+            wrongly_advertised.push(model);
+        }
+    }
+    assert!(
+        wrongly_advertised.is_empty(),
+        "token-starved models still advertised: {wrongly_advertised:?}"
+    );
+}
+
+fn free_only_tiny_context_config(url: &str, dir: &std::path::Path) -> String {
+    for (file, value) in [("owner", "owner-key"), ("ci", "ci-key")] {
+        std::fs::write(dir.join(file), value).unwrap();
+    }
+    let dir = dir.display();
+    format!(
+        r#"
+[server]
+client_keys = ["file:{dir}/owner", "file:{dir}/ci"]
+
+[[server.key_policies]]
+key = "file:{dir}/ci"
+free_only = true
+
+[[models]]
+name = "tiny-context"
+[[models.deployments]]
+id = "tiny-context"
+auth = "none"
+provider = "openai_compat"
+base_url = "{url}/v1"
+upstream_model = "up-tiny-context"
+billing = "free"
+max_context = 4
+"#
+    )
+}
+
+#[tokio::test]
+async fn context_too_small_for_minimal_chat_is_not_advertised() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let remote = TestServer::start(
+        Router::new()
+            .route("/v1/chat/completions", post(upstream))
+            .with_state(seen.clone()),
+    )
+    .await
+    .unwrap();
+    let gateway = TestServer::start(
+        llmux_server::app(
+            RuntimeConfig::parse(&free_only_tiny_context_config(&remote.url(), dir.path()))
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let gateway = gateway.url();
+
+    assert!(
+        !listed(&gateway, "ci-key")
+            .await
+            .contains(&"tiny-context".to_owned()),
+        "max_context=4 cannot fit the minimal OpenAI chat cost but was advertised"
+    );
+    let (status, body) = chat(&gateway, "ci-key", "tiny-context").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "max_context=4 minimal chat: {body}"
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        0,
+        "max_context=4 chat reached upstream"
+    );
+}
+
+fn token_floor_config(url: &str, dir: &std::path::Path, cap: u32) -> String {
+    for (file, value) in [
+        ("owner", "owner-key"),
+        ("ci", "ci-key"),
+        ("token-cred", "synthetic-token-cred"),
+    ] {
+        std::fs::write(dir.join(file), value).unwrap();
+    }
+    let dir = dir.display();
+    format!(
+        r#"
+[server]
+client_keys = ["file:{dir}/owner", "file:{dir}/ci"]
+
+[[server.key_policies]]
+key = "file:{dir}/ci"
+free_only = true
+
+[[credentials]]
+id = "token-cred"
+kind = "api_key"
+provider = "openai_compat"
+key = "file:{dir}/token-cred"
+quota = {{ tpm = {cap} }}
+
+[[models]]
+name = "token-floor"
+[[models.deployments]]
+id = "token-floor"
+credential = "token-cred"
+base_url = "{url}/v1"
+upstream_model = "up-token-floor"
+billing = "free"
+"#
+    )
+}
+
+#[tokio::test]
+async fn subfive_openai_chat_estimates_use_the_five_token_floor() {
+    for cap in [4_u32, 5] {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let remote = TestServer::start(
+            Router::new()
+                .route("/v1/chat/completions", post(upstream))
+                .with_state(seen.clone()),
+        )
+        .await
+        .unwrap();
+        let gateway = TestServer::start(
+            llmux_server::app(
+                RuntimeConfig::parse(&token_floor_config(&remote.url(), dir.path(), cap)).unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let gateway = gateway.url();
+
+        let advertised = listed(&gateway, "ci-key")
+            .await
+            .contains(&"token-floor".to_owned());
+        let (status, body) = empty_chat(&gateway, "ci-key", "token-floor").await;
+        let upstream_calls = seen.lock().unwrap().len();
+        if cap == 4 {
+            assert!(!advertised, "cap 4 advertised a sub-five-token chat");
+            assert_eq!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "cap 4 empty chat: {body}"
+            );
+            assert_eq!(upstream_calls, 0, "cap 4 empty chat reached upstream");
+        } else {
+            assert!(advertised, "cap 5 did not advertise the exact floor cost");
+            assert_eq!(status, StatusCode::OK, "cap 5 empty chat: {body}");
+            assert_eq!(upstream_calls, 1, "cap 5 empty chat missed upstream");
+        }
+    }
 }
 
 fn free_only_cred_config(url: &str, dir: &std::path::Path) -> String {

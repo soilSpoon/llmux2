@@ -35,6 +35,14 @@ llmux2 accepts and discards the CheaperInference routing fields `min_discount_pe
 
 Credentials use `provider = "openai"` or `"openai_compat"` for OpenAI-compatible upstreams, or `provider = "anthropic"` for the Anthropic Messages API. Anthropic deployments use a base URL such as `https://api.anthropic.com/v1` (the adapter appends `/messages`) and send the key as `x-api-key`. The gateway converts chat requests, JSON responses and SSE chunks between the OpenAI Chat and Anthropic formats, so a model can mix both kinds of deployments and fail over between them.
 
+A credential whose account or plan covers only some upstream models may set
+`allowed_upstream_models = ["exact-upstream-id"]`. Every entry must be a
+nonempty, unique exact id; `*` is not allowed. Configuration load then rejects
+any deployment on that credential whose `upstream_model` is outside the list,
+so a plan boundary is enforced before traffic rather than learned from upstream
+errors. A catch-all deployment cannot use such a credential because its upstream
+id is not statically exact.
+
 Use `POST /v1/messages` for Anthropic Messages JSON and SSE on Anthropic deployments. Authenticate with a gateway client key in `x-api-key` or `Authorization: Bearer`.
 
 Deployments may set `headers = { "X-Custom" = "literal value", "X-Secret" = "file:/private/header" }`.
@@ -185,6 +193,41 @@ Rejecting is the default. To trim instead, set `context_overflow = "middle-out"`
 
 `x-llmux-deployment` and `x-llmux-attempts` identify the winning deployment and number of HTTP attempts (not skipped deployments). Set `server.expose_routing_headers = false` to hide them. A stream commits on the first SSE event that carries content, a tool call, a finish reason, or usage, or on `[DONE]`. OpenAI-compat keepalive chunks (`choices: []` with none of those) do not commit and are dropped until then; after commit they are forwarded. An error frame before commit is classified like a non-stream embedded error and can fail over. After commit, failures end the stream with an error payload rather than replaying the request.
 
+### Request body size
+
+`server.max_request_bytes` caps each inbound chat completions, Messages, or
+Responses request body. It is a positive byte count and defaults to 33554432
+(32 MiB). A larger body returns 413 `invalid_request_error` before body
+validation, routing, or any upstream call; a body exactly at the limit is accepted. Zero
+or a negative value is a config error.
+
+Large bodies do not stay in memory while they wait for retries.
+`server.request_body_memory_bytes` (default 1048576, 1 MiB) is the per-request
+ingress buffering threshold. Once another chunk would cross it, the body is
+written incrementally to `server.request_body_spool_dir` (default
+`/var/tmp/llmux2-request-bodies` on Unix). Completed spools are immutable,
+mode 0600 on Unix, and atomically renamed; failover re-reads a fresh copy for
+the next candidate and drops that copy when the candidate is done.
+`server.request_body_spool_budget_bytes` (default 536870912, 512 MiB) is the
+total in-flight disk reservation. Reservations are made before writes, so a
+full budget returns a generic 503 before any upstream call and leaves no
+partial spool. Files are removed on success, error, and cancellation. On Linux
+and macOS, startup sweeps llmux orphans without unlinking locked files
+owned by an overlapping zero-downtime process. Other platforms do not provide
+that overlap-safety guarantee.
+
+The disk budget must fit comfortably within free space on the host; on small
+OCI shapes keep it on a disk-backed filesystem, not tmpfs, with the directory
+writable only by the gateway service user. Admission parsing, per-candidate
+materialization, and provider conversion may still hold full transient copies
+of one body, so spooling bounds ingress buffering and retry accumulation; it
+does not make peak memory independent of body size. The conservative 32 MiB
+default reflects that honest peak-memory model: operators that raise
+`max_request_bytes` must budget several transient copies per concurrent large
+request in addition to the spool disk budget. Spooling is request-side only
+and does not interact with streaming responses. Older binaries reject these
+settings; remove them before rolling back.
+
 ### End-user attribution
 
 Off unless `[server] end_user_header` is set. When the inbound request carries that header, the gateway hashes it and sends the hash as Anthropic `metadata.user_id` and, on `openai` / `openai_compat` deployments, as the Chat Completions `user` field. A client-supplied value is overridden. The raw header is not logged, not copied upstream, and not returned. The response header `x-llmux-end-user` is the hash only, including on gateway errors after the hash is computed, whether or not routing headers are exposed.
@@ -197,7 +240,7 @@ The hash is lowercase hex SHA-256 of the UTF-8 salt bytes immediately followed b
 
 `remote_images` is `allow` (default) or `reject`. `reject` answers 400 `{"error":{"message":"remote image URLs are not accepted; send a data: URL",...}}` before any upstream call when a chat, Messages, or Responses body contains an `http`/`https` `image_url` (object or string) or an Anthropic image source URL. Optional `max_image_bytes` rejects a `data:` image, or a native Anthropic base64 image, whose decoded payload exceeds the limit with 413. A non-positive limit is a config error. Unset means no size cap. Both checks run in one place on the inbound body, not in each adapter.
 
-Before a response is committed, the gateway can fail over on upstream server, connection, and timeout errors within its attempt and time limits. Rate-limit and quota-exhaustion failover are controlled by `routing.fallback_on` and enabled by default. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local request and token quotas use per-deployment sliding windows (one minute for `rpm`/`tpm`, one day for `rpd`/`tpd`) only when configured. Token quotas count the same prompt-plus-output estimate used for context fitting, and a single request larger than a token quota is still admitted when that window is empty. A credential may also set `quota` (`rpm`, `rpd`, `tpm`, `tpd`) for providers that limit per key or project across models; those windows are shared by every deployment that uses the credential.
+Before a response is committed, the gateway can fail over on upstream server, connection, and timeout errors within its attempt and time limits. Rate-limit and quota-exhaustion failover are controlled by `routing.fallback_on` and enabled by default. The server uses bounded JSON bodies and SSE events; request timeouts cover upstream setup/first event, then apply as an idle timeout between events. Local request and token quotas use per-deployment sliding windows (one minute for `rpm`/`tpm`, one day for `rpd`/`tpd`) only when configured. Token quotas count the same prompt-plus-output estimate used for context fitting; for OpenAI chat the input part is floored at 5 estimated tokens, the shared minimal chat admission cost. A single request larger than a token quota is still admitted when that window is empty. A credential may also set `quota` (`rpm`, `rpd`, `tpm`, `tpd`) for providers that limit per key or project across models; those windows are shared by every deployment that uses the credential.
 
 ### Strict OpenAI-compatible upstreams
 
@@ -285,14 +328,25 @@ allow-all-minus-`blocked`; an entry with neither is a config error, as is a
 `*` catch-all is never listed for any key. Older binaries reject
 `key_policies`; remove it when rolling back.
 
+`traffic_class = "ci_buyer_shaped" | "synthetic_probe" | "internal" | "unknown"`
+assigns server-side accounting identity for requests authenticated by that key.
+It is written to the request log as `traffic_class`; callers cannot forge it
+with headers or body fields. A traffic-class-only entry is valid and does not
+change routing or model access. Unclassified authenticated keys are logged as
+`unknown`.
+
 `free_only = true` makes a key free-only: every request behaves as if it sent
 `x-llmux-free-only: true` (billed legs are never eligible), and
 `GET /v1/models` advertises only models with at least one usable free leg — a
-non-fallback deployment marked `billing = "free"` whose credential is not
-disabled. "Free" means zero per-request cost, so subscription- or plan-covered
-legs count too; a model drops from the list when its last free leg is removed
-or its credential is disabled. A `free_only`-only entry needs no `models` or
-`blocked` lists.
+non-fallback deployment marked `billing = "free"` that could admit a minimal
+OpenAI chat request at that instant. Besides credential state, expiry,
+parking, stale live-catalog ids, context fit, and format support, this
+includes cooldown, local quota, and concurrency state. "Free" means zero
+per-request cost, so subscription- or plan-covered legs count too; a model
+drops from the list while its last free leg cannot currently admit, and returns when that state
+clears. The list is an admission snapshot, not a guarantee that a larger
+request or one needing unsupported conversion features will fit. A
+`free_only`-only entry needs no `models` or `blocked` lists.
 
 ## Credentials
 

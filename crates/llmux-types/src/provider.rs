@@ -5,11 +5,20 @@
 pub const OPENAI: &str = "openai";
 /// Any OpenAI-compatible chat-completions upstream.
 pub const OPENAI_COMPAT: &str = "openai_compat";
+/// OpenCode's inference gateway. Requests must reproduce the pinned CLI
+/// identity shape; plain OpenAI-compatible callers are a different contract.
+pub const OPENCODE: &str = "opencode";
+/// OpenCode inference base URL used when a deployment omits `base_url`.
+pub const OPENCODE_BASE_URL: &str = "https://opencode.ai/inference/openai/v1";
 /// OpenAI Responses API.
 pub const OPENAI_RESPONSES: &str = "openai_responses";
 /// Anthropic Messages API.
 pub const ANTHROPIC: &str = "anthropic";
 pub const DEEPAI: &str = "deepai";
+/// DeepAI Code's OpenAI-compatible lane at `api.deepai.org/deepai_code`.
+/// `api-key` authenticated, and every request carries the lane version header
+/// `x-deepai-code-theos` (a deployment header, not a credential).
+pub const DEEPAI_CODE: &str = "deepai_code";
 /// Freebuff through the Codebuff Chat Completions API.
 pub const FREEBUFF: &str = "freebuff";
 
@@ -49,9 +58,11 @@ mod tests {
             [
                 OPENAI,
                 OPENAI_COMPAT,
+                OPENCODE,
                 OPENAI_RESPONSES,
                 ANTHROPIC,
                 DEEPAI,
+                DEEPAI_CODE,
                 FREEBUFF,
                 XAI,
                 ANTIGRAVITY,
@@ -62,7 +73,7 @@ mod tests {
             .into_iter()
             .collect::<HashSet<_>>()
             .len(),
-            11
+            13
         );
         assert_eq!(ANTHROPIC_KEY_HEADER, "x-api-key");
     }

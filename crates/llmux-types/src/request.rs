@@ -2,7 +2,31 @@ use crate::{RequestId, UpstreamError};
 use bytes::Bytes;
 use futures_core::Stream;
 use http::{HeaderMap, StatusCode};
+use serde::Deserialize;
 use std::{pin::Pin, sync::Arc};
+
+/// Accounting identity of the authenticated gateway caller. This is never
+/// caller-asserted: the server derives it from the matched client key policy.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrafficClass {
+    CiBuyerShaped,
+    SyntheticProbe,
+    Internal,
+    #[default]
+    Unknown,
+}
+
+impl TrafficClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CiBuyerShaped => "ci_buyer_shaped",
+            Self::SyntheticProbe => "synthetic_probe",
+            Self::Internal => "internal",
+            Self::Unknown => "unknown",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InboundFormat {
@@ -11,6 +35,15 @@ pub enum InboundFormat {
     AnthropicMessages,
 }
 
+/// Minimum admission estimate for an OpenAI chat request. The gateway's
+/// minimal chat shape — one user message carrying the smoke-test text `hi` —
+/// has 17 counted prompt bytes, hence `ceil(17 / 4) = 5`. Routing floors
+/// smaller estimates at this value because the byte estimator omits message
+/// framing and tokenizer overhead; catalog availability probes use the same
+/// floor instead of an imaginary one-token request.
+pub const MINIMAL_OPENAI_CHAT_COST: u32 = 5;
+
+#[derive(Clone)]
 pub struct GatewayRequest {
     pub format: InboundFormat,
     pub model: Arc<str>,

@@ -111,14 +111,25 @@ and alerting report "resets at T" rather than a generic failure.
 
 ### Requirement: No billed legs behind free-only paths
 
-A credential whose plan covers only a subset SHALL be configured so its
-deployments reference only covered upstream models; anything out-of-plan relies
-on `NotProvisioned` as a safety net, not as the primary control. The
-`x-llmux-free-only` request flag SHALL keep excluding `billed` legs.
+A credential whose plan covers only a subset SHALL declare the covered exact
+upstream ids in `allowed_upstream_models`. Entries SHALL be nonempty, unique,
+exact ids — never `*` — and llmux-config SHALL reject every deployment on that
+credential whose `upstream_model` is absent from the list. Because the match is
+exact and static, a catch-all deployment cannot use such a credential. Anything
+out-of-plan relies on `NotProvisioned` only as a safety net, not as the primary
+control. The `x-llmux-free-only` request flag SHALL keep excluding `billed`
+legs.
 
 #### Scenario: Morph plan boundary
 
-WHEN the morph credential's Ultra plan covers `morph-kimik31` and the
-`morph-dsv41flash*` family only
-THEN no deployment on that credential names an out-of-plan upstream model, and
-any missed one dies on `NotProvisioned` without billing attempts piling up.
+WHEN the morph credential's reviewed Ultra scope is the DeepSeek plus Kimi
+K3.1 subset — `morph-kimik31`, `morph-dsv41flash`, `morph-dsv41flash-1017`,
+and privileged-access `morph-dsv41flash-abliterated` — rather than every id
+Morph may mark with Ultra metadata
+THEN a deployment on that credential naming `morph-kimik3`,
+`morph-kimik3-fast`, `morph-kimik3-abliterated`, or any other out-of-scope
+upstream model fails config validation, while the listed Kimi K3.1 and
+DeepSeek ids load. Although the Ultra prose calls `morph-kimik3` a K3.1
+alias, Morph's machine-readable catalog identifies it as `moonshotai/Kimi-K3`
+rather than `moonshotai/Kimi-K3.1-Pro`; exact whitelisting SHALL prefer the
+canonical `morph-kimik31` id over that ambiguous alias.

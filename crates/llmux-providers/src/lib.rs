@@ -13,6 +13,7 @@ pub mod nous_portal;
 pub mod oauth;
 mod openai_compat;
 mod openai_responses;
+pub mod opencode;
 mod responses;
 mod sse;
 mod truncate;
@@ -28,6 +29,7 @@ pub use freebuff::Freebuff;
 pub use llmux_types::{parse_devin_models, DevinModel};
 pub use openai_compat::{OpenAiCompat, RequestMetadata, StaticKey};
 pub use openai_responses::OpenAiResponses;
+pub use opencode::OpenCode;
 pub use truncate::{truncate_middle, truncate_middle_for_format, Truncated};
 pub use xai::Xai;
 

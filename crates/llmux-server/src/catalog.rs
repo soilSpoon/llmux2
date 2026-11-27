@@ -58,6 +58,11 @@ impl Catalog {
         *self.config.lock().expect("devin config") = config;
     }
 
+    #[cfg(test)]
+    pub(crate) fn refresh_was_started(&self) -> bool {
+        self.inner.lock().expect("catalog").last_attempt.is_some()
+    }
+
     pub(crate) fn loaded(&self) -> Option<Arc<HashSet<Arc<str>>>> {
         self.live.get()
     }

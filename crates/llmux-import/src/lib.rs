@@ -1,6 +1,7 @@
 //! Import OmniRoute JSON exports and SQLite table dumps into a static llmux configuration.
 
 mod aliases;
+mod approved_drops;
 mod bridge;
 mod connection;
 mod context;
@@ -10,6 +11,7 @@ mod devin;
 mod direct;
 pub mod discovery;
 mod fallback;
+pub mod fallback_policy;
 mod free_conditions;
 mod morph;
 mod nous;
@@ -59,6 +61,10 @@ pub struct ImportOptions<'a> {
     pub kilo_free_models: Option<&'a Path>,
     pub kilo_key_file: Option<&'a Path>,
     pub openrouter_replacements: bool,
+    /// Treat keyed official Morph connections as Ultra-plan credentials: emit
+    /// only plan-covered upstream models and record that exact allowlist in
+    /// the credential so hand-added out-of-plan legs fail config validation.
+    pub morph_ultra: bool,
     /// Saved `devin models` output; its `Free` rows rank ahead of Devin-plan models.
     pub devin_models: Option<&'a Path>,
     /// Nous Portal login state (`llmux-login nous`) and a saved `GET /v1/models`
@@ -593,10 +599,27 @@ struct Expander<'a> {
     exhausted: bool,
     policy: &'a policy::Policy,
     dead: &'a HashSet<String>,
+    fallback_blocked: &'a mut HashSet<String>,
+}
+
+fn interrupted_direct_model(
+    raw: &str,
+    provider: &upstream::ProviderIdentity,
+    model: &str,
+    nodes: &[Value],
+) -> bool {
+    approved_drops::lookup(raw).is_some()
+        || approved_drops::lookup(model).is_some()
+        || approved_drops::lookup(&format!("{provider}/{model}")).is_some()
+        || nodes.iter().any(|node| {
+            string(node, "id") == provider.as_str()
+                && approved_drops::lookup(&format!("{}/{model}", string(node, "prefix"))).is_some()
+        })
 }
 
 fn references_dead(
     combos: &HashMap<String, Value>,
+    nodes: &[Value],
     name: &str,
     dead: &HashSet<String>,
     visited: &mut HashSet<String>,
@@ -615,15 +638,29 @@ fn references_dead(
             .as_str()
             .unwrap_or_else(|| string(step, "model"))
             .trim();
+        let provider_id = match string(step, "providerId") {
+            "" => string(step, "provider"),
+            id => id,
+        };
         let target = if string(step, "kind") == "combo-ref" {
             string(step, "comboName")
-        } else if combos.contains_key(raw) {
+        } else if string(step, "kind") != "model"
+            && provider_id.is_empty()
+            && combos.contains_key(raw)
+        {
             raw
         } else {
             ""
         };
         if !target.is_empty()
-            && (dead.contains(target) || references_dead(combos, target, dead, visited))
+            && (dead.contains(target) || references_dead(combos, nodes, target, dead, visited))
+        {
+            return true;
+        }
+        if target.is_empty()
+            && upstream::model_target(step, nodes).is_some_and(|(provider, model)| {
+                interrupted_direct_model(raw, &provider, model, nodes)
+            })
         {
             return true;
         }
@@ -692,6 +729,7 @@ impl Expander<'_> {
                     self.warnings.push(format!(
                         "combo {name} step {index}: skipped dead reference {target}"
                     ));
+                    self.fallback_blocked.insert(stack[0].clone());
                     continue;
                 }
                 self.warnings.push(format!("combo {name} step {index}: expanded nested combo {target} inline; nested routing policy is not preserved"));
@@ -704,6 +742,13 @@ impl Expander<'_> {
                 ));
                 continue;
             };
+            if interrupted_direct_model(raw, &p, model, self.nodes) {
+                self.warnings.push(format!(
+                    "combo {name} step {index}: skipped interrupted direct upstream model {raw}"
+                ));
+                self.fallback_blocked.insert(stack[0].clone());
+                continue;
+            }
             let pinned = string(step, "connectionId");
             let allowed = array(step, "allowedConnectionIds");
             if !connection::valid_restrictions(step) {
@@ -1046,25 +1091,28 @@ pub fn import_with_options(
     options: &ImportOptions<'_>,
 ) -> Result<ImportReport, String> {
     let policy = policy::Policy::load(options)?;
-    let mut dead: HashSet<String> = match options.exclude_models {
-        Some(path) => serde_json::from_str::<Vec<String>>(
+    let mut dead: HashSet<String> = approved_drops::USER_APPROVED_DROPS
+        .iter()
+        .map(|drop| drop.spelling.to_owned())
+        .collect();
+    if let Some(path) = options.exclude_models {
+        let listed = serde_json::from_str::<Vec<String>>(
             &fs::read_to_string(path)
                 .map_err(|e| format!("could not read --exclude-models {}: {e}", path.display()))?,
         )
         .ok()
-        .and_then(|list| {
+        .filter(|list| {
             list.iter()
                 .all(|name| !name.is_empty() && !name.contains('*'))
-                .then(|| list.into_iter().collect())
         })
         .ok_or_else(|| {
             format!(
                 "--exclude-models {} must be a JSON array of nonempty model names",
                 path.display()
             )
-        })?,
-        None => HashSet::new(),
-    };
+        })?;
+        dead.extend(listed);
+    }
     let nous = match (options.nous_state, options.nous_models) {
         (None, None) => None,
         (Some(state), Some(models)) => Some(nous::Nous::load(state, models)?),
@@ -1279,7 +1327,11 @@ pub fn import_with_options(
                 }
                 let id = unique(&format!("upstream-{source_id}"), &mut ids);
                 let key = write_secret(&dir, &id, value)?;
-                credentials.push(json!({"id":id,"kind":"api_key","provider":kind,"key":key}));
+                let mut credential = json!({"id":id,"kind":"api_key","provider":kind,"key":key});
+                if policy.morph_ultra && base_url == morph::OFFICIAL_URL {
+                    credential["allowed_upstream_models"] = json!(morph::ULTRA_MODELS);
+                }
+                credentials.push(credential);
                 Some(id)
             }
             connection::SelectedAuth::Oauth(oauth) => {
@@ -1340,6 +1392,7 @@ pub fn import_with_options(
                 None
             }
         };
+        let morph_ultra = policy.morph_ultra && keyed && base_url == morph::OFFICIAL_URL;
         connections.push(Connection {
             headers: Value::Object(header_refs),
             source_id: source_id.into(),
@@ -1354,6 +1407,8 @@ pub fn import_with_options(
                 policy::ModelPolicy::Workers
             } else if policy::kilo(identity) && keyed {
                 policy::ModelPolicy::KiloFree
+            } else if morph_ultra {
+                policy::ModelPolicy::MorphUltra
             } else if kind == KIND_DEEPAI {
                 policy::ModelPolicy::DeepAiText
             } else if kind == KIND_OPENAI_COMPAT
@@ -1530,6 +1585,7 @@ pub fn import_with_options(
         replacements::seed(&mut direct, &connections);
         bridge::seed(&mut direct, nodes, &connections);
     }
+    let mut fallback_blocked = HashSet::new();
     let mut unavailable_combos = HashSet::new();
     if policy.openrouter_replacements {
         let mappings = aliases::sorted_mappings(&root);
@@ -1552,6 +1608,7 @@ pub fn import_with_options(
                     exhausted: false,
                     policy: &policy,
                     dead: &dead,
+                    fallback_blocked: &mut fallback_blocked,
                 }
                 .expand(target, &mut Vec::new(), &mut deployments);
                 if deployments.is_empty() {
@@ -1573,6 +1630,7 @@ pub fn import_with_options(
                                 exhausted: false,
                                 policy: &policy,
                                 dead: &dead,
+                                fallback_blocked: &mut fallback_blocked,
                             }
                             .expand(
                                 target,
@@ -1669,9 +1727,16 @@ pub fn import_with_options(
     let mut deployment_ids = HashSet::new();
     for name in order {
         if dead.contains(&name) {
-            warnings.push(format!(
-                "model {name}: dropped dead route listed in --exclude-models"
-            ));
+            if let Some(drop) = approved_drops::lookup(&name) {
+                warnings.push(format!(
+                    "model {name}: dropped user-approved buyer-visible interruption ({}; {})",
+                    drop.approval, drop.reason
+                ));
+            } else {
+                warnings.push(format!(
+                    "model {name}: dropped dead route listed in --exclude-models"
+                ));
+            }
             continue;
         }
         let lookup = if synthetic.contains_key(&name) {
@@ -1701,6 +1766,7 @@ pub fn import_with_options(
             exhausted: false,
             policy: &policy,
             dead: &dead,
+            fallback_blocked: &mut fallback_blocked,
         }
         .expand(&name, &mut Vec::new(), &mut deployments);
         // Discovered DeepAI Code legs are catalog-free and expand before the
@@ -1721,6 +1787,7 @@ pub fn import_with_options(
                         exhausted: false,
                         policy: &policy,
                         dead: &dead,
+                        fallback_blocked: &mut fallback_blocked,
                     }
                     .expand(&name, &mut Vec::new(), &mut discovered);
                     let mut added = false;
@@ -1773,6 +1840,7 @@ pub fn import_with_options(
                 exhausted: false,
                 policy: &policy,
                 dead: &dead,
+                fallback_blocked: &mut fallback_blocked,
             }
             .expand(&name, &mut Vec::new(), &mut free);
             xplabs::place(&name, &mut deployments, free, &connections, &mut warnings);
@@ -1800,6 +1868,7 @@ pub fn import_with_options(
                     exhausted: false,
                     policy: &policy,
                     dead: &dead,
+                    fallback_blocked: &mut fallback_blocked,
                 }
                 .expand(&name, &mut Vec::new(), &mut deployments);
             }
@@ -1826,7 +1895,7 @@ pub fn import_with_options(
             warnings.push(format!("combo {name}: skipped: no deployments"));
             // A combo that collapsed entirely into dead references is dead
             // itself: the catch-all must not serve its name either.
-            if references_dead(lookup, &name, &dead, &mut HashSet::new()) {
+            if references_dead(lookup, nodes, &name, &dead, &mut HashSet::new()) {
                 dead.insert(name.clone());
             }
             continue;
@@ -1846,6 +1915,14 @@ pub fn import_with_options(
         }
         keep
     });
+    aliases::apply_reviewed_exact_aliases(
+        &root,
+        &combos,
+        &dead,
+        &mut models,
+        &mut aliases,
+        &mut warnings,
+    );
     aliases::attach(&mut models, aliases, &mut warnings);
     context.report(&mut warnings);
     if let (Some(options), Some(exclusions)) = (fallback, fallback_exclusions) {
@@ -1855,6 +1932,7 @@ pub fn import_with_options(
         );
         let mut exclusions = exclusions.clone();
         exclusions.extend(dead.iter().cloned());
+        exclusions.extend(fallback_blocked.iter().cloned());
         let session_excluded = exclusions.clone();
         fallback::append(
             &mut models,
@@ -1959,6 +2037,29 @@ pub fn import_with_options(
                 }
             }
         };
+        let policy = if let Some((mut models, blocked, dropped)) = policy {
+            let removed: Vec<_> = models
+                .iter()
+                .filter(|model| approved_drops::lookup(model).is_some())
+                .cloned()
+                .collect();
+            if !removed.is_empty() {
+                models.retain(|model| approved_drops::lookup(model).is_none());
+                warnings.push(format!(
+                    "client key {i}: removed user-approved interrupted spellings {} from the restricted model allow list",
+                    removed.join(", ")
+                ));
+            }
+            if models.is_empty() {
+                warnings.push(format!(
+                    "client key {i}: skipped restricted key because user-approved interruptions left no allowed models"
+                ));
+                continue;
+            }
+            Some((models, blocked, dropped))
+        } else {
+            None
+        };
         let id = unique(&format!("client-{i}"), &mut ids);
         let key_ref = write_secret(&dir, &id, key["key"].as_str().unwrap())?;
         if let Some((models, blocked, dropped)) = policy {
@@ -2030,18 +2131,63 @@ pub fn import_with_options(
             }
         }
         merge_overlay(&mut config, overlay)?;
-        // Overlay models are routes too: drop the ones the sweep marked dead
-        // and shield their names from the catch-all.
-        if !dead.is_empty() {
-            if let Some(list) = config["models"].as_array_mut() {
-                list.retain(|model| !dead.contains(model["name"].as_str().unwrap_or("")));
-                for model in list.iter_mut() {
-                    if model["name"].as_str() == Some("*") {
-                        if let Some(exclude) = model["exclude"].as_array_mut() {
-                            for name in &dead {
-                                if !exclude.iter().any(|e| e.as_str() == Some(name)) {
-                                    exclude.push(json!(name));
-                                }
+    }
+    // Every assembled model source obeys the same approved-upstream cleanup;
+    // overlay-only filtering leaves catalog additions able to revive drops.
+    if !dead.is_empty() {
+        if let Some(list) = config["models"].as_array_mut() {
+            let mut collapsed = Vec::new();
+            for model in list.iter_mut() {
+                let model_name = string(model, "name").to_owned();
+                let alias_names: Vec<_> = array(model, "aliases")
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+                let mut dropped = Vec::new();
+                if let Some(deployments) =
+                    model.get_mut("deployments").and_then(Value::as_array_mut)
+                {
+                    deployments.retain(|deployment| {
+                        let upstream = string(deployment, "upstream_model");
+                        let keep = approved_drops::lookup(upstream).is_none();
+                        if !keep {
+                            dropped.push(upstream.to_owned());
+                        }
+                        keep
+                    });
+                    if !dropped.is_empty() {
+                        warnings.push(format!(
+                            "model {model_name}: dropped interrupted upstream deployment(s) {}",
+                            dropped.join(", ")
+                        ));
+                        if deployments.is_empty() {
+                            collapsed.push(model_name);
+                            collapsed.extend(alias_names);
+                        }
+                    }
+                }
+            }
+            for spelling in collapsed {
+                if !spelling.is_empty() {
+                    dead.insert(spelling);
+                }
+            }
+            list.retain(|model| !dead.contains(model["name"].as_str().unwrap_or("")));
+            for model in list.iter_mut() {
+                if let Some(aliases) = model.get_mut("aliases").and_then(Value::as_array_mut) {
+                    aliases.retain(|alias| !dead.contains(alias.as_str().unwrap_or("")));
+                }
+                if model["name"].as_str() == Some("*") {
+                    if model.get("exclude").is_none() {
+                        if let Some(object) = model.as_object_mut() {
+                            object.insert("exclude".to_owned(), json!([]));
+                        }
+                    }
+                    if let Some(exclude) = model.get_mut("exclude").and_then(Value::as_array_mut) {
+                        for name in &dead {
+                            if !exclude.iter().any(|e| e.as_str() == Some(name)) {
+                                exclude.push(json!(name));
                             }
                         }
                     }
@@ -2102,6 +2248,18 @@ fn write_canonical_map(
         .values()
         .map(|names| names.as_array().map_or(0, Vec::len))
         .sum();
+    let drop_decisions: Vec<_> = approved_drops::USER_APPROVED_DROPS
+        .iter()
+        .map(|drop| {
+            json!({
+                "spelling": drop.spelling,
+                "action": "drop",
+                "decision_source": "user-approved",
+                "approval": drop.approval,
+                "reason": drop.reason,
+            })
+        })
+        .collect();
     let doc = json!({
         "clusters": map
             .values()
@@ -2110,6 +2268,7 @@ fn write_canonical_map(
         "entries_before": spellings,
         "entries_after": map.len(),
         "map": Value::Object(map),
+        "drop_decisions": drop_decisions,
     });
     std::fs::write(
         path,

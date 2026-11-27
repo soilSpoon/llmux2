@@ -991,6 +991,36 @@ async fn openai_chat_enforces_explicit_stream_usage_options() {
 }
 
 #[tokio::test]
+async fn openai_chat_passthrough_keeps_legacy_duplicate_usage_semantics() {
+    let fixture = Fixture::start(
+        [Reply::InlineUsageStream, Reply::InlineUsageStream],
+        [Reply::InlineUsageStream, Reply::InlineUsageStream],
+        "",
+    )
+    .await;
+    let chunks = |response: Response| async move {
+        let output = body(response).await;
+        output
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str::<Value>(data).unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    let duplicate = r#"{"model":"alias","messages":[{"role":"user","content":"Hello"}],"stream":true,"stream_options":{"include_usage":false,"include_usage":true},"vendor_option":{"model":"leave-me-alone"}}"#;
+    let response = fixture
+        .post("/v1/chat/completions", "test-client", duplicate)
+        .await;
+    check_route(&response, "d1", "1");
+    let duplicate_chunks = chunks(response).await;
+    assert_eq!(duplicate_chunks.len(), 3);
+    assert!(duplicate_chunks[0].get("usage").is_none());
+    assert!(duplicate_chunks[1]["usage"].is_object());
+    assert!(duplicate_chunks[2]["usage"].is_object());
+}
+
+#[tokio::test]
 async fn dashboard_routes_are_absent_unless_configured() {
     let fixture = Fixture::start(
         [Reply::Complete, Reply::Complete],
@@ -1305,14 +1335,6 @@ async fn responses_rejects_invalid_requests_before_contacting_upstream() {
         let payload: Value = serde_json::from_str(&body(response).await).unwrap();
         assert_eq!(payload["error"]["code"], "invalid_request_error");
     }
-    let oversized = fixture
-        .post(
-            "/v1/responses",
-            "test-client",
-            vec![b' '; 2 * 1024 * 1024 + 1],
-        )
-        .await;
-    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(fixture.counts(), [0, 0]);
 }
 

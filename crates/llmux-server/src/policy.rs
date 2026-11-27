@@ -378,6 +378,10 @@ mod tests {
             key_policies: Box::new([]),
             deny: Box::new([]),
             request_timeout: Duration::from_secs(1),
+            max_request_bytes: 32 * 1024 * 1024,
+            request_body_memory_bytes: 1024 * 1024,
+            request_body_spool_dir: std::path::PathBuf::from("/tmp/llmux-policy-test-spool"),
+            request_body_spool_budget_bytes: 512 * 1024 * 1024,
             shutdown_timeout: Duration::from_secs(1),
             drain_grace: Duration::from_millis(0),
             expose_routing_headers: false,
@@ -568,6 +572,7 @@ mod tests {
             models: models.iter().map(|s| s.to_string()).collect(),
             blocked: blocked.iter().map(|s| s.to_string()).collect(),
             free_only: false,
+            traffic_class: None,
         };
         let p = policy(&["claude-*", "vendor/*"], &["vendor/blocked-*"]);
         assert!(allows_model(&p, "claude-x"));

@@ -960,6 +960,11 @@ fn classify_error_details(
     let free_allowance = [code, kind, message.as_str()]
         .iter()
         .any(|marker| normalized_code(marker).contains("free_allowance_used"));
+    // OpenCode Zen rewrites the original upstream code into a `[code]` label
+    // at the start of the message. That label is quota evidence, not a throttle.
+    let free_usage_limit = [code, kind, message.as_str()]
+        .iter()
+        .any(|marker| normalized_code(marker).contains("freeusagelimiterror"));
     // Cloudflare Workers AI reports errors in a top-level `errors[]` array —
     // codes 4006/3036 or the "daily free allocation" phrasing mean the
     // account's daily neuron allocation is spent until 00:00 UTC.
@@ -978,13 +983,23 @@ fn classify_error_details(
         402 => UpstreamError::QuotaExhausted {
             reset_at: quota_reset(now, cf_daily, monthly, wait_raw),
         },
-        429 if quota || free_allowance || daily || cf_daily || monthly => {
+        429 if quota || free_allowance || free_usage_limit || daily || cf_daily || monthly => {
             UpstreamError::QuotaExhausted {
                 reset_at: quota_reset(now, cf_daily, monthly, wait_raw),
             }
         }
         429 => UpstreamError::RateLimited { retry_after: wait },
         401 => UpstreamError::Auth { refreshable: true },
+        // DeepAI Code reports its daily metered balance on the system lane as a
+        // 403 `theos_*` refusal. It refills on a schedule, so it is a spent
+        // quota, not a credential that can never serve.
+        403 if matches!(code, "theos_exhausted" | "theos_insufficient")
+            || matches!(kind, "theos_exhausted" | "theos_insufficient") =>
+        {
+            UpstreamError::QuotaExhausted {
+                reset_at: quota_reset(now, false, false, wait_raw),
+            }
+        }
         403 if body.trim_ascii_start().starts_with(b"<") => UpstreamError::Server { status },
         403 => UpstreamError::Auth { refreshable: false },
         408 => UpstreamError::Timeout,
@@ -1659,6 +1674,42 @@ mod tests {
             parse_duration("999999999999999999999999h"),
             Some(MAX_RESET_HINT)
         );
+    }
+
+    #[test]
+    fn deepai_code_theos_refusals_are_a_spent_quota_not_a_dead_credential() {
+        let now = SystemTime::UNIX_EPOCH;
+        for body in [
+            &br#"{"error":{"code":"theos_exhausted","message":"Daily Theos are spent."}}"#[..],
+            &br#"{"error":{"type":"theos_insufficient","message":"Not enough Theos."}}"#[..],
+        ] {
+            assert!(
+                matches!(
+                    classify_error(
+                        StatusCode::FORBIDDEN,
+                        &HeaderMap::new(),
+                        Bytes::from_static(body),
+                        now
+                    ),
+                    UpstreamError::QuotaExhausted { reset_at: None }
+                ),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        // An account refusal on the same status stays a credential problem, so
+        // the leg parks instead of looking like a quota that refills.
+        assert!(matches!(
+            classify_error(
+                StatusCode::FORBIDDEN,
+                &HeaderMap::new(),
+                Bytes::from_static(
+                    br#"{"error":{"code":"machine_required","message":"Restart DeepAI Code."}}"#
+                ),
+                now
+            ),
+            UpstreamError::Auth { refreshable: false }
+        ));
     }
 
     #[test]

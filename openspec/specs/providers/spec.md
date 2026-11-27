@@ -43,6 +43,46 @@ WHEN a mixed free/paid provider account holds paid credit
 THEN only its free models carry deployments, and paid models are never served
 on that credit — even when every free leg is exhausted.
 
+### Requirement: OpenCode CLI-shaped anonymous inference
+
+An `opencode` deployment SHALL use the native provider adapter, accept
+`auth = "none"` with no credential, and default to
+`https://opencode.ai/inference/openai/v1` when `base_url` is omitted. The
+adapter SHALL reproduce the pinned OpenCode CLI v2.4.2 request shape recorded in
+its embedded protocol artifact: the official leading system prompt followed by
+caller system content, caller tools, OpenAI Chat Completions fields with
+`stream_options.include_usage`, `max_completion_tokens` rather than
+`max_tokens`, no `store` or `prompt_cache_key`, the anonymous public bearer, and
+the recorded CLI identity header set. It SHALL support OpenAI Chat Completions
+passthrough and SHALL pass OpenAI-shaped SSE data frames through without
+reordering, including fragmented tool calls and the `usage.opencode` billing
+block.
+
+Free-tier quota evidence (`FreeUsageLimitError` in any supported envelope, or
+HTTP 402) SHALL be classified as exhausted quota and SHALL NOT fall back to a
+billed or OmniRoute leg for any caller, including an unrestricted key. A 403
+free-tier client-gate refusal SHALL be surfaced to the caller rather than
+treated as a refreshable credential failure. Image inputs SHALL fail as a
+terminal invalid request before any upstream call or fallback because
+`big-pickle` has no image input support. This provider-contract refusal SHALL
+NOT use per-leg unsupported-conversion fallback; ordinary conversion
+incompatibility remains non-terminal for other providers. Client cancellation
+SHALL close the upstream response
+without a compensating request or immediate replay. The adapter SHALL NOT claim
+that the provider's free-tier admission gate is proven; the embedded artifact
+records only the pinned public CLI shape.
+
+#### Scenario: Anonymous deployment opt-in
+
+WHEN a deployment sets `provider = "opencode"` and `auth = "none"`
+THEN the configuration loads without a credential and uses the OpenCode base
+URL if none is configured.
+
+#### Scenario: Existing configuration remains inert
+
+WHEN no deployment names `opencode`
+THEN registering the provider kind changes no existing deployment or request.
+
 ### Requirement: DeepAI text API
 
 The gateway SHALL convert non-streaming Chat Completions requests with one
@@ -50,6 +90,18 @@ user text message for keyed `text-generator` and `summarization` deployments.
 It SHALL reject unsupported options and send the key in
 `Api-Key`, not `Authorization`. DeepAI Code SHALL use the existing
 `openai_compat` adapter when its gateway speaks Chat Completions.
+
+#### Scenario: DeepAI Code lane
+
+WHEN a deployment uses the `deepai_code` provider kind
+THEN the gateway SHALL send the credential as `Api-Key`, never as
+Authorization, and SHALL forward the deployment's configured
+`x-deepai-code-theos` header unchanged, because the lane refuses a request
+without it.
+AND a `403` whose code or type is `theos_exhausted` or `theos_insufficient`
+SHALL be classified as a spent quota rather than an unusable credential, while
+`social_login_required` and `machine_required` SHALL remain credential
+refusals.
 
 #### Scenario: DeepAI text response
 

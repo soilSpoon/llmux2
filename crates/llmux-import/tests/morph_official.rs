@@ -1,6 +1,7 @@
 use llmux_config::RuntimeConfig;
 use llmux_import::ImportOptions;
 use serde_json::{json, Value};
+use std::process::Command;
 
 fn fixture() -> Value {
     json!({
@@ -193,4 +194,103 @@ fn reviewed_flash_combos_move_only_verified_morph_ahead_of_mistral() {
             }
         }
     }
+}
+
+#[test]
+fn morph_ultra_opt_in_filters_out_of_plan_models_and_marks_the_credential() {
+    let mut root = fixture();
+    root["combos"][0]["models"] = json!([
+        "morph/morph-kimik31",
+        "morph/morph-kimik3",
+        "morph/morph-kimik3-fast",
+        "morph/morph-dsv41flash",
+        "morph/morph-dsv41flash-1017",
+        "morph/morph-dsv41flash-abliterated",
+        "morph/morph-v3-fast",
+        "morph/morph-kimik3-abliterated"
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.toml");
+    let report = llmux_import::import_with_options(
+        &root.to_string(),
+        &output,
+        None,
+        &ImportOptions {
+            morph_ultra: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let config = RuntimeConfig::load(&output).unwrap();
+    let model = config
+        .models
+        .iter()
+        .find(|model| model.name.as_ref() == "plain")
+        .unwrap();
+    let upstreams: Vec<_> = model
+        .deployments
+        .iter()
+        .map(|index| &config.deployments[index.0 as usize])
+        .filter(|dep| dep.credential.as_ref() == "upstream-morph")
+        .map(|dep| dep.upstream_model.as_ref())
+        .collect();
+    assert_eq!(
+        upstreams,
+        [
+            "morph-kimik31",
+            "morph-dsv41flash",
+            "morph-dsv41flash-1017",
+            "morph-dsv41flash-abliterated"
+        ]
+    );
+    let emitted = std::fs::read_to_string(&output).unwrap();
+    assert!(emitted.contains("allowed_upstream_models"));
+    assert!(emitted.contains("morph-kimik31"));
+    assert!(!upstreams.contains(&"morph-kimik3"));
+    assert!(report
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("outside the reviewed Morph Ultra scope")));
+
+    let output = dir.path().join("default.toml");
+    llmux_import::import(&root.to_string(), &output, None).unwrap();
+    let config = RuntimeConfig::load(&output).unwrap();
+    assert!(config
+        .deployments
+        .iter()
+        .any(|dep| dep.upstream_model.as_ref() == "morph-v3-fast"));
+}
+
+#[test]
+fn cli_morph_ultra_flag_reaches_the_emitted_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("input.json");
+    let output = dir.path().join("out.toml");
+    std::fs::write(&input, fixture().to_string()).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_llmux-import"))
+        .args(["--input"])
+        .arg(&input)
+        .args(["--output"])
+        .arg(&output)
+        .args(["--morph-ultra"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let emitted = std::fs::read_to_string(&output).unwrap();
+    assert!(emitted.contains("allowed_upstream_models"));
+
+    let duplicate = Command::new(env!("CARGO_BIN_EXE_llmux-import"))
+        .args(["--input"])
+        .arg(&input)
+        .args(["--output"])
+        .arg(&output)
+        .args(["--morph-ultra", "--morph-ultra"])
+        .output()
+        .unwrap();
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("duplicate argument"));
 }

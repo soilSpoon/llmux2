@@ -4,7 +4,7 @@ use http::{HeaderName, Uri};
 use llmux_types::{
     provider, AcpAgentSpec, AcpSessionMode, Billing, CanonicalModel, Capabilities,
     ChatRequestField, ContextOverflow, Deployment, DeploymentIdx, ErrorKind, NousState,
-    ProviderKind, QuotaSpec,
+    ProviderKind, QuotaSpec, TrafficClass,
 };
 use serde::Deserialize;
 use std::{
@@ -19,6 +19,9 @@ use thiserror::Error;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 86_400_000;
+const DEFAULT_MAX_REQUEST_BYTES: u64 = 32 * 1024 * 1024;
+const DEFAULT_REQUEST_BODY_MEMORY_BYTES: u64 = 1024 * 1024;
+const DEFAULT_REQUEST_BODY_SPOOL_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -38,6 +41,14 @@ pub struct ServerConfig {
     /// Glob patterns matching requested model names no key may use.
     pub deny: Box<[String]>,
     pub request_timeout: Duration,
+    /// Maximum accepted inbound request body size in bytes.
+    pub max_request_bytes: usize,
+    /// Inbound bytes buffered in memory before the body rolls over to disk.
+    pub request_body_memory_bytes: usize,
+    /// Directory holding immutable request-body spool files.
+    pub request_body_spool_dir: PathBuf,
+    /// Total bytes of in-flight spooled request bodies admitted at once.
+    pub request_body_spool_budget_bytes: u64,
     pub shutdown_timeout: Duration,
     pub drain_grace: Duration,
     pub expose_routing_headers: bool,
@@ -73,6 +84,8 @@ pub struct KeyPolicy {
     /// Free-only key: requests never route to billed legs, and `/v1/models`
     /// advertises only models with at least one usable free leg.
     pub free_only: bool,
+    /// Server-assigned accounting class for requests authenticated by this key.
+    pub traffic_class: Option<TrafficClass>,
 }
 
 pub struct RoutingConfig {
@@ -190,6 +203,10 @@ struct RawServer {
     listen: SocketAddr,
     client_keys: Vec<String>,
     request_timeout_ms: u64,
+    max_request_bytes: u64,
+    request_body_memory_bytes: u64,
+    request_body_spool_dir: PathBuf,
+    request_body_spool_budget_bytes: u64,
     shutdown_timeout_ms: u64,
     drain_grace_ms: u64,
     expose_routing_headers: bool,
@@ -204,12 +221,24 @@ struct RawServer {
     deny: Vec<String>,
 }
 
+fn default_request_body_spool_dir() -> PathBuf {
+    if cfg!(windows) {
+        std::env::temp_dir().join("llmux2-request-bodies")
+    } else {
+        PathBuf::from("/var/tmp/llmux2-request-bodies")
+    }
+}
+
 impl Default for RawServer {
     fn default() -> Self {
         Self {
             listen: SocketAddr::from(([127, 0, 0, 1], 8080)),
             client_keys: Vec::new(),
             request_timeout_ms: DEFAULT_TIMEOUT_MS,
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            request_body_memory_bytes: DEFAULT_REQUEST_BODY_MEMORY_BYTES,
+            request_body_spool_dir: default_request_body_spool_dir(),
+            request_body_spool_budget_bytes: DEFAULT_REQUEST_BODY_SPOOL_BUDGET_BYTES,
             shutdown_timeout_ms: 60_000,
             drain_grace_ms: 2_000,
             expose_routing_headers: true,
@@ -233,6 +262,7 @@ struct RawKeyPolicy {
     models: Option<Vec<String>>,
     blocked: Option<Vec<String>>,
     free_only: Option<bool>,
+    traffic_class: Option<TrafficClass>,
 }
 
 #[derive(Deserialize)]
@@ -277,6 +307,9 @@ enum RawCredential {
         id: String,
         provider: String,
         key: String,
+        /// Exact upstream model ids this credential's plan covers. When set,
+        /// every deployment referencing the credential must name one of them.
+        allowed_upstream_models: Option<Vec<String>>,
         #[serde(default)]
         quota: QuotaSpec,
         /// Start disabled: routing skips every deployment on this credential
@@ -295,6 +328,9 @@ enum RawCredential {
         resource: Option<String>,
         refresh_skew_ms: Option<u64>,
         request_timeout_ms: Option<u64>,
+        /// Exact upstream model ids this credential's plan covers. When set,
+        /// every deployment referencing the credential must name one of them.
+        allowed_upstream_models: Option<Vec<String>>,
         #[serde(default)]
         quota: QuotaSpec,
         /// Start disabled: routing skips every deployment on this credential
@@ -308,6 +344,9 @@ enum RawCredential {
         state_file: String,
         refresh_skew_ms: Option<u64>,
         request_timeout_ms: Option<u64>,
+        /// Exact upstream model ids this credential's plan covers. When set,
+        /// every deployment referencing the credential must name one of them.
+        allowed_upstream_models: Option<Vec<String>>,
         #[serde(default)]
         quota: QuotaSpec,
         /// Start disabled: routing skips every deployment on this credential
@@ -340,6 +379,9 @@ enum RawCredential {
         /// that require authentication before `session/new` (Antigravity's
         /// `agy acp` uses `oauth-personal`).
         auth_method: Option<String>,
+        /// Exact upstream model ids this credential's plan covers. When set,
+        /// every deployment referencing the credential must name one of them.
+        allowed_upstream_models: Option<Vec<String>>,
         #[serde(default)]
         quota: QuotaSpec,
         /// Start disabled: routing skips every deployment on this credential
@@ -419,6 +461,22 @@ impl RawConfig {
             models,
         } = self;
         let request_timeout = timeout(server.request_timeout_ms)?;
+        if server.max_request_bytes == 0 {
+            return Err(invalid("max_request_bytes must be positive"));
+        }
+        let max_request_bytes = usize::try_from(server.max_request_bytes)
+            .map_err(|_| invalid("max_request_bytes exceeds this platform"))?;
+        if server.request_body_memory_bytes == 0 {
+            return Err(invalid("request_body_memory_bytes must be positive"));
+        }
+        let request_body_memory_bytes = usize::try_from(server.request_body_memory_bytes)
+            .map_err(|_| invalid("request_body_memory_bytes exceeds this platform"))?;
+        if server.request_body_spool_dir.as_os_str().is_empty() {
+            return Err(invalid("request_body_spool_dir must not be empty"));
+        }
+        if server.request_body_spool_budget_bytes == 0 {
+            return Err(invalid("request_body_spool_budget_bytes must be positive"));
+        }
         if server.drain_grace_ms > 10_000 {
             return Err(invalid("server.drain_grace_ms must be between 0 and 10000"));
         }
@@ -506,13 +564,15 @@ impl RawConfig {
         }
         let mut credential_quotas = HashMap::new();
         let mut credential_disabled = HashSet::new();
+        let mut credential_upstream_models: HashMap<Arc<str>, HashSet<Arc<str>>> = HashMap::new();
         for credential in credentials {
-            let (id, provider, quota, disabled) = match &credential {
+            let (id, provider, quota, disabled, allowed_upstream_models) = match &credential {
                 RawCredential::ApiKey {
                     id,
                     provider,
                     quota,
                     disabled,
+                    allowed_upstream_models,
                     ..
                 }
                 | RawCredential::Oauth {
@@ -520,6 +580,7 @@ impl RawConfig {
                     provider,
                     quota,
                     disabled,
+                    allowed_upstream_models,
                     ..
                 }
                 | RawCredential::NousPortal {
@@ -527,6 +588,7 @@ impl RawConfig {
                     provider,
                     quota,
                     disabled,
+                    allowed_upstream_models,
                     ..
                 }
                 | RawCredential::AcpAgent {
@@ -534,8 +596,15 @@ impl RawConfig {
                     provider,
                     quota,
                     disabled,
+                    allowed_upstream_models,
                     ..
-                } => (id, provider, quota.clone(), *disabled),
+                } => (
+                    id,
+                    provider,
+                    quota.clone(),
+                    *disabled,
+                    allowed_upstream_models,
+                ),
             };
             if quota.concurrent.is_some()
                 || [quota.rpm, quota.rpd, quota.tpm, quota.tpd].contains(&Some(0))
@@ -549,6 +618,28 @@ impl RawConfig {
                 return Err(invalid(
                     "credential IDs must be unique and IDs and providers must be nonempty",
                 ));
+            }
+            if let Some(models) = allowed_upstream_models {
+                if models.is_empty() {
+                    return Err(invalid(
+                        "credential allowed_upstream_models must be nonempty when present",
+                    ));
+                }
+                let mut allowed = HashSet::new();
+                for model in models {
+                    if model.is_empty() || model == "*" {
+                        return Err(invalid(
+                            "credential allowed_upstream_models entries must be nonempty exact upstream model ids",
+                        ));
+                    }
+                    let model: Arc<str> = model.as_str().into();
+                    if !allowed.insert(model) {
+                        return Err(invalid(
+                            "credential allowed_upstream_models entries must be unique",
+                        ));
+                    }
+                }
+                credential_upstream_models.insert(id.as_str().into(), allowed);
             }
             let id: Arc<str> = id.as_str().into();
             let provider = ProviderKind(provider.as_str().into());
@@ -836,6 +927,7 @@ impl RawConfig {
                             provider.as_str(),
                             provider::OPENAI
                                 | provider::OPENAI_COMPAT
+                                | provider::OPENCODE
                                 | provider::DEVIN_ACP
                                 | provider::AWS_QUICK
                         ) =>
@@ -889,6 +981,10 @@ impl RawConfig {
                             .then_some("https://api.openai.com/v1")
                     })
                     .or_else(|| {
+                        (provider.0.as_ref() == provider::OPENCODE)
+                            .then_some(provider::OPENCODE_BASE_URL)
+                    })
+                    .or_else(|| {
                         (provider.0.as_ref() == provider::DEVIN_ACP)
                             .then_some(provider::DEVIN_ACP_BASE_URL)
                     })
@@ -908,6 +1004,15 @@ impl RawConfig {
                     return Err(invalid(
                         "upstream_model must be * exactly for catch-all deployments",
                     ));
+                }
+                if let Some(credential) = dep.credential.as_deref() {
+                    if let Some(allowed) = credential_upstream_models.get(credential) {
+                        if !allowed.contains(dep.upstream_model.as_str()) {
+                            return Err(invalid(&format!(
+                                "deployment {id} upstream_model is outside credential {credential}'s allowed_upstream_models"
+                            )));
+                        }
+                    }
                 }
                 if dep.max_context == Some(0) {
                     return Err(invalid("max_context must be positive"));
@@ -988,6 +1093,10 @@ impl RawConfig {
                 key_policies,
                 deny: deny.into_boxed_slice(),
                 request_timeout,
+                max_request_bytes,
+                request_body_memory_bytes,
+                request_body_spool_dir: server.request_body_spool_dir,
+                request_body_spool_budget_bytes: server.request_body_spool_budget_bytes,
                 shutdown_timeout: timeout(server.shutdown_timeout_ms)?,
                 drain_grace: Duration::from_millis(server.drain_grace_ms),
                 expose_routing_headers: server.expose_routing_headers,
@@ -1048,9 +1157,9 @@ fn resolve_key_policies(
         let models = entry.models.unwrap_or_default();
         let blocked = entry.blocked.unwrap_or_default();
         let free_only = entry.free_only.unwrap_or(false);
-        if models.is_empty() && blocked.is_empty() && !free_only {
+        if models.is_empty() && blocked.is_empty() && !free_only && entry.traffic_class.is_none() {
             return Err(invalid(
-                "server.key_policies entries need a nonempty models or blocked list",
+                "server.key_policies entries need a nonempty models or blocked list, free_only, or traffic_class",
             ));
         }
         if models
@@ -1065,6 +1174,7 @@ fn resolve_key_policies(
                 models: models.into(),
                 blocked: blocked.into(),
                 free_only,
+                traffic_class: entry.traffic_class,
             })
             .is_some()
         {
@@ -1375,6 +1485,17 @@ mod tests {
             "auth = \"none\"\nprovider = \"openai_compat\""
         ))
         .is_ok());
+        assert!(
+            super::RuntimeConfig::parse(&config("auth = \"none\"\nprovider = \"opencode\""))
+                .is_ok()
+        );
+        let without_base = config("auth = \"none\"\nprovider = \"opencode\"")
+            .replace("base_url = \"https://example.com/v1\"\n", "");
+        let opencode = super::RuntimeConfig::parse(&without_base).unwrap();
+        assert_eq!(
+            opencode.deployments[0].base_url.to_string(),
+            provider::OPENCODE_BASE_URL
+        );
         for auth in [
             "",
             "provider = \"openai_compat\"",
@@ -1546,6 +1667,51 @@ mod tests {
                 &base.replace("upstream_model =", &format!("{invalid}\nupstream_model ="))
             )
             .is_err());
+        }
+    }
+
+    #[test]
+    fn credential_upstream_model_allowlist_is_exact_and_enforced() {
+        let base = config(REQUIRED);
+        let allowed = base.replace(
+            "provider = \"openai_compat\"",
+            "provider = \"openai_compat\"\nallowed_upstream_models = [\"upstream\", \"other\"]",
+        );
+        assert!(RuntimeConfig::parse(&allowed).is_ok());
+        assert!(RuntimeConfig::parse(&allowed.replace(
+            "upstream_model = \"upstream\"",
+            "upstream_model = \"other\"",
+        ))
+        .is_ok());
+        for input in [
+            allowed.replace(
+                "upstream_model = \"upstream\"",
+                "upstream_model = \"outside\"",
+            ),
+            allowed
+                .replace("name = \"model\"", "name = \"*\"")
+                .replace("upstream_model = \"upstream\"", "upstream_model = \"*\""),
+            allowed.replace(
+                "allowed_upstream_models = [\"upstream\", \"other\"]",
+                "allowed_upstream_models = []",
+            ),
+            allowed.replace(
+                "allowed_upstream_models = [\"upstream\", \"other\"]",
+                "allowed_upstream_models = [\"\"]",
+            ),
+            allowed.replace(
+                "allowed_upstream_models = [\"upstream\", \"other\"]",
+                "allowed_upstream_models = [\"upstream\", \"upstream\"]",
+            ),
+            allowed.replace(
+                "allowed_upstream_models = [\"upstream\", \"other\"]",
+                "allowed_upstream_models = [\"*\"]",
+            ),
+        ] {
+            let err = RuntimeConfig::parse(&input)
+                .err()
+                .unwrap_or_else(|| panic!("accepted {input}"));
+            assert!(err.to_string().contains("allowed_upstream_models"), "{err}");
         }
     }
 
@@ -2015,6 +2181,79 @@ strip_request_fields = {fields}
     }
 
     #[test]
+    fn max_request_bytes_config_is_optional_and_must_be_positive() {
+        let base = config(REQUIRED);
+        let with = |extra: &str| {
+            base.replace(
+                "client_keys = [\"env:LLMUX_CONFIG_OAUTH_TEST_SECRET\"]\n",
+                &format!("client_keys = [\"env:LLMUX_CONFIG_OAUTH_TEST_SECRET\"]\n{extra}\n"),
+            )
+        };
+
+        let default = RuntimeConfig::parse(&base).unwrap();
+        assert_eq!(default.server.max_request_bytes, 32 * 1024 * 1024);
+        let custom = RuntimeConfig::parse(&with("max_request_bytes = 192")).unwrap();
+        assert_eq!(custom.server.max_request_bytes, 192);
+        let err = RuntimeConfig::parse(&with("max_request_bytes = 0"))
+            .err()
+            .expect("zero max_request_bytes config");
+        assert!(
+            err.to_string()
+                .contains("max_request_bytes must be positive"),
+            "{err}"
+        );
+        assert!(RuntimeConfig::parse(&with("max_request_bytes = -1")).is_err());
+    }
+
+    #[test]
+    fn request_body_spool_config_defaults_and_rejects_nonpositive_values() {
+        let base = config(REQUIRED);
+        let with = |extra: &str| {
+            base.replace(
+                "client_keys = [\"env:LLMUX_CONFIG_OAUTH_TEST_SECRET\"]\n",
+                &format!("client_keys = [\"env:LLMUX_CONFIG_OAUTH_TEST_SECRET\"]\n{extra}\n"),
+            )
+        };
+
+        let default = RuntimeConfig::parse(&base).unwrap();
+        assert_eq!(default.server.request_body_memory_bytes, 1024 * 1024);
+        assert_eq!(
+            default.server.request_body_spool_budget_bytes,
+            512 * 1024 * 1024
+        );
+        assert!(!default.server.request_body_spool_dir.as_os_str().is_empty());
+
+        let custom = RuntimeConfig::parse(&with(
+            "request_body_memory_bytes = 4096\nrequest_body_spool_dir = \"/tmp/llmux-test-spool\"\nrequest_body_spool_budget_bytes = 8192",
+        ))
+        .unwrap();
+        assert_eq!(custom.server.request_body_memory_bytes, 4096);
+        assert_eq!(
+            custom.server.request_body_spool_dir,
+            PathBuf::from("/tmp/llmux-test-spool")
+        );
+        assert_eq!(custom.server.request_body_spool_budget_bytes, 8192);
+
+        for (field, message) in [
+            (
+                "request_body_memory_bytes",
+                "request_body_memory_bytes must be positive",
+            ),
+            (
+                "request_body_spool_budget_bytes",
+                "request_body_spool_budget_bytes must be positive",
+            ),
+        ] {
+            let err = RuntimeConfig::parse(&with(&format!("{field} = 0")))
+                .err()
+                .expect("zero spool config");
+            assert!(err.to_string().contains(message), "{err}");
+            assert!(RuntimeConfig::parse(&with(&format!("{field} = -1"))).is_err());
+        }
+        assert!(RuntimeConfig::parse(&with("request_body_spool_dir = \"\"")).is_err());
+    }
+
+    #[test]
     fn end_user_and_image_policy_config_is_off_by_default_and_rejects_bad_values() {
         std::env::set_var("LLMUX_CONFIG_OAUTH_TEST_SECRET", "test-secret");
         std::env::set_var("LLMUX_END_USER_SALT_TEST", "salt-one");
@@ -2184,6 +2423,19 @@ upstream_model = "upstream"
         let entry = parsed.server.key_policies[1].as_ref().unwrap();
         assert!(entry.models.is_empty());
         assert_eq!(entry.blocked.join(","), "zc/*");
+
+        // A traffic-class-only entry is meaningful: it attaches server-side
+        // accounting identity without narrowing the key's model access.
+        let parsed =
+            RuntimeConfig::parse(&base(&policy(ci, "traffic_class = \"synthetic_probe\"")))
+                .unwrap();
+        assert_eq!(
+            parsed.server.key_policies[1]
+                .as_ref()
+                .unwrap()
+                .traffic_class,
+            Some(TrafficClass::SyntheticProbe)
+        );
 
         let err = |policies: &str| {
             RuntimeConfig::parse(&base(policies))

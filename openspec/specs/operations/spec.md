@@ -143,7 +143,9 @@ the response, otherwise the failure kind — so failover legs that the
 last-attempted fields hide stay visible. An attempt whose request could
 not be built SHALL leave no leg. Each record SHALL also carry a fingerprint of
 the gateway client key used (a `key_<16 hex>` hash keyed by the configured
-key set, never the key itself), the count of image inputs in the inbound
+key set, never the key itself), the server-assigned `traffic_class` for that
+authenticated key (`ci_buyer_shaped`, `synthetic_probe`, `internal`, or
+`unknown`; unclassified authenticated keys are `unknown`), the count of image inputs in the inbound
 request, and — when the upstream supplies one — the provider-side request ID
 (such as an Anthropic `msg_`/`req_` ID) so a provider flag can be matched by
 ID rather than timestamp alone. Optional fields SHALL be omitted rather than
@@ -167,6 +169,10 @@ unset, no file is written.
 #### Scenario: No attempts made
 - WHEN every candidate is cooling or limited before any attempt
 - THEN the record omits `deployment`, `provider` and `quota_remaining`.
+
+#### Scenario: Caller class is authenticated identity
+- WHEN a key policy assigns `synthetic_probe` to one client key and another key sends a probe-like header
+- THEN the first key's record is `synthetic_probe`, while the second key keeps its configured class or `unknown`; headers never change either class.
 
 ### Requirement: Korean dashboard
 
@@ -337,7 +343,12 @@ bound each request by `--timeout`, bound response bodies, print a JSON report
 naming each check's status and latency, never print the key, and exit 0 only
 when every probe passes (1 on failure, 2 on usage errors). A
 `llmux2-probe.service`/`llmux2-probe.timer` pair under `deploy/systemd` SHALL
-run it periodically as a oneshot user unit.
+run it periodically as a oneshot user unit. Claude-family model ids are scarce by policy: rotation, sweeps, pinned model lists, and extra-format probes SHALL NOT send them inference unless `--probe-scarce` is explicitly present. Without that flag a Claude-family candidate present in the authenticated catalog SHALL be reported as `skipped = "scarce_claude"` with `evidence = "catalog_only"`, using the authenticated catalog/admission view rather than consuming upstream inference. A pinned Claude-family candidate absent from that catalog SHALL fail with `evidence = "catalog_absent"` rather than reporting healthy catalog-only evidence. `--probe-scarce` is the deliberate one-off adoption/verification escape hatch, not a scheduled mode.
+
+#### Scenario: Pinned scarce model absent from the catalog
+
+WHEN `--models` names a Claude-family model absent from the authenticated catalog and `--probe-scarce` is absent
+THEN the probe sends no inference for that model and fails its check with `evidence = "catalog_absent"` rather than reporting healthy catalog-only evidence.
 
 #### Scenario: Rotating coverage bounds provider cost
 
@@ -413,8 +424,8 @@ export on every exit — success, failure, or abort — and deploy the installed
 #### Scenario: A full sweep finds the long tail
 
 WHEN `--sweep` runs against a catalog of N models
-THEN every listed model marked `free` is probed exactly once, billed
-models are skipped without an upstream call, and the rotation cursor is
+THEN every listed non-scarce model marked `free` is probed exactly once, billed
+models are skipped without an upstream call, scarce Claude-family models are catalog-only unless `--probe-scarce` is present, and the rotation cursor is
 unchanged, so recurring probes keep their place.
 
 ### Requirement: Free-model discovery scan
@@ -503,6 +514,35 @@ WHEN a free leg sits on a host whose reviewed conditions carry an
 `expires_at`
 THEN the emitted deployment carries that stamp, so the leg stops taking
 requests when the promo ends; billed legs on the same host are unstamped.
+
+### Requirement: Morph Ultra import boundary
+
+With `--morph-ultra`, the importer SHALL treat keyed connections to the
+official Morph endpoint as Ultra-plan credentials: it SHALL emit only the
+reviewed in-scope upstream ids (`morph-kimik31`, `morph-dsv41flash`,
+`morph-dsv41flash-1017`, and `morph-dsv41flash-abliterated`), drop other Morph
+upstream ids with a warning, and write the same exact list as the credential's
+`allowed_upstream_models`.
+This is the reviewed DeepSeek-plus-Kimi-K3.1 subset, not a mirror of every id
+Morph may mark with Ultra metadata. The ambiguous `morph-kimik3` id SHALL
+remain excluded because the reviewed scope uses only canonical Kimi K3.1;
+Morph's machine-readable catalog also identifies it as Kimi K3 rather than
+Kimi K3.1, even where Ultra prose calls it a K3.1 alias. Without the flag,
+Morph imports SHALL remain unfiltered.
+
+#### Scenario: Paid Kimi Abliterated never enters an Ultra config
+
+WHEN an export combo asks for `morph/morph-kimik3-abliterated` and the import
+runs with `--morph-ultra`
+THEN no deployment on the Morph credential contains that per-token model,
+the credential allowlist omits it, and the import warns that it is outside
+the reviewed Morph Ultra scope.
+
+#### Scenario: Opt-in only
+
+WHEN the same export imports without `--morph-ultra`
+THEN existing Morph deployments keep their prior behavior, because not every
+Morph key is an Ultra-plan key.
 
 ### Requirement: Simple and extensible
 

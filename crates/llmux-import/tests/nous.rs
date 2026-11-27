@@ -158,3 +158,29 @@ fn exclude_models_drops_listed_catalog_entries() {
         .collect();
     assert_eq!(names, ["nous/vendor/zero-priced"]);
 }
+
+#[test]
+fn approved_drop_catalog_entries_are_not_emitted_as_nous_upstreams() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let listing = json!({"data":[
+        {"id":"moonshotai/kimi-k2.6","pricing":{"prompt":"0","completion":"0"}},
+        {"id":"vendor/zero-priced","pricing":{"prompt":"0","completion":"0"}}
+    ]});
+    let config = import(dir.path(), listing, &state).unwrap();
+    assert!(
+        !config.model_names.contains_key("nous/moonshotai/kimi-k2.6"),
+        "interrupted Nous catalog entry stayed servable"
+    );
+    assert!(
+        config.model_names.contains_key("nous/vendor/zero-priced"),
+        "unrelated Nous catalog entry was removed"
+    );
+    assert!(
+        config
+            .deployments
+            .iter()
+            .all(|deployment| deployment.upstream_model.as_ref() != "moonshotai/kimi-k2.6"),
+        "interrupted moonshotai/kimi-k2.6 still has a servable Nous deployment"
+    );
+}

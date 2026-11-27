@@ -13,6 +13,11 @@ const MEANINGFUL_SUFFIXES: &[&str] = &[
     "low", "medium", "high", "xhigh", "fast", "no-think", "nothink", "thinking",
 ];
 
+pub(super) const REVIEWED_EXACT_ALIASES: &[(&str, &str)] = &[
+    ("morph-kimik3-abliterated", "morph-kimi-k3-abliterated"),
+    ("cfpd/deepseek-v4.1-flash", "deepseek-v4.1-flash"),
+];
+
 /// Ordered meaningful suffixes on a name's leaf (last `/` segment), matched
 /// outermost-first — `vendor/x-fast-low` yields `["low", "fast"]`.
 pub(super) fn meaningful_suffixes(name: &str) -> Vec<&'static str> {
@@ -53,6 +58,13 @@ pub(super) fn alias_map(root: &Value, warnings: &mut Vec<String>) -> BTreeMap<St
         }
     }
     result
+}
+
+pub(super) fn source_reservation(root: &Value, name: &str) -> bool {
+    root["modelAliases"].get(name).is_some()
+        || array(root, "modelComboMappings").iter().any(|row| {
+            (row["enabled"] == true || row["enabled"] == 1) && matches(string(row, "pattern"), name)
+        })
 }
 
 pub(super) fn matches(pattern: &str, name: &str) -> bool {
@@ -127,6 +139,16 @@ pub(super) fn prepare(
     let mappings = sorted_mappings(root);
     let mut names: BTreeSet<_> = aliases.keys().cloned().collect();
     names.extend(direct.keys().cloned());
+    names.extend(
+        REVIEWED_EXACT_ALIASES
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .filter(|name| {
+                mappings
+                    .iter()
+                    .any(|row| matches(string(row, "pattern"), name))
+            }),
+    );
     if official_replacements {
         names.extend(
             combos
@@ -255,11 +277,16 @@ pub(super) fn prepare(
             let direct = terminal
                 .split_once('/')
                 .is_some_and(|(provider, model)| exact(provider) && exact(model));
-            if !direct {
+            let reviewed_terminal = REVIEWED_EXACT_ALIASES
+                .iter()
+                .any(|(name, target)| terminal == *name && combos.contains_key(*target));
+            if !direct && !reviewed_terminal {
                 warnings.push(format!("alias {name}: target unavailable"));
                 continue;
             }
-            direct_targets.insert(terminal.clone());
+            if direct {
+                direct_targets.insert(terminal.clone());
+            }
         }
         resolved.insert(name.clone(), terminal);
     }
@@ -276,6 +303,39 @@ pub(super) fn prepare(
         synthetic,
         unavailable,
         dropped_suffixed,
+    }
+}
+
+pub(super) fn apply_reviewed_exact_aliases(
+    root: &Value,
+    combos: &HashMap<String, Value>,
+    dead: &HashSet<String>,
+    models: &mut Vec<Value>,
+    aliases: &mut BTreeMap<String, String>,
+    warnings: &mut Vec<String>,
+) {
+    for (name, target) in REVIEWED_EXACT_ALIASES {
+        if combos.contains_key(*name)
+            || dead.contains(*name)
+            || dead.contains(*target)
+            || source_reservation(root, name)
+            || !models.iter().any(|model| string(model, "name") == *target)
+        {
+            continue;
+        }
+        let before = models.len();
+        models.retain(|model| string(model, "name") != *name);
+        if models.len() != before {
+            warnings.push(format!(
+                "direct {name}: collision; reviewed exact alias wins"
+            ));
+        }
+        for resolved in aliases.values_mut() {
+            if resolved == name {
+                *resolved = (*target).to_owned();
+            }
+        }
+        aliases.insert((*name).to_owned(), (*target).to_owned());
     }
 }
 

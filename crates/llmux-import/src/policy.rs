@@ -89,6 +89,7 @@ pub(super) enum ModelPolicy {
     Workers,
     KiloFree,
     DeepAiText,
+    MorphUltra,
     DeepAiCode,
 }
 
@@ -117,6 +118,7 @@ pub(super) struct Policy {
     pub kilo_key: Option<String>,
     pub kilo_free: Option<HashSet<String>>,
     pub openrouter_replacements: bool,
+    pub morph_ultra: bool,
     pub devin_free: Option<HashSet<String>>,
     /// Provider-node ids and connection hosts marked free by
     /// `--free-providers`. A `None` model set marks the whole provider free;
@@ -291,6 +293,7 @@ impl Policy {
             kilo_free,
             kilo_key: options.kilo_key_file.map(reference).transpose()?,
             openrouter_replacements: options.openrouter_replacements,
+            morph_ultra: options.morph_ultra,
             devin_free: options
                 .devin_models
                 .map(crate::devin::free_models)
@@ -328,6 +331,10 @@ impl Policy {
                 Some(free) if free.contains(model) => Ok(model.to_owned()),
                 Some(_) => Err("Kilo model not verified free for both prompt and completion"),
             },
+            ModelPolicy::MorphUltra => crate::morph::ULTRA_MODELS
+                .contains(&model)
+                .then(|| model.to_owned())
+                .ok_or("outside the reviewed Morph Ultra scope"),
         }
     }
 }
@@ -440,6 +447,7 @@ mod tests {
             kilo_key: None,
             kilo_free: None,
             openrouter_replacements: false,
+            morph_ultra: false,
             devin_free,
             free_custom,
             deepai_code: None,

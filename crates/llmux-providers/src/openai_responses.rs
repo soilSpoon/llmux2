@@ -93,9 +93,8 @@ impl ProviderAdapter for OpenAiResponses {
                 if req.format == InboundFormat::AnthropicMessages {
                     messages::stream(chat_stream(stream, true))
                 } else if req.format == InboundFormat::OpenAiChat {
-                    let include_usage = serde_json::from_slice::<Value>(&req.body)
-                        .map_err(|_| bad_gateway())?["stream_options"]["include_usage"]
-                        == true;
+                    let include_usage =
+                        sse::requested_usage_last_duplicate(&req.body).unwrap_or(false);
                     chat_stream(stream, include_usage)
                 } else {
                     stream

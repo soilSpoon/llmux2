@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-11-27T00:00:00Z",
+  "inputs": {
+    "inventory_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "override_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "planner_version": "llmux-fallback-plan/1"
+  },
+  "defaults": {
+    "unverified_native": "retain-existing-fallback",
+    "unclassified_catchall_spelling": "report-only"
+  },
+  "models": [
+    {
+      "name": "native-ok",
+      "fallback": "suppress",
+      "reason": "native-working",
+      "evidence": {
+        "inventory_row": "native-ok",
+        "native_legs": [
+          "native-ok-0"
+        ],
+        "coverage": "success-observed"
+      },
+      "provenance": {
+        "decision_source": "automatic-rule",
+        "rule": "native-working-suppresses-fallback"
+      }
+    },
+    {
+      "name": "unverified-native",
+      "fallback": "transition-retain",
+      "reason": "needs-verification",
+      "evidence": {
+        "inventory_row": "unverified-native",
+        "native_legs": [
+          "unverified-native-0"
+        ],
+        "coverage": "present-unverified"
+      },
+      "provenance": {
+        "decision_source": "automatic-rule",
+        "rule": "present-unverified-transition-retains-existing"
+      }
+    },
+    {
+      "name": "unresolved-model",
+      "fallback": "hold-existing-unresolved",
+      "reason": "user decision required before removal",
+      "evidence": {
+        "inventory_row": "unresolved-model",
+        "native_legs": []
+      },
+      "provenance": {
+        "decision_source": "manual-override",
+        "evidence": "WO-177 unresolved row representation"
+      }
+    }
+  ],
+  "spellings": [
+    {
+      "spelling": "needs-review-spelling",
+      "action": "needs-review",
+      "reason": "semantic identity is unresolved",
+      "provenance": {
+        "decision_source": "manual-override",
+        "evidence": "WO-177 exact user-decision rows"
+      }
+    },
+    {
+      "spelling": "already-resolved-spelling",
+      "action": "already-resolved",
+      "target": "native-ok",
+      "reason": "already configured as an alias",
+      "provenance": {
+        "decision_source": "automatic-rule",
+        "rule": "configured-alias-noop"
+      }
+    },
+    {
+      "spelling": "approved-alias-spelling",
+      "action": "alias",
+      "target": "native-ok",
+      "reason": "reviewed spelling identity",
+      "provenance": {
+        "decision_source": "user-approved",
+        "approved_by": "designated-owner",
+        "approval_source": "synthetic-message-approval-0001"
+      }
+    },
+    {
+      "spelling": "definitely-not-a-model",
+      "action": "drop",
+      "reason": "explicit non-model test spelling",
+      "provenance": {
+        "decision_source": "manual-override",
+        "evidence": "WO-178 explicit drop seed"
+      }
+    }
+  ],
+  "catch_all": {
+    "mode": "transition",
+    "retain": [
+      {
+        "spelling": "required-omniroute-only",
+        "reason": "buyer use during transition",
+        "provenance": {
+          "decision_source": "user-approved",
+          "approved_by": "designated-owner",
+          "approval_source": "synthetic-message-approval-0002"
+        }
+      }
+    ],
+    "drop": [
+      {
+        "spelling": "wo163-nonexistent-model-no-upstream",
+        "reason": "synthetic probe spelling",
+        "provenance": {
+          "decision_source": "manual-override",
+          "evidence": "WO-178 explicit drop seed"
+        }
+      }
+    ]
+  }
+}

@@ -256,6 +256,10 @@ async fn fixture_full(
             key_policies: Box::new([]),
             deny: Box::new([]),
             request_timeout: Duration::from_secs(5),
+            max_request_bytes: 32 * 1024 * 1024,
+            request_body_memory_bytes: 1024 * 1024,
+            request_body_spool_dir: std::path::PathBuf::from("/tmp/llmux-core-test-spool"),
+            request_body_spool_budget_bytes: 512 * 1024 * 1024,
             shutdown_timeout: Duration::from_secs(60),
             drain_grace: Duration::from_secs(2),
             expose_routing_headers: true,
@@ -347,6 +351,141 @@ fn request() -> GatewayRequest {
         image_count: 2,
         free_only: false,
     }
+}
+
+/// Skip cooldown time without letting virtual time fire network timeouts:
+/// pause only after the request's I/O has completed, advance, then resume.
+async fn elapse(duration: Duration) {
+    tokio::time::pause();
+    tokio::time::advance(duration).await;
+    tokio::time::resume();
+}
+
+#[tokio::test]
+async fn spooled_replay_is_reread_for_each_failover_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = llmux_types::SpoolStore::open(dir.path(), 4096).unwrap();
+    let replay = store
+        .spool_bytes(br#"{"model":"model","messages":[]}"#)
+        .unwrap();
+    let (executor, _adapter, _credential, _server) = fixture(
+        vec![UpstreamError::RateLimited { retry_after: None }],
+        false,
+    )
+    .await;
+    let mut req = request();
+    req.body = Bytes::new();
+
+    executor
+        .execute_attributed_with_replay(req, Some(replay.clone()))
+        .await
+        .unwrap();
+
+    assert_eq!(replay.read_count(), 2);
+}
+
+#[cfg(test)]
+fn install_materialize_gate(
+    path: &std::path::Path,
+) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    MATERIALIZE_TEST_GATE.lock().unwrap().push((
+        path.to_path_buf(),
+        started.clone(),
+        release.clone(),
+    ));
+    (started, release)
+}
+
+fn clear_materialize_gate(path: &std::path::Path) {
+    MATERIALIZE_TEST_GATE
+        .lock()
+        .unwrap()
+        .retain(|(gate_path, _, _)| gate_path != path);
+}
+
+#[tokio::test]
+async fn spooled_materialization_finishes_before_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = llmux_types::SpoolStore::open(dir.path(), 4096).unwrap();
+    let replay = store
+        .spool_bytes(br#"{"model":"model","messages":[]}"#)
+        .unwrap();
+    let (executor, _adapter, _credential, _server) = fixture_with_models(
+        vec![],
+        false,
+        [None; 3],
+        &[("model", &[0])],
+        llmux_types::QuotaSpec {
+            concurrent: Some(1),
+            ..Default::default()
+        },
+    )
+    .await;
+    let limits = executor.bindings[0].limits.clone();
+    let replay_path = replay.path().to_path_buf();
+    let (started, release) = install_materialize_gate(&replay_path);
+    let routing = tokio::spawn({
+        let mut req = request();
+        req.body = Bytes::new();
+        async move {
+            executor
+                .execute_attributed_with_replay(req, Some(replay))
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), started.notified())
+        .await
+        .unwrap();
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        limits.inflight(),
+        Some(0),
+        "spool materialization must finish before admission consumes the concurrency permit"
+    );
+    release.notify_one();
+    routing.await.unwrap().unwrap();
+    clear_materialize_gate(&replay_path);
+}
+
+#[tokio::test(start_paused = true)]
+async fn spooled_materialization_uses_the_routing_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = llmux_types::SpoolStore::open(dir.path(), 4096).unwrap();
+    let replay = store
+        .spool_bytes(br#"{"model":"model","messages":[]}"#)
+        .unwrap();
+    let (executor, _adapter, _credential, _server) = fixture(vec![], false).await;
+    let replay_path = replay.path().to_path_buf();
+    let (started, _release) = install_materialize_gate(&replay_path);
+    let routing = tokio::spawn({
+        let mut req = request();
+        req.body = Bytes::new();
+        async move {
+            executor
+                .execute_attributed_with_replay(req, Some(replay))
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), started.notified())
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let result = tokio::time::timeout(Duration::from_secs(1), routing)
+        .await
+        .expect("spool materialization must obey the five-second routing deadline")
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(RoutedError {
+            error: GatewayError::Client(UpstreamError::Timeout),
+            ..
+        })
+    ));
+    clear_materialize_gate(&replay_path);
 }
 
 #[tokio::test]
@@ -504,6 +643,97 @@ async fn same_level_spread_keeps_a_prompt_prefix_on_one_deployment() {
     assert!(
         spread.len() > 1,
         "distinct cache keys should spread across same-level deployments"
+    );
+}
+
+#[tokio::test]
+async fn spooled_replay_preserves_cache_affinity() {
+    let future = SystemTime::now() + Duration::from_secs(60);
+    let (executor, _, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("model", &[0, 1, 2])],
+        Default::default(),
+        Default::default(),
+        false,
+        None,
+        [None; 3],
+        [Some((0, future)); 3],
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = llmux_types::SpoolStore::open(dir.path(), 4096).unwrap();
+    let replay = store
+        .spool_bytes(
+            br#"{"model":"model","messages":[{"role":"system","content":"shared cache prefix"},{"role":"user","content":"question"}]}"#,
+        )
+        .unwrap();
+    let spooled_request = || GatewayRequest {
+        body: Bytes::new(),
+        end_user: None,
+        client_key: None,
+        ..request()
+    };
+
+    let first = executor
+        .execute_attributed_with_replay(spooled_request(), Some(replay.clone()))
+        .await
+        .unwrap()
+        .deployment;
+    for _ in 0..4 {
+        assert_eq!(
+            executor
+                .execute_attributed_with_replay(spooled_request(), Some(replay.clone()))
+                .await
+                .unwrap()
+                .deployment,
+            first,
+            "a spooled repeated prompt prefix should keep cache affinity"
+        );
+    }
+}
+
+#[tokio::test]
+async fn spooled_replay_spreads_distinct_prompts_with_one_client_key() {
+    let future = SystemTime::now() + Duration::from_secs(60);
+    let (executor, _, _, _server) = fixture_full(
+        Vec::new(),
+        false,
+        [None; 3],
+        &[("model", &[0, 1, 2])],
+        Default::default(),
+        Default::default(),
+        false,
+        None,
+        [None; 3],
+        [Some((0, future)); 3],
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = llmux_types::SpoolStore::open(dir.path(), 1_000_000).unwrap();
+    let mut spread = HashSet::new();
+    for i in 0..24 {
+        let body = format!(
+            r#"{{"model":"model","messages":[{{"role":"system","content":"cache prefix {i}"}},{{"role":"user","content":"question"}}]}}"#
+        );
+        let replay = store.spool_bytes(body.as_bytes()).unwrap();
+        let routed = executor
+            .execute_attributed_with_replay(
+                GatewayRequest {
+                    body: Bytes::new(),
+                    ..request()
+                },
+                Some(replay),
+            )
+            .await
+            .unwrap()
+            .deployment;
+        spread.insert(routed);
+    }
+    assert!(
+        spread.len() > 1,
+        "distinct spooled cache keys should spread even for one client key"
     );
 }
 
@@ -1177,6 +1407,10 @@ async fn fixture_shared_group(
             key_policies: Box::new([]),
             deny: Box::new([]),
             request_timeout: Duration::from_secs(5),
+            max_request_bytes: 32 * 1024 * 1024,
+            request_body_memory_bytes: 1024 * 1024,
+            request_body_spool_dir: std::path::PathBuf::from("/tmp/llmux-core-test-spool"),
+            request_body_spool_budget_bytes: 512 * 1024 * 1024,
             shutdown_timeout: Duration::from_secs(60),
             drain_grace: Duration::from_secs(2),
             expose_routing_headers: true,
@@ -2000,7 +2234,7 @@ async fn repeated_limit_errors_after_stream_start_back_off() {
         let now = Instant::now();
         let until = executor.bindings[0].limits.cooldown_until(now).unwrap();
         cooldowns.push(until - now);
-        tokio::time::sleep(until - now + Duration::from_millis(50)).await;
+        elapse(until - now + Duration::from_millis(50)).await;
     }
     assert!(
         cooldowns[1] > Duration::from_millis(1500),
@@ -2098,7 +2332,7 @@ async fn after_a_cooldown_other_requests_fall_back_while_a_probe_is_open() {
             .as_ref(),
         "dep2"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    elapse(Duration::from_millis(100)).await;
     let streaming = GatewayRequest {
         stream: true,
         ..request()
@@ -2245,7 +2479,7 @@ async fn credential_peers_cool_only_until_the_quota_resets() {
         ..request()
     };
     assert!(executor.execute(to("a")).await.is_err());
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    elapse(Duration::from_millis(100)).await;
     executor.execute(to("b")).await.unwrap();
     let served: Vec<_> = adapter
         .calls

@@ -10,7 +10,10 @@ deployment behavior under load.
 ### Requirement: Failover on limit and failure
 
 The gateway SHALL detect 429, quota exhaustion, and upstream failures and
-retry the request on the next eligible deployment.
+retry the request on the next eligible deployment. When the inbound body is
+disk-spooled, each new deployment candidate SHALL materialize a fresh replay
+copy from immutable request-side storage; a candidate's copy SHALL NOT be
+retained for the rest of the request or used after a response commits.
 
 #### Scenario: 429 triggers failover
 
