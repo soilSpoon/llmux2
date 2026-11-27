@@ -927,6 +927,7 @@ impl RawConfig {
                             provider.as_str(),
                             provider::OPENAI
                                 | provider::OPENAI_COMPAT
+                                | provider::OPENCODE
                                 | provider::DEVIN_ACP
                                 | provider::AWS_QUICK
                         ) =>
@@ -978,6 +979,10 @@ impl RawConfig {
                     .or_else(|| {
                         (provider.0.as_ref() == provider::OPENAI_RESPONSES)
                             .then_some("https://api.openai.com/v1")
+                    })
+                    .or_else(|| {
+                        (provider.0.as_ref() == provider::OPENCODE)
+                            .then_some(provider::OPENCODE_BASE_URL)
                     })
                     .or_else(|| {
                         (provider.0.as_ref() == provider::DEVIN_ACP)
@@ -1480,6 +1485,17 @@ mod tests {
             "auth = \"none\"\nprovider = \"openai_compat\""
         ))
         .is_ok());
+        assert!(
+            super::RuntimeConfig::parse(&config("auth = \"none\"\nprovider = \"opencode\""))
+                .is_ok()
+        );
+        let without_base = config("auth = \"none\"\nprovider = \"opencode\"")
+            .replace("base_url = \"https://example.com/v1\"\n", "");
+        let opencode = super::RuntimeConfig::parse(&without_base).unwrap();
+        assert_eq!(
+            opencode.deployments[0].base_url.to_string(),
+            provider::OPENCODE_BASE_URL
+        );
         for auth in [
             "",
             "provider = \"openai_compat\"",

@@ -960,6 +960,11 @@ fn classify_error_details(
     let free_allowance = [code, kind, message.as_str()]
         .iter()
         .any(|marker| normalized_code(marker).contains("free_allowance_used"));
+    // OpenCode Zen rewrites the original upstream code into a `[code]` label
+    // at the start of the message. That label is quota evidence, not a throttle.
+    let free_usage_limit = [code, kind, message.as_str()]
+        .iter()
+        .any(|marker| normalized_code(marker).contains("freeusagelimiterror"));
     // Cloudflare Workers AI reports errors in a top-level `errors[]` array —
     // codes 4006/3036 or the "daily free allocation" phrasing mean the
     // account's daily neuron allocation is spent until 00:00 UTC.
@@ -978,7 +983,7 @@ fn classify_error_details(
         402 => UpstreamError::QuotaExhausted {
             reset_at: quota_reset(now, cf_daily, monthly, wait_raw),
         },
-        429 if quota || free_allowance || daily || cf_daily || monthly => {
+        429 if quota || free_allowance || free_usage_limit || daily || cf_daily || monthly => {
             UpstreamError::QuotaExhausted {
                 reset_at: quota_reset(now, cf_daily, monthly, wait_raw),
             }
