@@ -600,10 +600,19 @@ struct Expander<'a> {
     dead: &'a HashSet<String>,
 }
 
-fn interrupted_direct_model(raw: &str, provider: &upstream::ProviderIdentity, model: &str) -> bool {
+fn interrupted_direct_model(
+    raw: &str,
+    provider: &upstream::ProviderIdentity,
+    model: &str,
+    nodes: &[Value],
+) -> bool {
     approved_drops::lookup(raw).is_some()
         || approved_drops::lookup(model).is_some()
         || approved_drops::lookup(&format!("{provider}/{model}")).is_some()
+        || nodes.iter().any(|node| {
+            string(node, "id") == provider.as_str()
+                && approved_drops::lookup(&format!("{}/{model}", string(node, "prefix"))).is_some()
+        })
 }
 
 fn references_dead(
@@ -647,8 +656,9 @@ fn references_dead(
             return true;
         }
         if target.is_empty()
-            && upstream::model_target(step, nodes)
-                .is_some_and(|(provider, model)| interrupted_direct_model(raw, &provider, model))
+            && upstream::model_target(step, nodes).is_some_and(|(provider, model)| {
+                interrupted_direct_model(raw, &provider, model, nodes)
+            })
         {
             return true;
         }
@@ -729,7 +739,7 @@ impl Expander<'_> {
                 ));
                 continue;
             };
-            if interrupted_direct_model(raw, &p, model) {
+            if interrupted_direct_model(raw, &p, model, self.nodes) {
                 self.warnings.push(format!(
                     "combo {name} step {index}: skipped interrupted direct upstream model {raw}"
                 ));

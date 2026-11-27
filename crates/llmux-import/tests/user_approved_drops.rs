@@ -487,6 +487,16 @@ fn structured_interrupted_step_collapses_without_blocking_other_providers() {
     fs::write(&key, "synthetic-omniroute").unwrap();
     let key_ref = format!("file:{}", key.display());
     let mut root = fixture();
+    for node in root["providerNodes"].as_array_mut().unwrap() {
+        if node["id"] == "ddgw" {
+            node["id"] = "node-123".into();
+        }
+    }
+    for connection in root["providerConnections"].as_array_mut().unwrap() {
+        if connection["provider"] == "ddgw" {
+            connection["provider"] = "node-123".into();
+        }
+    }
     root["combos"].as_array_mut().unwrap().extend([
         json!({"id":"structured-interrupted","name":"structured-interrupted","models":[{"kind":"model","providerId":"ddgw","model":"gpt-5.4-mini"}]}),
         json!({"id":"other-mini","name":"other-mini","models":[{"kind":"model","providerId":"cfpd","model":"gpt-5.4-mini"}]}),
