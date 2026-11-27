@@ -202,6 +202,7 @@ fn morph_ultra_opt_in_filters_out_of_plan_models_and_marks_the_credential() {
     root["combos"][0]["models"] = json!([
         "morph/morph-kimik31",
         "morph/morph-kimik3",
+        "morph/morph-kimik3-fast",
         "morph/morph-dsv41flash",
         "morph/morph-dsv41flash-1017",
         "morph/morph-dsv41flash-abliterated",
@@ -237,7 +238,6 @@ fn morph_ultra_opt_in_filters_out_of_plan_models_and_marks_the_credential() {
         upstreams,
         [
             "morph-kimik31",
-            "morph-kimik3",
             "morph-dsv41flash",
             "morph-dsv41flash-1017",
             "morph-dsv41flash-abliterated"
@@ -246,6 +246,7 @@ fn morph_ultra_opt_in_filters_out_of_plan_models_and_marks_the_credential() {
     let emitted = std::fs::read_to_string(&output).unwrap();
     assert!(emitted.contains("allowed_upstream_models"));
     assert!(emitted.contains("morph-kimik31"));
+    assert!(!upstreams.contains(&"morph-kimik3"));
     assert!(report
         .warnings
         .iter()

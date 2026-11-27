@@ -122,10 +122,10 @@ legs.
 
 #### Scenario: Morph plan boundary
 
-WHEN the morph credential's Ultra plan covers Kimi K3.1 (`morph-kimik31`, with
-`morph-kimik3` as its alias) and the DeepSeek V4.1 Flash variants
-(`morph-dsv41flash`, `morph-dsv41flash-1017`, and privileged-access
-`morph-dsv41flash-abliterated`)
-THEN a deployment on that credential naming `morph-kimik3-abliterated` or any
-other out-of-plan upstream model fails config validation, while the listed
-Kimi and DeepSeek ids load.
+WHEN the morph credential's reviewed Ultra scope covers Kimi K3.1
+(`morph-kimik31`) and the DeepSeek V4.1 Flash variants (`morph-dsv41flash`,
+`morph-dsv41flash-1017`, and privileged-access `morph-dsv41flash-abliterated`)
+THEN a deployment on that credential naming `morph-kimik3`,
+`morph-kimik3-fast`, `morph-kimik3-abliterated`, or any other out-of-scope
+upstream model fails config validation, while the listed Kimi K3.1 and
+DeepSeek ids load.

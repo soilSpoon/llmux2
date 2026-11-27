@@ -519,9 +519,8 @@ requests when the promo ends; billed legs on the same host are unstamped.
 
 With `--morph-ultra`, the importer SHALL treat keyed connections to the
 official Morph endpoint as Ultra-plan credentials: it SHALL emit only the
-reviewed plan-covered upstream ids (`morph-kimik31`, `morph-kimik3`,
-`morph-dsv41flash`, `morph-dsv41flash-1017`, and
-`morph-dsv41flash-abliterated`), drop other Morph upstream ids with a warning,
+reviewed plan-covered upstream ids (`morph-kimik31`, `morph-dsv41flash`,
+`morph-dsv41flash-1017`, and `morph-dsv41flash-abliterated`), drop other Morph upstream ids with a warning,
 and write the same exact list as the credential's `allowed_upstream_models`.
 Without the flag, Morph imports SHALL remain unfiltered.
 
