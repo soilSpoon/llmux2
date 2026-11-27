@@ -359,7 +359,7 @@ fn workers_options_compose_with_explicit_omniroute_fallback() {
     assert_eq!(first.quota.tpd, None);
     assert_eq!(
         config.credential_quotas[first.credential.as_ref()].tpd,
-        Some(6_500)
+        Some(5_200)
     );
     assert_eq!(last.upstream_model.as_ref(), "workers");
     assert_eq!(last.base_url.to_string(), "http://127.0.0.1:20128/v1");
@@ -712,7 +712,7 @@ fn workers_opt_in_maps_bridges_and_fails_closed_for_unknown_deprecated_and_paid_
     let mut workers = config.credential_quotas.iter().collect::<Vec<_>>();
     assert_eq!(workers.len(), 1);
     let (id, quota) = workers.pop().unwrap();
-    assert_eq!(quota.tpd, Some(6_500));
+    assert_eq!(quota.tpd, Some(5_200));
     for i in 0..5 {
         let model = &config.models[config.model_names[format!("cf-{i}").as_str()]];
         let dep = &config.deployments[model.deployments[0].0 as usize];
@@ -1060,7 +1060,7 @@ fn workers_quota_rpm_is_configurable_and_needs_the_cloudflare_opt_in() {
     assert_eq!(dep.quota.tpd, None);
     assert_eq!(
         config.credential_quotas[dep.credential.as_ref()].tpd,
-        Some(6_500)
+        Some(5_200)
     );
 
     let result = run(&root, dir.path(), &[("--workers-ai-rpm", Path::new("12"))]);

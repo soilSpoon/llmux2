@@ -326,8 +326,12 @@ the official endpoint, never the bridge URL. Inactive/unusable/OAuth connections
 remain excluded. Other providers' loopback checks are unchanged. Models use a
 small source-linked allowlist in `src/policy.rs`, emitting exact `@cf/...` IDs.
 Unknown, deprecated, and explicitly paid-plan-only models are warned and skipped;
-in particular `@cf/meta/llama-3.2-1b-instruct` is never emitted. Catalog and billing
-eligibility can change; review this allowlist before deployment.
+in particular `@cf/meta/llama-3.2-1b-instruct` is never emitted. The sole exception
+is Kimi K2.6, reviewed by the owner for a native leg. Cloudflare documents
+`@cf/moonshotai/kimi-k2.6` as deprecated and requiring paid access, so the importer
+emits it with `billing = billed` as migration preparation. It is not evidence of
+free eligibility. Catalog and billing eligibility can change; review this allowlist
+before deployment.
 
 #### Retired models and an optional current catalog
 
@@ -357,9 +361,11 @@ lists the following per **million** tokens (input / output):
 Granite uses about 94.0% fewer input neurons and 86.5% fewer output neurons
 than the retired 8B. The free 10,000-neuron daily account allowance and
 per-deployment RPM limitations below still apply.
-On November 20, 2026, all nine allowlisted model pages linked in `src/policy.rs`
-and the official changelog were rechecked; none of those targets had an announced
-deprecation date. Pricing tables alone are not availability evidence.
+On November 20, 2026, the nine standard allowlisted model pages linked in
+`src/policy.rs` and the official changelog were rechecked; none of those targets
+had an announced deprecation date. The separately reviewed Kimi K2.6 exception is
+deprecated and paid-access-required as documented above. Pricing tables alone are
+not availability evidence.
 
 Supply `--workers-ai-models /private/workers-ai-models.json` (API field
 `workers_ai_models`) to intersect mapped upstream IDs with a saved successful
@@ -409,19 +415,22 @@ retired upstream IDs.
 enforce Cloudflare's model-dependent free neuron allowance. Imported Workers AI
 deployments carry `quota.rpm = 30` (configurable with `--workers-ai-rpm`, which
 requires the Cloudflare opt-in), and the shared `workers-ai` credential carries
-a hard `quota.tpd = 6500` cap on estimated input tokens that binds across
+a hard `quota.tpd = 5200` cap on estimated input tokens that binds across
 every deployment on the account. The daily cap is sized so a day of admitted
 input with output (including hidden reasoning tokens) up to 5x larger stays
 under the documented 10,000-neuron free daily allowance at the most expensive
-allowed model's rates (qwen3.8-27b: 6,500 × (0.040909 + 5 × 0.290909) ≈
-9,720 neurons). The rpm cap is **per deployment** (combos, direct names, and
+routable model's rates (Kimi K2.6: 5,200 × (0.086364 + 5 × 0.363636) ≈
+9,904 neurons). The rpm cap is **per deployment** (combos, direct names, and
 failover can multiply bursts). Credential quotas are hard ceilings — a
 request whose estimate exceeds the remaining shared window is rejected even
 on an empty window, unlike deployment quotas, which admit one oversized
 request to an idle deployment. The shared tpd still cannot guarantee zero
 charges: it counts estimated input tokens, so outputs above 5x input pass the
-allowance. Use a Workers Free account/no paid overage at Cloudflare and
-monitor its account-wide allowance.
+allowance. Use a Workers Free account/no paid overage at Cloudflare for the
+standard models, and monitor the account-wide allowance. The reviewed Kimi K2.6
+exception requires Workers Paid or prepaid AI Gateway credits before Cloudflare
+will serve it; the shared cap still bounds estimated usage but is not a spending
+guarantee.
 See https://developers.cloudflare.com/workers-ai/platform/pricing/.
 
 Keyed Kilo routes now fail closed unless `--kilo-free-models` supplies a saved

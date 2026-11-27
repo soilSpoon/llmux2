@@ -523,22 +523,23 @@ owner-reviewed exception is Kimi K2.6 below.
 WHEN an opted-in Cloudflare bridge leg targets `moonshotai/kimi-k2.6`
 THEN it uses the exact upstream ID `@cf/moonshotai/kimi-k2.6` on the official
 Workers AI account endpoint and remains `billed`. Cloudflare documents this
-model as requiring paid access and marks it deprecated, so this exact-ID
-exception is preparatory native routing evidence, not a claim of free
-eligibility or long-term availability.
+model as requiring paid access and marks it deprecated. This exact-ID exception
+prepares native routing; it is not evidence of free eligibility or long-term
+availability.
 
 #### Scenario: Workers AI quota is not a spending guarantee
 
 WHEN a Workers AI deployment is emitted
 THEN it has `rpm = 30` (configurable with `--workers-ai-rpm`, which requires
 the Cloudflare opt-in), and the shared Workers AI credential has
-`tpd = 6500`, a hard daily cap on estimated input tokens bound across every
+`tpd = 5200`, a hard daily cap on estimated input tokens bound across every
 deployment on the account, sized so a day of admitted input with output up to
 5x larger stays under the documented 10,000-neuron free daily allowance even
-at the most expensive allowed model's rates. Credential quota windows are
-hard ceilings: a request whose estimate exceeds the remaining window is
-rejected even when the window is empty, while a deployment quota still admits
-one oversized request to an idle deployment.
+at the most expensive routable model's rates. The current worst case is the
+reviewed Kimi K2.6 exception. Credential quota windows are hard ceilings: a
+request whose estimate exceeds the remaining window is rejected even when the
+window is empty, while a deployment quota still admits one oversized request
+to an idle deployment.
 Documentation warns that these are not account-wide neuron accounting or a
 guarantee against paid overage.
 
