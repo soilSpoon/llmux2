@@ -73,6 +73,9 @@ pub enum BuildError {
     /// A converting adapter cannot represent this request upstream.
     #[error("request cannot be converted for this deployment")]
     UnsupportedConversion,
+    /// The request violates a provider contract that forbids substitution.
+    #[error("request violates provider contract")]
+    ProviderContractViolation,
     #[error("invalid request body")]
     InvalidBody,
     #[error("invalid upstream URI or request headers")]

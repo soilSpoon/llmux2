@@ -29,8 +29,8 @@ use llmux_providers::nous_portal::{NousPortalConfig, NousPortalSource};
 use llmux_providers::oauth::{OAuthConfig, OAuthCredentialSource};
 use llmux_providers::{
     truncate_middle_for_format, AcpAgent, Anthropic, Antigravity, AwsQuick, DeepAi, DevinAcp,
-    DevinAcpConfig, Freebuff, NoAuthSource, OpenAiCompat, OpenAiResponses, RequestMetadata,
-    StaticKey, Xai,
+    DevinAcpConfig, Freebuff, NoAuthSource, OpenAiCompat, OpenAiResponses, OpenCode,
+    RequestMetadata, StaticKey, Xai,
 };
 use llmux_types::{
     provider, AcpAgentSpec, Billing, ContextOverflow, CredentialSource, GatewayRequest,
@@ -79,6 +79,7 @@ fn provider_registry(
     }
     registry.register(Arc::new(Anthropic::new(provider::ANTHROPIC)));
     registry.register(Arc::new(OpenAiResponses::new()));
+    registry.register(Arc::new(OpenCode::new()));
     registry.register(Arc::new(DeepAi::new()));
     registry.register(Arc::new(Freebuff::new()));
     registry.register(Arc::new(Xai::new()));

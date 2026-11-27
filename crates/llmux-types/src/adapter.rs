@@ -38,6 +38,14 @@ pub trait ProviderAdapter: Send + Sync + 'static {
 
     fn supports(&self, inbound: InboundFormat) -> Support;
 
+    /// Whether routing may continue to another deployment after this adapter
+    /// reports exhausted quota. When this is `false`, the active request stops
+    /// after that error and later billed candidates stay blocked while the
+    /// quota cooldown is active.
+    fn fallback_on_quota_exhausted(&self) -> bool {
+        true
+    }
+
     async fn build_request(
         &self,
         req: &GatewayRequest,

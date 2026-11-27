@@ -741,12 +741,26 @@ impl Executor {
         let mut incompatible = Vec::new();
         let mut unavailable = false;
         let mut machine = State::new(self.cfg.routing.max_attempts as u32);
+        let mut block_billed_after_terminal_quota = false;
         'groups: for group in groups {
             let shift = sequence % group.len();
             let (before, after) = deployments[group.clone()].split_at(shift);
             for &idx in after.iter().chain(before) {
                 let idx = index(idx);
                 let dep = &self.cfg.deployments[idx];
+                let binding = &self.bindings[idx];
+                let support = binding.adapter.supports(req.format);
+                let now = Instant::now();
+                if !binding.adapter.fallback_on_quota_exhausted()
+                    && binding.limits.quota_cooldown_until(now).is_some()
+                {
+                    block_billed_after_terminal_quota = true;
+                }
+                if block_billed_after_terminal_quota
+                    && (dep.billing == Billing::Billed || dep.fallback)
+                {
+                    continue;
+                }
                 // A free-only probe never routes to a billed leg, so a sweep
                 // cannot spend on paid or quota-capped legs — including billed
                 // fallback legs a dying free leg would otherwise fall through
@@ -755,9 +769,6 @@ impl Executor {
                 if req.free_only && dep.billing == Billing::Billed {
                     continue;
                 }
-                let binding = &self.bindings[idx];
-                let support = binding.adapter.supports(req.format);
-                let now = Instant::now();
                 machine.select();
                 let mut skip_reason = binding.skip_reason(support, fits(dep), dep.expires_at);
                 let mut event = if skip_reason.is_some() {
@@ -881,7 +892,9 @@ impl Executor {
                             let upstream = upstream.take().expect("built before send");
                             if matches!(
                                 upstream,
-                                Ok(Err(BuildError::InvalidBody | BuildError::UnsupportedFormat))
+                                Ok(Err(BuildError::InvalidBody
+                                    | BuildError::UnsupportedFormat
+                                    | BuildError::ProviderContractViolation))
                             ) {
                                 return Err(GatewayError::InvalidRequest);
                             }
@@ -956,7 +969,8 @@ impl Executor {
                                         .cfg
                                         .routing
                                         .fallback_on
-                                        .contains(&ErrorKind::QuotaExhausted),
+                                        .contains(&ErrorKind::QuotaExhausted)
+                                        && binding.adapter.fallback_on_quota_exhausted(),
                                 },
                                 Err(GatewayError::Client(UpstreamError::NotProvisioned)) => {
                                     Outcome::NotProvisioned

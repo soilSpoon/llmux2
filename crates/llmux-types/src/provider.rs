@@ -5,6 +5,11 @@
 pub const OPENAI: &str = "openai";
 /// Any OpenAI-compatible chat-completions upstream.
 pub const OPENAI_COMPAT: &str = "openai_compat";
+/// OpenCode's inference gateway. Requests must reproduce the pinned CLI
+/// identity shape; plain OpenAI-compatible callers are a different contract.
+pub const OPENCODE: &str = "opencode";
+/// OpenCode inference base URL used when a deployment omits `base_url`.
+pub const OPENCODE_BASE_URL: &str = "https://opencode.ai/inference/openai/v1";
 /// OpenAI Responses API.
 pub const OPENAI_RESPONSES: &str = "openai_responses";
 /// Anthropic Messages API.
@@ -53,6 +58,7 @@ mod tests {
             [
                 OPENAI,
                 OPENAI_COMPAT,
+                OPENCODE,
                 OPENAI_RESPONSES,
                 ANTHROPIC,
                 DEEPAI,
@@ -67,7 +73,7 @@ mod tests {
             .into_iter()
             .collect::<HashSet<_>>()
             .len(),
-            12
+            13
         );
         assert_eq!(ANTHROPIC_KEY_HEADER, "x-api-key");
     }
