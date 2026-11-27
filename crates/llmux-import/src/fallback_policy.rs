@@ -333,11 +333,18 @@ pub fn parse_fallback_policy(input: &str) -> Result<FallbackPolicy, String> {
 
 fn fallback_policy_schema_error(error: serde_json::Error) -> String {
     let error = error.to_string();
-    if error.starts_with("unknown field") {
-        "invalid fallback policy JSON: unknown object key".to_owned()
+    let detail = if error.starts_with("missing field `") || error.starts_with("duplicate field `") {
+        error
+    } else if error.starts_with("unknown field") {
+        "unknown object key".to_owned()
+    } else if error.starts_with("unknown variant") {
+        "unknown enum variant".to_owned()
+    } else if error.starts_with("invalid type") {
+        "invalid value type".to_owned()
     } else {
-        format!("invalid fallback policy JSON: {error}")
-    }
+        "schema mismatch".to_owned()
+    };
+    format!("invalid fallback policy JSON: {detail}")
 }
 
 pub fn serialize_fallback_audit(audit: &FallbackAudit) -> Result<String, String> {
