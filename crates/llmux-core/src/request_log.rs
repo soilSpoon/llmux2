@@ -4,7 +4,7 @@ use crate::GatewayError;
 use llmux_types::{ErrorKind, TrafficClass};
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::OpenOptions,
     io::{self, Write},
     path::Path,
@@ -38,6 +38,18 @@ pub struct AttemptLeg {
     pub outcome: &'static str,
 }
 
+#[derive(Default, Serialize)]
+pub struct CandidateSelection {
+    pub total: usize,
+    pub considered: usize,
+    pub max_attempts: usize,
+    pub free_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub skip_reasons: BTreeMap<&'static str, u64>,
+}
+
 #[derive(Serialize)]
 pub struct RequestRecord<'a> {
     pub ts_ms: u64,
@@ -66,6 +78,10 @@ pub struct RequestRecord<'a> {
     /// aggregate routing error hides it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_upstream_error_kind: Option<&'a str>,
+    /// Candidate-selection accounting for this request. Present once the
+    /// router has resolved a model and entered candidate selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_selection: Option<CandidateSelection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_remaining: Option<QuotaRemaining>,
 }
@@ -251,6 +267,7 @@ mod tests {
                 outcome: "routed",
                 error_kind: None,
                 last_upstream_error_kind: None,
+                candidate_selection: None,
                 quota_remaining: Some(QuotaRemaining {
                     rpm: Some(9),
                     concurrent: None,
@@ -299,6 +316,7 @@ mod tests {
             outcome: "error",
             error_kind: Some("rate_limited"),
             last_upstream_error_kind: None,
+            candidate_selection: None,
             quota_remaining: None,
         });
         drop(log);
@@ -335,6 +353,7 @@ mod tests {
             outcome: "routed",
             error_kind: None,
             last_upstream_error_kind: None,
+            candidate_selection: None,
             quota_remaining: None,
         };
         // The writer is parked on the barrier, so these fill the bounded queue.

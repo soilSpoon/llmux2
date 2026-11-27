@@ -138,7 +138,18 @@ the failure kind on errors, and the remaining RPM/concurrency headroom of
 the last-attempted deployment. A failed request that reached an upstream
 SHALL also carry `last_upstream_error_kind` with the last upstream failure
 kind, even when the terminal routing failure is an aggregate kind such as
-`all_candidates_exhausted`. Each record SHALL also carry a `legs` list
+`all_candidates_exhausted`. Once a model enters candidate selection, each
+record SHALL also carry `candidate_selection` with the configured candidate
+count, the count considered before selection stopped, the attempt budget,
+whether the request was free-only, the retry delay in milliseconds when one
+is known, and per-request counts of candidate skip reasons. Skip reason keys
+SHALL distinguish pre-send policy skips (`free_only_billed` and
+`terminal_quota_billed`), eligibility skips (`disabled`, `not_provisioned`,
+`unsupported_format`, `expired`, `context_length`, `unsupported_conversion`,
+and `upstream_unavailable`), cooldowns (`cooldown`), and the exact admission
+limit when one is known (`rpm_limited`, `rpd_limited`, `tpm_limited`,
+`tpd_limited`, `fixed_request_quota`, `fixed_token_quota`,
+`concurrency_limited`, or `limit_probe`). Each record SHALL also carry a `legs` list
 with one entry per upstream send, in send order — including each body
 repaired and resent to the same deployment — naming that leg's
 deployment ID and provider and its outcome — `routed` when the leg served
