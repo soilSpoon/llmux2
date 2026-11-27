@@ -92,6 +92,10 @@ impl ProviderAdapter for OpenCode {
         }
     }
 
+    fn fallback_on_quota_exhausted(&self) -> bool {
+        false
+    }
+
     async fn build_request(
         &self,
         req: &GatewayRequest,
@@ -100,6 +104,9 @@ impl ProviderAdapter for OpenCode {
     ) -> Result<Request<Bytes>, BuildError> {
         if req.format != InboundFormat::OpenAiChat {
             return Err(BuildError::UnsupportedFormat);
+        }
+        if req.image_count > 0 {
+            return Err(BuildError::UnsupportedConversion);
         }
         let mut request = self.0.build_request(req, dep, &AuthMaterial::None).await?;
         let (body, identity) = rewrite_body(request.body(), req)?;

@@ -141,6 +141,11 @@ impl DeploymentLimits {
         (reset > now).then_some(reset)
     }
 
+    pub fn quota_cooldown_until(&self, now: Instant) -> Option<Instant> {
+        self.cooldown_until(now)
+            .filter(|_| self.credential_cooldown.load(Ordering::Relaxed))
+    }
+
     pub fn cool_down(&self, wait: Duration) -> Instant {
         self.cool_down_with_scope(wait, false)
     }
