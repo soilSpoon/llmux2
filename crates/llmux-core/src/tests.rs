@@ -2769,6 +2769,48 @@ async fn request_log_records_each_request() {
     assert_eq!(lines[2]["upstream_request_id"], "req_fixture_1");
 }
 
+#[tokio::test]
+async fn request_log_preserves_upstream_error_kind_when_auth_fatal_is_masked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("requests.jsonl");
+    let (executor, _adapter, _, _server) = fixture_full(
+        vec![UpstreamError::Auth { refreshable: false }],
+        false,
+        [Some(1024); 3],
+        &[("model", &[0])],
+        Default::default(),
+        Default::default(),
+        false,
+        Some(path.clone()),
+        [None; 3],
+        [None; 3],
+    )
+    .await;
+
+    let error = executor
+        .execute(request())
+        .await
+        .err()
+        .expect("auth rejection must fail the request");
+    assert!(
+        matches!(
+            &error,
+            GatewayError::AllCandidatesExhausted { attempts: 1, .. }
+        ),
+        "{error:?}"
+    );
+    drop(executor);
+
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["error_kind"], "all_candidates_exhausted");
+    assert_eq!(lines[0]["last_upstream_error_kind"], "auth");
+}
+
 #[tokio::test(start_paused = true)]
 async fn request_log_lists_every_attempt_leg() {
     let dir = tempfile::tempdir().unwrap();
