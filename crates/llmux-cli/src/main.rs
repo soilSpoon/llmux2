@@ -101,14 +101,7 @@ async fn run() -> Result<String, String> {
         encoded
     }
     let parsed_url = url::Url::parse(&args.url).map_err(|err| format!("bad --url: {err}"))?;
-    // 127.0.0.0/8 and ::1 are all loopback, not just 127.0.0.1.
-    let loopback = match parsed_url.host() {
-        Some(url::Host::Ipv4(address)) => address.is_loopback(),
-        Some(url::Host::Ipv6(address)) => address.is_loopback(),
-        Some(url::Host::Domain(domain)) => domain == "localhost",
-        None => false,
-    };
-    if parsed_url.scheme() == "http" && !loopback && args.key.is_some() {
+    if parsed_url.scheme() == "http" && !loopback_url(&parsed_url) && args.key.is_some() {
         return Err(
             "refusing to send the admin key over plaintext http to a non-loopback host".into(),
         );
@@ -154,4 +147,40 @@ async fn run() -> Result<String, String> {
     let pretty: serde_json::Value =
         serde_json::from_slice(&body).map_err(|err| format!("invalid JSON response: {err}"))?;
     Ok(serde_json::to_string_pretty(&pretty).unwrap())
+}
+
+// 127.0.0.0/8 and ::1 are all loopback, not just 127.0.0.1.
+fn loopback_url(parsed_url: &url::Url) -> bool {
+    match parsed_url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(domain)) => domain == "localhost",
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn plaintext_loopback_classification_covers_the_whole_ipv4_range() {
+        for url in [
+            "http://127.0.0.1:8080",
+            "http://127.0.0.2:8080",
+            "http://127.99.100.101:8080",
+            "http://[::1]:8080",
+            "http://localhost:8080",
+        ] {
+            assert!(
+                super::loopback_url(&url::Url::parse(url).unwrap()),
+                "{url} must be treated as loopback"
+            );
+        }
+
+        for url in ["http://example.com", "http://192.0.2.1"] {
+            assert!(
+                !super::loopback_url(&url::Url::parse(url).unwrap()),
+                "{url} must not be treated as loopback"
+            );
+        }
+    }
 }

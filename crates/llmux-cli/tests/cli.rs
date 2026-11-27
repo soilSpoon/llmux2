@@ -204,16 +204,4 @@ async fn secrets_never_echo_and_plaintext_remote_is_refused() {
     .await;
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("invalid JSON"));
-
-    // Every 127.0.0.0/8 address is loopback, not just 127.0.0.1: plaintext
-    // http to another local gateway address must not be refused.
-    let out = run(&[
-        "--url",
-        &server.url().replace("127.0.0.1", "127.0.0.2"),
-        "--key",
-        "admin-key",
-        "status",
-    ]);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!stderr.contains("plaintext"), "wrong refusal: {stderr}");
 }
