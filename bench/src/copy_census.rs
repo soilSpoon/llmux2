@@ -51,6 +51,12 @@ struct PairResult {
     gateway: Batch,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct AttemptsObserved {
+    consistent: Option<usize>,
+    missing: usize,
+}
+
 fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
@@ -136,10 +142,11 @@ async fn measure_endpoint(
     bearer: &str,
     body: &Bytes,
     requests: usize,
-) -> Result<(Batch, usize, Option<usize>)> {
+) -> Result<(Batch, usize, AttemptsObserved)> {
     let start = alloc_counter::snapshot();
     let mut response_bytes = 0;
-    let mut attempts_seen = None;
+    let mut consistent = None;
+    let mut missing = 0usize;
     for _ in 0..requests {
         let (status, response, attempts) = send(client, uri, bearer, body).await?;
         if !status.is_success() {
@@ -150,7 +157,21 @@ async fn measure_endpoint(
             .into());
         }
         response_bytes = response_bytes.max(response.len());
-        attempts_seen = attempts_seen.or(attempts);
+        match attempts {
+            Some(value) => {
+                if let Some(previous) = consistent {
+                    if previous != value {
+                        return Err(format!(
+                            "inconsistent x-llmux-attempts within one batch: {previous} then {value}"
+                        )
+                        .into());
+                    }
+                } else {
+                    consistent = Some(value);
+                }
+            }
+            None => missing += 1,
+        }
     }
     tokio::time::sleep(Duration::from_millis(2)).await;
     let delta = alloc_counter::delta_since(start);
@@ -160,7 +181,10 @@ async fn measure_endpoint(
             bytes: delta.bytes as f64 / requests as f64,
         },
         response_bytes,
-        attempts_seen,
+        AttemptsObserved {
+            consistent,
+            missing,
+        },
     ))
 }
 
@@ -225,7 +249,7 @@ priority = {first_priority}
     )
 }
 
-async fn end_to_end_case(case: EndToEndCase, pairs: usize) -> Result<String> {
+async fn end_to_end_case(case: EndToEndCase, pairs: usize) -> Result<(String, String)> {
     std::env::set_var("LLMUX_BENCH_CENSUS_CLIENT_KEY", CLIENT_KEY);
     std::env::set_var("LLMUX_BENCH_CENSUS_UPSTREAM_KEY", "mock-backend");
     let upstream = TestServer::start(mock_load_upstream::router(false, Duration::ZERO)).await?;
@@ -252,8 +276,7 @@ async fn end_to_end_case(case: EndToEndCase, pairs: usize) -> Result<String> {
 
     let mut measurements = Vec::new();
     let mut response_bytes = 0;
-    let mut attempts_seen = None;
-    for _ in 0..pairs {
+    for batch in 0..pairs {
         let (direct, direct_response, _) = measure_endpoint(
             &client,
             &direct_uri,
@@ -271,7 +294,13 @@ async fn end_to_end_case(case: EndToEndCase, pairs: usize) -> Result<String> {
         )
         .await?;
         response_bytes = response_bytes.max(direct_response).max(gateway_response);
-        attempts_seen = attempts_seen.or(attempts);
+        if case.retry && (attempts.consistent != Some(2) || attempts.missing != 0) {
+            return Err(format!(
+                "retry census batch {batch} did not exercise two attempts on every request                  (x-llmux-attempts consistent={:?}, missing={})",
+                attempts.consistent, attempts.missing,
+            )
+            .into());
+        }
         measurements.push(PairResult { direct, gateway });
     }
 
@@ -287,14 +316,22 @@ async fn end_to_end_case(case: EndToEndCase, pairs: usize) -> Result<String> {
             .map(|pair| pair.gateway)
             .collect::<Vec<_>>(),
     );
-    let actual_attempts = attempts_seen.unwrap_or(1);
-    if case.retry && actual_attempts != 2 {
-        return Err(format!(
-            "retry census did not exercise two attempts (x-llmux-attempts={actual_attempts})"
-        )
-        .into());
-    }
-    Ok(format!(
+    let deltas = measurements
+        .iter()
+        .map(|pair| Batch {
+            allocations: pair.gateway.allocations - pair.direct.allocations,
+            bytes: pair.gateway.bytes - pair.direct.bytes,
+        })
+        .collect::<Vec<_>>();
+    let delta = median_batch(&deltas);
+    let spread = deltas
+        .iter()
+        .map(|batch| batch.bytes)
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), value| {
+            (min.min(value), max.max(value))
+        });
+    let actual_attempts = if case.retry { 2 } else { 1 };
+    let row = format!(
         "| {} | {} | {} | {} | {:.1} | {:.1} | {:+.1} | {:.0} | {:.0} | {:+.0} | {:.2} |\n",
         case.name,
         case.target_bytes,
@@ -302,12 +339,17 @@ async fn end_to_end_case(case: EndToEndCase, pairs: usize) -> Result<String> {
         actual_attempts,
         direct.allocations,
         gateway.allocations,
-        gateway.allocations - direct.allocations,
+        delta.allocations,
         direct.bytes,
         gateway.bytes,
-        gateway.bytes - direct.bytes,
-        (gateway.bytes - direct.bytes) / case.target_bytes.max(1) as f64,
-    ))
+        delta.bytes,
+        delta.bytes / case.target_bytes.max(1) as f64,
+    );
+    let spread_row = format!(
+        "| {} | {:+.0} | {:+.0} | {:+.0} |\n",
+        case.name, spread.0, delta.bytes, spread.1,
+    );
+    Ok((row, spread_row))
 }
 
 fn deployment(upstream_model: &str) -> Deployment {
@@ -508,8 +550,11 @@ pub async fn run(_args: &[String]) -> Result<()> {
     ];
 
     let mut end_to_end_rows = String::new();
+    let mut spread_rows = String::new();
     for case in cases {
-        end_to_end_rows.push_str(&end_to_end_case(case, PAIRS).await?);
+        let (row, spread_row) = end_to_end_case(case, PAIRS).await?;
+        end_to_end_rows.push_str(&row);
+        spread_rows.push_str(&spread_row);
     }
     let build_rows = adapter_census().await?;
     let admission_rows = admission_parse_census();
@@ -527,6 +572,11 @@ pub async fn run(_args: &[String]) -> Result<()> {
     .expect("string write");
     writeln!(
         output,
+        "\nPer-batch paired Δ alloc bytes/req (the table above reports the median of these per-batch paired deltas, which can differ slightly from the difference of the leg medians):\n\n| Case | Min | Median | Max |\n| --- | ---: | ---: | ---: |\n{spread_rows}"
+    )
+    .expect("string write");
+    writeln!(
+        output,
         "\n### Provider `build_request` allocation census (64 KiB inputs)\n\n| Case | Input bytes | Output bytes | Allocs/op | Alloc bytes/op | Alloc bytes ÷ input bytes |\n| --- | ---: | ---: | ---: | ---: | ---: |\n{build_rows}"
     )
     .expect("string write");
@@ -537,7 +587,7 @@ pub async fn run(_args: &[String]) -> Result<()> {
     .expect("string write");
     writeln!(
         output,
-        "\nValidation: every request returned 2xx; retry case asserted `x-llmux-attempts: 2`. The direct leg uses the same mock upstream and final backend model, so subtraction isolates gateway work in steady state."
+        "\nValidation: every request returned 2xx; every retry-case batch required `x-llmux-attempts: 2` on every response. The direct leg uses the same mock upstream and final backend model, so subtraction isolates gateway work in steady state."
     )
     .expect("string write");
     print!("{output}");
@@ -592,7 +642,7 @@ mod tests {
 
     #[tokio::test]
     async fn spooled_retry_census_and_isolated_parser_measurements_smoke() {
-        let row = end_to_end_case(
+        let (row, spread_row) = end_to_end_case(
             EndToEndCase {
                 name: "test spooled retry",
                 target_bytes: 2048,
@@ -607,6 +657,7 @@ mod tests {
         .unwrap();
         assert!(row.contains("test spooled retry"));
         assert!(row.contains("| 2 |"));
+        assert!(spread_row.contains("test spooled retry"));
 
         let build_rows = adapter_census().await.unwrap();
         assert!(build_rows.contains("OpenAI Responses → chat conversion"));
