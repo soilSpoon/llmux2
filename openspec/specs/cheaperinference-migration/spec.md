@@ -422,6 +422,55 @@ WHEN an enabled Codex-routing mapping pattern cannot be expressed as an exact
 ID or a prefix with a single trailing `*`
 THEN import fails clearly without writing the output configuration.
 
+### Requirement: Fallback policy and audit artifacts are typed and redacted
+
+The importer library SHALL parse `fallback-policy.json` as a schema-versioned
+typed artifact before any policy-mode use. Schema version 1 SHALL define
+fallback decisions `suppress`, `retain`, `transition-retain`, and
+`hold-existing-unresolved`; spelling actions `alias`, `drop`,
+`retain-catchall`, `needs-review`, and `already-resolved`; and catch-all modes
+`transition` and `strict`. Every model, spelling, and catch-all decision SHALL
+carry provenance. `automatic-rule` provenance SHALL name its rule, and
+`user-approved` provenance SHALL name a non-secret `approval_source`.
+
+The artifact schema SHALL have no credential, client-key, token, or secret
+fields and SHALL reject unknown fields. The JSON parser SHALL reject duplicate
+object keys at any depth rather than collapse them. Validation SHALL fail
+closed rather than emit recognizable secret references or tokens in free text,
+and validation errors SHALL NOT echo unknown object keys or artifact input
+values. Artifact hash fields SHALL validate only the lowercase 64-character
+SHA-256 hex format in this phase. Semantic binding to the export, overlay, and
+policy source bytes remains a producer and consumer phase contract because this
+parser receives only the artifact. A spelling SHALL NOT appear in more than one
+spelling or catch-all disposition row. The `fallback-audit.json` writer SHALL
+produce deterministic bytes for equivalent input by sorting decisions and
+native-leg ids, and its summary SHALL agree with the decision rows.
+Needs-verification and held-unresolved rows count toward `needs_review` until
+the schema grows separate counters.
+
+This typed artifact support SHALL NOT by itself change importer output,
+fallback emission, routing, or production behavior. Policy-mode importer flags
+and runtime application are later migration phases.
+
+#### Scenario: Unresolved states are representable
+
+WHEN a schema version 1 policy uses `hold-existing-unresolved` for a model
+and `needs-review` or `already-resolved` for a spelling
+THEN typed parsing accepts those states without treating them as user approval.
+
+#### Scenario: User approval needs evidence
+
+WHEN a decision has `decision_source = "user-approved"` without
+`approval_source`
+THEN schema validation fails.
+
+#### Scenario: Audit output is deterministic and redacted
+
+WHEN equivalent audit decisions are serialized in different input orders
+THEN the bytes are identical
+AND secret references or credential and client-key metadata fail validation
+instead of appearing in output.
+
 ### Requirement: Restricted client keys keep their model policy
 
 An export API key SHALL be imported as a `client_keys` entry when its only

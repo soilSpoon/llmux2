@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "input_hashes": {
+    "export": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "overlay": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "fallback_policy": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "importer_binary_or_commit": "test-commit"
+  },
+  "summary": {
+    "fallback_legs_emitted": 1,
+    "fallback_legs_suppressed": 1,
+    "aliases_added": 1,
+    "spellings_dropped": 1,
+    "catchall_retained": 1,
+    "needs_review": 1
+  },
+  "decisions": [
+    {
+      "subject": "canonical-model",
+      "action": "suppressed-fallback",
+      "reason": "native-working",
+      "native_legs": [
+        "canonical-model-a",
+        "canonical-model-z"
+      ],
+      "policy_provenance": {
+        "decision_source": "automatic-rule",
+        "rule": "test-rule"
+      }
+    },
+    {
+      "subject": "catchall-spelling",
+      "action": "catchall-retained",
+      "reason": "buyer-use-during-transition",
+      "native_legs": [],
+      "policy_provenance": {
+        "decision_source": "automatic-rule",
+        "rule": "test-rule"
+      }
+    },
+    {
+      "subject": "dropped-spelling",
+      "action": "spelling-dropped",
+      "reason": "explicit-test-spelling",
+      "native_legs": [],
+      "policy_provenance": {
+        "decision_source": "automatic-rule",
+        "rule": "test-rule"
+      }
+    },
+    {
+      "subject": "emitted-model",
+      "action": "emitted-fallback",
+      "reason": "buyer-use",
+      "native_legs": [],
+      "policy_provenance": {
+        "decision_source": "automatic-rule",
+        "rule": "test-rule"
+      }
+    },
+    {
+      "subject": "needed-alias",
+      "action": "alias-added",
+      "reason": "reviewed spelling identity",
+      "native_legs": [],
+      "target": "canonical-model",
+      "policy_provenance": {
+        "decision_source": "automatic-rule",
+        "rule": "test-rule"
+      }
+    },
+    {
+      "subject": "unresolved-spelling",
+      "action": "needs-review",
+      "reason": "user decision required",
+      "native_legs": [],
+      "policy_provenance": {
+        "decision_source": "automatic-rule",
+        "rule": "test-rule"
+      }
+    }
+  ]
+}

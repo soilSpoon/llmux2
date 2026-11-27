@@ -792,6 +792,7 @@ name = "llmux-import"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "bytes",
  "http",
  "http-body-util",
@@ -801,8 +802,10 @@ dependencies = [
  "llmux-config",
  "llmux-testkit",
  "llmux-types",
+ "serde",
  "serde_json",
  "tempfile",
+ "time",
  "tokio",
  "toml",
 ]
