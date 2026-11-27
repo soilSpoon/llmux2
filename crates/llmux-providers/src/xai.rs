@@ -4,7 +4,7 @@
 use crate::{openai_compat::OpenAiCompat, OpenAiResponses};
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::{HeaderMap, Request, Response};
+use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, Uri};
 use hyper::body::Incoming;
 use llmux_types::{
     provider, AuthMaterial, BuildError, Deployment, GatewayRequest, GatewayResponse, InboundFormat,
@@ -13,7 +13,18 @@ use llmux_types::{
 use serde_json::{json, Value};
 
 const EFFORTS: &[&str] = &["xhigh", "high", "medium", "low"];
-const RESPONSES: &[&str] = &["grok-4.5", "grok-4.6", "grok-4.20-multi-agent-0309"];
+const RESPONSES: &[&str] = &[
+    "grok-4.5",
+    "grok-4.6",
+    "grok-4.7",
+    "grok-4.20-multi-agent-0309",
+];
+const GROK_SUBSCRIPTION_PROXY_HOST: &str = "cli-chat-proxy.grok.com";
+const GROK_SUBSCRIPTION_IDENTITY: &[(&str, &str)] = &[
+    ("x-xai-token-auth", "xai-grok-cli"),
+    ("x-grok-client-identifier", "grok-shell"),
+    ("x-grok-client-version", "1.0.46"),
+];
 const EFFORT_ALLOWED: &[&str] = &["grok-4.3", "grok-4.20-0309-reasoning"];
 const EFFORT_DENIED: &[&str] = &["grok-build-0.1", "grok-4.20-0309-non-reasoning"];
 
@@ -44,6 +55,23 @@ fn stripped(model: &str) -> (String, Option<&str>) {
 
 fn responses(model: &str) -> bool {
     RESPONSES.contains(&model)
+}
+
+fn with_subscription_identity(headers: &mut HeaderMap, base_url: &Uri) {
+    if !base_url
+        .host()
+        .is_some_and(|host| host.eq_ignore_ascii_case(GROK_SUBSCRIPTION_PROXY_HOST))
+    {
+        return;
+    }
+    for (name, value) in GROK_SUBSCRIPTION_IDENTITY {
+        if !headers.contains_key(*name) {
+            headers.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
+        }
+    }
 }
 
 fn with_model(req: &GatewayRequest, body: Bytes, model: &str) -> GatewayRequest {
@@ -94,9 +122,11 @@ impl ProviderAdapter for Xai {
         auth: &AuthMaterial,
     ) -> Result<Request<Bytes>, BuildError> {
         let (model, effort) = stripped(crate::upstream_model(req, dep));
+        let mut headers = dep.headers.clone();
+        with_subscription_identity(&mut headers, &dep.base_url);
         let dep = Deployment {
             upstream_model: model.clone().into(),
-            headers: dep.headers.clone(),
+            headers,
             fallback: dep.fallback,
             idx: dep.idx,
             id: dep.id.clone(),
@@ -164,7 +194,7 @@ mod tests {
     use llmux_types::{Billing, DeploymentIdx, QuotaSpec, RequestId};
     use std::time::Duration;
 
-    fn dep(model: &str) -> Deployment {
+    fn dep_at(model: &str, base_url: &str) -> Deployment {
         Deployment {
             headers: HeaderMap::new(),
             fallback: false,
@@ -172,7 +202,7 @@ mod tests {
             id: "xai".into(),
             provider: ProviderKind(provider::XAI.into()),
             credential: "oauth".into(),
-            base_url: "https://api.x.ai/v1".parse().unwrap(),
+            base_url: base_url.parse().unwrap(),
             upstream_model: model.into(),
             strip_request_fields: Box::default(),
             shared_quota: None,
@@ -185,6 +215,10 @@ mod tests {
             priority_boost_until: None,
             billing: Billing::Billed,
         }
+    }
+
+    fn dep(model: &str) -> Deployment {
+        dep_at(model, "https://api.x.ai/v1")
     }
 
     fn request(body: Value) -> GatewayRequest {
@@ -237,5 +271,78 @@ mod tests {
         let body: Value = serde_json::from_slice(built.body()).unwrap();
         assert_eq!(body["model"], "grok-4.3");
         assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[tokio::test]
+    async fn subscription_proxy_adds_grok_cli_identity_headers() {
+        let adapter = Xai::new();
+        for model in ["grok-4.3", "grok-4.5"] {
+            let built = adapter
+                .build_request(
+                    &request(json!({"messages":[{"role":"user","content":"hi"}]})),
+                    &dep_at(model, "https://cli-chat-proxy.grok.com/v1"),
+                    &AuthMaterial::Bearer("synthetic-token".into()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(built.headers()["x-xai-token-auth"], "xai-grok-cli");
+            assert_eq!(built.headers()["x-grok-client-identifier"], "grok-shell");
+            assert_eq!(built.headers()["x-grok-client-version"], "1.0.46");
+        }
+    }
+
+    #[tokio::test]
+    async fn subscription_proxy_deployment_headers_override_identity_defaults() {
+        let adapter = Xai::new();
+        let mut deployment = dep_at("grok-4.5", "https://cli-chat-proxy.grok.com/v1");
+        deployment.headers.insert(
+            "x-grok-client-version",
+            http::HeaderValue::from_static("1.0.47"),
+        );
+        let built = adapter
+            .build_request(
+                &request(json!({"messages":[{"role":"user","content":"hi"}]})),
+                &deployment,
+                &AuthMaterial::Bearer("synthetic-token".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(built.headers()["x-xai-token-auth"], "xai-grok-cli");
+        assert_eq!(built.headers()["x-grok-client-identifier"], "grok-shell");
+        assert_eq!(built.headers()["x-grok-client-version"], "1.0.47");
+    }
+
+    #[tokio::test]
+    async fn identity_headers_are_not_added_off_proxy() {
+        let adapter = Xai::new();
+        for base_url in ["https://api.x.ai/v1", "https://example.com/v1"] {
+            let built = adapter
+                .build_request(
+                    &request(json!({"messages":[{"role":"user","content":"hi"}]})),
+                    &dep_at("grok-4.5", base_url),
+                    &AuthMaterial::Bearer("synthetic-token".into()),
+                )
+                .await
+                .unwrap();
+            assert!(!built.headers().contains_key("x-xai-token-auth"));
+            assert!(!built.headers().contains_key("x-grok-client-identifier"));
+            assert!(!built.headers().contains_key("x-grok-client-version"));
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_4_7_uses_the_responses_endpoint() {
+        let adapter = Xai::new();
+        let built = adapter
+            .build_request(
+                &request(json!({"messages":[{"role":"user","content":"hi"}]})),
+                &dep("grok-4.7"),
+                &AuthMaterial::Bearer("synthetic-token".into()),
+            )
+            .await
+            .unwrap();
+        assert!(built.uri().to_string().ends_with("/v1/responses"));
+        let body: Value = serde_json::from_slice(built.body()).unwrap();
+        assert_eq!(body["model"], "grok-4.7");
     }
 }
