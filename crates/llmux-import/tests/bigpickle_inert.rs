@@ -444,6 +444,7 @@ fn mutate_first_deployment(model: &mut Table, mutate: impl FnOnce(&mut Table)) {
 }
 
 fn generate_candidate() -> (String, tempfile::TempDir) {
+    let _env_guard = ENV_LOCK.lock().unwrap();
     std::env::set_var("LLMUX_SYNTHETIC_BIGPICKLE_BUYER_KEY", "synthetic-buyer-key");
     std::env::set_var(
         "LLMUX_SYNTHETIC_BIGPICKLE_NONBUYER_KEY",
@@ -710,12 +711,6 @@ fn structural_buyer_key_proof_rejects_wrong_or_ambiguous_shapes() {
 
 #[test]
 fn synthetic_import_with_fallback_and_overlay_ends_with_only_the_overlay_free_leg() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    std::env::set_var("LLMUX_SYNTHETIC_BIGPICKLE_BUYER_KEY", "synthetic-buyer-key");
-    std::env::set_var(
-        "LLMUX_SYNTHETIC_BIGPICKLE_NONBUYER_KEY",
-        "synthetic-nonbuyer-key",
-    );
     let (text, _dir) = generate_candidate();
     validate_candidate_shape(&text).unwrap();
 
