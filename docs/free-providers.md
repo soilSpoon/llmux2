@@ -66,7 +66,6 @@ ban.
 | `packet-minimax-m3.1-flash` | `api.packet.ai/v1`, `MiniMaxAI/MiniMax-M3.1-Flash` | same window | `expires_at = 2026-12-16T23:59:59Z` |
 | `zen-hy4-flash` | `opencode.ai/inference/openai/v1`, `hy4-flash-free` | “for a limited time”, no date on the page | `expires_at = 2026-11-30T23:59:59Z` (the window this project was given, not an official date) |
 | `zen-deepseek-v4.1-flash` | same endpoint, `deepseek-v4.1-flash-free` | “for a limited time” | none, because no end date is announced |
-| `zen-big-pickle` | same endpoint, `big-pickle` | “for a limited time” | none |
 | `nvidia-gemma-4-31b` | `integrate.api.nvidia.com/v1`, `google/gemma-4-31b-it` | Free Endpoint Available; no announced end | none |
 | `freemodel-claude-fable-5` | `https://freemodel.in/v1`, `claude-fable-5` | 1M tokens/month on the Free plan, reset monthly | none; a recurring allowance is not an expiry |
 
@@ -155,7 +154,7 @@ or live catalog, not a guarantee that they remain free or available.
 | Exclude: GitHub Models | No active endpoint/auth | Official docs say fully retired July 30, 2026 [GH1]; no current free models/limits | Do not configure legacy `models.github.ai/inference` or PAT examples. No. |
 | Hold: LLM7 | `https://api.llm7.io/v1`; dashboard API token; `default`, `fast`, `pro` selectors [L1] | No current free allowance or limits verified. Homepage advertises lower prices, not free access | First-party docs establish keyed OpenAI client support, not underlying provider authorization. Training/resale/multi-account terms and provenance **unverified**. Technically Chat yes; do not recommend until those are established. |
 | Temporary: packet.ai Token Factory | `https://api.packet.ai/v1`; account API key after email plus SMS verification [P1] | Input and output tokens `$0` for every account until 2026-12-16, then paid [P1]. `DeepSeek-V4.1-Flash-NVFP4` and `MiniMax-M3.1-Flash`, 131K ctx [P1]. Rate limit **unverified** | Promo, not recurring. Endpoint and model IDs rest on the landing page only: keyless `/v1/models` returned `403`, docs behind a challenge [P1]. Retention policy unstated. Chat with streaming, JSON mode and tool calling per the page. |
-| Conditional: OpenCode Zen free pool | `https://opencode.ai/inference/openai/v1`; Zen API key [Z1] | `*-free` IDs priced 0 in the live catalog (`deepseek-v4.1-flash-free`, `hy4-flash-free`, `big-pickle`, others); all “for a limited time”, no dates [Z1] | “Free-tier chat models require OpenCode”; a keyless outside request got `429 FreeUsageLimitError` [Z1]. Zero retention is stated for DeepSeek V4.1 Flash Free and Hy4 Flash Free only; Big Pickle may be trained on. |
+| Conditional: OpenCode Zen free pool | `https://opencode.ai/inference/openai/v1`; Zen API key [Z1] | `*-free` IDs priced 0 in the live catalog (`deepseek-v4.1-flash-free`, `hy4-flash-free`, `big-pickle`, others); all “for a limited time”, no dates [Z1] | “Free-tier chat models require OpenCode”; a keyless outside request got `429 FreeUsageLimitError` [Z1]. Zero retention is stated for DeepSeek V4.1 Flash Free and Hy4 Flash Free only; Big Pickle may be trained on. `big-pickle` is parked and intentionally absent from the copyable example while the free-tier client restriction and training posture make it unsuitable for buyer traffic. |
 | Conditional: freemodel.in Free plan | `https://freemodel.in/v1`; account key [F2] | 1M tokens/month, prompt and reply combined, 60 RPM, 100K TPM; `402` when spent [F2]. 29 models in the catalog, including `claude-fable-5` | Third-party aggregator reselling other providers' models; its retention terms are the only ones you get, so upstream training/resale terms are **unverified**. Not an expiry: the allowance resets monthly. Monthly token caps are not expressible in `quota`. |
 
 Do not treat “unverified” ToS fields as permission. Before serving other users,
@@ -741,17 +740,7 @@ upstream_model = "hy4-flash-free"
 timeout_ms = 60000
 expires_at = 2026-11-30T23:59:59Z
 
-[[models]]
-name = "big-pickle"
-capabilities = { stream = true, max_context = 200000 }
-[[models.deployments]]
-id = "zen-big-pickle"
-credential = "zen-key"
-base_url = "https://opencode.ai/inference/openai/v1"
-upstream_model = "big-pickle"
-timeout_ms = 60000
 ```
-
 ### NVIDIA NIM (free endpoint, per-model)
 
 The model page says “Free Endpoint Available”, but the quickstart publishes no

@@ -1536,9 +1536,7 @@ mod tests {
                     assert_eq!(dep.expires_at, Some(expiry(1_797_465_599)), "{}", dep.id)
                 }
                 "zen-hy4-flash" => assert_eq!(dep.expires_at, Some(expiry(1_796_083_199))),
-                "zen-deepseek-v4.1-flash" | "zen-big-pickle" => {
-                    assert_eq!(dep.expires_at, None, "{}", dep.id)
-                }
+                "zen-deepseek-v4.1-flash" => assert_eq!(dep.expires_at, None, "{}", dep.id),
                 "nvidia-gemma-4-31b" => {
                     assert_eq!(dep.expires_at, None);
                     assert_eq!(dep.quota.rpm, Some(20));
@@ -1557,11 +1555,14 @@ mod tests {
             "nvidia-gemma-4-31b",
             "zen-hy4-flash",
             "zen-deepseek-v4.1-flash",
-            "zen-big-pickle",
             "freemodel-claude-fable-5",
         ] {
             assert!(seen.contains(id), "example config is missing {id}");
         }
+        assert!(
+            !seen.contains("zen-big-pickle") && !parsed.model_names.contains_key("big-pickle"),
+            "big-pickle must stay parked while no compliant free buyer lane exists"
+        );
     }
 
     #[test]

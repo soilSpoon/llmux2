@@ -1053,7 +1053,7 @@ pub fn import_with_options(
     let policy = policy::Policy::load(options)?;
     let mut dead: HashSet<String> = approved_drops::USER_APPROVED_DROPS
         .iter()
-        .map(|name| (*name).to_owned())
+        .map(|drop| drop.spelling.to_owned())
         .collect();
     if let Some(path) = options.exclude_models {
         let listed = serde_json::from_str::<Vec<String>>(
@@ -1684,11 +1684,10 @@ pub fn import_with_options(
     let mut deployment_ids = HashSet::new();
     for name in order {
         if dead.contains(&name) {
-            if approved_drops::user_approved(&name) {
+            if let Some(drop) = approved_drops::lookup(&name) {
                 warnings.push(format!(
                     "model {name}: dropped user-approved buyer-visible interruption ({}; {})",
-                    approved_drops::APPROVAL_SOURCE,
-                    approved_drops::REASON
+                    drop.approval, drop.reason
                 ));
             } else {
                 warnings.push(format!(
@@ -1982,6 +1981,29 @@ pub fn import_with_options(
                 }
             }
         };
+        let policy = if let Some((mut models, blocked, dropped)) = policy {
+            let removed: Vec<_> = models
+                .iter()
+                .filter(|model| approved_drops::lookup(model).is_some())
+                .cloned()
+                .collect();
+            if !removed.is_empty() {
+                models.retain(|model| approved_drops::lookup(model).is_none());
+                warnings.push(format!(
+                    "client key {i}: removed user-approved interrupted spellings {} from the restricted model allow list",
+                    removed.join(", ")
+                ));
+            }
+            if models.is_empty() {
+                warnings.push(format!(
+                    "client key {i}: skipped restricted key because user-approved interruptions left no allowed models"
+                ));
+                continue;
+            }
+            Some((models, blocked, dropped))
+        } else {
+            None
+        };
         let id = unique(&format!("client-{i}"), &mut ids);
         let key_ref = write_secret(&dir, &id, key["key"].as_str().unwrap())?;
         if let Some((models, blocked, dropped)) = policy {
@@ -2127,13 +2149,13 @@ fn write_canonical_map(
         .sum();
     let drop_decisions: Vec<_> = approved_drops::USER_APPROVED_DROPS
         .iter()
-        .map(|spelling| {
+        .map(|drop| {
             json!({
-                "spelling": spelling,
+                "spelling": drop.spelling,
                 "action": "drop",
                 "decision_source": "user-approved",
-                "approval": approved_drops::APPROVAL_SOURCE,
-                "reason": approved_drops::REASON,
+                "approval": drop.approval,
+                "reason": drop.reason,
             })
         })
         .collect();

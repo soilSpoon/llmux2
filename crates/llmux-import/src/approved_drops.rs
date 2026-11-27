@@ -2,20 +2,79 @@
 //! no compliant free exact native lane exists. Keep this current-importer
 //! table until WO-175 fallback-policy spellings carry explicit drop decisions.
 
-pub(crate) const APPROVAL_SOURCE: &str = "WO-189 user decision: buyer-visible interruption";
-pub(crate) const REASON: &str = "no compliant free exact native lane";
+pub(crate) struct ApprovedDrop {
+    pub(crate) spelling: &'static str,
+    pub(crate) approval: &'static str,
+    pub(crate) reason: &'static str,
+}
 
-pub(crate) const USER_APPROVED_DROPS: &[&str] = &[
-    "kimi-k2.6",
-    "moonshotai/kimi-k2.6",
-    "cloudflare-direct/moonshotai/kimi-k2.6",
-    "cfp/moonshotai/kimi-k2.6",
-    "cfpd/moonshotai/kimi-k2.6",
-    "cloudflare-playground/moonshotai/kimi-k2.6",
-    "ddgw/gpt-5.4-mini",
-    "duckduckgo-web/ddgw/gpt-5.4-mini",
+const WO189_APPROVAL: &str = "WO-189 user decision: buyer-visible interruption";
+const WO189_REASON: &str = "no compliant free exact native lane";
+const WO187_APPROVAL: &str = "WO-187 user constraint: free lanes only";
+const WO188_APPROVAL: &str = "WO-188 user constraint: free lanes only";
+const PARKED_REASON: &str =
+    "no compliant free exact native lane; free lane candidates parked by the free-lane constraint";
+
+pub(crate) const USER_APPROVED_DROPS: &[ApprovedDrop] = &[
+    ApprovedDrop {
+        spelling: "kimi-k2.6",
+        approval: WO189_APPROVAL,
+        reason: WO189_REASON,
+    },
+    ApprovedDrop {
+        spelling: "moonshotai/kimi-k2.6",
+        approval: WO189_APPROVAL,
+        reason: WO189_REASON,
+    },
+    ApprovedDrop {
+        spelling: "cloudflare-direct/moonshotai/kimi-k2.6",
+        approval: WO189_APPROVAL,
+        reason: WO189_REASON,
+    },
+    ApprovedDrop {
+        spelling: "cfp/moonshotai/kimi-k2.6",
+        approval: WO189_APPROVAL,
+        reason: WO189_REASON,
+    },
+    ApprovedDrop {
+        spelling: "cfpd/moonshotai/kimi-k2.6",
+        approval: WO189_APPROVAL,
+        reason: WO189_REASON,
+    },
+    ApprovedDrop {
+        spelling: "cloudflare-playground/moonshotai/kimi-k2.6",
+        approval: WO189_APPROVAL,
+        reason: WO189_REASON,
+    },
+    ApprovedDrop {
+        spelling: "ddgw/gpt-5.4-mini",
+        approval: WO189_APPROVAL,
+        reason: WO189_REASON,
+    },
+    ApprovedDrop {
+        spelling: "duckduckgo-web/ddgw/gpt-5.4-mini",
+        approval: WO189_APPROVAL,
+        reason: WO189_REASON,
+    },
+    ApprovedDrop {
+        spelling: "big-pickle",
+        approval: WO187_APPROVAL,
+        reason: PARKED_REASON,
+    },
+    ApprovedDrop {
+        spelling: "gpt-5.6-luna",
+        approval: WO188_APPROVAL,
+        reason: PARKED_REASON,
+    },
+    ApprovedDrop {
+        spelling: "duckduckgo-web/ddgw/gpt-5.6-luna",
+        approval: WO188_APPROVAL,
+        reason: PARKED_REASON,
+    },
 ];
 
-pub(crate) fn user_approved(name: &str) -> bool {
-    USER_APPROVED_DROPS.contains(&name)
+pub(crate) fn lookup(name: &str) -> Option<&'static ApprovedDrop> {
+    USER_APPROVED_DROPS
+        .iter()
+        .find(|drop| drop.spelling == name)
 }
