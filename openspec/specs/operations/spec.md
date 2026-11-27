@@ -520,9 +520,12 @@ requests when the promo ends; billed legs on the same host are unstamped.
 With `--morph-ultra`, the importer SHALL treat keyed connections to the
 official Morph endpoint as Ultra-plan credentials: it SHALL emit only the
 reviewed plan-covered upstream ids (`morph-kimik31`, `morph-dsv41flash`,
-`morph-dsv41flash-1017`, and `morph-dsv41flash-abliterated`), drop other Morph upstream ids with a warning,
-and write the same exact list as the credential's `allowed_upstream_models`.
-Without the flag, Morph imports SHALL remain unfiltered.
+`morph-dsv41flash-1017`, and `morph-dsv41flash-abliterated`), drop other Morph
+upstream ids with a warning, and write the same exact list as the credential's `allowed_upstream_models`.
+The ambiguous `morph-kimik3` id SHALL remain excluded because Morph's
+machine-readable catalog identifies it as Kimi K3 rather than Kimi K3.1, even
+where Ultra prose calls it a K3.1 alias. Without the flag, Morph imports SHALL
+remain unfiltered.
 
 #### Scenario: Paid Kimi Abliterated never enters an Ultra config
 

@@ -128,4 +128,7 @@ WHEN the morph credential's reviewed Ultra scope covers Kimi K3.1
 THEN a deployment on that credential naming `morph-kimik3`,
 `morph-kimik3-fast`, `morph-kimik3-abliterated`, or any other out-of-scope
 upstream model fails config validation, while the listed Kimi K3.1 and
-DeepSeek ids load.
+DeepSeek ids load. Although the Ultra prose calls `morph-kimik3` a K3.1
+alias, Morph's machine-readable catalog identifies it as `moonshotai/Kimi-K3`
+rather than `moonshotai/Kimi-K3.1-Pro`; exact whitelisting SHALL prefer the
+canonical `morph-kimik31` id over that ambiguous alias.

@@ -5,10 +5,13 @@ pub(super) const OFFICIAL_URL: &str = "https://api.morphllm.com/v1";
 
 /// Upstream ids the reviewed Morph Ultra scope allows without per-token
 /// list-price billing: Kimi K3.1 plus the DeepSeek V4.1 Flash variants. The
-/// abliteratated DeepSeek row still requires Morph privileged access, but it
+/// abliterated DeepSeek row still requires Morph privileged access, but it
 /// is never list-price billed when that access is approved. Kimi K3, Kimi K3
-/// Fast, and Kimi Abliterated are deliberately absent: the first two are not
-/// Kimi K3.1, and Morph bills Kimi Abliterated per token even then.
+/// Fast, and Kimi Abliterated are deliberately absent: Morph's Ultra prose
+/// calls morph-kimik3 a K3.1 alias, but Morph's machine-readable model
+/// catalog identifies it as moonshotai/Kimi-K3 rather than
+/// moonshotai/Kimi-K3.1-Pro. Exact whitelisting uses the canonical K3.1 id
+/// only; Kimi Abliterated is billed per token even then.
 pub(super) const ULTRA_MODELS: &[&str] = &[
     "morph-kimik31",
     "morph-dsv41flash",
