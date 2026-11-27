@@ -3,6 +3,19 @@ use serde_json::Value;
 
 pub(super) const OFFICIAL_URL: &str = "https://api.morphllm.com/v1";
 
+/// Upstream ids Morph Ultra covers without per-token list-price billing:
+/// Kimi K3.1 and its alias, plus the DeepSeek V4.1 Flash variants. The
+/// abliteratated DeepSeek row still requires Morph privileged access, but it
+/// is never list-price billed when that access is approved; Kimi Abliterated
+/// is deliberately absent because Morph bills it per token even then.
+pub(super) const ULTRA_MODELS: &[&str] = &[
+    "morph-kimik31",
+    "morph-kimik3",
+    "morph-dsv41flash",
+    "morph-dsv41flash-1017",
+    "morph-dsv41flash-abliterated",
+];
+
 // OCI verified the existing Morph key lists morph-dsv41flash-1017 and returns logprobs:
 // https://api.morphllm.com/v1/models
 // Mistral rejects logprobs for deepseek-v4-1-flash-1017. Reviewed exported combo names only.

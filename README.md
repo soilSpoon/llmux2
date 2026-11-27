@@ -35,6 +35,14 @@ llmux2 accepts and discards the CheaperInference routing fields `min_discount_pe
 
 Credentials use `provider = "openai"` or `"openai_compat"` for OpenAI-compatible upstreams, or `provider = "anthropic"` for the Anthropic Messages API. Anthropic deployments use a base URL such as `https://api.anthropic.com/v1` (the adapter appends `/messages`) and send the key as `x-api-key`. The gateway converts chat requests, JSON responses and SSE chunks between the OpenAI Chat and Anthropic formats, so a model can mix both kinds of deployments and fail over between them.
 
+A credential whose account or plan covers only some upstream models may set
+`allowed_upstream_models = ["exact-upstream-id"]`. Every entry must be a
+nonempty, unique exact id; `*` is not allowed. Configuration load then rejects
+any deployment on that credential whose `upstream_model` is outside the list,
+so a plan boundary is enforced before traffic rather than learned from upstream
+errors. A catch-all deployment cannot use such a credential because its upstream
+id is not statically exact.
+
 Use `POST /v1/messages` for Anthropic Messages JSON and SSE on Anthropic deployments. Authenticate with a gateway client key in `x-api-key` or `Authorization: Bearer`.
 
 Deployments may set `headers = { "X-Custom" = "literal value", "X-Secret" = "file:/private/header" }`.

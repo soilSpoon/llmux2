@@ -13,6 +13,7 @@ fn run() -> Result<(), String> {
     let mut nous_state = None;
     let mut nous_models = None;
     let mut replacements = false;
+    let mut morph_ultra = false;
     let mut fallback = None;
     let mut key = None;
     let mut excluded = None;
@@ -34,6 +35,13 @@ fn run() -> Result<(), String> {
                 return Err("duplicate argument".into());
             }
             replacements = true;
+            continue;
+        }
+        if arg == "--morph-ultra" {
+            if morph_ultra {
+                return Err("duplicate argument".into());
+            }
+            morph_ultra = true;
             continue;
         }
         if arg == "--workers-ai-rpm" {
@@ -76,7 +84,7 @@ fn run() -> Result<(), String> {
             Some("--scan-probe-base") => &mut scan_probe_base,
             Some("--scan-key-file") => &mut scan_key_file,
             _ => return Err(
-                "usage: llmux-import --input export.json --output llmux.toml [--secrets-dir DIR] [--cloudflare-account-id-file PATH --cloudflare-token-file PATH] [--workers-ai-models PATH] [--kilo-free-models PATH] [--kilo-key-file PATH] [--devin-models PATH] [--nous-state PATH --nous-models PATH] [--openrouter-replacements] [--workers-ai-rpm RPM] [--omniroute-fallback BASE_URL --omniroute-key SECRET_REF] [--exclude-models PATH] [--listen HOST:PORT] [--overlay PATH] [--free-providers PATH] [--deepai-code-state PATH --deepai-code-token-file PATH] [--canonical-map PATH] | llmux-import --scan-free PROVIDER [--scan-page-url URL] [--scan-probe-base URL] [--scan-key-file PATH]"
+                "usage: llmux-import --input export.json --output llmux.toml [--secrets-dir DIR] [--cloudflare-account-id-file PATH --cloudflare-token-file PATH] [--workers-ai-models PATH] [--kilo-free-models PATH] [--kilo-key-file PATH] [--devin-models PATH] [--nous-state PATH --nous-models PATH] [--openrouter-replacements] [--morph-ultra] [--workers-ai-rpm RPM] [--omniroute-fallback BASE_URL --omniroute-key SECRET_REF] [--exclude-models PATH] [--listen HOST:PORT] [--overlay PATH] [--free-providers PATH] [--deepai-code-state PATH --deepai-code-token-file PATH] [--canonical-map PATH] | llmux-import --scan-free PROVIDER [--scan-page-url URL] [--scan-probe-base URL] [--scan-key-file PATH]"
                     .into(),
             ),
         };
@@ -111,6 +119,7 @@ fn run() -> Result<(), String> {
         nous_state: nous_state.as_deref(),
         nous_models: nous_models.as_deref(),
         openrouter_replacements: replacements,
+        morph_ultra,
         workers_ai_rpm: workers_rpm,
         omniroute_fallback: fallback,
         listen: listen.as_deref().and_then(|p| p.to_str()),

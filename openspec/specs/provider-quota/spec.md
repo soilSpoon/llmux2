@@ -111,14 +111,21 @@ and alerting report "resets at T" rather than a generic failure.
 
 ### Requirement: No billed legs behind free-only paths
 
-A credential whose plan covers only a subset SHALL be configured so its
-deployments reference only covered upstream models; anything out-of-plan relies
-on `NotProvisioned` as a safety net, not as the primary control. The
-`x-llmux-free-only` request flag SHALL keep excluding `billed` legs.
+A credential whose plan covers only a subset SHALL declare the covered exact
+upstream ids in `allowed_upstream_models`. Entries SHALL be nonempty, unique,
+exact ids — never `*` — and llmux-config SHALL reject every deployment on that
+credential whose `upstream_model` is absent from the list. Because the match is
+exact and static, a catch-all deployment cannot use such a credential. Anything
+out-of-plan relies on `NotProvisioned` only as a safety net, not as the primary
+control. The `x-llmux-free-only` request flag SHALL keep excluding `billed`
+legs.
 
 #### Scenario: Morph plan boundary
 
-WHEN the morph credential's Ultra plan covers `morph-kimik31` and the
-`morph-dsv41flash*` family only
-THEN no deployment on that credential names an out-of-plan upstream model, and
-any missed one dies on `NotProvisioned` without billing attempts piling up.
+WHEN the morph credential's Ultra plan covers Kimi K3.1 (`morph-kimik31`, with
+`morph-kimik3` as its alias) and the DeepSeek V4.1 Flash variants
+(`morph-dsv41flash`, `morph-dsv41flash-1017`, and privileged-access
+`morph-dsv41flash-abliterated`)
+THEN a deployment on that credential naming `morph-kimik3-abliterated` or any
+other out-of-plan upstream model fails config validation, while the listed
+Kimi and DeepSeek ids load.

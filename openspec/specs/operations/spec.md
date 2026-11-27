@@ -515,6 +515,30 @@ WHEN a free leg sits on a host whose reviewed conditions carry an
 THEN the emitted deployment carries that stamp, so the leg stops taking
 requests when the promo ends; billed legs on the same host are unstamped.
 
+### Requirement: Morph Ultra import boundary
+
+With `--morph-ultra`, the importer SHALL treat keyed connections to the
+official Morph endpoint as Ultra-plan credentials: it SHALL emit only the
+reviewed plan-covered upstream ids (`morph-kimik31`, `morph-kimik3`,
+`morph-dsv41flash`, `morph-dsv41flash-1017`, and
+`morph-dsv41flash-abliterated`), drop other Morph upstream ids with a warning,
+and write the same exact list as the credential's `allowed_upstream_models`.
+Without the flag, Morph imports SHALL remain unfiltered.
+
+#### Scenario: Paid Kimi Abliterated never enters an Ultra config
+
+WHEN an export combo asks for `morph/morph-kimik3-abliterated` and the import
+runs with `--morph-ultra`
+THEN no deployment on the Morph credential contains that per-token model,
+the credential allowlist omits it, and the import warns that it is outside
+the Morph Ultra plan.
+
+#### Scenario: Opt-in only
+
+WHEN the same export imports without `--morph-ultra`
+THEN existing Morph deployments keep their prior behavior, because not every
+Morph key is an Ultra-plan key.
+
 ### Requirement: Simple and extensible
 
 The codebase SHALL stay simple with low overhead, and be easy to extend and

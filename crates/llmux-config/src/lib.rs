@@ -307,6 +307,9 @@ enum RawCredential {
         id: String,
         provider: String,
         key: String,
+        /// Exact upstream model ids this credential's plan covers. When set,
+        /// every deployment referencing the credential must name one of them.
+        allowed_upstream_models: Option<Vec<String>>,
         #[serde(default)]
         quota: QuotaSpec,
         /// Start disabled: routing skips every deployment on this credential
@@ -325,6 +328,9 @@ enum RawCredential {
         resource: Option<String>,
         refresh_skew_ms: Option<u64>,
         request_timeout_ms: Option<u64>,
+        /// Exact upstream model ids this credential's plan covers. When set,
+        /// every deployment referencing the credential must name one of them.
+        allowed_upstream_models: Option<Vec<String>>,
         #[serde(default)]
         quota: QuotaSpec,
         /// Start disabled: routing skips every deployment on this credential
@@ -338,6 +344,9 @@ enum RawCredential {
         state_file: String,
         refresh_skew_ms: Option<u64>,
         request_timeout_ms: Option<u64>,
+        /// Exact upstream model ids this credential's plan covers. When set,
+        /// every deployment referencing the credential must name one of them.
+        allowed_upstream_models: Option<Vec<String>>,
         #[serde(default)]
         quota: QuotaSpec,
         /// Start disabled: routing skips every deployment on this credential
@@ -370,6 +379,9 @@ enum RawCredential {
         /// that require authentication before `session/new` (Antigravity's
         /// `agy acp` uses `oauth-personal`).
         auth_method: Option<String>,
+        /// Exact upstream model ids this credential's plan covers. When set,
+        /// every deployment referencing the credential must name one of them.
+        allowed_upstream_models: Option<Vec<String>>,
         #[serde(default)]
         quota: QuotaSpec,
         /// Start disabled: routing skips every deployment on this credential
@@ -552,13 +564,15 @@ impl RawConfig {
         }
         let mut credential_quotas = HashMap::new();
         let mut credential_disabled = HashSet::new();
+        let mut credential_upstream_models: HashMap<Arc<str>, HashSet<Arc<str>>> = HashMap::new();
         for credential in credentials {
-            let (id, provider, quota, disabled) = match &credential {
+            let (id, provider, quota, disabled, allowed_upstream_models) = match &credential {
                 RawCredential::ApiKey {
                     id,
                     provider,
                     quota,
                     disabled,
+                    allowed_upstream_models,
                     ..
                 }
                 | RawCredential::Oauth {
@@ -566,6 +580,7 @@ impl RawConfig {
                     provider,
                     quota,
                     disabled,
+                    allowed_upstream_models,
                     ..
                 }
                 | RawCredential::NousPortal {
@@ -573,6 +588,7 @@ impl RawConfig {
                     provider,
                     quota,
                     disabled,
+                    allowed_upstream_models,
                     ..
                 }
                 | RawCredential::AcpAgent {
@@ -580,8 +596,15 @@ impl RawConfig {
                     provider,
                     quota,
                     disabled,
+                    allowed_upstream_models,
                     ..
-                } => (id, provider, quota.clone(), *disabled),
+                } => (
+                    id,
+                    provider,
+                    quota.clone(),
+                    *disabled,
+                    allowed_upstream_models,
+                ),
             };
             if quota.concurrent.is_some()
                 || [quota.rpm, quota.rpd, quota.tpm, quota.tpd].contains(&Some(0))
@@ -595,6 +618,28 @@ impl RawConfig {
                 return Err(invalid(
                     "credential IDs must be unique and IDs and providers must be nonempty",
                 ));
+            }
+            if let Some(models) = allowed_upstream_models {
+                if models.is_empty() {
+                    return Err(invalid(
+                        "credential allowed_upstream_models must be nonempty when present",
+                    ));
+                }
+                let mut allowed = HashSet::new();
+                for model in models {
+                    if model.is_empty() || model == "*" {
+                        return Err(invalid(
+                            "credential allowed_upstream_models entries must be nonempty exact upstream model ids",
+                        ));
+                    }
+                    let model: Arc<str> = model.as_str().into();
+                    if !allowed.insert(model) {
+                        return Err(invalid(
+                            "credential allowed_upstream_models entries must be unique",
+                        ));
+                    }
+                }
+                credential_upstream_models.insert(id.as_str().into(), allowed);
             }
             let id: Arc<str> = id.as_str().into();
             let provider = ProviderKind(provider.as_str().into());
@@ -954,6 +999,15 @@ impl RawConfig {
                     return Err(invalid(
                         "upstream_model must be * exactly for catch-all deployments",
                     ));
+                }
+                if let Some(credential) = dep.credential.as_deref() {
+                    if let Some(allowed) = credential_upstream_models.get(credential) {
+                        if !allowed.contains(dep.upstream_model.as_str()) {
+                            return Err(invalid(&format!(
+                                "deployment {id} upstream_model is outside credential {credential}'s allowed_upstream_models"
+                            )));
+                        }
+                    }
                 }
                 if dep.max_context == Some(0) {
                     return Err(invalid("max_context must be positive"));
@@ -1597,6 +1651,51 @@ mod tests {
                 &base.replace("upstream_model =", &format!("{invalid}\nupstream_model ="))
             )
             .is_err());
+        }
+    }
+
+    #[test]
+    fn credential_upstream_model_allowlist_is_exact_and_enforced() {
+        let base = config(REQUIRED);
+        let allowed = base.replace(
+            "provider = \"openai_compat\"",
+            "provider = \"openai_compat\"\nallowed_upstream_models = [\"upstream\", \"other\"]",
+        );
+        assert!(RuntimeConfig::parse(&allowed).is_ok());
+        assert!(RuntimeConfig::parse(&allowed.replace(
+            "upstream_model = \"upstream\"",
+            "upstream_model = \"other\"",
+        ))
+        .is_ok());
+        for input in [
+            allowed.replace(
+                "upstream_model = \"upstream\"",
+                "upstream_model = \"outside\"",
+            ),
+            allowed
+                .replace("name = \"model\"", "name = \"*\"")
+                .replace("upstream_model = \"upstream\"", "upstream_model = \"*\""),
+            allowed.replace(
+                "allowed_upstream_models = [\"upstream\", \"other\"]",
+                "allowed_upstream_models = []",
+            ),
+            allowed.replace(
+                "allowed_upstream_models = [\"upstream\", \"other\"]",
+                "allowed_upstream_models = [\"\"]",
+            ),
+            allowed.replace(
+                "allowed_upstream_models = [\"upstream\", \"other\"]",
+                "allowed_upstream_models = [\"upstream\", \"upstream\"]",
+            ),
+            allowed.replace(
+                "allowed_upstream_models = [\"upstream\", \"other\"]",
+                "allowed_upstream_models = [\"*\"]",
+            ),
+        ] {
+            let err = RuntimeConfig::parse(&input)
+                .err()
+                .unwrap_or_else(|| panic!("accepted {input}"));
+            assert!(err.to_string().contains("allowed_upstream_models"), "{err}");
         }
     }
 

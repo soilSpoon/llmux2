@@ -177,6 +177,19 @@ No logprobs fields are stripped. An enabled OmniRoute fallback remains last.
 To roll back, remove the reviewed
 Morph endpoint exception and combo-order policy before regenerating config.
 
+`--morph-ultra` marks keyed connections to the official Morph endpoint as
+Ultra-plan credentials. The importer keeps only the plan-covered upstream ids
+`morph-kimik31`, `morph-kimik3` (the Kimi K3.1 alias), `morph-dsv41flash`,
+`morph-dsv41flash-1017`, and `morph-dsv41flash-abliterated`, warns and drops
+other Morph upstream ids, and writes the same exact list as the credential's
+`allowed_upstream_models` so later hand-added out-of-plan legs fail config
+validation. `morph-kimik3-abliterated` is excluded because Morph bills it per
+token even for privileged-access accounts. The DeepSeek Abliterated id remains
+listed because the Ultra plan covers it without a token meter when the account
+has privileged access; without that approval Morph rejects it rather than
+billing list price. Without `--morph-ultra`, Morph imports are unchanged
+because the importer cannot infer a key's plan.
+
 Free XPLabs (Experiential Labs) routes go first in the reviewed combos
 `gpt-6-luna`, `deepseek-v4.1-flash` and `deepseek-v4.1-flash-fast` (after Morph
 in the fast combo), using the active API-key connection of the custom
