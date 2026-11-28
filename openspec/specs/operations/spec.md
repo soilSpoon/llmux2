@@ -146,7 +146,8 @@ is known, and per-request counts of candidate skip reasons. Skip reason keys
 SHALL distinguish pre-send policy skips (`free_only_billed` and
 `terminal_quota_billed`), eligibility skips (`disabled`, `not_provisioned`,
 `unsupported_format`, `expired`, `context_length`, `unsupported_conversion`,
-and `upstream_unavailable`), cooldowns (`cooldown`), and the exact admission
+`output_token_limit`, and `upstream_unavailable`), cooldowns (`cooldown`),
+and the exact admission
 limit when one is known (`rpm_limited`, `rpd_limited`, `tpm_limited`,
 `tpd_limited`, `fixed_request_quota`, `fixed_token_quota`,
 `concurrency_limited`, or `limit_probe`). Each record SHALL also carry a `legs` list
