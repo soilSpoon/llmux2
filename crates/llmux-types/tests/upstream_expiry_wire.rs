@@ -247,6 +247,15 @@ fn valid_deferred_inventory() -> Value {
     value
 }
 
+fn inventory_with_deferred_records(records: Vec<Value>, tip: u64, tip_hash: &str) -> Value {
+    let mut value = valid_deferred_inventory();
+    let cursor = &mut value["source_cursors"]["evidence_lanes"][0]["cursor"];
+    cursor["deferred_records"] = json!(records);
+    cursor["last_contiguous_artifact_seq"] = json!(tip);
+    cursor["last_contiguous_record_sha256"] = json!(tip_hash);
+    value
+}
+
 fn recovery_state() -> Value {
     json!({
         "incident_id":"incident-1",
@@ -1002,6 +1011,147 @@ fn scope_resolution_evidence_and_edge_invariants_are_mutation_sensitive() {
         parse_signed_inventory_pr1(&text(&cyclic)).is_err(),
         "reverse resolution edges are invalid"
     );
+}
+
+#[test]
+fn deferred_cursor_coordinate_variants_are_rejected() {
+    let zero_seq =
+        inventory_with_deferred_records(vec![deferred_record(0, 0, HASH_A, HASH_A)], 0, HASH_A);
+    assert!(parse_signed_inventory_pr1(&text(&zero_seq)).is_err());
+
+    let exceeds_tip =
+        inventory_with_deferred_records(vec![deferred_record(3, 0, HASH_A, HASH_A)], 2, HASH_B);
+    assert!(parse_signed_inventory_pr1(&text(&exceeds_tip)).is_err());
+
+    let mut epoch_record = deferred_record(1, 0, HASH_A, HASH_A);
+    epoch_record["log_epoch"] = json!(2);
+    let epoch_mismatch = inventory_with_deferred_records(vec![epoch_record], 1, HASH_A);
+    assert!(parse_signed_inventory_pr1(&text(&epoch_mismatch)).is_err());
+
+    let mut external_record = deferred_record(1, 0, HASH_A, HASH_A);
+    external_record["evidence_ref"]["uri_or_journal_key"] = json!("https://example.com/evidence");
+    let external_ref = inventory_with_deferred_records(vec![external_record], 1, HASH_A);
+    assert!(parse_signed_inventory_pr1(&text(&external_ref)).is_err());
+
+    let mut wrong_lane_record = deferred_record(1, 0, HASH_A, HASH_A);
+    wrong_lane_record["evidence_ref"]["uri_or_journal_key"] = json!(format!(
+        "evidence-artifact:regeneration_importer:{HASH_C}:1:1:{HASH_A}"
+    ));
+    let wrong_lane = inventory_with_deferred_records(vec![wrong_lane_record], 1, HASH_A);
+    assert!(parse_signed_inventory_pr1(&text(&wrong_lane)).is_err());
+
+    let mut zero_len_record = deferred_record(1, 0, HASH_A, HASH_A);
+    zero_len_record["byte_len"] = json!(0);
+    let zero_len = inventory_with_deferred_records(vec![zero_len_record], 1, HASH_A);
+    assert!(parse_signed_inventory_pr1(&text(&zero_len)).is_err());
+}
+
+#[test]
+fn scope_resolution_target_variants_are_rejected() {
+    let mut endpoint_mismatch = scope_resolution();
+    endpoint_mismatch["evidence"]["from_subject"] = subject();
+    assert!(
+        parse_signed_inventory_pr1(&text(&inventory_with_scope_resolutions(vec![
+            endpoint_mismatch
+        ])))
+        .is_err()
+    );
+
+    let mut account_missing_key = scope_resolution();
+    account_missing_key["evidence"]["shared_account_key"] = Value::Null;
+    account_missing_key["evidence"]["shared_quota_scope_key"] = json!("quota-1");
+    assert!(
+        parse_signed_inventory_pr1(&text(&inventory_with_scope_resolutions(vec![
+            account_missing_key
+        ])))
+        .is_err()
+    );
+
+    let quota_target = json!({"tag":"provider_quota_scope","payload":{"upstream_account_key":"acct-1","quota_scope_key":"quota-1"}});
+    let mut quota_missing_key = scope_resolution();
+    quota_missing_key["to"] = quota_target.clone();
+    quota_missing_key["evidence"]["to_subject"] = quota_target.clone();
+    assert!(
+        parse_signed_inventory_pr1(&text(&inventory_with_scope_resolutions(vec![
+            quota_missing_key
+        ])))
+        .is_err()
+    );
+
+    let conflicting_quota_target = json!({"tag":"provider_quota_scope","payload":{"upstream_account_key":"acct-2","quota_scope_key":"quota-1"}});
+    let mut conflicting_account = scope_resolution();
+    conflicting_account["to"] = conflicting_quota_target.clone();
+    conflicting_account["evidence"]["to_subject"] = conflicting_quota_target;
+    conflicting_account["evidence"]["shared_quota_scope_key"] = json!("quota-1");
+    assert!(
+        parse_signed_inventory_pr1(&text(&inventory_with_scope_resolutions(vec![
+            conflicting_account
+        ])))
+        .is_err()
+    );
+
+    let mut unknown_target = scope_resolution();
+    unknown_target["from"] = subject();
+    unknown_target["to"] = unknown_subject();
+    unknown_target["evidence"]["from_subject"] = subject();
+    unknown_target["evidence"]["to_subject"] = unknown_subject();
+    assert!(
+        parse_signed_inventory_pr1(&text(&inventory_with_scope_resolutions(vec![
+            unknown_target
+        ])))
+        .is_err()
+    );
+
+    let mut second_target = scope_resolution();
+    let second_subject =
+        json!({"tag":"provider_account","payload":{"upstream_account_key":"acct-2"}});
+    second_target["to"] = second_subject.clone();
+    second_target["evidence"]["to_subject"] = second_subject;
+    second_target["evidence"]["shared_account_key"] = json!("acct-2");
+    let multiple_targets =
+        inventory_with_scope_resolutions(vec![scope_resolution(), second_target]);
+    assert!(parse_signed_inventory_pr1(&text(&multiple_targets)).is_err());
+}
+
+#[test]
+fn artifact_checkpoint_edge_variants_are_rejected() {
+    let zero_seq = refresh_record_hash(mutated(regeneration_record(), &["artifact_seq"], |v| {
+        *v = json!(0)
+    }));
+    assert!(parse_regeneration_evidence_record(&text(&zero_seq)).is_err());
+
+    let initial_epoch_with_checkpoint =
+        refresh_record_hash(mutated(epoch2_checkpoint_record(), &["log_epoch"], |v| {
+            *v = json!(1)
+        }));
+    assert!(parse_regeneration_evidence_record(&text(&initial_epoch_with_checkpoint)).is_err());
+
+    let new_epoch_mismatch = refresh_record_hash(mutated(
+        epoch2_checkpoint_record(),
+        &["continuity_reinitialization", "new_epoch"],
+        |v| *v = json!(1),
+    ));
+    assert!(parse_regeneration_evidence_record(&text(&new_epoch_mismatch)).is_err());
+
+    let prior_epoch_mismatch = refresh_record_hash(mutated(
+        epoch2_checkpoint_record(),
+        &["continuity_reinitialization", "prior_epoch"],
+        |v| *v = json!(0),
+    ));
+    assert!(parse_regeneration_evidence_record(&text(&prior_epoch_mismatch)).is_err());
+
+    let coverage_on_success =
+        refresh_record_hash(mutated(regeneration_record(), &["failure_coverage"], |v| {
+            *v = json!("complete_input_lifecycle_universe")
+        }));
+    assert!(parse_regeneration_evidence_record(&text(&coverage_on_success)).is_err());
+
+    let deployment_previous_on_first = refresh_record_hash(mutated(
+        deployment_record(),
+        &["previous_record_sha256"],
+        |v| *v = json!(HASH_B),
+    ));
+    assert!(parse_server_deployment_evidence_record(&text(&deployment_previous_on_first)).is_err());
 }
 
 #[test]
