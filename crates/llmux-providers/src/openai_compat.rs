@@ -922,7 +922,23 @@ fn classify_error_details(
     } else {
         (false, None)
     };
-    let wait_raw = gemini_wait
+    // A free allowance that will not convert to paid answers 429
+    // `free_allowance_used` (Revenue Analyst WO-70). The allowance is spent,
+    // so the leg is exhausted, not briefly limited, and must not stay a retry
+    // candidate. Codes arrive in snake, kebab, or prose spelling.
+    // Runcrate carries the weekly allowance reset in error.free_tier.resets_at.
+    // That exact provider timestamp is authoritative; without it the documented
+    // weekly boundary below is the fallback.
+    let free_allowance = [code, kind, message.as_str()]
+        .iter()
+        .any(|marker| normalized_code(marker).contains("free_allowance_used"));
+    let free_allowance_reset = if free_allowance {
+        free_tier_reset_at(details, now)
+    } else {
+        None
+    };
+    let wait_raw = free_allowance_reset
+        .or(gemini_wait)
         .or_else(|| retry_after_cap(headers, now))
         .or_else(|| {
             header_text(headers, "retry-after-ms")?
@@ -953,13 +969,6 @@ fn classify_error_details(
                 | "credits_exhausted"
         )
     });
-    // A free allowance that will not convert to paid answers 429
-    // `free_allowance_used` (Revenue Analyst WO-70). The allowance is spent,
-    // so the leg is exhausted, not briefly limited, and must not stay a retry
-    // candidate. Codes arrive in snake, kebab, or prose spelling.
-    let free_allowance = [code, kind, message.as_str()]
-        .iter()
-        .any(|marker| normalized_code(marker).contains("free_allowance_used"));
     // OpenCode Zen rewrites the original upstream code into a `[code]` label
     // at the start of the message. That label is quota evidence, not a throttle.
     let free_usage_limit = [code, kind, message.as_str()]
@@ -994,7 +1003,8 @@ fn classify_error_details(
             || ultra_daily =>
         {
             UpstreamError::QuotaExhausted {
-                reset_at: quota_reset(now, cf_daily || ultra_daily, monthly, wait_raw),
+                reset_at: quota_reset(now, cf_daily || ultra_daily, monthly, wait_raw)
+                    .or_else(|| free_allowance.then(|| next_utc_monday(now))),
             }
         }
         429 => UpstreamError::RateLimited { retry_after: wait },
@@ -1047,6 +1057,31 @@ fn normalized_code(value: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Runcrate's dashboard/API error schema nests free-tier metadata under the
+/// error object. Honor its exact RFC3339 reset when the upstream includes it.
+fn free_tier_reset_at(details: &serde_json::Value, now: SystemTime) -> Option<Duration> {
+    let value = details.get("free_tier")?.get("resets_at")?.as_str()?;
+    let reset =
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()?;
+    SystemTime::from(reset)
+        .duration_since(now)
+        .ok()
+        .map(|wait| wait.min(MAX_RESET_HINT))
+}
+
+/// Runcrate's free allowance resets every Monday at 00:00 UTC. Start from the
+/// next calendar day so an exhaustion after Monday's boundary waits a week.
+fn next_utc_monday(now: SystemTime) -> SystemTime {
+    let mut date = time::OffsetDateTime::from(now).date();
+    for _ in 0..7 {
+        date = date.next_day().unwrap_or(date);
+        if date.weekday() == time::Weekday::Monday {
+            break;
+        }
+    }
+    SystemTime::from(date.midnight().assume_utc())
 }
 
 /// The first entry of a Cloudflare-style `{"errors":[{"code":N,"message":M}]}`
@@ -2067,10 +2102,7 @@ mod tests {
             let body =
                 format!(r#"{{"error":{{"code":"{code}","message":"upstream refused the call"}}}}"#);
             assert!(
-                matches!(
-                    classify(429, &body),
-                    UpstreamError::QuotaExhausted { reset_at: None }
-                ),
+                matches!(classify(429, &body), UpstreamError::QuotaExhausted { .. }),
                 "{code} must classify as QuotaExhausted, got {:?}",
                 classify(429, &body)
             );
@@ -2081,7 +2113,7 @@ mod tests {
                 429,
                 r#"{"error":{"message":"Free Allowance Used for this model"}}"#
             ),
-            UpstreamError::QuotaExhausted { reset_at: None }
+            UpstreamError::QuotaExhausted { .. }
         ));
     }
 
@@ -2115,11 +2147,90 @@ mod tests {
             classify_error(StatusCode::TOO_MANY_REQUESTS, &headers, body.clone(), now),
             UpstreamError::QuotaExhausted { reset_at: Some(reset) } if reset == now + Duration::from_secs(2_592_000)
         ));
-        // With no hint it keeps the existing policy: no derived reset.
+        // With no hint it derives the documented weekly reset instead of
+        // falling back to an unbounded quota park.
         assert!(matches!(
             classify_error(StatusCode::TOO_MANY_REQUESTS, &HeaderMap::new(), body, now),
-            UpstreamError::QuotaExhausted { reset_at: None }
+            UpstreamError::QuotaExhausted { reset_at: Some(_) }
         ));
+    }
+
+    #[test]
+    fn runcrate_free_allowance_without_hint_parks_until_next_utc_monday() {
+        let body = Bytes::from_static(
+            br#"{"error":{"code":"free_allowance_used","message":"free allowance spent"}}"#,
+        );
+        for (now, monday) in [
+            // Sunday morning: the next boundary is the following day.
+            (
+                time::Date::from_calendar_date(2026, time::Month::November, 29)
+                    .unwrap()
+                    .with_hms(10, 30, 0)
+                    .unwrap()
+                    .assume_utc(),
+                time::Date::from_calendar_date(2026, time::Month::November, 30)
+                    .unwrap()
+                    .midnight()
+                    .assume_utc(),
+            ),
+            // Monday after the boundary: the next boundary is a week later.
+            (
+                time::Date::from_calendar_date(2026, time::Month::November, 30)
+                    .unwrap()
+                    .with_hms(10, 30, 0)
+                    .unwrap()
+                    .assume_utc(),
+                time::Date::from_calendar_date(2026, time::Month::December, 7)
+                    .unwrap()
+                    .midnight()
+                    .assume_utc(),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    classify_error(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        &HeaderMap::new(),
+                        body.clone(),
+                        SystemTime::from(now),
+                    ),
+                    UpstreamError::QuotaExhausted { reset_at: Some(reset) } if reset == SystemTime::from(monday)
+                ),
+                "free_allowance_used must park until the next Monday 00:00 UTC"
+            );
+        }
+    }
+
+    #[test]
+    fn runcrate_free_allowance_uses_the_reported_resets_at() {
+        let now = SystemTime::from(
+            time::Date::from_calendar_date(2026, time::Month::November, 29)
+                .unwrap()
+                .with_hms(10, 30, 0)
+                .unwrap()
+                .assume_utc(),
+        );
+        let expected = SystemTime::from(
+            time::Date::from_calendar_date(2026, time::Month::November, 30)
+                .unwrap()
+                .midnight()
+                .assume_utc(),
+        );
+        let body = Bytes::from_static(
+            br#"{"error":{"code":"free_allowance_used","message":"free allowance spent","free_tier":{"resets_at":"2026-11-30T00:00:00Z"}}}"#,
+        );
+        assert!(
+            matches!(
+                classify_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    &HeaderMap::new(),
+                    body,
+                    now,
+                ),
+                UpstreamError::QuotaExhausted { reset_at: Some(reset) } if reset == expected
+            ),
+            "error.free_tier.resets_at must be honored as the provider-reported reset"
+        );
     }
 
     #[tokio::test]
