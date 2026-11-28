@@ -636,3 +636,30 @@ THEN the hashed `user` field is omitted from the upstream body.
 WHEN the end-user feature is off or the request has no identifier
 THEN Anthropic still copies a client `user` into `metadata.user_id` and does not
 invent one.
+
+### Requirement: Single-shot Big Pickle probe harness
+
+The repository SHALL provide a development-only probe harness, separate from the
+gateway runtime, that builds its request through the merged OpenCode adapter and
+its pinned protocol artifact and sends at most one upstream request. It SHALL
+default to a dry run that opens no connection, require an explicit execute flag
+plus a run id and a validated target row, enforce a 20-second total timeout and
+a 10-second stream-idle timeout that may only be shortened, capture at most
+64 KiB of response data, and record redacted evidence with separate sha256
+values for the exact unredacted outbound bytes and the canonical redacted copy.
+It SHALL record exactly one design §6.7 terminal class and SHALL exit non-zero
+for every class other than `free zero-cost streaming success`. It SHALL NOT be
+wired into gateway config, keysync, runtime defaults, the server binary, or a
+deployment path, and it SHALL NOT retry or fall back.
+
+#### Scenario: Dry run opens no connection
+
+WHEN the harness runs without the explicit execute flag
+THEN it records a dry-run evidence record and makes no network connection.
+
+#### Scenario: Ambiguous outcome fails closed
+
+WHEN the single response is non-SSE, malformed, truncated, missing a required
+success fact, or otherwise not classifiable
+THEN the harness records a named §6.7 class and exits non-zero without sending a
+second request.

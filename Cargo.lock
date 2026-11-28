@@ -856,6 +856,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "llmux-probe"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "futures-util",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "llmux-providers",
+ "llmux-testkit",
+ "llmux-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "llmux-providers"
 version = "0.1.0"
 dependencies = [

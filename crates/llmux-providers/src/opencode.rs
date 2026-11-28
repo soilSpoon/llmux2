@@ -176,6 +176,12 @@ fn rendered_prompt() -> String {
     )
 }
 
+/// The rendered pinned system prompt. Probe tooling uses this to redact
+/// provider text that echoes the pinned artifact; it is not a request builder.
+pub fn pinned_system_prompt() -> String {
+    rendered_prompt()
+}
+
 fn rewrite_body(body: &Bytes, req: &GatewayRequest) -> Result<(Bytes, Identity), BuildError> {
     let mut value: Value = serde_json::from_slice(body).map_err(|_| BuildError::InvalidBody)?;
     let identity = identity_for(req, &value);
@@ -334,5 +340,11 @@ mod tests {
         assert!(rendered_prompt()
             .starts_with("You are an AI agent running in OpenCode, a coding agent harness."));
         assert!(!rendered_prompt().contains(TOOL_GUIDANCE_PLACEHOLDER));
+    }
+
+    #[test]
+    fn pinned_system_prompt_is_the_rendered_artifact() {
+        assert_eq!(pinned_system_prompt(), rendered_prompt());
+        assert!(!pinned_system_prompt().contains(TOOL_GUIDANCE_PLACEHOLDER));
     }
 }
