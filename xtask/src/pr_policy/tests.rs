@@ -111,6 +111,48 @@ fn source_change_without_test_change_fails() {
     assert!(errors[0].contains(SRC[0]));
 }
 #[test]
+fn deploy_source_change_without_test_change_fails() {
+    let errors = check(FILLED, &["deploy/src/lib.rs"], "");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("deploy/src/lib.rs"));
+}
+#[test]
+fn bench_source_change_without_test_change_fails() {
+    let errors = check(FILLED, &["bench/src/main.rs"], "");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("bench/src/main.rs"));
+}
+#[test]
+fn xtask_source_change_without_test_change_fails() {
+    let errors = check(FILLED, &["xtask/src/merge_gate.rs"], "");
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("xtask/src/merge_gate.rs"));
+}
+#[test]
+fn workspace_member_test_file_satisfies_source_change() {
+    for (source, test) in [
+        ("deploy/src/lib.rs", "deploy/tests/deployment.rs"),
+        ("xtask/src/merge_gate.rs", "xtask/tests/merge_gate_cli.rs"),
+    ] {
+        assert!(
+            check(FILLED, &[source, test], "").is_empty(),
+            "{source} should accept {test} as test evidence"
+        );
+    }
+}
+#[test]
+fn workspace_member_source_exemption_satisfies() {
+    assert!(check(
+        &FILLED.replace(
+            "Red:",
+            "Test exemption: deployment helper reorder only.\n\nRed:"
+        ),
+        &["deploy/src/lib.rs"],
+        ""
+    )
+    .is_empty());
+}
+#[test]
 fn integration_test_file_satisfies() {
     assert!(check(FILLED, &[SRC[0], "crates/llmux-server/tests/chat.rs"], DIFF).is_empty());
 }
