@@ -3,8 +3,8 @@ use llmux_types::upstream_expiry::{
     lane_key_sha256, parse_regeneration_evidence_record, parse_server_deployment_evidence_record,
     parse_signed_inventory_pr1, render_wire_type_inventory, sha256_hex, to_canonical_json,
     wire_type_inventory, AttestationStatus, CapacitySubject, ConfirmationSatisfaction,
-    LifecycleState, ObservedDeploymentOutcome, ObservedRegenerationOutcome, RecoveryBlocker,
-    RecoveryOrigin, RegenerationFact, RegenerationInclusionOutcome,
+    EvidenceLaneKey, LifecycleState, ObservedDeploymentOutcome, ObservedRegenerationOutcome,
+    RecoveryBlocker, RecoveryOrigin, RegenerationFact, RegenerationInclusionOutcome,
 };
 use serde_json::{json, Value};
 
@@ -15,8 +15,13 @@ const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const HASH_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const SIG: &str = "ed25519:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
+fn regeneration_lane_hash() -> String {
+    let lane: EvidenceLaneKey = serde_json::from_value(regeneration_lane()).unwrap();
+    lane_key_sha256(&lane).unwrap()
+}
 fn evidence_ref() -> Value {
-    json!({"kind":"evidence_artifact","uri_or_journal_key":format!("evidence-artifact:regeneration_importer:{HASH_C}:1:1:{HASH_A}"),"observed_at":TS,"sha256":HASH_A})
+    let lane_hash = regeneration_lane_hash();
+    json!({"kind":"evidence_artifact","uri_or_journal_key":format!("evidence-artifact:regeneration_importer:{lane_hash}:1:1:{HASH_A}"),"observed_at":TS,"sha256":HASH_A})
 }
 fn subject() -> Value {
     json!({"tag":"provider_account","payload":{"upstream_account_key":"acct-1"}})
@@ -46,11 +51,22 @@ fn state_entry() -> Value {
 fn signed_inventory() -> Value {
     json!({"schema_version":10,"writer":"llmux2-health-reconcile","writer_instance":"instance-a","generation":2,"previous_generation":1,"previous_sha256":HASH_B,"generated_at":TS,"heartbeat_at":TS,"source_cursors":source_cursors(),"states":[{"key":upstream_ref(),"value":state_entry()}],"bindings":[{"key":"cred-local-1","value":{"local_credential_ref":"cred-local-1","provider_key":"xai","endpoint":upstream_ref()["identity"]["endpoint"],"subject":subject(),"first_seen_config_generation":1,"latest_seen_config_generation":2}}],"scope_resolutions":[],"transition_watermark":1,"signature":SIG})
 }
+fn refresh_record_hash(mut record: Value) -> Value {
+    let mut unsigned = record.clone();
+    unsigned.as_object_mut().unwrap().remove("record_sha256");
+    let digest = sha256_hex(to_canonical_json(&unsigned).unwrap().as_bytes());
+    record["record_sha256"] = json!(digest);
+    record
+}
 fn regeneration_record() -> Value {
-    json!({"schema_version":3,"artifact_seq":1,"log_epoch":1,"previous_record_sha256":null,"record_sha256":HASH_A,"continuity_reinitialization":null,"import_run_id":"import-1","started_at":TS,"finished_at":TS,"input_inventory_generation":2,"input_inventory_sha256":HASH_B,"config_generation":7,"config_sha256":HASH_C,"fingerprint_algorithm":"v1","status":{"tag":"success","payload":null},"failure_coverage":null,"rows":[{"upstream_ref":upstream_ref(),"row":{"inclusion":{"tag":"included","payload":null},"expected_deployment_fingerprint":HASH_C}}]})
+    refresh_record_hash(
+        json!({"schema_version":3,"artifact_seq":1,"log_epoch":1,"previous_record_sha256":null,"record_sha256":HASH_A,"continuity_reinitialization":null,"import_run_id":"import-1","started_at":TS,"finished_at":TS,"input_inventory_generation":2,"input_inventory_sha256":HASH_B,"config_generation":7,"config_sha256":HASH_C,"fingerprint_algorithm":"v1","status":{"tag":"success","payload":null},"failure_coverage":null,"rows":[{"upstream_ref":upstream_ref(),"row":{"inclusion":{"tag":"included","payload":null},"expected_deployment_fingerprint":HASH_C}}]}),
+    )
 }
 fn deployment_record() -> Value {
-    json!({"schema_version":3,"artifact_seq":1,"log_epoch":1,"previous_record_sha256":null,"record_sha256":HASH_A,"continuity_reinitialization":null,"server_instance_id":"server-a","boot_id":"boot-1","record_kind":"config_load","emitted_at":TS,"load_started_at":TS,"load_finished_at":TS,"input_inventory_generation":2,"input_inventory_sha256":HASH_B,"loaded_config_generation":7,"loaded_config_sha256":HASH_C,"fingerprint_algorithm":"v1","traffic_role":"active_traffic","rows":[{"upstream_ref":upstream_ref(),"row":{"present":true,"actual_deployment_fingerprint":HASH_C}}]})
+    refresh_record_hash(
+        json!({"schema_version":3,"artifact_seq":1,"log_epoch":1,"previous_record_sha256":null,"record_sha256":HASH_A,"continuity_reinitialization":null,"server_instance_id":"server-a","boot_id":"boot-1","record_kind":"config_load","emitted_at":TS,"load_started_at":TS,"load_finished_at":TS,"input_inventory_generation":2,"input_inventory_sha256":HASH_B,"loaded_config_generation":7,"loaded_config_sha256":HASH_C,"fingerprint_algorithm":"v1","traffic_role":"active_traffic","rows":[{"upstream_ref":upstream_ref(),"row":{"present":true,"actual_deployment_fingerprint":HASH_C}}]}),
+    )
 }
 fn mutated(mut value: Value, path: &[&str], f: impl FnOnce(&mut Value)) -> Value {
     let mut target = &mut value;
@@ -158,11 +174,11 @@ fn evidence_artifacts_round_trip_and_enforce_row_and_option_shape() {
         &["rows", "0"],
         |v| *v = json!({"upstream_ref":upstream_ref(),"inclusion":{"tag":"included","payload":null},"expected_deployment_fingerprint":HASH_C}),
     );
-    assert!(parse_regeneration_evidence_record(&text(&flat_row)).is_err());
+    assert!(parse_regeneration_evidence_record(&text(&refresh_record_hash(flat_row))).is_err());
     let missing_null = mutated(regeneration_record(), &[], |v| {
         v.as_object_mut().unwrap().remove("failure_coverage");
     });
-    assert!(parse_regeneration_evidence_record(&text(&missing_null)).is_err());
+    assert!(parse_regeneration_evidence_record(&text(&refresh_record_hash(missing_null))).is_err());
 }
 
 #[test]
@@ -218,14 +234,150 @@ fn hash_inputs_remove_fields_instead_of_nulling_and_signature_is_domain_separate
     assert_ne!(&payload[31..], inventory_digest.as_bytes());
 }
 
+fn valid_deferred_inventory() -> Value {
+    let mut value = signed_inventory();
+    let cursor = &mut value["source_cursors"]["evidence_lanes"][0]["cursor"];
+    cursor["last_contiguous_artifact_seq"] = json!(2);
+    cursor["last_contiguous_record_sha256"] = json!(HASH_B);
+    cursor["quality"] = json!({"kind":"deferred_unknown_inventory_generation"});
+    cursor["deferred_records"] = json!([
+        deferred_record(1, 0, HASH_A, HASH_A),
+        deferred_record(2, 50, HASH_B, HASH_B)
+    ]);
+    value
+}
+
+fn recovery_state() -> Value {
+    json!({
+        "incident_id":"incident-1",
+        "entered_at":TS,
+        "entered_generation":2,
+        "origin":{"tag":"quarantined_positive_clearance","payload":null},
+        "confirmation":{
+            "catalog_evidence_required":true,
+            "authoritative_free_observations":[],
+            "runtime_success_at":null,
+            "zero_cost_success_at":null,
+            "last_organic_admission_at":null,
+            "organic_admissions_24h":{"window":86400000,"events":[]},
+            "confirmation_satisfied_at":null,
+            "confirmation_satisfied_by":null
+        },
+        "regeneration":{
+            "inclusion_required":true,
+            "never_excluded_since_incident":false,
+            "latest_regeneration":null,
+            "latest_deployment":null
+        },
+        "flap":{"consecutive_failures":0,"damped_until":null}
+    })
+}
+
+fn recovering_inventory() -> Value {
+    let mut value = signed_inventory();
+    value["states"][0]["value"]["lifecycle"] =
+        json!({"tag":"recovering","payload":{"recovery":recovery_state()}});
+    value["states"][0]["value"]["recovery_evaluation"] = recovery_evaluation();
+    value
+}
+
+fn interrupted_cause_entry() -> Value {
+    json!({
+        "status":"clearing",
+        "activated_at":TS,
+        "activation_evidence":evidence_ref(),
+        "clearing_started_at":TS,
+        "clearing_evidence":evidence_ref(),
+        "last_interrupted_clearing":{
+            "started_at":TS,
+            "evidence":evidence_ref(),
+            "interrupted_at":TS_LATER,
+            "interrupting_evidence":evidence_ref()
+        }
+    })
+}
+
+fn inventory_with_cause(cause: Value) -> Value {
+    let mut value = signed_inventory();
+    value["states"][0]["value"]["cause_states"] = json!([{"key":"absent_catalog","value":cause}]);
+    value
+}
+
+fn unknown_subject() -> Value {
+    json!({"tag":"unknown_keyed","payload":{"subject_fingerprint":HASH_C}})
+}
+
+fn scope_resolution() -> Value {
+    json!({
+        "from":unknown_subject(),
+        "to":subject(),
+        "evidence":{
+            "provider_key":"xai",
+            "from_subject":unknown_subject(),
+            "to_subject":subject(),
+            "shared_account_key":"acct-1",
+            "shared_quota_scope_key":null,
+            "source":"exact_provider_response_envelope",
+            "evidence_ref":evidence_ref(),
+            "observed_at":TS,
+            "confidence":"exact_machine"
+        },
+        "resolved_at":TS
+    })
+}
+
+fn inventory_with_scope_resolutions(resolutions: Vec<Value>) -> Value {
+    let mut value = signed_inventory();
+    value["scope_resolutions"] = json!(resolutions);
+    value
+}
+
+fn epoch2_checkpoint_record() -> Value {
+    let mut record = regeneration_record();
+    record["log_epoch"] = json!(2);
+    record["continuity_reinitialization"] = json!({
+        "lane":regeneration_lane(),
+        "new_epoch":2,
+        "prior_epoch":1,
+        "prior_terminal_artifact_seq":1,
+        "prior_terminal_record_sha256":HASH_A,
+        "reason":"sequence_gap"
+    });
+    refresh_record_hash(record)
+}
+
+fn epoch2_deployment_checkpoint_record() -> Value {
+    let mut record = deployment_record();
+    record["log_epoch"] = json!(2);
+    record["continuity_reinitialization"] = json!({
+        "lane":deployment_lane(),
+        "new_epoch":2,
+        "prior_epoch":1,
+        "prior_terminal_artifact_seq":1,
+        "prior_terminal_record_sha256":HASH_A,
+        "reason":"sequence_gap"
+    });
+    refresh_record_hash(record)
+}
+
+fn failed_regeneration_record(coverage: &str, rows: Value) -> Value {
+    let mut record = regeneration_record();
+    record["status"] = json!({"tag":"failed","payload":{"kind":"inventory_invalid"}});
+    record["failure_coverage"] = json!(coverage);
+    record["config_generation"] = Value::Null;
+    record["config_sha256"] = Value::Null;
+    record["rows"] = rows;
+    refresh_record_hash(record)
+}
+
 fn deferred_record(
     artifact_seq: u64,
     byte_start: u64,
     record_hash: &str,
     evidence_hash: &str,
 ) -> Value {
+    let lane_hash = regeneration_lane_hash();
     json!({
-        "lane": regeneration_lane(),
         "log_epoch": 1,
         "artifact_seq": artifact_seq,
         "byte_start": byte_start,
@@ -233,7 +385,7 @@ fn deferred_record(
         "input_inventory_generation": 2,
         "input_inventory_sha256": HASH_B,
         "record_sha256": record_hash,
-        "evidence_ref": {"kind":"evidence_artifact","uri_or_journal_key":format!("evidence-artifact:regeneration_importer:{HASH_C}:1:{artifact_seq}:{record_hash}"),"observed_at":TS,"sha256":evidence_hash}
+        "evidence_ref": {"kind":"evidence_artifact","uri_or_journal_key":format!("evidence-artifact:regeneration_importer:{lane_hash}:1:{artifact_seq}:{record_hash}"),"observed_at":TS,"sha256":evidence_hash}
     })
 }
 
@@ -388,37 +540,61 @@ fn artifact_conditional_option_rules_are_mutation_sensitive() {
         &["rows", "0", "row", "expected_deployment_fingerprint"],
         |v| *v = Value::Null,
     );
-    assert!(parse_regeneration_evidence_record(&text(&included_without_fingerprint)).is_err());
+    assert!(
+        parse_regeneration_evidence_record(&text(&refresh_record_hash(
+            included_without_fingerprint
+        )))
+        .is_err()
+    );
 
     let mut excluded = regeneration_record();
     excluded["rows"][0]["row"] = json!({"inclusion":{"tag":"excluded","payload":{"reasons":["lifecycle_suppressed"]}},"expected_deployment_fingerprint":HASH_C});
-    assert!(parse_regeneration_evidence_record(&text(&excluded)).is_err());
+    assert!(parse_regeneration_evidence_record(&text(&refresh_record_hash(excluded))).is_err());
 
     let success_without_config = mutated(regeneration_record(), &["config_generation"], |v| {
         *v = Value::Null
     });
-    assert!(parse_regeneration_evidence_record(&text(&success_without_config)).is_err());
+    assert!(
+        parse_regeneration_evidence_record(&text(&refresh_record_hash(success_without_config)))
+            .is_err()
+    );
 
     let first_with_previous = mutated(regeneration_record(), &["previous_record_sha256"], |v| {
         *v = json!(HASH_B)
     });
-    assert!(parse_regeneration_evidence_record(&text(&first_with_previous)).is_err());
+    assert!(
+        parse_regeneration_evidence_record(&text(&refresh_record_hash(first_with_previous)))
+            .is_err()
+    );
 
     let mut second_without_previous = regeneration_record();
     second_without_previous["artifact_seq"] = json!(2);
-    assert!(parse_regeneration_evidence_record(&text(&second_without_previous)).is_err());
+    assert!(
+        parse_regeneration_evidence_record(&text(&refresh_record_hash(second_without_previous)))
+            .is_err()
+    );
 
     let present_without_fingerprint = mutated(
         deployment_record(),
         &["rows", "0", "row", "actual_deployment_fingerprint"],
         |v| *v = Value::Null,
     );
-    assert!(parse_server_deployment_evidence_record(&text(&present_without_fingerprint)).is_err());
+    assert!(
+        parse_server_deployment_evidence_record(&text(&refresh_record_hash(
+            present_without_fingerprint
+        )))
+        .is_err()
+    );
 
     let absent_with_fingerprint = mutated(deployment_record(), &["rows", "0", "row"], |v| {
         *v = json!({"present":false,"actual_deployment_fingerprint":HASH_C})
     });
-    assert!(parse_server_deployment_evidence_record(&text(&absent_with_fingerprint)).is_err());
+    assert!(
+        parse_server_deployment_evidence_record(&text(&refresh_record_hash(
+            absent_with_fingerprint
+        )))
+        .is_err()
+    );
 }
 
 #[test]
@@ -434,8 +610,9 @@ fn deferred_evidence_ref_journal_key_grammar_is_mutation_sensitive() {
         ],
         |v| {
             let mut record = deferred_record(1, 0, HASH_A, HASH_A);
+            let lane_hash = regeneration_lane_hash();
             record["evidence_ref"]["uri_or_journal_key"] = json!(format!(
-                "evidence-artifact:regeneration_importer:{HASH_C}:01:1:{HASH_A}"
+                "evidence-artifact:regeneration_importer:{lane_hash}:01:1:{HASH_A}"
             ));
             *v = json!([record]);
         },
@@ -580,6 +757,251 @@ fn payload_enum_variants_round_trip_across_the_closed_surface() {
     }
     let absent: ObservedDeploymentOutcome = serde_json::from_value(json!({"tag":"absent","payload":{"loaded_config_generation":7,"loaded_config_sha256":HASH_C}})).unwrap();
     assert_eq!(serde_json::to_value(absent).unwrap()["tag"], "absent");
+}
+
+#[test]
+fn artifact_record_hash_is_self_validating() {
+    let valid = regeneration_record();
+    assert!(parse_regeneration_evidence_record(&text(&valid)).is_ok());
+    let mut wrong_hash = valid.clone();
+    wrong_hash["record_sha256"] = json!(HASH_A);
+    assert!(
+        parse_regeneration_evidence_record(&text(&wrong_hash)).is_err(),
+        "a record whose self-hash does not match the canonical hash input must reject"
+    );
+}
+
+#[test]
+fn deferred_cursor_shape_and_invariants_are_exact() {
+    let valid = valid_deferred_inventory();
+    assert!(
+        parse_signed_inventory_pr1(&text(&valid)).is_ok(),
+        "schema-v8 descriptor shape has no duplicated lane field"
+    );
+
+    let mut quality_valid = valid.clone();
+    quality_valid["source_cursors"]["evidence_lanes"][0]["cursor"]["quality"] =
+        json!({"kind":"valid"});
+    assert!(
+        parse_signed_inventory_pr1(&text(&quality_valid)).is_err(),
+        "valid quality cannot retain deferred descriptors"
+    );
+
+    let mut empty_deferred = valid.clone();
+    empty_deferred["source_cursors"]["evidence_lanes"][0]["cursor"]["deferred_records"] = json!([]);
+    assert!(
+        parse_signed_inventory_pr1(&text(&empty_deferred)).is_err(),
+        "deferred quality requires a nonempty deferred chain"
+    );
+
+    let mut tip_mismatch = valid.clone();
+    tip_mismatch["source_cursors"]["evidence_lanes"][0]["cursor"]["last_contiguous_artifact_seq"] =
+        json!(1);
+    assert!(
+        parse_signed_inventory_pr1(&text(&tip_mismatch)).is_err(),
+        "contiguous tip must equal the greatest deferred artifact sequence"
+    );
+
+    let mut unpaired_tip = valid.clone();
+    unpaired_tip["source_cursors"]["evidence_lanes"][0]["cursor"]
+        ["last_contiguous_record_sha256"] = Value::Null;
+    assert!(
+        parse_signed_inventory_pr1(&text(&unpaired_tip)).is_err(),
+        "cursor sequence and hash options must be present together"
+    );
+
+    let mut wrong_tip_hash = valid.clone();
+    wrong_tip_hash["source_cursors"]["evidence_lanes"][0]["cursor"]
+        ["last_contiguous_record_sha256"] = json!(HASH_A);
+    assert!(
+        parse_signed_inventory_pr1(&text(&wrong_tip_hash)).is_err(),
+        "contiguous tip hash must equal the greatest deferred record hash"
+    );
+
+    let mut noncontiguous = valid_deferred_inventory();
+    noncontiguous["source_cursors"]["evidence_lanes"][0]["cursor"]["deferred_records"] = json!([
+        deferred_record(1, 0, HASH_A, HASH_A),
+        deferred_record(3, 50, HASH_B, HASH_B)
+    ]);
+    noncontiguous["source_cursors"]["evidence_lanes"][0]["cursor"]
+        ["last_contiguous_artifact_seq"] = json!(3);
+    assert!(
+        parse_signed_inventory_pr1(&text(&noncontiguous)).is_err(),
+        "deferred artifact sequences must be contiguous"
+    );
+}
+
+#[test]
+fn checkpoint_and_failure_coverage_invariants_are_mutation_sensitive() {
+    let valid_checkpoint = epoch2_checkpoint_record();
+    assert!(parse_regeneration_evidence_record(&text(&valid_checkpoint)).is_ok());
+
+    let missing_checkpoint = refresh_record_hash(mutated(
+        valid_checkpoint.clone(),
+        &["continuity_reinitialization"],
+        |v| *v = Value::Null,
+    ));
+    assert!(
+        parse_regeneration_evidence_record(&text(&missing_checkpoint)).is_err(),
+        "first artifact of a later epoch must carry its checkpoint"
+    );
+
+    let half_terminal = refresh_record_hash(mutated(
+        valid_checkpoint.clone(),
+        &[
+            "continuity_reinitialization",
+            "prior_terminal_record_sha256",
+        ],
+        |v| *v = Value::Null,
+    ));
+    assert!(
+        parse_regeneration_evidence_record(&text(&half_terminal)).is_err(),
+        "checkpoint terminal sequence and hash must be null together"
+    );
+
+    let mut seq2 = valid_checkpoint.clone();
+    seq2["artifact_seq"] = json!(2);
+    seq2["previous_record_sha256"] = json!(HASH_B);
+    let seq2 = refresh_record_hash(seq2);
+    assert!(
+        parse_regeneration_evidence_record(&text(&seq2)).is_err(),
+        "non-initial artifacts cannot carry a checkpoint"
+    );
+
+    let wrong_checkpoint_lane = refresh_record_hash(mutated(
+        valid_checkpoint.clone(),
+        &["continuity_reinitialization", "lane"],
+        |v| *v = deployment_lane(),
+    ));
+    assert!(
+        parse_regeneration_evidence_record(&text(&wrong_checkpoint_lane)).is_err(),
+        "regeneration checkpoints cannot name a deployment lane"
+    );
+
+    let valid_deployment_checkpoint = epoch2_deployment_checkpoint_record();
+    assert!(
+        parse_server_deployment_evidence_record(&text(&valid_deployment_checkpoint)).is_ok(),
+        "matching deployment checkpoint lane parses"
+    );
+    let wrong_server_lane = refresh_record_hash(mutated(
+        valid_deployment_checkpoint.clone(),
+        &["continuity_reinitialization", "lane", "server_instance_id"],
+        |v| *v = json!("server-b"),
+    ));
+    assert!(
+        parse_server_deployment_evidence_record(&text(&wrong_server_lane)).is_err(),
+        "deployment checkpoint lane must match the record server instance"
+    );
+
+    let unavailable_with_rows = failed_regeneration_record(
+        "unavailable_before_inventory_enumeration",
+        json!([{"upstream_ref":upstream_ref(),"row":{"inclusion":{"tag":"import_failed","payload":{"kind":"inventory_invalid"}},"expected_deployment_fingerprint":null}}]),
+    );
+    assert!(
+        parse_regeneration_evidence_record(&text(&unavailable_with_rows)).is_err(),
+        "unavailable-before-enumeration failure coverage requires empty rows"
+    );
+
+    let success_import_failed = refresh_record_hash(mutated(
+        regeneration_record(),
+        &["rows", "0", "row"],
+        |v| *v = json!({"inclusion":{"tag":"import_failed","payload":{"kind":"inventory_invalid"}},"expected_deployment_fingerprint":null}),
+    ));
+    assert!(
+        parse_regeneration_evidence_record(&text(&success_import_failed)).is_err(),
+        "success artifacts cannot carry import-failed rows"
+    );
+
+    let complete_with_included = failed_regeneration_record(
+        "complete_input_lifecycle_universe",
+        json!([{"upstream_ref":upstream_ref(),"row":{"inclusion":{"tag":"included","payload":null},"expected_deployment_fingerprint":HASH_C}}]),
+    );
+    assert!(
+        parse_regeneration_evidence_record(&text(&complete_with_included)).is_err(),
+        "complete failure coverage rows must be import failures"
+    );
+}
+
+#[test]
+fn cause_clearing_interruption_and_recovery_confirmation_options_are_exact() {
+    let valid = inventory_with_cause(interrupted_cause_entry());
+    assert!(
+        parse_signed_inventory_pr1(&text(&valid)).is_ok(),
+        "schema-v5 interrupted-clearing history parses"
+    );
+
+    let mut missing_history_field = interrupted_cause_entry();
+    missing_history_field
+        .as_object_mut()
+        .unwrap()
+        .remove("last_interrupted_clearing");
+    assert!(
+        parse_signed_inventory_pr1(&text(&inventory_with_cause(missing_history_field))).is_err(),
+        "optional interrupted-clearing field must still be present, possibly null"
+    );
+
+    let mut active_with_clearing = interrupted_cause_entry();
+    active_with_clearing["status"] = json!("active");
+    assert!(
+        parse_signed_inventory_pr1(&text(&inventory_with_cause(active_with_clearing))).is_err(),
+        "an active cause cannot retain current clearing fields"
+    );
+
+    let mut half_clearing = interrupted_cause_entry();
+    half_clearing["clearing_evidence"] = Value::Null;
+    assert!(
+        parse_signed_inventory_pr1(&text(&inventory_with_cause(half_clearing))).is_err(),
+        "clearing timestamp and evidence must be present together"
+    );
+
+    let mut unpaired_confirmation = recovering_inventory();
+    unpaired_confirmation["states"][0]["value"]["lifecycle"]["payload"]["recovery"]
+        ["confirmation"]["confirmation_satisfied_at"] = json!(TS);
+    assert!(
+        parse_signed_inventory_pr1(&text(&unpaired_confirmation)).is_err(),
+        "confirmation timestamp and satisfaction value must be present together"
+    );
+}
+
+#[test]
+fn scope_resolution_evidence_and_edge_invariants_are_mutation_sensitive() {
+    let valid = inventory_with_scope_resolutions(vec![scope_resolution()]);
+    assert!(parse_signed_inventory_pr1(&text(&valid)).is_ok());
+
+    let mut same_edge = scope_resolution();
+    same_edge["from"] = subject();
+    let same_edge = inventory_with_scope_resolutions(vec![same_edge]);
+    assert!(
+        parse_signed_inventory_pr1(&text(&same_edge)).is_err(),
+        "identity resolution edge cannot start and end at the same subject"
+    );
+
+    let mut no_shared_key = scope_resolution();
+    no_shared_key["evidence"]["shared_account_key"] = Value::Null;
+    let no_shared_key = inventory_with_scope_resolutions(vec![no_shared_key]);
+    assert!(
+        parse_signed_inventory_pr1(&text(&no_shared_key)).is_err(),
+        "resolution evidence requires at least one shared key"
+    );
+
+    let mut weak_confidence = scope_resolution();
+    weak_confidence["evidence"]["confidence"] = json!("provider_heuristic");
+    let weak_confidence = inventory_with_scope_resolutions(vec![weak_confidence]);
+    assert!(
+        parse_signed_inventory_pr1(&text(&weak_confidence)).is_err(),
+        "resolution edges require exact or authoritative confidence"
+    );
+
+    let mut reverse = scope_resolution();
+    reverse["from"] = scope_resolution()["to"].clone();
+    reverse["to"] = scope_resolution()["from"].clone();
+    reverse["evidence"]["from_subject"] = scope_resolution()["to"].clone();
+    reverse["evidence"]["to_subject"] = scope_resolution()["from"].clone();
+    let cyclic = inventory_with_scope_resolutions(vec![scope_resolution(), reverse]);
+    assert!(
+        parse_signed_inventory_pr1(&text(&cyclic)).is_err(),
+        "reverse resolution edges are invalid"
+    );
 }
 
 #[test]

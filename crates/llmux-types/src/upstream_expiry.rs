@@ -773,6 +773,22 @@ impl<'de> Deserialize<'de> for EvidenceRef {
     }
 }
 
+fn evidence_artifact_parts(uri_or_journal_key: &str) -> Option<Vec<&str>> {
+    let parts: Vec<_> = uri_or_journal_key.split(':').collect();
+    if parts.len() == 6 && parts[0] == "evidence-artifact" {
+        Some(parts)
+    } else {
+        None
+    }
+}
+
+fn evidence_lane_kind(lane: &EvidenceLaneKey) -> &'static str {
+    match lane {
+        EvidenceLaneKey::RegenerationImporter { .. } => "regeneration_importer",
+        EvidenceLaneKey::ServerDeployment { .. } => "server_deployment",
+    }
+}
+
 impl WireValidate for EvidenceRef {
     fn validate(&self) -> Result<(), WireError> {
         if self.uri_or_journal_key.is_empty()
@@ -829,6 +845,69 @@ pub struct ScopeResolution {
     pub resolved_at: Timestamp,
 }
 
+impl WireValidate for ScopeResolution {
+    fn validate(&self) -> Result<(), WireError> {
+        if self.from == self.to {
+            return Err(WireError::new("scope resolution endpoints are identical"));
+        }
+        if self.evidence.from_subject != self.from || self.evidence.to_subject != self.to {
+            return Err(WireError::new(
+                "resolution evidence subjects do not match edge endpoints",
+            ));
+        }
+        if self.evidence.shared_account_key.is_none()
+            && self.evidence.shared_quota_scope_key.is_none()
+        {
+            return Err(WireError::new(
+                "resolution evidence requires at least one shared key",
+            ));
+        }
+        if !matches!(
+            self.evidence.confidence,
+            EvidenceConfidence::ExactMachine | EvidenceConfidence::AuthoritativeCatalog
+        ) {
+            return Err(WireError::new(
+                "resolution evidence confidence cannot create an edge",
+            ));
+        }
+        match &self.to {
+            CapacitySubject::ProviderAccount(payload) => {
+                if self.evidence.shared_account_key.as_ref() != Some(&payload.upstream_account_key)
+                {
+                    return Err(WireError::new(
+                        "provider-account target does not carry the shared account key",
+                    ));
+                }
+            }
+            CapacitySubject::ProviderQuotaScope(payload) => {
+                if self.evidence.shared_quota_scope_key.as_ref() != Some(&payload.quota_scope_key) {
+                    return Err(WireError::new(
+                        "provider-quota-scope target does not carry the shared quota key",
+                    ));
+                }
+                if let Some(account_key) = &payload.upstream_account_key {
+                    if self
+                        .evidence
+                        .shared_account_key
+                        .as_ref()
+                        .is_some_and(|shared| shared != account_key)
+                    {
+                        return Err(WireError::new(
+                            "provider-quota-scope target carries a conflicting account key",
+                        ));
+                    }
+                }
+            }
+            CapacitySubject::AnonymousNetwork(_) | CapacitySubject::UnknownKeyed(_) => {
+                return Err(WireError::new(
+                    "resolution target cannot represent a shared provider key",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterResolutionEvidence {
@@ -882,14 +961,13 @@ pub struct CatalogCursor {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeferredEvidenceRecordDescriptor {
-    pub lane: EvidenceLaneKey,
-    pub log_epoch: EvidenceLogEpoch,
     pub artifact_seq: u64,
-    pub byte_start: u64,
-    pub byte_len: u64,
+    pub log_epoch: EvidenceLogEpoch,
+    pub record_sha256: Sha256,
     pub input_inventory_generation: InventoryGeneration,
     pub input_inventory_sha256: Sha256,
-    pub record_sha256: Sha256,
+    pub byte_start: u64,
+    pub byte_len: u64,
     pub evidence_ref: EvidenceRef,
 }
 
@@ -910,16 +988,73 @@ pub struct EvidenceLaneCursor {
 
 impl WireValidate for EvidenceLaneCursor {
     fn validate(&self) -> Result<(), WireError> {
+        if self.last_contiguous_artifact_seq.is_some()
+            != self.last_contiguous_record_sha256.is_some()
+        {
+            return Err(WireError::new(
+                "cursor contiguous sequence and hash must be present together",
+            ));
+        }
+        if self.last_contiguous_artifact_seq.is_none() && !self.deferred_records.is_empty() {
+            return Err(WireError::new(
+                "deferred records cannot exist without a contiguous chain tip",
+            ));
+        }
+        if self.quality == EvidenceLaneQuality::Valid && !self.deferred_records.is_empty() {
+            return Err(WireError::new(
+                "valid lane quality cannot retain deferred records",
+            ));
+        }
+        if self.quality == EvidenceLaneQuality::DeferredUnknownInventoryGeneration
+            && self.deferred_records.is_empty()
+        {
+            return Err(WireError::new(
+                "deferred lane quality requires deferred records",
+            ));
+        }
+
+        let lane_hash = lane_key_sha256(&self.lane)?;
+        let expected_lane_kind = evidence_lane_kind(&self.lane);
         let mut previous_end = None;
-        for record in &self.deferred_records {
-            if record.lane != self.lane || record.log_epoch != self.log_epoch {
+        for (index, record) in self.deferred_records.iter().enumerate() {
+            if record.artifact_seq == 0 {
+                return Err(WireError::new("deferred artifact sequence is zero"));
+            }
+            if index > 0 && record.artifact_seq != self.deferred_records[index - 1].artifact_seq + 1
+            {
                 return Err(WireError::new(
-                    "deferred record lane or epoch does not match cursor",
+                    "deferred artifact sequences are not contiguous",
+                ));
+            }
+            if let Some(tip) = self.last_contiguous_artifact_seq {
+                if record.artifact_seq > tip {
+                    return Err(WireError::new(
+                        "deferred artifact sequence exceeds contiguous tip",
+                    ));
+                }
+            }
+            if record.log_epoch != self.log_epoch {
+                return Err(WireError::new(
+                    "deferred record epoch does not match cursor epoch",
                 ));
             }
             if record.evidence_ref.sha256 != record.record_sha256 {
                 return Err(WireError::new(
                     "deferred record evidence hash does not match record hash",
+                ));
+            }
+            let parts = evidence_artifact_parts(&record.evidence_ref.uri_or_journal_key)
+                .ok_or_else(|| WireError::new("deferred evidence ref is not an artifact key"))?;
+            if parts[1] != expected_lane_kind || parts[2] != lane_hash {
+                return Err(WireError::new(
+                    "deferred evidence ref lane does not match cursor lane",
+                ));
+            }
+            if parts[3].parse::<u64>().ok() != Some(record.log_epoch.get())
+                || parts[4].parse::<u64>().ok() != Some(record.artifact_seq)
+            {
+                return Err(WireError::new(
+                    "deferred evidence ref coordinates do not match descriptor",
                 ));
             }
             if record.byte_len == 0 {
@@ -937,6 +1072,18 @@ impl WireValidate for EvidenceLaneCursor {
         for pair in self.deferred_records.windows(2) {
             if pair[0].artifact_seq >= pair[1].artifact_seq {
                 return Err(WireError::new("deferred records out of order"));
+            }
+        }
+        if let Some(last) = self.deferred_records.last() {
+            if self.last_contiguous_artifact_seq != Some(last.artifact_seq) {
+                return Err(WireError::new(
+                    "contiguous tip must equal greatest deferred artifact sequence",
+                ));
+            }
+            if self.last_contiguous_record_sha256.as_ref() != Some(&last.record_sha256) {
+                return Err(WireError::new(
+                    "contiguous tip hash must equal greatest deferred record hash",
+                ));
             }
         }
         Ok(())
@@ -1211,6 +1358,36 @@ pub struct CauseStateEntry {
     pub clearing_started_at: Option<Timestamp>,
     #[serde(deserialize_with = "required_option")]
     pub clearing_evidence: Option<EvidenceRef>,
+    #[serde(deserialize_with = "required_option")]
+    pub last_interrupted_clearing: Option<InterruptedClearingAttempt>,
+}
+
+impl WireValidate for CauseStateEntry {
+    fn validate(&self) -> Result<(), WireError> {
+        if self.clearing_started_at.is_some() != self.clearing_evidence.is_some() {
+            return Err(WireError::new(
+                "clearing timestamp and evidence must be present together",
+            ));
+        }
+        match self.status {
+            CauseStatus::Active if self.clearing_started_at.is_some() => Err(WireError::new(
+                "active cause cannot retain current clearing fields",
+            )),
+            CauseStatus::Clearing if self.clearing_started_at.is_none() => Err(WireError::new(
+                "clearing cause requires current clearing fields",
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterruptedClearingAttempt {
+    pub started_at: Timestamp,
+    pub evidence: EvidenceRef,
+    pub interrupted_at: Timestamp,
+    pub interrupting_evidence: EvidenceRef,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1276,6 +1453,23 @@ pub struct RecoveryConfirmation {
     pub confirmation_satisfied_at: Option<Timestamp>,
     #[serde(deserialize_with = "required_option")]
     pub confirmation_satisfied_by: Option<ConfirmationSatisfaction>,
+}
+
+impl WireValidate for RecoveryConfirmation {
+    fn validate(&self) -> Result<(), WireError> {
+        if self.confirmation_satisfied_at.is_some() != self.confirmation_satisfied_by.is_some() {
+            return Err(WireError::new(
+                "confirmation satisfaction timestamp and value must be present together",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl WireValidate for RecoveryState {
+    fn validate(&self) -> Result<(), WireError> {
+        self.confirmation.validate()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1578,6 +1772,12 @@ impl WireValidate for InventoryStateEntry {
         if let Some(evaluation) = &self.recovery_evaluation {
             evaluation.validate()?;
         }
+        if let LifecycleState::Recovering(payload) = &self.lifecycle {
+            payload.recovery.validate()?;
+        }
+        for cause in &self.cause_states.entries {
+            cause.value.validate()?;
+        }
         for entry in &self.holds.active.entries {
             if entry.key != entry.value.kind {
                 return Err(WireError::new(
@@ -1636,6 +1836,21 @@ impl WireValidate for SignedInventory {
                 ));
             }
         }
+        for resolution in &self.scope_resolutions {
+            resolution.validate()?;
+        }
+        for (index, left) in self.scope_resolutions.iter().enumerate() {
+            for right in &self.scope_resolutions[index + 1..] {
+                if left.from == right.to && left.to == right.from {
+                    return Err(WireError::new("reverse scope resolution edge"));
+                }
+                if left.from == right.from && left.to != right.to {
+                    return Err(WireError::new(
+                        "one scope-resolution source has multiple targets",
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -1690,10 +1905,78 @@ pub struct RegenerationEvidenceRecord {
     pub rows: Vec<EvidenceRowEntry<RegenerationEvidenceRow>>,
 }
 
+fn validate_record_self_hash<T: Serialize>(record: &T, actual: &Sha256) -> Result<(), WireError> {
+    if evidence_record_sha256(record)? != actual.as_str() {
+        return Err(WireError::new(
+            "record hash does not match canonical hash input",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_artifact_checkpoint(
+    artifact_seq: u64,
+    log_epoch: EvidenceLogEpoch,
+    checkpoint: &Option<EvidenceLogReinitialization>,
+) -> Result<(), WireError> {
+    if artifact_seq == 0 || log_epoch.get() == 0 {
+        return Err(WireError::new("artifact sequence and epoch start at one"));
+    }
+    match (artifact_seq, log_epoch.get(), checkpoint) {
+        (1, 1, None) => Ok(()),
+        (1, 1, Some(_)) => Err(WireError::new(
+            "initial lane epoch cannot carry a reinitialization checkpoint",
+        )),
+        (1, _, None) => Err(WireError::new(
+            "first artifact of a later epoch is missing its checkpoint",
+        )),
+        (1, epoch, Some(checkpoint)) => {
+            if checkpoint.new_epoch.get() != epoch {
+                return Err(WireError::new(
+                    "checkpoint new epoch does not match artifact epoch",
+                ));
+            }
+            if checkpoint.prior_epoch.get().checked_add(1) != Some(epoch) {
+                return Err(WireError::new(
+                    "checkpoint prior epoch is not the immediately previous epoch",
+                ));
+            }
+            if checkpoint.prior_terminal_artifact_seq.is_some()
+                != checkpoint.prior_terminal_record_sha256.is_some()
+            {
+                return Err(WireError::new(
+                    "checkpoint terminal sequence and hash must be present together",
+                ));
+            }
+            Ok(())
+        }
+        (_, _, Some(_)) => Err(WireError::new(
+            "non-initial artifact cannot carry a reinitialization checkpoint",
+        )),
+        (_, _, None) => Ok(()),
+    }
+}
+
 impl WireValidate for RegenerationEvidenceRecord {
     fn validate(&self) -> Result<(), WireError> {
         if self.schema_version != 3 {
             return Err(WireError::new("evidence schema version must be 3"));
+        }
+        validate_record_self_hash(self, &self.record_sha256)?;
+        validate_artifact_checkpoint(
+            self.artifact_seq,
+            self.log_epoch,
+            &self.continuity_reinitialization,
+        )?;
+        if let Some(checkpoint) = &self.continuity_reinitialization {
+            if !matches!(
+                checkpoint.lane,
+                EvidenceLaneKey::RegenerationImporter { .. }
+            ) {
+                return Err(WireError::new(
+                    "regeneration checkpoint must name a regeneration lane",
+                ));
+            }
         }
         validate_rows(&self.rows)?;
         for row in &self.rows {
@@ -1709,8 +1992,39 @@ impl WireValidate for RegenerationEvidenceRecord {
                         "successful regeneration lacks config coordinates",
                     ));
                 }
+                if self.rows.iter().any(|entry| {
+                    matches!(
+                        entry.row.inclusion,
+                        RegenerationInclusionOutcome::ImportFailed(_)
+                    )
+                }) {
+                    return Err(WireError::new(
+                        "success artifact cannot carry import-failed rows",
+                    ));
+                }
             }
-            (RegenerationEvidenceStatus::Failed(_), Some(_)) => {}
+            (RegenerationEvidenceStatus::Failed(failure), Some(coverage)) => match coverage {
+                RegenerationFailureCoverage::UnavailableBeforeInventoryEnumeration => {
+                    if !self.rows.is_empty() {
+                        return Err(WireError::new(
+                            "unavailable-before-enumeration failure coverage requires empty rows",
+                        ));
+                    }
+                }
+                RegenerationFailureCoverage::CompleteInputLifecycleUniverse => {
+                    for entry in &self.rows {
+                        match &entry.row.inclusion {
+                                RegenerationInclusionOutcome::ImportFailed(row_failure)
+                                    if row_failure.kind == failure.kind => {}
+                                _ => {
+                                    return Err(WireError::new(
+                                        "complete failure coverage rows must carry the same import failure kind",
+                                    ))
+                                }
+                            }
+                    }
+                }
+            },
             _ => {
                 return Err(WireError::new(
                     "failure coverage does not match regeneration status",
@@ -1751,6 +2065,24 @@ impl WireValidate for ServerDeploymentEvidenceRecord {
     fn validate(&self) -> Result<(), WireError> {
         if self.schema_version != 3 {
             return Err(WireError::new("evidence schema version must be 3"));
+        }
+        validate_record_self_hash(self, &self.record_sha256)?;
+        validate_artifact_checkpoint(
+            self.artifact_seq,
+            self.log_epoch,
+            &self.continuity_reinitialization,
+        )?;
+        if let Some(checkpoint) = &self.continuity_reinitialization {
+            match &checkpoint.lane {
+                EvidenceLaneKey::ServerDeployment {
+                    server_instance_id, ..
+                } if server_instance_id == &self.server_instance_id => {}
+                _ => {
+                    return Err(WireError::new(
+                        "deployment checkpoint lane does not match record server instance",
+                    ))
+                }
+            }
         }
         validate_rows(&self.rows)?;
         if (self.artifact_seq == 1) == self.previous_record_sha256.is_some() {
