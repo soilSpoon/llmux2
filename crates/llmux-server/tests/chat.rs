@@ -1782,6 +1782,75 @@ async fn converted_requests_record_unsupported_conversion_and_admission_skips() 
 }
 
 #[tokio::test]
+async fn nonstream_output_token_limit_skips_leg_without_an_attempt() {
+    let fixture = Fixture::start_with_options(
+        [Reply::Complete, Reply::Complete],
+        [Reply::Complete, Reply::Complete],
+        "nonstream_max_output_tokens = 65536",
+        4,
+        true,
+        true,
+    )
+    .await;
+    // A non-stream request over the leg's output limit cannot be served by it:
+    // the upstream would reject it deterministically, so routing skips it
+    // without consuming an attempt and falls through to the next leg.
+    let over = fixture
+        .post(
+            "/v1/chat/completions",
+            "test-client",
+            r#"{
+        "model":"shared","messages":[{"role":"user","content":"Hello"}],"max_tokens":80000,
+        "vendor_option":{"model":"leave-me-alone"}
+    }"#,
+        )
+        .await;
+    check_route(&over, "d2", "1");
+    assert_eq!(fixture.counts(), [0, 1]);
+    assert_eq!(
+        fixture.skip_reasons("d1").await,
+        json!({"output_token_limit":1})
+    );
+
+    // Exactly at the limit the leg serves.
+    let at = fixture
+        .post(
+            "/v1/chat/completions",
+            "test-client",
+            r#"{
+        "model":"shared","messages":[{"role":"user","content":"Hello"}],"max_tokens":65536,
+        "vendor_option":{"model":"leave-me-alone"}
+    }"#,
+        )
+        .await;
+    check_route(&at, "d1", "1");
+
+    // Streaming requests are exempt: the upstream limit applies to non-stream
+    // only, so a big streaming request still uses the leg.
+    let streaming = fixture
+        .post(
+            "/v1/chat/completions",
+            "test-client",
+            r#"{
+        "model":"shared","stream":true,"messages":[{"role":"user","content":"Hello"}],
+        "max_tokens":70001,"vendor_option":{"model":"leave-me-alone"}
+    }"#,
+        )
+        .await;
+    check_route(&streaming, "d1", "1");
+
+    // No max_tokens at all means no deterministic rejection, so the leg serves.
+    let plain = fixture.request("test-client", "shared", false).await;
+    check_route(&plain, "d1", "1");
+
+    assert_eq!(fixture.counts(), [3, 1]);
+    assert_eq!(
+        fixture.skip_reasons("d1").await,
+        json!({"output_token_limit":1})
+    );
+}
+
+#[tokio::test]
 async fn expired_deployment_skip_is_attributed_without_an_attempt() {
     let fixture = Fixture::start_with_options(
         [Reply::Complete, Reply::Complete],

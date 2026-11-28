@@ -144,6 +144,11 @@ pub struct Deployment {
     pub timeout: Duration,
     /// Context window in tokens (prompt plus completion); `None` is unchecked.
     pub max_context: Option<u32>,
+    /// Largest `max_output_tokens` a non-streaming request may ask of this
+    /// leg; bigger non-stream requests are skipped because the upstream would
+    /// reject them deterministically. Streaming and uncapped requests are
+    /// unaffected. `None` is unchecked.
+    pub nonstream_max_output_tokens: Option<u32>,
     /// When this deployment stops being eligible, for time-limited offers.
     /// `None` means it never expires.
     pub expires_at: Option<SystemTime>,
