@@ -2,7 +2,9 @@ use llmux_types::upstream_expiry::{
     evidence_record_sha256, inventory_sha256_without_signature, inventory_signature_payload,
     parse_regeneration_evidence_record, parse_server_deployment_evidence_record,
     parse_signed_inventory_pr1, render_wire_type_inventory, sha256_hex, to_canonical_json,
-    wire_type_inventory, RegenerationFact,
+    wire_type_inventory, AttestationStatus, CapacitySubject, ConfirmationSatisfaction,
+    LifecycleState, ObservedDeploymentOutcome, ObservedRegenerationOutcome, RecoveryBlocker,
+    RecoveryOrigin, RegenerationFact, RegenerationInclusionOutcome,
 };
 use serde_json::{json, Value};
 
@@ -507,5 +509,84 @@ fn required_lane_snapshots_match_requirement_states_and_lane_kinds() {
     assert!(
         parse_signed_inventory_pr1(&text(&wrong_lane_kind)).is_err(),
         "deployment input cannot require a regeneration lane"
+    );
+}
+
+#[test]
+fn payload_enum_variants_round_trip_across_the_closed_surface() {
+    let lifecycle_values = [
+        json!({"tag":"unknown","payload":null}),
+        json!({"tag":"serving","payload":null}),
+        json!({"tag":"suspect","payload":{"sources":["catalog_absent","cost_unconfirmed","exact_runtime"]}}),
+        json!({"tag":"quarantined","payload":{"sources":["catalog_absent","exact_runtime"]}}),
+        json!({"tag":"expired","payload":{"causes":["absent_catalog","absent_exact_runtime","deadline_passed","not_free"]}}),
+        json!({"tag":"expiring_soon","payload":{"expires_at":TS}}),
+    ];
+    for value in lifecycle_values {
+        let parsed: LifecycleState = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+    }
+
+    let blockers = [
+        json!({"tag":"active_cause_remains","payload":null}),
+        json!({"tag":"flap_damped_until","payload":{"until":TS}}),
+        json!({"tag":"evidence_input_degraded","payload":{"input":"deployment_evidence"}}),
+        json!({"tag":"evidence_input_deferred","payload":{"input":"regeneration_evidence"}}),
+    ];
+    for value in blockers {
+        let parsed: RecoveryBlocker = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+    }
+
+    let origin: RecoveryOrigin = serde_json::from_value(
+        json!({"tag":"operator_correction","payload":{"correction_id":"corr-1"}}),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(origin).unwrap()["tag"],
+        "operator_correction"
+    );
+    let attestation: AttestationStatus = serde_json::from_value(
+        json!({"tag":"superseded","payload":{"at":TS,"evidence":evidence_ref()}}),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(attestation).unwrap()["tag"],
+        "superseded"
+    );
+    let satisfaction: ConfirmationSatisfaction = serde_json::from_value(
+        json!({"tag":"operator_attested","payload":{"correction_id":"corr-1","accepted_at":TS}}),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(satisfaction).unwrap()["tag"],
+        "operator_attested"
+    );
+    let subject: CapacitySubject = serde_json::from_value(json!({"tag":"provider_quota_scope","payload":{"upstream_account_key":null,"quota_scope_key":"quota-1"}})).unwrap();
+    assert_eq!(
+        serde_json::to_value(subject).unwrap()["tag"],
+        "provider_quota_scope"
+    );
+
+    let regen_outcomes = [
+        json!({"tag":"excluded","payload":{"reasons":["legacy_suppressed","lifecycle_suppressed","mapping_rejected","not_in_source_universe","revoked_discovery_candidate"]}}),
+        json!({"tag":"import_failed","payload":{"kind":"inventory_invalid"}}),
+    ];
+    for value in regen_outcomes {
+        let observed: ObservedRegenerationOutcome = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(observed).unwrap(), value);
+        let row: RegenerationInclusionOutcome = serde_json::from_value(value).unwrap();
+        assert!(!serde_json::to_value(row).unwrap()["payload"].is_null());
+    }
+    let absent: ObservedDeploymentOutcome = serde_json::from_value(json!({"tag":"absent","payload":{"loaded_config_generation":7,"loaded_config_sha256":HASH_C}})).unwrap();
+    assert_eq!(serde_json::to_value(absent).unwrap()["tag"], "absent");
+}
+
+#[test]
+fn canonical_json_handles_unicode_keys_and_strings() {
+    let value = json!({"😀":"control\u{1}","é":["\u{7}", "snowman ☃"]});
+    assert_eq!(
+        to_canonical_json(&value).unwrap(),
+        "{\"é\":[\"\\u0007\",\"snowman ☃\"],\"😀\":\"control\\u0001\"}"
     );
 }
