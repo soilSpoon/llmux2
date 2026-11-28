@@ -1,6 +1,6 @@
 use llmux_types::upstream_expiry::{
     evidence_record_sha256, inventory_sha256_without_signature, inventory_signature_payload,
-    parse_regeneration_evidence_record, parse_server_deployment_evidence_record,
+    lane_key_sha256, parse_regeneration_evidence_record, parse_server_deployment_evidence_record,
     parse_signed_inventory_pr1, render_wire_type_inventory, sha256_hex, to_canonical_json,
     wire_type_inventory, AttestationStatus, CapacitySubject, ConfirmationSatisfaction,
     LifecycleState, ObservedDeploymentOutcome, ObservedRegenerationOutcome, RecoveryBlocker,
@@ -589,4 +589,26 @@ fn canonical_json_handles_unicode_keys_and_strings() {
         to_canonical_json(&value).unwrap(),
         "{\"é\":[\"\\u0007\",\"snowman ☃\"],\"😀\":\"control\\u0001\"}"
     );
+}
+
+#[test]
+fn lane_quality_variants_hash_helper_and_invalid_brands_are_covered() {
+    use llmux_types::upstream_expiry::{
+        EvidenceLaneKey, EvidenceLaneQuality, ProviderKey, Sha256, Timestamp,
+    };
+    for value in [
+        json!({"kind":"valid"}),
+        json!({"kind":"deferred_unknown_inventory_generation"}),
+        json!({"kind":"degraded","reason":"sequence_gap"}),
+    ] {
+        let parsed: EvidenceLaneQuality = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+    }
+    let lane: EvidenceLaneKey = serde_json::from_value(regeneration_lane()).unwrap();
+    assert_eq!(lane_key_sha256(&lane).unwrap().len(), 64);
+    assert!(ProviderKey::parse("bad key").is_err());
+    assert!(
+        Sha256::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_err()
+    );
+    assert!(Timestamp::parse("2026-02-29T00:00:00.000000000Z").is_err());
 }
