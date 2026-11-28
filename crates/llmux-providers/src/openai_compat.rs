@@ -972,7 +972,9 @@ fn classify_error_details(
         && cloudflare_error(&body).is_some_and(|(code, message)| {
             matches!(code, 3036 | 4006) || message.contains("daily free allocation")
         });
-    // Monthly-plan providers (for example Morph) say so in the message.
+    // Morph's account-wide Ultra daily allowance refills at UTC midnight.
+    let ultra_daily = [code, kind].contains(&"ultra_daily_budget_exceeded");
+    // Monthly-plan providers say so in the message.
     let monthly = message.contains("monthly quota");
     // A plan without an API allowance can never serve: this leg is parked
     // until the config reloads rather than retried as a transient limit.
@@ -983,9 +985,16 @@ fn classify_error_details(
         402 => UpstreamError::QuotaExhausted {
             reset_at: quota_reset(now, cf_daily, monthly, wait_raw),
         },
-        429 if quota || free_allowance || free_usage_limit || daily || cf_daily || monthly => {
+        429 if quota
+            || free_allowance
+            || free_usage_limit
+            || daily
+            || cf_daily
+            || monthly
+            || ultra_daily =>
+        {
             UpstreamError::QuotaExhausted {
-                reset_at: quota_reset(now, cf_daily, monthly, wait_raw),
+                reset_at: quota_reset(now, cf_daily || ultra_daily, monthly, wait_raw),
             }
         }
         429 => UpstreamError::RateLimited { retry_after: wait },
@@ -1922,6 +1931,46 @@ mod tests {
             ),
             UpstreamError::RateLimited { retry_after: None }
         ));
+    }
+
+    #[test]
+    fn morph_ultra_daily_budget_exhaustion_parks_until_utc_midnight() {
+        // 2026-11-28T12:39:31Z. The observed response carried Retry-After:
+        // 40,829 seconds; this test omits that header so the fixed daily boundary,
+        // not the hint, is what proves the reset at 2026-11-29T00:00:00Z.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_795_869_571);
+        let midnight = SystemTime::UNIX_EPOCH + Duration::from_secs(1_795_910_400);
+        let body = r#"{"error":{"type":"rate_limit_error","code":"ultra_daily_budget_exceeded","message":"You've used today's Ultra allowance ($70 of tokens at list price). It resets at 4:00 PM PT (00:00 UTC), in 11h 21m. Add credits to keep going now..."}}"#;
+        assert!(
+            matches!(
+                classify_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    &HeaderMap::new(),
+                    Bytes::from_static(body.as_bytes()),
+                    now,
+                ),
+                UpstreamError::QuotaExhausted { reset_at: Some(reset) } if reset == midnight
+            ),
+            "morph ultra daily budget exhaustion must park until UTC midnight"
+        );
+
+        // An ordinary 429 rate limit remains a transient deployment cooldown
+        // and keeps honoring the provider's retry hint.
+        let ordinary = r#"{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"Too many requests, retry later."}}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("40829"));
+        assert!(
+            matches!(
+                classify_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    &headers,
+                    Bytes::from_static(ordinary.as_bytes()),
+                    now,
+                ),
+                UpstreamError::RateLimited { retry_after: Some(wait) } if wait == Duration::from_secs(40_829)
+            ),
+            "ordinary 429 rate limits must stay transient"
+        );
     }
 
     #[test]
