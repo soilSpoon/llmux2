@@ -142,6 +142,7 @@ impl Binding {
         &self,
         support: Support,
         fits: bool,
+        output_fits: bool,
         expires_at: Option<SystemTime>,
     ) -> Option<SkipReason> {
         if self.disabled.load(Ordering::Relaxed) {
@@ -154,6 +155,8 @@ impl Binding {
             Some(SkipReason::Expired)
         } else if !fits {
             Some(SkipReason::ContextLength)
+        } else if !output_fits {
+            Some(SkipReason::OutputTokenLimit)
         } else {
             None
         }
@@ -202,6 +205,16 @@ pub struct Executor {
 fn fits_context(dep: &Deployment, needed: u64) -> bool {
     dep.max_context
         .is_none_or(|limit| needed <= u64::from(limit))
+}
+
+/// A leg whose upstream deterministically rejects non-stream requests above
+/// an output-token cap is skipped only for those requests: streaming and
+/// uncapped asks never hit the cap.
+fn fits_output(dep: &Deployment, stream: bool, max_output_tokens: Option<u32>) -> bool {
+    stream
+        || dep
+            .nonstream_max_output_tokens
+            .is_none_or(|limit| max_output_tokens.is_none_or(|asked| asked <= limit))
 }
 
 impl Executor {
@@ -692,6 +705,7 @@ impl Executor {
             u64::from(req.est_input_tokens) + u64::from(req.max_output_tokens.unwrap_or(0));
         let check_context = needed > u64::from(order.min_context);
         let fits = |dep: &Deployment| !check_context || fits_context(dep, needed);
+        let output_fits = |dep: &Deployment| fits_output(dep, req.stream, req.max_output_tokens);
         if check_context {
             let mut limit = None;
             for &idx in &model.deployments {
@@ -716,9 +730,12 @@ impl Executor {
                         let binding = &self.bindings[index(idx)];
                         let dep = &self.cfg.deployments[index(idx)];
                         let support = binding.adapter.supports(req.format);
-                        if let Some(reason) =
-                            binding.skip_reason(support, fits(dep), dep.expires_at)
-                        {
+                        if let Some(reason) = binding.skip_reason(
+                            support,
+                            fits(dep),
+                            output_fits(dep),
+                            dep.expires_at,
+                        ) {
                             binding.record_skip(reason);
                         }
                     }
@@ -808,7 +825,8 @@ impl Executor {
                     continue;
                 }
                 machine.select();
-                let mut skip_reason = binding.skip_reason(support, fits(dep), dep.expires_at);
+                let mut skip_reason =
+                    binding.skip_reason(support, fits(dep), output_fits(dep), dep.expires_at);
                 let mut skip_log_key = skip_reason.map(skip_reason_log_key);
                 let mut event = if skip_reason.is_some() {
                     Event::Ineligible
@@ -1398,6 +1416,7 @@ fn skip_reason_log_key(reason: SkipReason) -> &'static str {
         SkipReason::UpstreamUnavailable => "upstream_unavailable",
         SkipReason::Expired => "expired",
         SkipReason::NotProvisioned => "not_provisioned",
+        SkipReason::OutputTokenLimit => "output_token_limit",
     }
 }
 

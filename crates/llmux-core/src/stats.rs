@@ -92,9 +92,11 @@ pub(crate) enum SkipReason {
     Expired,
     /// The provider does not provision this deployment; parked until reload.
     NotProvisioned,
+    /// A non-stream request asked for more output tokens than the leg serves.
+    OutputTokenLimit,
 }
 
-const SKIP_REASONS: [&str; 9] = [
+const SKIP_REASONS: [&str; 10] = [
     "disabled",
     "unsupported_format",
     "context_length",
@@ -104,6 +106,7 @@ const SKIP_REASONS: [&str; 9] = [
     "upstream_unavailable",
     "expired",
     "not_provisioned",
+    "output_token_limit",
 ];
 
 fn snapshot_counts<const N: usize>(

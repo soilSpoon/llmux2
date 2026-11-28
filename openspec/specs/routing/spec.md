@@ -108,6 +108,36 @@ WHEN no eligible-format deployment can convert the request, including those
 temporarily rate-limited
 THEN the gateway returns an invalid-request error rather than a rate-limit error.
 
+### Requirement: Per-leg non-stream output token limit
+
+A deployment MAY declare `nonstream_max_output_tokens` when its upstream
+deterministically rejects non-streaming requests that ask for more output
+tokens than a cap. The gateway SHALL skip such a deployment, without consuming
+an attempt or quota, for requests that are non-streaming and carry a larger
+`max_output_tokens`; the request then considers the next deployment. Streaming
+requests and requests without an output-token ask SHALL NOT be skipped by this
+rule, because the upstream cap does not apply to them. The limit is per-leg
+only: there is no model-capability fallback, and a zero value is invalid.
+
+#### Scenario: Oversized non-stream request skips the capped leg
+
+WHEN a leg declares `nonstream_max_output_tokens = 65536`
+AND a non-streaming request carries `max_tokens` above 65536
+THEN that leg is skipped without an upstream call, is attributed an
+`output_token_limit` skip, and the next eligible deployment is tried.
+
+#### Scenario: Streaming request exempt from the cap
+
+WHEN a streaming request carries `max_tokens` above the leg's
+`nonstream_max_output_tokens`
+THEN the leg stays eligible for that request.
+
+#### Scenario: Uncapped or within-cap requests unaffected
+
+WHEN a non-streaming request carries no `max_tokens`, or one at or below the
+leg's `nonstream_max_output_tokens`
+THEN the leg stays eligible for that request.
+
 ### Requirement: Quota window tracking
 
 The gateway SHALL model each periodic quota as a window bound to a

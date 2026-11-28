@@ -440,6 +440,7 @@ struct RawDeployment {
     shared_quota: Option<String>,
     timeout_ms: Option<u64>,
     max_context: Option<u32>,
+    nonstream_max_output_tokens: Option<u32>,
     expires_at: Option<toml::value::Datetime>,
     priority_boost: Option<i32>,
     priority_boost_until: Option<toml::value::Datetime>,
@@ -1025,6 +1026,9 @@ impl RawConfig {
                 if dep.max_context == Some(0) {
                     return Err(invalid("max_context must be positive"));
                 }
+                if dep.nonstream_max_output_tokens == Some(0) {
+                    return Err(invalid("nonstream_max_output_tokens must be positive"));
+                }
                 let quota = &dep.quota;
                 if [quota.rpm, quota.rpd, quota.tpm, quota.tpd, quota.concurrent].contains(&Some(0))
                     || invalid_fixed_windows(quota)
@@ -1075,6 +1079,7 @@ impl RawConfig {
                     shared_quota,
                     timeout: timeout(dep.timeout_ms.unwrap_or(server.request_timeout_ms))?,
                     max_context: dep.max_context.or(model.capabilities.max_context),
+                    nonstream_max_output_tokens: dep.nonstream_max_output_tokens,
                     expires_at,
                     priority_boost: dep.priority_boost,
                     priority_boost_until,
@@ -2136,6 +2141,31 @@ refresh_token = "env:LLMUX_CONFIG_OAUTH_TEST_SECRET""#;
                 .to_string()
                 .contains("max_context must be positive"));
         }
+    }
+
+    #[test]
+    fn nonstream_max_output_tokens_parses_and_validates() {
+        let parsed = RuntimeConfig::parse(&context_config("", "")).unwrap();
+        assert!(parsed
+            .deployments
+            .iter()
+            .all(|dep| dep.nonstream_max_output_tokens.is_none()));
+        let parsed =
+            RuntimeConfig::parse(&context_config("", "nonstream_max_output_tokens = 65536"))
+                .unwrap();
+        assert_eq!(
+            parsed.deployments[0].nonstream_max_output_tokens,
+            Some(65536)
+        );
+        // No model-capability fallback: the cap is a per-leg upstream limit.
+        assert!(parsed.deployments[1].nonstream_max_output_tokens.is_none());
+        assert!(
+            RuntimeConfig::parse(&context_config("", "nonstream_max_output_tokens = 0"))
+                .err()
+                .expect("invalid config")
+                .to_string()
+                .contains("nonstream_max_output_tokens must be positive")
+        );
     }
 
     #[test]
