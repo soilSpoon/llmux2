@@ -11,6 +11,7 @@ pub mod provider;
 mod request;
 mod spool;
 mod upstream;
+pub mod upstream_expiry;
 
 pub use acp::*;
 pub use adapter::*;
