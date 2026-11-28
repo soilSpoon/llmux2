@@ -140,6 +140,51 @@ pub struct RuntimeConfig {
     pub deployments: Box<[Deployment]>,
 }
 
+pub struct ConfigInventory {
+    pub request_log: Option<PathBuf>,
+    pub credentials: HashMap<Arc<str>, CredentialInventory>,
+    pub shared_quotas: HashMap<Arc<str>, QuotaSpec>,
+    pub models: Vec<ModelInventory>,
+}
+
+pub struct CredentialInventory {
+    pub provider: ProviderKind,
+    pub quota: QuotaSpec,
+    pub disabled: bool,
+}
+
+pub struct ModelInventory {
+    pub name: Arc<str>,
+    pub aliases: Vec<Arc<str>>,
+    pub deployments: Vec<DeploymentInventory>,
+}
+
+pub struct DeploymentInventory {
+    pub id: Arc<str>,
+    pub credential: Option<Arc<str>>,
+    pub provider: ProviderKind,
+    pub base_url: Option<String>,
+    pub upstream_model: Arc<str>,
+    pub priority: i32,
+    pub quota: QuotaSpec,
+    pub shared_quota: Option<Arc<str>>,
+    pub expires_at: Option<SystemTime>,
+    pub priority_boost: Option<i32>,
+    pub priority_boost_until: Option<SystemTime>,
+    pub billing: Billing,
+}
+
+impl ConfigInventory {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let content = fs::read_to_string(path).map_err(ConfigError::Read)?;
+        Self::parse(&content)
+    }
+
+    pub fn parse(content: &str) -> Result<Self, ConfigError> {
+        parse_raw(content)?.into_inventory()
+    }
+}
+
 pub struct OAuthCredential {
     pub token_url: String,
     pub client_id: String,
@@ -167,11 +212,14 @@ impl RuntimeConfig {
     }
 
     pub fn parse(content: &str) -> Result<Self, ConfigError> {
-        let raw: RawConfig = toml::from_str(content).map_err(|err| ConfigError::Parse {
-            offset: err.span().map_or(0, |span| span.start),
-        })?;
-        raw.into_runtime()
+        parse_raw(content)?.into_runtime()
     }
+}
+
+fn parse_raw(content: &str) -> Result<RawConfig, ConfigError> {
+    toml::from_str(content).map_err(|err| ConfigError::Parse {
+        offset: err.span().map_or(0, |span| span.start),
+    })
 }
 
 #[derive(Deserialize)]
@@ -452,6 +500,120 @@ struct RawDeployment {
 #[serde(rename_all = "snake_case")]
 enum DeploymentAuth {
     None,
+}
+
+impl RawConfig {
+    fn into_inventory(self) -> Result<ConfigInventory, ConfigError> {
+        let RawConfig {
+            server,
+            credentials,
+            shared_quotas: raw_shared_quotas,
+            models,
+            ..
+        } = self;
+        let mut credential_inventories = HashMap::new();
+        let mut provider_by_id = HashMap::new();
+        for credential in credentials {
+            let (id, provider, quota, disabled) = match credential {
+                RawCredential::ApiKey {
+                    id,
+                    provider,
+                    quota,
+                    disabled,
+                    ..
+                }
+                | RawCredential::Oauth {
+                    id,
+                    provider,
+                    quota,
+                    disabled,
+                    ..
+                }
+                | RawCredential::NousPortal {
+                    id,
+                    provider,
+                    quota,
+                    disabled,
+                    ..
+                }
+                | RawCredential::AcpAgent {
+                    id,
+                    provider,
+                    quota,
+                    disabled,
+                    ..
+                } => (id, provider, quota, disabled),
+            };
+            let id: Arc<str> = id.as_str().into();
+            let provider = ProviderKind(provider.as_str().into());
+            provider_by_id.insert(id.clone(), provider.clone());
+            credential_inventories.insert(
+                id,
+                CredentialInventory {
+                    provider,
+                    quota,
+                    disabled,
+                },
+            );
+        }
+        let shared_quotas = raw_shared_quotas
+            .into_iter()
+            .map(|group| (Arc::from(group.name.as_str()), group.quota))
+            .collect();
+        let mut inventory_models = Vec::new();
+        for model in models {
+            let mut inventory_deployments = Vec::new();
+            for deployment in model.deployments {
+                let credential: Option<Arc<str>> = deployment.credential.as_deref().map(Arc::from);
+                let provider = match (&credential, deployment.provider.as_deref()) {
+                    (Some(id), None) => provider_by_id
+                        .get(id.as_ref())
+                        .cloned()
+                        .ok_or_else(|| invalid("deployment references an unknown credential"))?,
+                    (None, Some(provider)) => ProviderKind(provider.into()),
+                    _ => {
+                        return Err(invalid(
+                            "deployment requires a credential, or auth = 'none' with a provider; do not combine them",
+                        ))
+                    }
+                };
+                let id: Arc<str> = deployment.id.as_str().into();
+                let expires_at = deployment
+                    .expires_at
+                    .map(|stamp| expiry(&id, stamp))
+                    .transpose()?;
+                let priority_boost_until = deployment
+                    .priority_boost_until
+                    .map(|stamp| boost_until(&id, stamp))
+                    .transpose()?;
+                inventory_deployments.push(DeploymentInventory {
+                    id,
+                    credential,
+                    provider,
+                    base_url: deployment.base_url,
+                    upstream_model: deployment.upstream_model.into(),
+                    priority: deployment.priority,
+                    quota: deployment.quota,
+                    shared_quota: deployment.shared_quota.as_deref().map(Arc::from),
+                    expires_at,
+                    priority_boost: deployment.priority_boost,
+                    priority_boost_until,
+                    billing: deployment.billing,
+                });
+            }
+            inventory_models.push(ModelInventory {
+                name: model.name.into(),
+                aliases: model.aliases.into_iter().map(Arc::from).collect(),
+                deployments: inventory_deployments,
+            });
+        }
+        Ok(ConfigInventory {
+            request_log: server.request_log,
+            credentials: credential_inventories,
+            shared_quotas,
+            models: inventory_models,
+        })
+    }
 }
 
 impl RawConfig {
