@@ -387,6 +387,7 @@ fn deferred_record(
 ) -> Value {
     let lane_hash = regeneration_lane_hash();
     json!({
+        "lane": regeneration_lane(),
         "log_epoch": 1,
         "artifact_seq": artifact_seq,
         "byte_start": byte_start,
@@ -1152,6 +1153,129 @@ fn artifact_checkpoint_edge_variants_are_rejected() {
         |v| *v = json!(HASH_B),
     ));
     assert!(parse_server_deployment_evidence_record(&text(&deployment_previous_on_first)).is_err());
+}
+
+#[test]
+fn deferred_descriptor_lane_is_required_and_matches_owning_cursor() {
+    let valid = valid_deferred_inventory();
+    assert!(
+        parse_signed_inventory_pr1(&text(&valid)).is_ok(),
+        "schema-v10 descriptor with its lane coordinate parses"
+    );
+
+    let mut missing_lane = valid_deferred_inventory();
+    missing_lane["source_cursors"]["evidence_lanes"][0]["cursor"]["deferred_records"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("lane");
+    assert!(
+        parse_signed_inventory_pr1(&text(&missing_lane)).is_err(),
+        "descriptor lane is required even when it duplicates cursor context"
+    );
+
+    let mut mismatched_lane = valid_deferred_inventory();
+    mismatched_lane["source_cursors"]["evidence_lanes"][0]["cursor"]["deferred_records"][0]
+        ["lane"] = deployment_lane();
+    assert!(
+        parse_signed_inventory_pr1(&text(&mismatched_lane)).is_err(),
+        "descriptor lane must equal its owning cursor lane"
+    );
+}
+
+#[test]
+fn escaped_duplicate_object_names_are_rejected_root_and_nested() {
+    let root = text(&signed_inventory()).replacen(
+        "\"schema_version\":10",
+        "\"\\u0073chema_version\":9,\"schema_version\":10",
+        1,
+    );
+    assert!(
+        parse_signed_inventory_pr1(&root).is_err(),
+        "escaped root object names that decode to schema_version are duplicates"
+    );
+
+    let nested =
+        text(&signed_inventory()).replacen("\"inode\":99", "\"\\u0069node\":98,\"inode\":99", 1);
+    assert!(
+        parse_signed_inventory_pr1(&nested).is_err(),
+        "escaped nested object names that decode to inode are duplicates"
+    );
+
+    let escape_variants = text(&signed_inventory()).replacen(
+        "\"uri_or_journal_key\"",
+        "\"uri_or_\\u006aournal_key\":\"x\",\"uri_or_\\u006Aournal_key\":\"x\",\"uri_or_journal_key\"",
+        1,
+    );
+    assert!(
+        parse_signed_inventory_pr1(&escape_variants).is_err(),
+        "different escape spellings that normalize to the same member name are duplicates"
+    );
+}
+
+#[test]
+fn integer_boundaries_are_exactly_pinned() {
+    let mut exact_max = signed_inventory();
+    exact_max["generation"] = json!(9_007_199_254_740_991_u64);
+    assert!(
+        parse_signed_inventory_pr1(&text(&exact_max)).is_ok(),
+        "2^53-1 is the largest accepted canonical integer"
+    );
+
+    let mut above_max = signed_inventory();
+    above_max["generation"] = json!(9_007_199_254_740_992_u64);
+    assert!(parse_signed_inventory_pr1(&text(&above_max)).is_err());
+
+    for bad in [json!(-1), json!(2.5)] {
+        let mut value = signed_inventory();
+        value["generation"] = bad;
+        assert!(parse_signed_inventory_pr1(&text(&value)).is_err());
+    }
+
+    let exponent = text(&signed_inventory()).replacen("\"generation\":2", "\"generation\":2e0", 1);
+    assert!(
+        parse_signed_inventory_pr1(&exponent).is_err(),
+        "exponent notation is not a canonical safe integer"
+    );
+}
+
+#[test]
+fn canonical_json_orders_keys_by_utf16_code_units() {
+    let astral = '\u{10000}';
+    let bmp_high = '\u{ffff}';
+    let mut object = serde_json::Map::new();
+    object.insert(bmp_high.to_string(), json!(1));
+    object.insert(astral.to_string(), json!(2));
+    let canonical = to_canonical_json(&Value::Object(object)).unwrap();
+    let astral_at = canonical.find(&astral.to_string()).unwrap();
+    let bmp_high_at = canonical.find(&bmp_high.to_string()).unwrap();
+    assert!(
+        astral_at < bmp_high_at,
+        "UTF-16 ordering puts U+10000 before U+FFFF even though Unicode scalar ordering reverses them: {canonical}"
+    );
+}
+
+#[test]
+fn later_pr_legacy_exclusions_root_is_directly_rejected() {
+    let mut value = signed_inventory();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("legacy_exclusions".to_string(), json!([]));
+    assert!(parse_signed_inventory_pr1(&text(&value)).is_err());
+}
+
+#[test]
+fn generated_inventory_has_no_trailing_whitespace() {
+    let checked_in = include_str!("upstream_expiry_wire_inventory.tsv");
+    for line in checked_in
+        .lines()
+        .chain(render_wire_type_inventory().lines())
+    {
+        assert!(
+            !line.ends_with(' ') && !line.ends_with('\t'),
+            "inventory line has trailing whitespace: {line:?}"
+        );
+    }
 }
 
 #[test]

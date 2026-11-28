@@ -961,13 +961,14 @@ pub struct CatalogCursor {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeferredEvidenceRecordDescriptor {
-    pub artifact_seq: u64,
+    pub lane: EvidenceLaneKey,
     pub log_epoch: EvidenceLogEpoch,
-    pub record_sha256: Sha256,
-    pub input_inventory_generation: InventoryGeneration,
-    pub input_inventory_sha256: Sha256,
+    pub artifact_seq: u64,
     pub byte_start: u64,
     pub byte_len: u64,
+    pub input_inventory_generation: InventoryGeneration,
+    pub input_inventory_sha256: Sha256,
+    pub record_sha256: Sha256,
     pub evidence_ref: EvidenceRef,
 }
 
@@ -1019,6 +1020,11 @@ impl WireValidate for EvidenceLaneCursor {
         for (index, record) in self.deferred_records.iter().enumerate() {
             if record.artifact_seq == 0 {
                 return Err(WireError::new("deferred artifact sequence is zero"));
+            }
+            if record.lane != self.lane {
+                return Err(WireError::new(
+                    "deferred record lane does not match owning cursor lane",
+                ));
             }
             if index > 0 && record.artifact_seq != self.deferred_records[index - 1].artifact_seq + 1
             {
@@ -2424,8 +2430,10 @@ fn reject_duplicate_object_members(input: &str) -> Result<(), WireError> {
             }
             loop {
                 let key = self.string_token()?;
-                if !keys.insert(key) {
-                    return Err(WireError::new("duplicate raw object member"));
+                let decoded_key: String = serde_json::from_str(key)
+                    .map_err(|_| WireError::new("invalid object key string"))?;
+                if !keys.insert(decoded_key) {
+                    return Err(WireError::new("duplicate decoded object member"));
                 }
                 self.expect(b':')?;
                 self.value()?;
@@ -2574,8 +2582,10 @@ pub fn render_wire_type_inventory() -> String {
         output.push_str(row.type_name);
         output.push('\t');
         output.push_str(row.kind);
-        output.push('\t');
-        output.push_str(&row.fields.join(","));
+        if !row.fields.is_empty() {
+            output.push('\t');
+            output.push_str(&row.fields.join(","));
+        }
         output.push('\n');
     }
     output
