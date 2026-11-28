@@ -26,7 +26,7 @@ Check the risks the change touches, not every row in every PR:
 
 Keep provider-specific behavior out of the routing core where the adapter contract suffices. Reuse shared fixtures and abstractions; avoid speculative dependencies, unbounded work, and unrelated cleanup.
 
-Run the applicable checks locally and require the GitHub Actions `check` job to pass on the PR head. The `pr-policy` job fails a PR whose template sections are empty, or whose `crates/*/src` changes come without a test change (a `crates/*/tests/` or `llmux-testkit` file, or an added `#[test]` or `assert!`); when no deterministic test applies, write `Test exemption: <reason>` in the Verification section. The `coverage` job fails when workspace line coverage drops below `.github/coverage-floor` or a PR lowers that number; raise it when coverage rises. Address Devin Review findings before merging; explain any finding you do not act on.
+Run the applicable checks locally and require the GitHub Actions `check` job to pass on the PR head. The `pr-policy` job fails a PR whose template sections are empty, or whose workspace package Rust source changes come without a test change (a package `tests/` or `llmux-testkit` file, or an added `#[test]` or `assert!`); this includes `crates/*/src`, `deploy/src`, `bench/src`, and `xtask/src`. When no deterministic test applies, write `Test exemption: <reason>` in the Verification section. The `coverage` job fails when workspace line coverage drops below `.github/coverage-floor` or a PR lowers that number; raise it when coverage rises. Address Devin Review findings before merging; explain any finding you do not act on.
 
 ```sh
 cargo fmt --all -- --check
@@ -55,7 +55,7 @@ Each standard above pairs with the mechanism that makes it fail before merge. A 
 | --- | --- | --- |
 | Format and lint clean | `cargo fmt --check`, `clippy -D warnings` in CI `check` job | CI |
 | Tests pass | `cargo test --locked --workspace --doc` and `node --test crates/llmux-server/tests/dashboard.cjs` in the `check` job; workspace unit/integration tests via `cargo llvm-cov nextest --locked --workspace` in the `coverage` job | CI |
-| `crates/*/src` changes need test evidence or `Test exemption:` | `pr-policy` job (`cargo xtask pr-policy`) | CI |
+| Workspace package Rust source changes need test evidence or `Test exemption:` | `pr-policy` job (`cargo xtask pr-policy`) | CI |
 | PR template sections non-empty | `pr-policy` job | CI |
 | Workspace line coverage never drops | `coverage` job vs `.github/coverage-floor` | CI |
 | Required plugins pinned to reviewed commits | `.devin/config.json` requiredPlugins SHAs | Config |

@@ -64,7 +64,15 @@ fn sections(body: &str) -> HashMap<String, String> {
 
 fn test_file(file: &str) -> bool {
     file.starts_with("crates/llmux-testkit/")
-        || crate_path(file).is_some_and(|p| p.starts_with("tests/"))
+        || package_path(file).is_some_and(|p| p.starts_with("tests/"))
+}
+
+fn package_path(file: &str) -> Option<&str> {
+    if let Some(path) = crate_path(file) {
+        return Some(path);
+    }
+    let (member, path) = file.split_once('/')?;
+    (!member.is_empty() && !member.starts_with('.')).then_some(path)
 }
 
 fn crate_path(file: &str) -> Option<&str> {
@@ -110,7 +118,7 @@ pub fn check(body: &str, files: &[&str], diff: &str) -> Vec<String> {
         .iter()
         .copied()
         .filter(|file| {
-            crate_path(file).is_some_and(|path| {
+            package_path(file).is_some_and(|path| {
                 path.starts_with("src/") && path.len() > 7 && path.ends_with(".rs")
             }) && !test_file(file)
         })
