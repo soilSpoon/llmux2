@@ -50,33 +50,42 @@ serving on `claude_gpt_weekly` budget.
 
 #### Scenario: Whole-account exhaustion
 
-WHEN a provider's quota is account-wide (Cloudflare daily neurons, morph
-monthly quota)
+WHEN a provider's quota is account-wide (Cloudflare daily neurons, Morph
+Ultra daily allowance)
 THEN the family is the account itself and every leg on the credential cools.
 
 ### Requirement: Authoritative resets may exceed the backoff cap
 
 A provider-reported reset (`reset_at`, reset headers, or a documented fixed
-boundary like Cloudflare's UTC-midnight reset) SHALL be honored up to
-`cooldown.quota_max_ms` (default ~32 days), independent of the exponential
-backoff cap `cooldown.max` that governs unhinted 429s.
+boundary like Cloudflare's or Morph Ultra's UTC-midnight reset) SHALL be
+honored up to `cooldown.quota_max_ms` (default ~32 days), independent of the
+exponential backoff cap `cooldown.max` that governs unhinted 429s.
+
+#### Scenario: Morph Ultra daily allowance
+
+WHEN Morph reports 429 `ultra_daily_budget_exceeded` for the account-wide
+Ultra daily allowance
+THEN the credential's quota scope parks until the next 00:00 UTC instead of
+cooling only one deployment as a transient rate limit.
 
 #### Scenario: Monthly quota
 
-WHEN morph reports monthly quota exhaustion
+WHEN a provider reports monthly quota exhaustion
 THEN the credential parks until the next monthly boundary instead of
 re-probing every `cooldown.max`.
 
 ### Requirement: Provider signature catalog
 
 Each adapter SHALL map its provider's exhaustion signatures to the classes
-above. Current catalog, from observed traffic:
+above. Current catalog, from observed traffic; rows marked legacy are retained
+parser behavior rather than current provider evidence:
 
 | Provider | Signature | Class | Reset |
 | --- | --- | --- | --- |
 | Cloudflare Workers AI | 429 with `errors[].code: 4006` | QuotaExhausted (account) | next UTC midnight |
 | Gemini API | QuotaFailure `perDay` violations | QuotaExhausted | retryInfo delay / daily reset |
-| Morph | "monthly quota exceeded" | QuotaExhausted (account) | next month UTC |
+| Morph | 429 `ultra_daily_budget_exceeded` (Ultra daily allowance) | QuotaExhausted (account) | next UTC midnight |
+| Legacy monthly-plan providers | "monthly quota exceeded" | QuotaExhausted (account) | next month UTC |
 | Morph | "no API allowance" | NotProvisioned | config reload |
 | Antigravity | 429 RESOURCE_EXHAUSTED | QuotaExhausted (family) | weekly window end |
 | Credit relays | `insufficient_credits` / 402 credits | QuotaExhausted (account) | unknown; park to quota_max |
