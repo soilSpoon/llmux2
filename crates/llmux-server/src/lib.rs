@@ -32,6 +32,7 @@ use llmux_providers::{
     DevinAcpConfig, Freebuff, NoAuthSource, OpenAiCompat, OpenAiResponses, OpenCode,
     RequestMetadata, StaticKey, Xai,
 };
+use llmux_providers::{DahlConfig, DahlCredentialSource};
 use llmux_types::{
     provider, AcpAgentSpec, Billing, ContextOverflow, CredentialSource, GatewayRequest,
     GatewayResponse, InboundFormat, ProviderRegistry, RequestId, SpoolStore, TrafficClass,
@@ -115,6 +116,7 @@ pub fn validate_startup(mut config: RuntimeConfig) -> Result<(), Box<dyn Error +
         .keys()
         .chain(config.oauth.keys())
         .chain(config.nous.keys())
+        .chain(config.dahl.keys())
         .chain(config.acp_agents.keys())
         .cloned()
         .collect();
@@ -206,6 +208,7 @@ async fn build(
             .keys()
             .chain(config.oauth.keys())
             .chain(config.nous.keys())
+            .chain(config.dahl.keys())
             .chain(config.acp_agents.keys())
             .cloned()
             .collect(),
@@ -244,6 +247,22 @@ async fn build(
         nous.refresh_skew = credential.refresh_skew;
         nous.request_timeout = credential.request_timeout;
         sources.insert(id, Arc::new(NousPortalSource::start(nous).await?));
+    }
+    for (id, credential) in std::mem::take(&mut config.dahl) {
+        sources.insert(
+            id,
+            Arc::new(
+                DahlCredentialSource::start(DahlConfig {
+                    base_url: credential.base_url,
+                    fingerprint: credential.fingerprint,
+                    state_path: credential.state_path,
+                    allocation_tokens: credential.allocation_tokens,
+                    allocate_entire_pool: credential.allocate_entire_pool,
+                    request_timeout: credential.request_timeout,
+                })
+                .await?,
+            ),
+        );
     }
     // acp_agent credentials name a local child process, not remote auth; the
     // executor still requires a source per referenced credential id.
